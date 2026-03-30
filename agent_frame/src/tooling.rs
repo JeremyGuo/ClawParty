@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -118,8 +119,9 @@ fn resolve_path(path: &str, workspace_root: &Path) -> PathBuf {
     }
 }
 
-fn with_timeout<T: Send + 'static>(
+fn with_timeout_and_cancel<T: Send + 'static>(
     timeout_seconds: f64,
+    cancel_flag: Option<Arc<AtomicBool>>,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -127,15 +129,34 @@ fn with_timeout<T: Send + 'static>(
         let _ = sender.send(operation());
     });
 
-    receiver
-        .recv_timeout(Duration::from_secs_f64(timeout_seconds))
-        .map_err(|_| anyhow!("operation timed out after {} seconds", timeout_seconds))?
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
+    loop {
+        if let Some(cancel_flag) = &cancel_flag
+            && cancel_flag.load(Ordering::SeqCst)
+        {
+            return Err(anyhow!("operation cancelled"));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!("operation timed out after {} seconds", timeout_seconds));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let slice = remaining.min(Duration::from_millis(25));
+        match receiver.recv_timeout(slice) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("operation worker disconnected"));
+            }
+        }
+    }
 }
 
 fn wait_for_child_with_timeout(
     child: &mut Child,
     timeout_seconds: f64,
     timeout_label: &str,
+    cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Output> {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     loop {
@@ -170,11 +191,18 @@ fn wait_for_child_with_timeout(
                 timeout_seconds
             ));
         }
+        if let Some(cancel_flag) = cancel_flag
+            && cancel_flag.load(Ordering::SeqCst)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("{} cancelled", timeout_label));
+        }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn read_file_tool(workspace_root: PathBuf) -> Tool {
+fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
     Tool::new(
         "read_file",
         "Read a UTF-8 text file. The model must choose timeout_seconds.",
@@ -200,7 +228,7 @@ fn read_file_tool(workspace_root: PathBuf) -> Tool {
             let limit_lines = usize_arg_with_default(arguments, "limit_lines", 200)?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout(timeout_seconds, move || {
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
                 if encoding.to_lowercase() != "utf-8" {
                     return Err(anyhow!("only utf-8 encoding is supported"));
                 }
@@ -228,7 +256,7 @@ fn read_file_tool(workspace_root: PathBuf) -> Tool {
     )
 }
 
-fn write_file_tool(workspace_root: PathBuf) -> Tool {
+fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
     Tool::new(
         "write_file",
         "Write a UTF-8 text file. The model must choose timeout_seconds.",
@@ -254,7 +282,7 @@ fn write_file_tool(workspace_root: PathBuf) -> Tool {
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout(timeout_seconds, move || {
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
                 if encoding.to_lowercase() != "utf-8" {
                     return Err(anyhow!("only utf-8 encoding is supported"));
                 }
@@ -285,7 +313,7 @@ fn write_file_tool(workspace_root: PathBuf) -> Tool {
     )
 }
 
-fn edit_tool(workspace_root: PathBuf) -> Tool {
+fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
     Tool::new(
         "edit",
         "Edit a UTF-8 text file by replacing old_text with new_text. The model must choose timeout_seconds.",
@@ -321,7 +349,7 @@ fn edit_tool(workspace_root: PathBuf) -> Tool {
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout(timeout_seconds, move || {
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
                 if encoding.to_lowercase() != "utf-8" {
                     return Err(anyhow!("only utf-8 encoding is supported"));
                 }
@@ -428,7 +456,7 @@ fn process_is_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn exec_tool(workspace_root: PathBuf) -> Tool {
+fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
     Tool::new(
         "exec",
         "Execute a shell command. Use wait=false to start a background process that can later be inspected with the process tool. The model must choose timeout_seconds.",
@@ -460,7 +488,8 @@ fn exec_tool(workspace_root: PathBuf) -> Tool {
                 .unwrap_or_else(|| workspace_root.clone());
 
             if wait {
-                return with_timeout(timeout_seconds + 1.0, move || {
+                let exec_cancel_flag = cancel_flag.clone();
+                return with_timeout_and_cancel(timeout_seconds + 1.0, cancel_flag.clone(), move || {
                     let mut child = Command::new("sh")
                         .arg("-c")
                         .arg(&command)
@@ -469,8 +498,12 @@ fn exec_tool(workspace_root: PathBuf) -> Tool {
                         .stderr(Stdio::piped())
                         .spawn()
                         .with_context(|| format!("failed to execute shell in {}", cwd.display()))?;
-                    let output =
-                        wait_for_child_with_timeout(&mut child, timeout_seconds, "command")?;
+                    let output = wait_for_child_with_timeout(
+                        &mut child,
+                        timeout_seconds,
+                        "command",
+                        exec_cancel_flag.as_ref(),
+                    )?;
                     Ok(json!({
                         "command": command,
                         "cwd": cwd.display().to_string(),
@@ -618,7 +651,7 @@ fn process_tool(workspace_root: PathBuf) -> Tool {
     )
 }
 
-fn apply_patch_tool(workspace_root: PathBuf) -> Tool {
+fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
     Tool::new(
         "apply_patch",
         "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. The model must choose timeout_seconds.",
@@ -651,7 +684,8 @@ fn apply_patch_tool(workspace_root: PathBuf) -> Tool {
                 .unwrap_or(false);
             let patch_workspace_root = workspace_root.clone();
 
-            with_timeout(timeout_seconds + 1.0, move || {
+            let patch_cancel_flag = cancel_flag.clone();
+            with_timeout_and_cancel(timeout_seconds + 1.0, cancel_flag.clone(), move || {
                 let mut command = Command::new("git");
                 command
                     .arg("apply")
@@ -676,7 +710,12 @@ fn apply_patch_tool(workspace_root: PathBuf) -> Tool {
                     .write_all(patch.as_bytes())
                     .context("failed to write patch to git apply stdin")?;
                 let _ = child.stdin.take();
-                let output = wait_for_child_with_timeout(&mut child, timeout_seconds, "git apply")?;
+                let output = wait_for_child_with_timeout(
+                    &mut child,
+                    timeout_seconds,
+                    "git apply",
+                    patch_cancel_flag.as_ref(),
+                )?;
                 Ok(json!({
                     "applied": output.status.success(),
                     "returncode": output.status.code().unwrap_or(-1),
@@ -919,8 +958,8 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
     )
 }
 
-fn run_shell_tool(workspace_root: PathBuf) -> Tool {
-    let exec = exec_tool(workspace_root);
+fn run_shell_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+    let exec = exec_tool(workspace_root, cancel_flag);
     Tool::new(
         "run_shell",
         "Deprecated alias for exec. Execute a shell command. The model must choose timeout_seconds.",
@@ -944,7 +983,10 @@ fn shell_escape_path(path: &Path) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
-fn load_skill_tool(skills: &[SkillMetadata]) -> Result<Tool> {
+fn load_skill_tool(
+    skills: &[SkillMetadata],
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<Tool> {
     let skill_index = build_skill_index(skills)?;
     let available_skills = skill_index.keys().cloned().collect::<Vec<_>>();
     Ok(Tool::new(
@@ -966,7 +1008,7 @@ fn load_skill_tool(skills: &[SkillMetadata]) -> Result<Tool> {
             let skill_name = string_arg(arguments, "skill_name")?;
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let skill_index = skill_index.clone();
-            with_timeout(timeout_seconds, move || {
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
                 let (skill, content) = load_skill_by_name(&skill_index, &skill_name)?;
                 Ok(json!({
                     "name": skill.name,
@@ -985,28 +1027,52 @@ pub fn build_tool_registry(
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
 ) -> Result<BTreeMap<String, Tool>> {
+    build_tool_registry_with_cancel(
+        enabled_tools,
+        workspace_root,
+        upstream,
+        skills,
+        extra_tools,
+        None,
+    )
+}
+
+pub fn build_tool_registry_with_cancel(
+    enabled_tools: &[String],
+    workspace_root: &Path,
+    upstream: &UpstreamConfig,
+    skills: &[SkillMetadata],
+    extra_tools: &[Tool],
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<BTreeMap<String, Tool>> {
     let mut builtins = BTreeMap::from([
         (
             "read_file".to_string(),
-            read_file_tool(workspace_root.to_path_buf()),
+            read_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "write_file".to_string(),
-            write_file_tool(workspace_root.to_path_buf()),
+            write_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "run_shell".to_string(),
-            run_shell_tool(workspace_root.to_path_buf()),
+            run_shell_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
-        ("edit".to_string(), edit_tool(workspace_root.to_path_buf())),
-        ("exec".to_string(), exec_tool(workspace_root.to_path_buf())),
+        (
+            "edit".to_string(),
+            edit_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "exec".to_string(),
+            exec_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
         (
             "process".to_string(),
             process_tool(workspace_root.to_path_buf()),
         ),
         (
             "apply_patch".to_string(),
-            apply_patch_tool(workspace_root.to_path_buf()),
+            apply_patch_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         ("web_fetch".to_string(), web_fetch_tool()),
         ("http_request".to_string(), http_request_tool()),
@@ -1036,7 +1102,7 @@ pub fn build_tool_registry(
     }
 
     if !skills.is_empty() {
-        let skill_tool = load_skill_tool(skills)?;
+        let skill_tool = load_skill_tool(skills, cancel_flag)?;
         registry.insert(skill_tool.name.clone(), skill_tool);
     }
 

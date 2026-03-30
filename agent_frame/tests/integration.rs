@@ -4,9 +4,9 @@ use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tool;
 use agent_frame::tooling::{build_tool_registry, execute_tool_call};
 use agent_frame::{
-    ExternalWebSearchConfig, NativeWebSearchConfig, UpstreamConfig,
+    ExternalWebSearchConfig, NativeWebSearchConfig, SessionExecutionControl, UpstreamConfig,
     compact_session_messages_with_report, extract_assistant_text, load_config_value, run_session,
-    run_session_with_report,
+    run_session_with_report, run_session_with_report_controlled,
 };
 use anyhow::Result;
 use assert_cmd::Command;
@@ -92,6 +92,9 @@ fn handle_stream(
     responses: &Arc<Mutex<VecDeque<Value>>>,
     requests: &Arc<Mutex<Vec<Value>>>,
 ) {
+    stream
+        .set_nonblocking(false)
+        .expect("set blocking mode on accepted stream");
     let mut buffer = vec![0_u8; 64 * 1024];
     let bytes_read = stream.read(&mut buffer).expect("read request");
     let request_text = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
@@ -813,6 +816,77 @@ fn run_session_report_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     assert_eq!(report.usage.cache_hit_tokens, 12);
     assert_eq!(report.usage.cache_write_tokens, 2);
     assert_eq!(report.usage.cache_miss_tokens, 12);
+    Ok(())
+}
+
+#[test]
+fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "draft answer",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "multiply",
+                        "arguments": "{\"a\":6,\"b\":7}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+
+    let multiply = tool! {
+        description: "Multiply two integers.",
+        fn multiply(a: i64, b: i64) -> i64 {
+            a * b
+        }
+    };
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let checkpoints = Arc::new(Mutex::new(Vec::new()));
+    let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
+    let control = {
+        let checkpoints = Arc::clone(&checkpoints);
+        let control_holder = Arc::clone(&control_holder);
+        SessionExecutionControl::with_checkpoint_callback(move |report| {
+            checkpoints.lock().unwrap().push(report);
+            if let Some(control) = control_holder.lock().unwrap().as_ref() {
+                control.request_cancel();
+            }
+        })
+    };
+    *control_holder.lock().unwrap() = Some(control.clone());
+
+    let error = run_session_with_report_controlled(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        Some(control),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    let checkpoints = checkpoints.lock().unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(extract_assistant_text(&checkpoints[0].messages), "draft answer");
+    assert_eq!(checkpoints[0].usage.total_tokens, 26);
     Ok(())
 }
 

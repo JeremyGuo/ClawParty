@@ -5,9 +5,11 @@ use crate::config::AgentConfig;
 use crate::llm::{TokenUsage, create_chat_completion};
 use crate::message::ChatMessage;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
-use crate::tooling::{Tool, build_tool_registry, execute_tool_call};
+use crate::tooling::{Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool_call};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const AGENT_FRAME_MARKER: &str = "[AgentFrame Runtime]";
 
@@ -105,11 +107,79 @@ pub struct SessionRunReport {
     pub usage: TokenUsage,
 }
 
+#[derive(Clone)]
+pub struct SessionExecutionControl {
+    cancel_flag: Arc<AtomicBool>,
+    checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
+}
+
+impl SessionExecutionControl {
+    pub fn new() -> Self {
+        Self {
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            checkpoint_callback: None,
+        }
+    }
+
+    pub fn with_checkpoint_callback(
+        callback: impl Fn(SessionRunReport) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            checkpoint_callback: Some(Arc::new(callback)),
+        }
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
+    }
+
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(anyhow!("session execution cancelled"));
+        }
+        Ok(())
+    }
+
+    fn emit_checkpoint(&self, messages: &[ChatMessage], usage: &TokenUsage) {
+        if let Some(callback) = &self.checkpoint_callback {
+            callback(SessionRunReport {
+                messages: messages.to_vec(),
+                usage: usage.clone(),
+            });
+        }
+    }
+}
+
+impl Default for SessionExecutionControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn run_session_with_report(
     previous_messages: Vec<ChatMessage>,
     prompt: impl Into<String>,
     config: AgentConfig,
     extra_tools: Vec<Tool>,
+) -> Result<SessionRunReport> {
+    run_session_with_report_controlled(previous_messages, prompt, config, extra_tools, None)
+}
+
+pub fn run_session_with_report_controlled(
+    previous_messages: Vec<ChatMessage>,
+    prompt: impl Into<String>,
+    config: AgentConfig,
+    extra_tools: Vec<Tool>,
+    control: Option<SessionExecutionControl>,
 ) -> Result<SessionRunReport> {
     let prompt = prompt.into();
     let discovered_skills = discover_skills(&config.skills_dirs)?;
@@ -117,12 +187,17 @@ pub fn run_session_with_report(
     let mut messages = ensure_system_message(&previous_messages, &system_prompt);
     let mut usage = TokenUsage::default();
 
-    let registry = build_tool_registry(
+    if let Some(control) = &control {
+        control.ensure_not_cancelled()?;
+    }
+
+    let registry = build_tool_registry_with_cancel(
         &config.enabled_tools,
         &config.workspace_root,
         &config.upstream,
         &discovered_skills,
         &extra_tools,
+        control.as_ref().map(SessionExecutionControl::cancel_flag),
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
 
@@ -135,21 +210,35 @@ pub fn run_session_with_report(
     }
 
     for round_index in 0..config.max_tool_roundtrips {
+        if let Some(control) = &control {
+            control.ensure_not_cancelled()?;
+        }
         if round_index > 0 {
             let compaction =
                 maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
             usage.add_assign(&compaction.usage);
             messages = compaction.messages;
         }
+        if let Some(control) = &control {
+            control.ensure_not_cancelled()?;
+        }
         let outcome = create_chat_completion(&config.upstream, &messages, &tool_definitions, None)?;
         usage.add_assign(&outcome.usage);
         let tool_calls = outcome.message.tool_calls.clone().unwrap_or_default();
         messages.push(outcome.message);
+        if let Some(control) = &control
+            && !extract_assistant_text(&messages).trim().is_empty()
+        {
+            control.emit_checkpoint(&messages, &usage);
+        }
         if tool_calls.is_empty() {
             return Ok(SessionRunReport { messages, usage });
         }
 
         for tool_call in tool_calls {
+            if let Some(control) = &control {
+                control.ensure_not_cancelled()?;
+            }
             let result = execute_tool_call(
                 &registry,
                 &tool_call.function.name,

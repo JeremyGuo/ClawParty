@@ -67,6 +67,8 @@ pub struct ModelConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MainAgentConfig {
     pub model: String,
+    #[serde(default)]
+    pub timeout_seconds: Option<f64>,
     #[serde(default = "default_main_agent_language")]
     pub language: String,
     #[serde(default = "default_enabled_tools")]
@@ -237,6 +239,13 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
             config.main_agent.model
         ));
     }
+    if config
+        .main_agent
+        .timeout_seconds
+        .is_some_and(|value| value <= 0.0)
+    {
+        return Err(anyhow!("main_agent.timeout_seconds must be greater than 0"));
+    }
     for channel in &config.channels {
         if let ChannelConfig::Telegram(telegram) = channel {
             validate_bot_commands(&telegram.commands).with_context(|| {
@@ -371,5 +380,39 @@ mod tests {
                 .to_string()
                 .contains("idle_context_compaction_poll_interval_seconds")
         );
+    }
+
+    #[test]
+    fn main_agent_timeout_must_be_positive_when_present() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main",
+                "timeout_seconds": 0
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(error.to_string().contains("main_agent.timeout_seconds"));
     }
 }

@@ -20,8 +20,9 @@ use crate::session::{SessionManager, SessionSnapshot};
 use crate::sink::{SinkRouter, SinkTarget};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
-    ChatMessage, TokenUsage, Tool, compact_session_messages_with_report, extract_assistant_text,
-    run_session_with_report,
+    ChatMessage, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
+    compact_session_messages_with_report, extract_assistant_text,
+    run_session_with_report_controlled,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -34,7 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::select;
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
@@ -71,6 +72,14 @@ struct SubAgentSlot {
     counter: Arc<AtomicUsize>,
 }
 
+enum TimedRunOutcome {
+    Completed(SessionRunReport),
+    TimedOut {
+        checkpoint: Option<SessionRunReport>,
+        error: anyhow::Error,
+    },
+}
+
 impl Drop for SubAgentSlot {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
@@ -82,6 +91,18 @@ impl ServerRuntime {
         self.models
             .get(model_key)
             .with_context(|| format!("unknown model {}", model_key))
+    }
+
+    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
+            return Ok(timeout_seconds);
+        }
+        Ok(background_agent_timeout_seconds(
+            self.models
+                .get(model_key)
+                .with_context(|| format!("unknown model {}", model_key))?
+                .timeout_seconds,
+        ))
     }
 
     fn register_managed_agent(
@@ -167,6 +188,27 @@ impl ServerRuntime {
         }
     }
 
+    fn mark_managed_agent_timed_out(
+        &self,
+        id: uuid::Uuid,
+        usage: &TokenUsage,
+        error: &anyhow::Error,
+    ) {
+        if let Ok(mut registry) = self.agent_registry.lock() {
+            if let Err(persist_error) =
+                registry.mark_timed_out(id, Utc::now(), usage.clone(), format!("{error:#}"))
+            {
+                warn!(
+                    log_stream = "server",
+                    kind = "agent_registry_persist_failed",
+                    agent_id = %id,
+                    error = %format!("{persist_error:#}"),
+                    "failed to persist agent registry after mark_timed_out"
+                );
+            }
+        }
+    }
+
     fn list_managed_agents(&self, kind: ManagedAgentKind) -> Result<Value> {
         let registry = self
             .agent_registry
@@ -194,12 +236,19 @@ impl ServerRuntime {
             .unwrap_or(false)
     }
 
+    async fn wait_for_child_agents_to_finish(&self, parent_agent_id: uuid::Uuid) {
+        while self.has_active_child_agents(parent_agent_id) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     fn build_agent_frame_config(
         &self,
         session: &SessionSnapshot,
         workspace_root: &Path,
         kind: AgentPromptKind,
         model_key: &str,
+        upstream_timeout_seconds: Option<f64>,
     ) -> Result<FrameAgentConfig> {
         let model = self.model_config(model_key)?;
         let commands = self
@@ -216,7 +265,9 @@ impl ServerRuntime {
                 api_key: model.api_key.clone(),
                 api_key_env: model.api_key_env.clone(),
                 chat_completions_path: model.chat_completions_path.clone(),
-                timeout_seconds: model.timeout_seconds,
+                timeout_seconds: upstream_timeout_seconds
+                    .unwrap_or(model.timeout_seconds)
+                    .min(model.timeout_seconds),
                 context_window_tokens: model.context_window_tokens,
                 cache_control: model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
                     cache_type: "ephemeral".to_string(),
@@ -262,21 +313,23 @@ impl ServerRuntime {
             let session = session.clone();
             tools.push(Tool::new(
                 "run_subagent",
-                "Run delegated subagent work in the shared rundir. Use either task/model for a single subagent, or tasks:[{task, model?}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_path, and token usage.",
+                "Run delegated subagent work in the shared rundir. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_path, timeout status, and token usage.",
                 json!({
                     "type": "object",
                     "properties": {
                         "task": {"type": "string"},
                         "model": {"type": "string"},
+                        "timeout_seconds": {"type": "number"},
                         "tasks": {
                             "type": "array",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "task": {"type": "string"},
-                                    "model": {"type": "string"}
+                                    "model": {"type": "string"},
+                                    "timeout_seconds": {"type": "number"}
                                 },
-                                "required": ["task"],
+                                "required": ["task", "timeout_seconds"],
                                 "additionalProperties": false
                             }
                         }
@@ -304,7 +357,12 @@ impl ServerRuntime {
                                     .get("model")
                                     .and_then(Value::as_str)
                                     .map(ToOwned::to_owned);
-                                Ok((task.to_string(), model_key))
+                                let timeout_seconds = item
+                                    .get("timeout_seconds")
+                                    .and_then(Value::as_f64)
+                                    .filter(|value| *value > 0.0)
+                                    .ok_or_else(|| anyhow!("timeout_seconds must be a positive number"))?;
+                                Ok((task.to_string(), model_key, timeout_seconds))
                             })
                             .collect::<Result<Vec<_>>>()?;
                         if requests.is_empty() {
@@ -322,11 +380,17 @@ impl ServerRuntime {
                             .get("model")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
+                        let timeout_seconds = object
+                            .get("timeout_seconds")
+                            .and_then(Value::as_f64)
+                            .filter(|value| *value > 0.0)
+                            .ok_or_else(|| anyhow!("timeout_seconds must be a positive number"))?;
                         runtime.run_subagent(
                             agent_id,
                             session.clone(),
                             model_key,
                             task.to_string(),
+                            timeout_seconds,
                         )
                     }
                 },
@@ -643,11 +707,25 @@ impl ServerRuntime {
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
+        upstream_timeout_seconds: Option<f64>,
+        execution_control: Option<SessionExecutionControl>,
     ) -> Result<agent_frame::SessionRunReport> {
         let workspace_root = self.agent_workspace.rundir.clone();
-        let config = self.build_agent_frame_config(&session, &workspace_root, kind, &model_key)?;
+        let config = self.build_agent_frame_config(
+            &session,
+            &workspace_root,
+            kind,
+            &model_key,
+            upstream_timeout_seconds,
+        )?;
         let extra_tools = self.build_extra_tools(&session, kind, agent_id);
-        run_session_with_report(previous_messages, prompt, config, extra_tools)
+        run_session_with_report_controlled(
+            previous_messages,
+            prompt,
+            config,
+            extra_tools,
+            execution_control,
+        )
     }
 
     async fn run_agent_turn_with_timeout(
@@ -659,33 +737,117 @@ impl ServerRuntime {
         previous_messages: Vec<ChatMessage>,
         prompt: String,
         timeout_seconds: f64,
+        upstream_timeout_seconds: Option<f64>,
         timeout_label: &str,
         join_label: &str,
-    ) -> Result<agent_frame::SessionRunReport> {
+    ) -> Result<TimedRunOutcome> {
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
         let join_label = join_label.to_string();
-        match timeout(
-            Duration::from_secs_f64(timeout_seconds),
-            tokio::task::spawn_blocking(move || {
-                runtime.run_agent_turn_sync(
-                    session,
-                    kind,
-                    agent_id,
-                    model_key,
-                    previous_messages,
-                    prompt,
-                )
-            }),
-        )
-        .await
-        {
-            Ok(join_result) => join_result.context(join_label)?,
-            Err(_) => Err(anyhow!(
-                "{} timed out after {:.1} seconds",
-                timeout_label,
-                timeout_seconds
-            )),
+        let (checkpoint_sender, mut checkpoint_receiver) = mpsc::unbounded_channel();
+        let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
+            let _ = checkpoint_sender.send(report);
+        });
+        let cancellation_handle = execution_control.clone();
+        let join_handle = tokio::task::spawn_blocking(move || {
+            runtime.run_agent_turn_sync(
+                session,
+                kind,
+                agent_id,
+                model_key,
+                previous_messages,
+                prompt,
+                upstream_timeout_seconds,
+                Some(execution_control),
+            )
+        });
+        let deadline = tokio::time::sleep(Duration::from_secs_f64(timeout_seconds));
+        tokio::pin!(deadline);
+        let mut latest_checkpoint = None;
+        tokio::pin!(join_handle);
+        loop {
+            select! {
+                checkpoint = checkpoint_receiver.recv() => {
+                    if checkpoint.is_none() {
+                        continue;
+                    }
+                    latest_checkpoint = checkpoint;
+                }
+                join_result = &mut join_handle => {
+                    let report = join_result.context(join_label)?.context("agent turn failed")?;
+                    return Ok(TimedRunOutcome::Completed(report));
+                }
+                _ = &mut deadline => {
+                    cancellation_handle.request_cancel();
+                    return Ok(TimedRunOutcome::TimedOut {
+                        checkpoint: latest_checkpoint,
+                        error: anyhow!(
+                            "{} timed out after {:.1} seconds",
+                            timeout_label,
+                            timeout_seconds
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    fn run_agent_turn_with_timeout_blocking(
+        &self,
+        session: SessionSnapshot,
+        kind: AgentPromptKind,
+        agent_id: uuid::Uuid,
+        model_key: String,
+        previous_messages: Vec<ChatMessage>,
+        prompt: String,
+        timeout_seconds: f64,
+        upstream_timeout_seconds: Option<f64>,
+        timeout_label: &str,
+    ) -> Result<TimedRunOutcome> {
+        let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
+        let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
+            let _ = checkpoint_sender.send(report);
+        });
+        let cancellation_handle = execution_control.clone();
+        let runtime = self.clone();
+        let timeout_label = timeout_label.to_string();
+        let handle = std::thread::spawn(move || {
+            runtime.run_agent_turn_sync(
+                session,
+                kind,
+                agent_id,
+                model_key,
+                previous_messages,
+                prompt,
+                upstream_timeout_seconds,
+                Some(execution_control),
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds);
+        let mut latest_checkpoint = None;
+        loop {
+            match checkpoint_receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(report) => latest_checkpoint = Some(report),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            if handle.is_finished() {
+                let report = handle
+                    .join()
+                    .map_err(|_| anyhow!("agent worker thread panicked"))??;
+                return Ok(TimedRunOutcome::Completed(report));
+            }
+            if std::time::Instant::now() >= deadline {
+                cancellation_handle.request_cancel();
+                return Ok(TimedRunOutcome::TimedOut {
+                    checkpoint: latest_checkpoint,
+                    error: anyhow!(
+                        "{} timed out after {:.1} seconds",
+                        timeout_label,
+                        timeout_seconds
+                    ),
+                });
+            }
         }
     }
 
@@ -695,6 +857,7 @@ impl ServerRuntime {
         session: SessionSnapshot,
         model_key: Option<String>,
         prompt: String,
+        timeout_seconds: f64,
     ) -> Result<Value> {
         let _slot = self.try_acquire_subagent_slot()?;
         let subagent_id = uuid::Uuid::new_v4();
@@ -720,18 +883,30 @@ impl ServerRuntime {
             "subagent started"
         );
 
-        let report = self.run_agent_turn_sync(
+        let report = self.run_agent_turn_with_timeout_blocking(
             session.clone(),
             AgentPromptKind::SubAgent,
             subagent_id,
             model_key.clone(),
             Vec::new(),
             prompt,
+            timeout_seconds,
+            Some(timeout_seconds),
+            "subagent",
         );
-        let report = match report {
-            Ok(report) => {
+        let (report, timed_out) = match report {
+            Ok(TimedRunOutcome::Completed(report)) => {
                 self.mark_managed_agent_completed(subagent_id, &report.usage);
-                report
+                (report, false)
+            }
+            Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_timed_out(subagent_id, &usage, &error);
+                let report = checkpoint.ok_or(error)?;
+                (report, true)
             }
             Err(error) => {
                 self.mark_managed_agent_failed(subagent_id, &TokenUsage::default(), &error);
@@ -770,6 +945,7 @@ impl ServerRuntime {
             "model": model_key,
             "text": clean_text,
             "attachment_path": attachment_path,
+            "timed_out": timed_out,
             "usage": {
                 "llm_calls": report.usage.llm_calls,
                 "prompt_tokens": report.usage.prompt_tokens,
@@ -787,14 +963,14 @@ impl ServerRuntime {
         &self,
         parent_agent_id: uuid::Uuid,
         session: SessionSnapshot,
-        requests: Vec<(String, Option<String>)>,
+        requests: Vec<(String, Option<String>, f64)>,
     ) -> Result<Value> {
         let mut handles = Vec::with_capacity(requests.len());
-        for (task, model_key) in requests {
+        for (task, model_key, timeout_seconds) in requests {
             let runtime = self.clone();
             let session = session.clone();
             let handle = std::thread::spawn(move || {
-                runtime.run_subagent(parent_agent_id, session, model_key, task)
+                runtime.run_subagent(parent_agent_id, session, model_key, task, timeout_seconds)
             });
             handles.push(handle);
         }
@@ -874,8 +1050,7 @@ impl ServerRuntime {
             model = %job.model_key,
             "background agent started"
         );
-        let timeout_seconds =
-            background_agent_timeout_seconds(self.model_config(&job.model_key)?.timeout_seconds);
+        let timeout_seconds = self.main_agent_timeout_seconds(&job.model_key)?;
         let run_result = self
             .run_agent_turn_with_timeout(
                 job.session.clone(),
@@ -885,13 +1060,14 @@ impl ServerRuntime {
                 Vec::new(),
                 job.prompt.clone(),
                 timeout_seconds,
+                Some(timeout_seconds),
                 "background agent",
                 "background agent task join failed",
             )
             .await;
 
         match run_result {
-            Ok(report) => {
+            Ok(TimedRunOutcome::Completed(report)) => {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
                     &job.session,
@@ -935,6 +1111,15 @@ impl ServerRuntime {
                 cleanup_detached_session_root(&job).ok();
                 Ok(())
             }
+            Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
+                cleanup_detached_session_root(&job).ok();
+                self.handle_background_job_failure(&job, &error).await
+            }
             Err(error) => {
                 self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
                 cleanup_detached_session_root(&job).ok();
@@ -969,6 +1154,7 @@ impl ServerRuntime {
                 channel_id = %job.session.address.channel_id,
                 "background agent timed out while child agents were still active; skipping automatic recovery"
             );
+            self.wait_for_child_agents_to_finish(job.agent_id).await;
             let text = background_timeout_with_active_children_text(&self.main_agent.language);
             let sink_router = self.sink_router.read().await;
             sink_router
@@ -999,10 +1185,8 @@ impl ServerRuntime {
             "background failure recovery agent started"
         );
 
-        let recovery_timeout = background_recovery_timeout_seconds(
-            self.model_config(&job.model_key)?.timeout_seconds,
-            error,
-        );
+        let recovery_timeout =
+            background_recovery_timeout_seconds(self.main_agent_timeout_seconds(&job.model_key)?, error);
         let recovery_prompt = format!(
             "A previous main background agent failed before completing its work.\n\nOriginal task:\n{}\n\nFailure:\n{}\n\nYour job now:\n1. Diagnose the failure.\n2. If it is recoverable without user intervention, continue or retry the original task yourself now and produce the final user-facing result. Do not mention the failure unless it is relevant.\n3. If it is not recoverable, produce a concise user-facing explanation of the problem and what the user should do next.\n4. Do not say that you will continue later. Either complete the work now or explain the blocker clearly.",
             job.prompt, error
@@ -1016,13 +1200,14 @@ impl ServerRuntime {
                 Vec::new(),
                 recovery_prompt,
                 recovery_timeout,
+                Some(recovery_timeout),
                 "background failure recovery",
                 "background failure recovery task join failed",
             )
             .await;
 
         match run_result {
-            Ok(report) => {
+            Ok(TimedRunOutcome::Completed(report)) => {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
                     &job.session,
@@ -1041,6 +1226,31 @@ impl ServerRuntime {
                     kind = "background_agent_recovery_completed",
                     failed_agent_id = %job.agent_id,
                     "background failure recovery agent completed"
+                );
+                Ok(())
+            }
+            Ok(TimedRunOutcome::TimedOut {
+                checkpoint,
+                error: recovery_error,
+            }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_timed_out(recovery_agent_id, &usage, &recovery_error);
+                let text = user_facing_error_text(&self.main_agent.language, error);
+                let sink_router = self.sink_router.read().await;
+                sink_router
+                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
+                    .await
+                    .context("failed to dispatch background failure notification")?;
+                warn!(
+                    log_stream = "agent",
+                    log_key = %recovery_agent_id,
+                    kind = "background_agent_recovery_failed",
+                    failed_agent_id = %job.agent_id,
+                    error = %format!("{recovery_error:#}"),
+                    "background failure recovery agent timed out; user was notified"
                 );
                 Ok(())
             }
@@ -1447,6 +1657,7 @@ impl Server {
                 &self.agent_workspace.rundir,
                 AgentPromptKind::MainForeground,
                 &self.main_agent.model,
+                None,
             )?;
             let extra_tools = runtime.build_extra_tools(
                 &session,
@@ -1629,7 +1840,7 @@ impl Server {
             self.send_user_error_message(&channel, &incoming.address, error)
                 .await;
         }
-        let (messages, outgoing, usage) = turn_result?;
+        let (messages, outgoing, usage, timed_out) = turn_result?;
 
         self.sessions
             .record_agent_turn(&incoming.address, messages)
@@ -1654,6 +1865,7 @@ impl Server {
             session_id = %foreground.session_id,
             channel_id = %foreground.channel_id,
             system_prompt_len = foreground.system_prompt.len() as u64,
+            timed_out,
             has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
             attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
             "foreground agent produced reply"
@@ -1727,13 +1939,23 @@ impl Server {
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
         let greeting = greeting_for_language(&self.main_agent.language).to_string();
-        let (messages, outgoing, usage) = self
+        let (messages, outgoing, usage, timed_out) = self
             .run_main_agent_turn(session, greeting)
             .await
             .context("failed to initialize foreground session")?;
         self.sessions
             .record_agent_turn(&session.address, messages)?;
         self.log_turn_usage(session, &usage, true);
+        if timed_out {
+            warn!(
+                log_stream = "agent",
+                log_key = %session.agent_id,
+                kind = "foreground_initialization_timed_out",
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
+                "foreground initialization returned the latest stable checkpoint after timeout"
+            );
+        }
         if show_reply {
             self.sessions.append_assistant_message(
                 &session.address,
@@ -1748,44 +1970,40 @@ impl Server {
         &self,
         session: &SessionSnapshot,
         prompt: String,
-    ) -> Result<(Vec<ChatMessage>, OutgoingMessage, TokenUsage)> {
+    ) -> Result<(Vec<ChatMessage>, OutgoingMessage, TokenUsage, bool)> {
         let workspace_root = self.agent_workspace.rundir.clone();
         let previous_messages = session.agent_messages.clone();
-        let timeout_seconds = self.main_model()?.timeout_seconds + 15.0;
+        let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
         let runtime = self.tool_runtime();
-        let session_snapshot = session.clone();
-        let agent_id = session.agent_id;
-        let model_key = self.main_agent.model.clone();
-        let run_result = timeout(
-            Duration::from_secs_f64(timeout_seconds),
-            tokio::task::spawn_blocking(move || {
-                runtime.run_agent_turn_sync(
-                    session_snapshot,
-                    AgentPromptKind::MainForeground,
-                    agent_id,
-                    model_key,
-                    previous_messages,
-                    prompt,
-                )
-            }),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "foreground agent turn timed out after {:.1} seconds",
-                timeout_seconds
+        let run_result = runtime
+            .run_agent_turn_with_timeout(
+                session.clone(),
+                AgentPromptKind::MainForeground,
+                session.agent_id,
+                self.main_agent.model.clone(),
+                previous_messages,
+                prompt,
+                timeout_seconds,
+                Some(timeout_seconds),
+                "foreground agent turn",
+                "agent_frame task join failed",
             )
-        })?
-        .context("agent_frame task join failed")?;
+            .await?;
 
         match run_result {
-            Ok(report) => {
+            TimedRunOutcome::Completed(report) => {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing =
                     build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok((report.messages, outgoing, report.usage))
+                Ok((report.messages, outgoing, report.usage, false))
             }
-            Err(error) => Err(error),
+            TimedRunOutcome::TimedOut { checkpoint, error } => {
+                let report = checkpoint.ok_or(error)?;
+                let assistant_text = extract_assistant_text(&report.messages);
+                let outgoing =
+                    build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
+                Ok((report.messages, outgoing, report.usage, true))
+            }
         }
     }
 
@@ -1793,6 +2011,18 @@ impl Server {
         self.models
             .get(&self.main_agent.model)
             .with_context(|| format!("unknown main_agent model {}", self.main_agent.model))
+    }
+
+    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
+            return Ok(timeout_seconds);
+        }
+        Ok(background_agent_timeout_seconds(
+            self.models
+                .get(model_key)
+                .with_context(|| format!("unknown model {}", model_key))?
+                .timeout_seconds,
+        ))
     }
 
     fn build_foreground_agent(&self, session: &SessionSnapshot) -> Result<ForegroundAgent> {

@@ -79,7 +79,7 @@ pub fn build_agent_system_prompt(
 
     match kind {
         AgentPromptKind::MainForeground => {
-            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir and cannot create further subagents.".to_string());
+            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir, cannot create further subagents, and each subagent call must include a timeout_seconds value that fits the task.".to_string());
             parts.push("You may launch a main background agent with the start_background_agent tool when work should continue asynchronously after this turn.".to_string());
             parts.push("You may create and manage persisted cron jobs with the cron tools when work should run on a schedule.".to_string());
             parts.push("You can inspect tracked background agents and subagents with the agent status tools when you need model, state, or token-usage statistics.".to_string());
@@ -88,7 +88,7 @@ pub fn build_agent_system_prompt(
             parts.push("For cron jobs, use a checker when a cheap precondition can avoid an unnecessary LLM run. Checker semantics: exit code 0 means trigger the LLM, non-zero means skip this scheduled run, and checker execution errors or timeouts still trigger the LLM.".to_string());
         }
         AgentPromptKind::MainBackground => {
-            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir and cannot create further subagents.".to_string());
+            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir, cannot create further subagents, and each subagent call must include a timeout_seconds value that fits the task.".to_string());
             parts
                 .push("You cannot launch additional main background agents from here.".to_string());
             parts.push("You may create and manage persisted cron jobs with the cron tools when scheduled follow-up work is appropriate.".to_string());

@@ -20,6 +20,7 @@ pub enum ManagedAgentState {
     Enqueued,
     Running,
     Completed,
+    TimedOut,
     Failed,
 }
 
@@ -110,6 +111,22 @@ impl AgentRegistry {
     ) -> Result<()> {
         if let Some(record) = self.records.get_mut(&id) {
             record.state = ManagedAgentState::Failed;
+            record.finished_at = Some(finished_at);
+            record.error = Some(error);
+            record.usage = usage;
+        }
+        self.persist()
+    }
+
+    pub fn mark_timed_out(
+        &mut self,
+        id: Uuid,
+        finished_at: DateTime<Utc>,
+        usage: TokenUsage,
+        error: String,
+    ) -> Result<()> {
+        if let Some(record) = self.records.get_mut(&id) {
+            record.state = ManagedAgentState::TimedOut;
             record.finished_at = Some(finished_at);
             record.error = Some(error);
             record.usage = usage;
@@ -252,5 +269,53 @@ mod tests {
             .mark_completed(child_id, created_at, TokenUsage::default())
             .unwrap();
         assert!(!registry.has_active_children(parent_id));
+    }
+
+    #[test]
+    fn agent_registry_persists_timed_out_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+
+        let mut registry = AgentRegistry::load_or_create(temp_dir.path()).unwrap();
+        registry
+            .register(ManagedAgentRecord {
+                id,
+                kind: ManagedAgentKind::Background,
+                parent_agent_id: None,
+                session_id: None,
+                channel_id: "telegram-main".to_string(),
+                model_key: "main".to_string(),
+                state: ManagedAgentState::Running,
+                created_at,
+                started_at: Some(created_at),
+                finished_at: None,
+                error: None,
+                usage: TokenUsage::default(),
+            })
+            .unwrap();
+        registry
+            .mark_timed_out(
+                id,
+                created_at,
+                TokenUsage {
+                    llm_calls: 1,
+                    prompt_tokens: 12,
+                    completion_tokens: 3,
+                    total_tokens: 15,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 12,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                "timed out".to_string(),
+            )
+            .unwrap();
+
+        let restored = AgentRegistry::load_or_create(temp_dir.path()).unwrap();
+        let record = restored.get(id).unwrap();
+        assert_eq!(record.state, ManagedAgentState::TimedOut);
+        assert_eq!(record.usage.total_tokens, 15);
+        assert_eq!(record.error.as_deref(), Some("timed out"));
     }
 }
