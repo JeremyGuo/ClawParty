@@ -122,14 +122,10 @@ impl Channel for CommandLineChannel {
             "sending message to CLI user"
         );
         let mut stdout = io::stdout();
+        self.send_media_group(_address, message.images).await?;
         if let Some(text) = message.text {
             stdout
                 .write_all(format!("\nagent> {}\n", text).as_bytes())
-                .await?;
-        }
-        for image in message.images {
-            stdout
-                .write_all(format!("agent> [image] {}\n", image.path.display()).as_bytes())
                 .await?;
         }
         for attachment in message.attachments {
@@ -139,6 +135,20 @@ impl Channel for CommandLineChannel {
         }
         stdout.flush().await?;
         self.print_prompt().await?;
+        Ok(())
+    }
+
+    async fn send_media_group(
+        &self,
+        _address: &ChannelAddress,
+        images: Vec<crate::domain::OutgoingAttachment>,
+    ) -> Result<()> {
+        let mut stdout = io::stdout();
+        for image in images {
+            stdout
+                .write_all(format!("agent> [image] {}\n", image.path.display()).as_bytes())
+                .await?;
+        }
         Ok(())
     }
 

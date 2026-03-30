@@ -45,17 +45,15 @@ pub fn build_agent_system_prompt(
     let mut parts = vec![
         header.to_string(),
         role_line.to_string(),
-        "Use tools when they materially help. Prefer direct, efficient execution over long explanations.".to_string(),
-        "Use only tools that are actually available to this agent. Do not assume a tool exists unless it is exposed in this run.".to_string(),
         "All agents share the same rundir workspace.".to_string(),
         "Organize project-specific work under ./projects/<NAME>/.".to_string(),
         "Every project directory must maintain ./projects/<NAME>/README.md and ./projects/<NAME>/ABSTRACT.md.".to_string(),
         "README.md must remain the detailed project description. ABSTRACT.md must remain the short version, and if you do not know what a project is about you should check ABSTRACT.md before doing deeper reads.".to_string(),
         "Any material project change must be reflected in both README.md and ABSTRACT.md before you finish the turn.".to_string(),
         skill_line.to_string(),
-        "If you need to send one file or image back to the user, append exactly one tag in your final reply using this format: <attachment>relative/path/from/rundir</attachment>. The path must be relative to the current workspace root, and you must return at most one attachment tag.".to_string(),
+        "If you need to send files or images back to the user, append one or more tags in your final reply using this format: <attachment>relative/path/from/rundir</attachment>. Each path must be relative to the current workspace root.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
-        "You are talking to the user inside a chat application. Your normal user-facing replies should be plain chat text, not Markdown-heavy formatting or other special layout syntax unless the user explicitly asks for it.".to_string(),
+        "You are talking to the user inside a chat application. You may reply naturally, including structured Markdown when it helps.".to_string(),
         format!(
             "Reply to the user in {} unless the user clearly asks for another language.",
             main_agent.language
@@ -84,72 +82,54 @@ pub fn build_agent_system_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     if !model_catalog.is_empty() {
-        parts.push(format!("# Available Models\n\n{}", model_catalog));
+        parts.push("Available models:".to_string());
+        parts.extend(model_catalog.lines().map(ToOwned::to_owned));
     }
 
     match kind {
         AgentPromptKind::MainForeground => {
-            parts.push("# Agent Capabilities\n\n- You can launch subagents for delegated work.\n- You can start a main background agent for asynchronous work.\n- You can create and manage persisted cron jobs.\n- You can inspect tracked background agents and subagents, including model, state, and token-usage statistics.".to_string());
-            parts.push("If the user explicitly wants a background task, or the work should continue after you reply, prefer starting a background agent instead of forcing everything into the foreground turn.".to_string());
-            parts.push("When you launch a subagent, choose a timeout that fits the task rather than using an arbitrary default.".to_string());
-            parts.push("Prefer the default sink for background work unless you truly need custom routing. Do not confuse session identifiers with chat or conversation identifiers.".to_string());
-            parts.push("For cron jobs, use a checker when a cheap precondition can avoid an unnecessary LLM run.".to_string());
+            parts.push("You are the primary agent for this user-facing conversation.".to_string());
         }
         AgentPromptKind::MainBackground => {
-            parts.push("# Agent Capabilities\n\n- You can launch subagents for delegated work.\n- You cannot launch additional main background agents from here.\n- You can create and manage persisted cron jobs.\n- You can inspect tracked background agents and subagents, including model, state, and token-usage statistics.".to_string());
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
             parts.push("If you delegate a chunk to one or more subagents, including parallel subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
-            parts.push("When you launch a subagent, choose a timeout that fits the task rather than using an arbitrary default.".to_string());
         }
         AgentPromptKind::SubAgent => {
-            parts.push(
-                "# Agent Capabilities\n\n- You cannot create subagents.\n- You cannot start main background agents.\n- You should focus on the delegated task and return concise results for the caller."
-                    .to_string(),
-            );
+            parts.push("Focus on the delegated task and return concise results for the caller.".to_string());
             parts.push("When you generate substantial files or large content, end by clearly summarizing what you created, where it lives, and what a downstream agent should know before continuing. Keep that summary concise.".to_string());
         }
     }
 
     let identity = workspace.identity_prompt.trim();
     if !identity.is_empty() {
-        parts.push(format!("# Identity\n\n{}", identity));
+        parts.push("Identity:".to_string());
+        parts.push(identity.to_string());
     }
 
     if let Some(user_meta) = extract_frontmatter(&workspace.user_profile_markdown) {
-        parts.push(format!("# User Meta\n\n{}", user_meta.trim()));
+        parts.push("User meta:".to_string());
+        parts.push(user_meta.trim().to_string());
     }
 
     if !workspace.agents_markdown.trim().is_empty() {
-        parts.push(format!(
-            "# Runtime Notes\n\n{}",
-            workspace.agents_markdown.trim()
-        ));
+        parts.push("Runtime notes:".to_string());
+        parts.push(workspace.agents_markdown.trim().to_string());
     }
 
-    let commands_text = if commands.is_empty() {
-        "No commands configured.".to_string()
-    } else {
-        commands
-            .iter()
-            .map(|command| format!("/{} - {}", command.command, command.description))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let _ = commands;
 
     parts.push(format!(
-        "# Runtime Context\n\n- channel_id: {}\n- session_id: {}\n- agent_id: {}\n- workspace root: {}\n- startup directory: {}\n- projects root: {}\n- available commands:\n{}",
+        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_root={}, projects_root={}",
         session.address.channel_id,
         session.id,
         session.agent_id,
         workspace.rundir.display(),
-        workspace.rundir.display(),
         workspace.projects_dir.display(),
-        commands_text
     ));
 
-    parts.join("\n\n")
+    parts.join("\n")
 }
 
 pub fn greeting_for_language(language: &str) -> &'static str {
@@ -183,5 +163,102 @@ fn extract_frontmatter(markdown: &str) -> Option<String> {
         None
     } else {
         Some(meta.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentPromptKind, build_agent_system_prompt};
+    use crate::bootstrap::AgentWorkspace;
+    use crate::config::{MainAgentConfig, ModelConfig};
+    use crate::domain::ChannelAddress;
+    use crate::session::SessionSnapshot;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    #[test]
+    fn prompt_includes_attachment_guidance_and_omits_channel_details() {
+        let workspace = AgentWorkspace {
+            root_dir: PathBuf::from("/tmp/work"),
+            rundir: PathBuf::from("/tmp/work/rundir"),
+            agent_dir: PathBuf::from("/tmp/work/agent"),
+            projects_dir: PathBuf::from("/tmp/work/rundir/projects"),
+            skills_dir: PathBuf::from("/tmp/work/rundir/.skills"),
+            skill_creator_dir: PathBuf::from("/tmp/work/rundir/.skills/skill-creator"),
+            tmp_dir: PathBuf::from("/tmp/work/rundir/tmp"),
+            identity_md_path: PathBuf::from("/tmp/work/agent/IDENTITY.md"),
+            user_md_path: PathBuf::from("/tmp/work/agent/USER.md"),
+            agents_md_path: PathBuf::from("/tmp/work/rundir/AGENTS.md"),
+            identity_prompt: "You are Test Agent.".to_string(),
+            user_profile_markdown: "---\nname: Test User\n---".to_string(),
+            raw_identity_markdown: "# ignored\nYou are Test Agent.".to_string(),
+            agents_markdown: String::new(),
+        };
+        let session = SessionSnapshot {
+            id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            address: ChannelAddress {
+                channel_id: "telegram-main".to_string(),
+                conversation_id: "123".to_string(),
+                user_id: None,
+                display_name: None,
+            },
+            root_dir: PathBuf::from("/tmp/work/sessions/test"),
+            attachments_dir: PathBuf::from("/tmp/work/sessions/test/attachments"),
+            message_count: 0,
+            agent_message_count: 0,
+            agent_messages: Vec::new(),
+            last_agent_returned_at: None,
+            last_compacted_at: None,
+            turn_count: 0,
+            last_compacted_turn_count: 0,
+        };
+        let model = ModelConfig {
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "example-model".to_string(),
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            headers: serde_json::Map::new(),
+            context_window_tokens: 100_000,
+            description: "General-purpose test model".to_string(),
+            timeout_seconds: 30.0,
+            cache_ttl: None,
+            reasoning: None,
+            native_web_search: None,
+            external_web_search: None,
+        };
+        let mut models = BTreeMap::new();
+        models.insert("main".to_string(), model.clone());
+        let main_agent = MainAgentConfig {
+            model: "main".to_string(),
+            language: "zh-CN".to_string(),
+            timeout_seconds: Some(60.0),
+            enabled_tools: vec!["read_file".to_string()],
+            max_tool_roundtrips: 8,
+            enable_context_compression: true,
+            effective_context_window_percent: 0.9,
+            auto_compact_token_limit: None,
+            retain_recent_messages: 12,
+            enable_idle_context_compaction: false,
+            idle_context_compaction_poll_interval_seconds: 15,
+        };
+
+        let prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &main_agent,
+            &[],
+        );
+
+        assert!(prompt.contains("append one or more tags in your final reply"));
+        assert!(!prompt.contains("Use only tools that are actually available to this agent"));
+        assert!(!prompt.contains("available commands:"));
+        assert!(!prompt.contains("delivery channel may translate rich text"));
     }
 }

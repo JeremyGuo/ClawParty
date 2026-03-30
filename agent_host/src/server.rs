@@ -242,6 +242,13 @@ impl ServerRuntime {
         }
     }
 
+    fn ensure_agent_tmp_dir(&self, agent_id: uuid::Uuid) -> Result<PathBuf> {
+        let path = self.agent_workspace.tmp_dir.join(agent_id.to_string());
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create agent tmp dir {}", path.display()))?;
+        Ok(path)
+    }
+
     fn build_agent_frame_config(
         &self,
         session: &SessionSnapshot,
@@ -313,7 +320,7 @@ impl ServerRuntime {
             let session = session.clone();
             tools.push(Tool::new(
                 "run_subagent",
-                "Run delegated subagent work in the shared rundir. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_path, timeout status, and token usage.",
+                "Run delegated subagent work in the shared rundir. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -711,6 +718,7 @@ impl ServerRuntime {
         execution_control: Option<SessionExecutionControl>,
     ) -> Result<agent_frame::SessionRunReport> {
         let workspace_root = self.agent_workspace.rundir.clone();
+        let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
         let config = self.build_agent_frame_config(
             &session,
             &workspace_root,
@@ -922,12 +930,12 @@ impl ServerRuntime {
             Some(parent_agent_id),
         );
         let assistant_text = extract_assistant_text(&report.messages);
-        let (clean_text, attachment) =
-            extract_attachment_reference(&assistant_text, &self.agent_workspace.rundir)?;
-        let attachment_path = attachment
-            .as_ref()
+        let (clean_text, attachments) =
+            extract_attachment_references(&assistant_text, &self.agent_workspace.rundir)?;
+        let attachment_paths = attachments
+            .iter()
             .map(|item| relative_attachment_path(&self.agent_workspace.rundir, &item.path))
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         info!(
             log_stream = "agent",
             log_key = %subagent_id,
@@ -936,7 +944,7 @@ impl ServerRuntime {
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             has_text = !clean_text.trim().is_empty(),
-            has_attachment = attachment_path.is_some(),
+            attachment_count = attachment_paths.len() as u64,
             "subagent completed"
         );
         Ok(json!({
@@ -944,7 +952,7 @@ impl ServerRuntime {
             "parent_agent_id": parent_agent_id,
             "model": model_key,
             "text": clean_text,
-            "attachment_path": attachment_path,
+            "attachment_paths": attachment_paths,
             "timed_out": timed_out,
             "usage": {
                 "llm_calls": report.usage.llm_calls,
@@ -2138,10 +2146,10 @@ fn spawn_processing_keepalive(
     Some(stop_sender)
 }
 
-fn extract_attachment_reference(
+fn extract_attachment_references(
     assistant_text: &str,
     workspace_root: &Path,
-) -> Result<(String, Option<OutgoingAttachment>)> {
+) -> Result<(String, Vec<OutgoingAttachment>)> {
     let mut clean = String::new();
     let mut remainder = assistant_text;
     let mut found_paths = Vec::new();
@@ -2164,22 +2172,12 @@ fn extract_attachment_reference(
         remainder = &after_open[close_index + ATTACHMENT_CLOSE_TAG.len()..];
     }
 
-    if found_paths.len() > 1 {
-        warn!(
-            log_stream = "server",
-            kind = "multiple_attachment_tags",
-            count = found_paths.len() as u64,
-            "assistant returned more than one attachment tag; only the first one will be used"
-        );
-    }
+    let attachments = found_paths
+        .into_iter()
+        .map(|path_text| resolve_outgoing_attachment(workspace_root, &path_text))
+        .collect::<Result<Vec<_>>>()?;
 
-    let attachment = if let Some(path_text) = found_paths.first() {
-        Some(resolve_outgoing_attachment(workspace_root, path_text)?)
-    } else {
-        None
-    };
-
-    Ok((clean.trim().to_string(), attachment))
+    Ok((clean.trim().to_string(), attachments))
 }
 
 fn resolve_outgoing_attachment(
@@ -2228,7 +2226,8 @@ fn build_outgoing_message_for_session(
     assistant_text: &str,
     workspace_root: &Path,
 ) -> Result<OutgoingMessage> {
-    let (clean_text, attachment) = extract_attachment_reference(assistant_text, workspace_root)?;
+    let (clean_text, attachments) =
+        extract_attachment_references(assistant_text, workspace_root)?;
     let mut outgoing = OutgoingMessage {
         text: if clean_text.trim().is_empty() {
             None
@@ -2238,7 +2237,7 @@ fn build_outgoing_message_for_session(
         images: Vec::new(),
         attachments: Vec::new(),
     };
-    if let Some(attachment) = attachment {
+    for attachment in attachments {
         let attachment = persist_outgoing_attachment(session, attachment)?;
         match attachment.kind {
             AttachmentKind::Image => outgoing.images.push(attachment),
@@ -2628,7 +2627,7 @@ fn log_turn_usage(
 mod tests {
     use super::{
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
-        background_timeout_with_active_children_text, extract_attachment_reference,
+        background_timeout_with_active_children_text, extract_attachment_references,
         is_timeout_like, parse_sink_target, should_attempt_idle_context_compaction,
     };
     use crate::domain::ChannelAddress;
@@ -2643,20 +2642,22 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn extracts_single_attachment_and_strips_tag() {
+    fn extracts_multiple_attachments_and_strips_tags() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("agent-1").join("note.txt");
+        let image_path = temp_dir.path().join("agent-1").join("image.png");
         fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         fs::write(&file_path, "hello").unwrap();
+        fs::write(&image_path, "png").unwrap();
 
-        let (text, attachment) = extract_attachment_reference(
-            "Here you go.\n<attachment>agent-1/note.txt</attachment>",
+        let (text, attachments) = extract_attachment_references(
+            "Here you go.\n<attachment>agent-1/note.txt</attachment>\n<attachment>agent-1/image.png</attachment>",
             temp_dir.path(),
         )
         .unwrap();
 
         assert_eq!(text, "Here you go.");
-        assert!(attachment.is_some());
+        assert_eq!(attachments.len(), 2);
     }
 
     #[test]

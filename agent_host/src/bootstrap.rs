@@ -61,6 +61,7 @@ pub struct AgentWorkspace {
     pub agent_dir: PathBuf,
     pub rundir: PathBuf,
     pub projects_dir: PathBuf,
+    pub tmp_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub skill_creator_dir: PathBuf,
     pub user_md_path: PathBuf,
@@ -78,6 +79,7 @@ impl AgentWorkspace {
         let agent_dir = root_dir.join("agent");
         let rundir = root_dir.join("rundir");
         let projects_dir = rundir.join("projects");
+        let tmp_dir = rundir.join("tmp");
         let skills_dir = rundir.join(".skills");
         let skill_creator_dir = skills_dir.join("skill-creator");
         fs::create_dir_all(&agent_dir)
@@ -86,6 +88,8 @@ impl AgentWorkspace {
             .with_context(|| format!("failed to create {}", rundir.display()))?;
         fs::create_dir_all(&projects_dir)
             .with_context(|| format!("failed to create {}", projects_dir.display()))?;
+        fs::create_dir_all(&tmp_dir)
+            .with_context(|| format!("failed to create {}", tmp_dir.display()))?;
         fs::create_dir_all(&skill_creator_dir)
             .with_context(|| format!("failed to create {}", skill_creator_dir.display()))?;
 
@@ -112,6 +116,7 @@ impl AgentWorkspace {
             agent_dir,
             rundir,
             projects_dir,
+            tmp_dir,
             skills_dir,
             skill_creator_dir,
             user_md_path,
@@ -178,6 +183,7 @@ mod tests {
         assert!(workspace.identity_md_path.exists());
         assert!(workspace.agents_md_path.exists());
         assert!(workspace.projects_dir.exists());
+        assert!(workspace.tmp_dir.exists());
         assert!(
             workspace
                 .raw_identity_markdown
@@ -202,5 +208,6 @@ mod tests {
         let workspace = AgentWorkspace::initialize(temp_dir.path()).unwrap();
         assert_eq!(workspace.identity_prompt, "You are Claw.\nWarm and direct.");
         assert!(workspace.projects_dir.ends_with("rundir/projects"));
+        assert!(workspace.tmp_dir.ends_with("rundir/tmp"));
     }
 }

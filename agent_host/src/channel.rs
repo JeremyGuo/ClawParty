@@ -111,6 +111,22 @@ pub trait Channel: Send + Sync {
 
     async fn run(self: Arc<Self>, sender: mpsc::Sender<IncomingMessage>) -> Result<()>;
 
+    /// Send a platform-native media group.
+    ///
+    /// Channel implementations may translate rich text or Markdown-like agent output
+    /// into the provider's supported formatting at send time. That translation is a
+    /// channel responsibility rather than a prompt contract.
+    async fn send_media_group(
+        &self,
+        address: &ChannelAddress,
+        images: Vec<crate::domain::OutgoingAttachment>,
+    ) -> Result<()>;
+
+    /// Send a message to the user on this channel.
+    ///
+    /// Channel implementations may translate rich text or Markdown-like agent output
+    /// into the provider's supported formatting at send time. That translation is a
+    /// channel responsibility rather than a prompt contract.
     async fn send(&self, address: &ChannelAddress, message: OutgoingMessage) -> Result<()>;
 
     async fn set_processing(&self, address: &ChannelAddress, state: ProcessingState) -> Result<()>;

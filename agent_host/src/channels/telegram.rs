@@ -5,6 +5,7 @@ use crate::domain::{
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -251,7 +252,9 @@ impl TelegramChannel {
             .text("chat_id", chat_id.to_string())
             .part("photo", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            form.text("caption", caption)
+            let translated = translate_markdown_to_telegram_html(&caption);
+            form.text("caption", translated.text)
+                .text("parse_mode", "HTML".to_string())
         } else {
             form
         };
@@ -272,12 +275,81 @@ impl TelegramChannel {
             .text("chat_id", chat_id.to_string())
             .part("document", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            form.text("caption", caption)
+            let translated = translate_markdown_to_telegram_html(&caption);
+            form.text("caption", translated.text)
+                .text("parse_mode", "HTML".to_string())
         } else {
             form
         };
         self.call_multipart("sendDocument", form).await?;
         Ok(())
+    }
+
+    async fn send_photo_group(
+        &self,
+        chat_id: &str,
+        images: Vec<OutgoingAttachment>,
+        shared_caption: Option<String>,
+    ) -> Result<()> {
+        if images.len() <= 1 {
+            if let Some(mut image) = images.into_iter().next() {
+                if image.caption.is_none() {
+                    image.caption = shared_caption;
+                }
+                self.send_photo(chat_id, image).await?;
+            }
+            return Ok(());
+        }
+
+        let mut form = Form::new().text("chat_id", chat_id.to_string());
+        let mut media = Vec::new();
+        for (index, image) in images.into_iter().enumerate() {
+            let file_name = image
+                .path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("image-{}.bin", index));
+            let bytes = fs::read(&image.path)
+                .await
+                .with_context(|| format!("failed to read image {}", image.path.display()))?;
+            let field_name = format!("file{}", index);
+            let mut item = json!({
+                "type": "photo",
+                "media": format!("attach://{}", field_name),
+            });
+            let caption = if image.caption.is_some() {
+                image.caption
+            } else if index == 0 {
+                shared_caption.clone()
+            } else {
+                None
+            };
+            if let Some(caption) = caption
+                && let Some(object) = item.as_object_mut()
+            {
+                let translated = translate_markdown_to_telegram_html(&caption);
+                object.insert("caption".to_string(), json!(translated.text));
+                object.insert("parse_mode".to_string(), json!("HTML"));
+            }
+            media.push(item);
+            form = form.part(field_name, Part::bytes(bytes).file_name(file_name));
+        }
+        form = form.text(
+            "media",
+            serde_json::to_string(&media).context("failed to serialize telegram media group")?,
+        );
+        self.call_multipart("sendMediaGroup", form).await?;
+        Ok(())
+    }
+
+    async fn send_media_group_with_caption(
+        &self,
+        address: &ChannelAddress,
+        images: Vec<OutgoingAttachment>,
+        caption: Option<String>,
+    ) -> Result<()> {
+        self.send_photo_group(&address.conversation_id, images, caption)
+            .await
     }
 }
 
@@ -341,37 +413,61 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, address: &ChannelAddress, message: OutgoingMessage) -> Result<()> {
+        let OutgoingMessage {
+            text,
+            images,
+            attachments,
+        } = message;
         info!(
             log_stream = "channel",
             log_key = %self.id,
             kind = "telegram_send",
             conversation_id = %address.conversation_id,
-            has_text = message.text.is_some(),
-            image_count = message.images.len() as u64,
-            attachment_count = message.attachments.len() as u64,
+            has_text = text.is_some(),
+            image_count = images.len() as u64,
+            attachment_count = attachments.len() as u64,
             "sending message to telegram user"
         );
-        if let Some(text) = message.text {
-            self.call_api::<serde_json::Value>(
-                "sendMessage",
-                json!({
-                    "chat_id": address.conversation_id,
-                    "text": text,
-                }),
-            )
-            .await?;
+        if images.len() >= 2 {
+            self.send_media_group_with_caption(address, images, text).await?;
+        } else {
+            let mut images = images;
+            let has_images = !images.is_empty();
+            if let Some(image) = images.first_mut()
+                && image.caption.is_none()
+            {
+                image.caption = text.clone();
+            }
+            self.send_media_group(address, images).await?;
+            if let Some(text) = text
+                && !has_images
+            {
+                self.call_api::<serde_json::Value>(
+                    "sendMessage",
+                    json!({
+                        "chat_id": address.conversation_id,
+                        "text": translate_markdown_to_telegram_html(&text).text,
+                        "parse_mode": "HTML",
+                    }),
+                )
+                .await?;
+            }
         }
-
-        for image in message.images {
-            self.send_photo(&address.conversation_id, image).await?;
-        }
-
-        for attachment in message.attachments {
+        for attachment in attachments {
             self.send_document(&address.conversation_id, attachment)
                 .await?;
         }
 
         Ok(())
+    }
+
+    async fn send_media_group(
+        &self,
+        address: &ChannelAddress,
+        images: Vec<OutgoingAttachment>,
+    ) -> Result<()> {
+        self.send_photo_group(&address.conversation_id, images, None)
+            .await
     }
 
     async fn set_processing(&self, address: &ChannelAddress, state: ProcessingState) -> Result<()> {
@@ -401,6 +497,265 @@ impl Channel for TelegramChannel {
         } else {
             None
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TelegramFormattedText {
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextContainer {
+    Paragraph,
+    Heading,
+    BlockQuote,
+}
+
+fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
+    let parser = Parser::new_ext(input, Options::all());
+    let mut output = String::new();
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    let mut blockquote_depth = 0usize;
+    let mut pending_list_item = false;
+    let mut text_stack: Vec<TextContainer> = Vec::new();
+    let mut code_block_language: Option<String> = None;
+    let mut code_block_buffer: Option<String> = None;
+    let mut need_paragraph_break = false;
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    text_stack.push(TextContainer::Paragraph);
+                }
+                Tag::Heading { level, .. } => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    let _ = level;
+                    output.push_str("<b>");
+                    text_stack.push(TextContainer::Heading);
+                }
+                Tag::BlockQuote(_) => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    blockquote_depth += 1;
+                    text_stack.push(TextContainer::BlockQuote);
+                }
+                Tag::List(start) => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    list_stack.push(start);
+                }
+                Tag::Item => {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    let prefix = if let Some(Some(next_number)) = list_stack.last_mut() {
+                        let prefix = format!("{}. ", *next_number);
+                        *next_number += 1;
+                        prefix
+                    } else {
+                        "• ".to_string()
+                    };
+                    if blockquote_depth > 0 {
+                        output.push_str(&"&gt; ".repeat(blockquote_depth));
+                    }
+                    output.push_str(&prefix);
+                    pending_list_item = false;
+                }
+                Tag::Emphasis => output.push_str("<i>"),
+                Tag::Strong => output.push_str("<b>"),
+                Tag::Strikethrough => output.push_str("<s>"),
+                Tag::Link { dest_url, .. } => {
+                    output.push_str("<a href=\"");
+                    output.push_str(&escape_html_attribute(&dest_url));
+                    output.push_str("\">");
+                }
+                Tag::CodeBlock(kind) => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    let language = match kind {
+                        CodeBlockKind::Indented => None,
+                        CodeBlockKind::Fenced(language) => {
+                            let trimmed = language.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        }
+                    };
+                    code_block_language = language;
+                    code_block_buffer = Some(String::new());
+                }
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => {
+                    let _ = text_stack.pop();
+                    need_paragraph_break = true;
+                }
+                TagEnd::Heading(_) => {
+                    output.push_str("</b>");
+                    let _ = text_stack.pop();
+                    need_paragraph_break = true;
+                }
+                TagEnd::BlockQuote(_) => {
+                    blockquote_depth = blockquote_depth.saturating_sub(1);
+                    let _ = text_stack.pop();
+                    need_paragraph_break = true;
+                }
+                TagEnd::List(_) => {
+                    let _ = list_stack.pop();
+                    need_paragraph_break = true;
+                }
+                TagEnd::Item => pending_list_item = false,
+                TagEnd::Emphasis => output.push_str("</i>"),
+                TagEnd::Strong => output.push_str("</b>"),
+                TagEnd::Strikethrough => output.push_str("</s>"),
+                TagEnd::Link => output.push_str("</a>"),
+                TagEnd::CodeBlock => {
+                    let code = code_block_buffer.take().unwrap_or_default();
+                    if let Some(language) = code_block_language.take() {
+                        output.push_str("<pre><code class=\"language-");
+                        output.push_str(&escape_html_attribute(&language));
+                        output.push_str("\">");
+                        output.push_str(&escape_html_text(&code));
+                        output.push_str("</code></pre>");
+                    } else {
+                        output.push_str("<pre>");
+                        output.push_str(&escape_html_text(&code));
+                        output.push_str("</pre>");
+                    }
+                    need_paragraph_break = true;
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                if let Some(buffer) = code_block_buffer.as_mut() {
+                    buffer.push_str(&text);
+                } else {
+                    if blockquote_depth > 0 && starts_new_block_line(&output) && !pending_list_item {
+                        output.push_str(&"&gt; ".repeat(blockquote_depth));
+                    }
+                    output.push_str(&escape_html_text(&text));
+                }
+            }
+            Event::Code(code) => {
+                output.push_str("<code>");
+                output.push_str(&escape_html_text(&code));
+                output.push_str("</code>");
+            }
+            Event::SoftBreak => {
+                if code_block_buffer.is_some() {
+                    if let Some(buffer) = code_block_buffer.as_mut() {
+                        buffer.push('\n');
+                    }
+                } else {
+                    output.push('\n');
+                    pending_list_item = false;
+                }
+            }
+            Event::HardBreak => output.push_str("<br/>"),
+            Event::Rule => {
+                ensure_block_break(&mut output, &mut need_paragraph_break);
+                output.push_str("──────────");
+                need_paragraph_break = true;
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                output.push_str(&escape_html_text(&html));
+            }
+            Event::InlineMath(math) => {
+                output.push_str("<code>");
+                output.push_str(&escape_html_text(&math));
+                output.push_str("</code>");
+            }
+            Event::DisplayMath(math) => {
+                ensure_block_break(&mut output, &mut need_paragraph_break);
+                output.push_str("<pre>");
+                output.push_str(&escape_html_text(&math));
+                output.push_str("</pre>");
+                need_paragraph_break = true;
+            }
+            Event::FootnoteReference(text) => {
+                output.push('[');
+                output.push_str(&escape_html_text(&text));
+                output.push(']');
+            }
+            Event::TaskListMarker(checked) => {
+                output.push_str(if checked { "☑ " } else { "☐ " });
+            }
+        }
+    }
+
+    TelegramFormattedText {
+        text: output.trim().to_string(),
+    }
+}
+
+fn ensure_block_break(output: &mut String, need_paragraph_break: &mut bool) {
+    if output.is_empty() {
+        *need_paragraph_break = false;
+        return;
+    }
+    if *need_paragraph_break {
+        if !output.ends_with("\n\n") {
+            if output.ends_with('\n') {
+                output.push('\n');
+            } else {
+                output.push_str("\n\n");
+            }
+        }
+        *need_paragraph_break = false;
+    } else if !output.ends_with('\n') {
+        output.push('\n');
+    }
+}
+
+fn starts_new_block_line(output: &str) -> bool {
+    output.is_empty() || output.ends_with('\n')
+}
+
+fn escape_html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    escape_html_text(value).replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translate_markdown_to_telegram_html;
+
+    #[test]
+    fn translates_basic_markdown_to_telegram_html() {
+        let translated = translate_markdown_to_telegram_html(
+            "# Title\n\n**bold** and *italic* with [link](https://example.com).\n\n- one\n- two",
+        );
+
+        assert!(translated.text.contains("<b>Title</b>"));
+        assert!(translated.text.contains("<b>bold</b>"));
+        assert!(translated.text.contains("<i>italic</i>"));
+        assert!(
+            translated
+                .text
+                .contains("<a href=\"https://example.com\">link</a>")
+        );
+        assert!(translated.text.contains("• one"));
+        assert!(translated.text.contains("• two"));
+    }
+
+    #[test]
+    fn translates_code_blocks_and_escapes_html() {
+        let translated = translate_markdown_to_telegram_html(
+            "```rust\nlet x = 1 < 2;\n```\n\n`inline <tag>`",
+        );
+
+        assert!(translated.text.contains("<pre><code class=\"language-rust\">"));
+        assert!(translated.text.contains("let x = 1 &lt; 2;"));
+        assert!(translated.text.contains("<code>inline &lt;tag&gt;</code>"));
     }
 }
 
