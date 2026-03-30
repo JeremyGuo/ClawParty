@@ -16,7 +16,7 @@
       },
       "external_web_search": {
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "perplexity/sonar",
+        "model": "perplexity/sonar-pro",
         "api_key_env": "OPENROUTER_API_KEY",
         "chat_completions_path": "/chat/completions",
         "timeout_seconds": 60,
