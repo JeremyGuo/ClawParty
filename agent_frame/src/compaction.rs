@@ -53,7 +53,14 @@ fn content_to_text(content: &Option<Value>) -> String {
                     }
                     "input_image" | "image_url" => object
                         .get("image_url")
-                        .and_then(Value::as_str)
+                        .and_then(|value| match value {
+                            Value::String(url) => Some(url.clone()),
+                            Value::Object(map) => map
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                            _ => None,
+                        })
                         .map(|value| format!("[image] {}", value)),
                     _ => None,
                 }
@@ -270,4 +277,30 @@ pub fn maybe_compact_messages_with_report(
         estimated_tokens_after,
         token_limit: limit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_to_text;
+    use serde_json::json;
+
+    #[test]
+    fn content_to_text_reads_image_url_objects() {
+        let content = Some(json!([
+            {
+                "type": "text",
+                "text": "Please inspect this."
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,abc123"
+                }
+            }
+        ]));
+
+        let text = content_to_text(&content);
+        assert!(text.contains("Please inspect this."));
+        assert!(text.contains("[image] data:image/png;base64,abc123"));
+    }
 }

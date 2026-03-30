@@ -21,6 +21,7 @@ dependencies = [
  "agent_frame",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "cron",

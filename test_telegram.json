@@ -3,6 +3,7 @@
     "main": {
       "api_endpoint": "https://openrouter.ai/api/v1",
       "model": "anthropic/claude-sonnet-4.6",
+      "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "cache_ttl": "5m",
       "context_window_tokens": 128000,

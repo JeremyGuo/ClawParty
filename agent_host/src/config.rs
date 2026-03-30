@@ -41,6 +41,8 @@ pub struct ModelConfig {
     pub api_endpoint: String,
     pub model: String,
     #[serde(default)]
+    pub supports_vision_input: bool,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,

@@ -25,6 +25,7 @@ use agent_frame::{
     run_session_with_report_controlled,
 };
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
 use chrono::Utc;
 use humantime::parse_duration;
 use serde_json::{Value, json};
@@ -1821,7 +1822,11 @@ impl Server {
         let stored_attachments = self
             .materialize_attachments(&session.attachments_dir, incoming.attachments)
             .await?;
-        let prompt = compose_user_prompt(incoming.text.as_deref(), &stored_attachments);
+        let user_message = build_user_turn_message(
+            incoming.text.as_deref(),
+            &stored_attachments,
+            self.main_model()?,
+        )?;
 
         channel
             .set_processing(&incoming.address, ProcessingState::Typing)
@@ -1834,7 +1839,7 @@ impl Server {
         );
 
         let turn_result = self
-            .run_main_agent_turn(&session, prompt)
+            .run_main_agent_turn(&session, user_message)
             .await
             .context("foreground agent turn failed");
         if let Some(stop_sender) = typing_guard {
@@ -1946,7 +1951,7 @@ impl Server {
         session: &SessionSnapshot,
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
-        let greeting = greeting_for_language(&self.main_agent.language).to_string();
+        let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
         let (messages, outgoing, usage, timed_out) = self
             .run_main_agent_turn(session, greeting)
             .await
@@ -1977,10 +1982,11 @@ impl Server {
     async fn run_main_agent_turn(
         &self,
         session: &SessionSnapshot,
-        prompt: String,
+        next_user_message: ChatMessage,
     ) -> Result<(Vec<ChatMessage>, OutgoingMessage, TokenUsage, bool)> {
         let workspace_root = self.agent_workspace.rundir.clone();
-        let previous_messages = session.agent_messages.clone();
+        let mut previous_messages = session.agent_messages.clone();
+        previous_messages.push(next_user_message);
         let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
         let runtime = self.tool_runtime();
         let run_result = runtime
@@ -1990,7 +1996,7 @@ impl Server {
                 session.agent_id,
                 self.main_agent.model.clone(),
                 previous_messages,
-                prompt,
+                String::new(),
                 timeout_seconds,
                 Some(timeout_seconds),
                 "foreground agent turn",
@@ -2112,6 +2118,109 @@ fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttachment]) -> 
     } else {
         sections.join("\n\n")
     }
+}
+
+fn build_user_turn_message(
+    text: Option<&str>,
+    attachments: &[StoredAttachment],
+    model: &ModelConfig,
+) -> Result<ChatMessage> {
+    let image_attachments = attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .collect::<Vec<_>>();
+    if !model.supports_vision_input || image_attachments.is_empty() {
+        return Ok(ChatMessage::text(
+            "user",
+            compose_user_prompt(text, attachments),
+        ));
+    }
+
+    let mut text_sections = Vec::new();
+    if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
+        text_sections.push(text.to_string());
+    }
+
+    let file_attachments = attachments
+        .iter()
+        .filter(|attachment| attachment.kind != AttachmentKind::Image)
+        .collect::<Vec<_>>();
+    if !file_attachments.is_empty() {
+        let mut attachment_lines = vec!["Non-image attachments available for this turn:".to_string()];
+        for attachment in file_attachments {
+            attachment_lines.push(format!(
+                "- kind={:?}, path={}, original_name={}, media_type={}",
+                attachment.kind,
+                attachment.path.display(),
+                attachment.original_name.as_deref().unwrap_or("unknown"),
+                attachment.media_type.as_deref().unwrap_or("unknown")
+            ));
+        }
+        attachment_lines.push(
+            "Use tools if you need to inspect any non-image attachment or related files."
+                .to_string(),
+        );
+        text_sections.push(attachment_lines.join("\n"));
+    }
+
+    if text_sections.is_empty() {
+        text_sections.push(format!(
+            "The user attached {} image(s). Inspect the images directly.",
+            image_attachments.len()
+        ));
+    }
+
+    let mut content = vec![json!({
+        "type": "text",
+        "text": text_sections.join("\n\n")
+    })];
+    for image in image_attachments {
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": build_image_data_url(image)?,
+            }
+        }));
+    }
+
+    Ok(ChatMessage {
+        role: "user".to_string(),
+        content: Some(Value::Array(content)),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    })
+}
+
+fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
+    let bytes = std::fs::read(&attachment.path)
+        .with_context(|| format!("failed to read image attachment {}", attachment.path.display()))?;
+    let mime_type = attachment
+        .media_type
+        .as_deref()
+        .filter(|value| value.starts_with("image/"))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| infer_image_media_type(&attachment.path));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{};base64,{}", mime_type, encoded))
+}
+
+fn infer_image_media_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+    .to_string()
 }
 
 fn spawn_processing_keepalive(
@@ -2627,9 +2736,12 @@ fn log_turn_usage(
 mod tests {
     use super::{
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
-        background_timeout_with_active_children_text, extract_attachment_references,
-        is_timeout_like, parse_sink_target, should_attempt_idle_context_compaction,
+        background_timeout_with_active_children_text, build_user_turn_message,
+        extract_attachment_references, is_timeout_like, parse_sink_target,
+        should_attempt_idle_context_compaction,
     };
+    use crate::config::ModelConfig;
+    use crate::domain::{AttachmentKind, StoredAttachment};
     use crate::domain::ChannelAddress;
     use crate::session::SessionSnapshot;
     use anyhow::anyhow;
@@ -2658,6 +2770,47 @@ mod tests {
 
         assert_eq!(text, "Here you go.");
         assert_eq!(attachments.len(), 2);
+    }
+
+    #[test]
+    fn builds_multimodal_user_message_for_vision_models() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("photo.png");
+        fs::write(&image_path, [0_u8, 1, 2, 3]).unwrap();
+        let attachment = StoredAttachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Image,
+            original_name: Some("photo.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            path: image_path,
+            size_bytes: 4,
+        };
+        let model = ModelConfig {
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            supports_vision_input: true,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            native_web_search: None,
+            external_web_search: None,
+        };
+
+        let message =
+            build_user_turn_message(Some("看看这张图"), &[attachment], &model).unwrap();
+
+        let content = message.content.unwrap();
+        let items = content.as_array().unwrap();
+        assert_eq!(items[0]["type"], "text");
+        assert_eq!(items[1]["type"], "image_url");
+        let url = items[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
     }
 
     #[test]
