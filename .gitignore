@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+.env
+.env.*
+!.env.example
+
+**/target/
+*_workdir/
+test_telegram_workdir/
+agent_host/example_config_workdir/
+
+logs/
+sessions/
