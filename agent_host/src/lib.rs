@@ -13,5 +13,6 @@ pub mod prompt;
 pub mod server;
 pub mod session;
 pub mod sink;
+pub mod workspace;
 
 pub use server::Server;

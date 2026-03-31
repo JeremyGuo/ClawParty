@@ -23,6 +23,7 @@ use crate::domain::{
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
 use crate::session::{SessionManager, SessionSnapshot};
 use crate::sink::{SinkRouter, SinkTarget};
+use crate::workspace::WorkspaceManager;
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
     ChatMessage, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
@@ -61,6 +62,8 @@ struct BackgroundJobRequest {
 #[derive(Clone)]
 struct ServerRuntime {
     agent_workspace: AgentWorkspace,
+    workspace_manager: WorkspaceManager,
+    active_workspace_ids: Vec<String>,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -72,9 +75,14 @@ struct ServerRuntime {
     subagent_count: Arc<AtomicUsize>,
     cron_poll_interval_seconds: u64,
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
+    summary_in_progress: Arc<AtomicUsize>,
 }
 
 struct SubAgentSlot {
+    counter: Arc<AtomicUsize>,
+}
+
+struct SummaryInProgressGuard {
     counter: Arc<AtomicUsize>,
 }
 
@@ -89,6 +97,19 @@ enum TimedRunOutcome {
 impl Drop for SubAgentSlot {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SummaryInProgressGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl SummaryInProgressGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
     }
 }
 
@@ -235,6 +256,106 @@ impl ServerRuntime {
         Ok(serde_json::to_value(record).context("failed to serialize agent record")?)
     }
 
+    fn list_workspaces(&self, query: Option<String>, include_archived: bool) -> Result<Value> {
+        while self.summary_in_progress.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let items = self
+            .workspace_manager
+            .list_workspaces(query.as_deref(), include_archived)?
+            .into_iter()
+            .filter(|workspace| {
+                workspace_visible_in_list(
+                    &workspace.id,
+                    &self.active_workspace_ids,
+                    include_archived && workspace.state == "archived",
+                )
+            })
+            .map(|workspace| {
+                json!({
+                    "workspace_id": workspace.id,
+                    "title": workspace.title,
+                    "summary": workspace.summary,
+                    "state": workspace.state,
+                    "updated_at": workspace.updated_at,
+                    "last_content_modified_at": workspace.last_content_modified_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "workspaces": items }))
+    }
+
+    fn list_workspace_contents(
+        &self,
+        workspace_id: String,
+        path: Option<String>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let items = self.workspace_manager.list_workspace_contents(
+            &workspace_id,
+            path.as_deref(),
+            depth,
+            limit,
+        )?;
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "path": path.unwrap_or_else(|| ".".to_string()),
+            "entries": items,
+        }))
+    }
+
+    fn mount_workspace(
+        &self,
+        session: &SessionSnapshot,
+        source_workspace_id: String,
+        mount_name: Option<String>,
+    ) -> Result<Value> {
+        let mount_name = mount_name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("workspace-{}", &source_workspace_id[..8.min(source_workspace_id.len())]));
+        let mount_path = self.workspace_manager.mount_workspace_snapshot(
+            &session.workspace_id,
+            &source_workspace_id,
+            &mount_name,
+        )?;
+        let relative_mount = mount_path
+            .strip_prefix(&session.workspace_root)
+            .unwrap_or(&mount_path)
+            .to_string_lossy()
+            .to_string();
+        Ok(json!({
+            "workspace_id": source_workspace_id,
+            "mount_name": mount_name,
+            "mount_path": relative_mount,
+            "read_only": true,
+        }))
+    }
+
+    fn move_workspace_contents(
+        &self,
+        session: &SessionSnapshot,
+        source_workspace_id: String,
+        paths: Vec<String>,
+        target_dir: Option<String>,
+        source_summary_update: Option<String>,
+        target_summary_update: Option<String>,
+    ) -> Result<Value> {
+        if source_workspace_id == session.workspace_id {
+            return Err(anyhow!("source workspace must differ from the current workspace"));
+        }
+        let summary = self.workspace_manager.move_contents_between_workspaces(
+            &source_workspace_id,
+            &session.workspace_id,
+            &paths,
+            target_dir.as_deref(),
+            source_summary_update,
+            target_summary_update,
+        )?;
+        Ok(serde_json::to_value(summary).context("failed to serialize workspace move result")?)
+    }
+
     fn has_active_child_agents(&self, parent_agent_id: uuid::Uuid) -> bool {
         self.agent_registry
             .lock()
@@ -296,6 +417,11 @@ impl ServerRuntime {
             .get(&session.address.channel_id)
             .cloned()
             .unwrap_or_else(default_bot_commands);
+        let workspace_summary = self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)
+            .map(|workspace| workspace.summary)
+            .unwrap_or_default();
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
@@ -324,6 +450,7 @@ impl ServerRuntime {
             system_prompt: build_agent_system_prompt(
                 &self.agent_workspace,
                 session,
+                &workspace_summary,
                 kind,
                 model_key,
                 model,
@@ -347,6 +474,139 @@ impl ServerRuntime {
         agent_id: uuid::Uuid,
     ) -> Vec<Tool> {
         let mut tools = Vec::new();
+        {
+            let runtime = self.clone();
+            tools.push(Tool::new(
+                "workspaces_list",
+                "Call this tool to get historical information, including earlier chat content and the corresponding workspace. It lists known workspaces by id, title, summary, state, and timestamps. Archived workspaces are hidden by default.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "include_archived": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.list_workspaces(
+                        optional_string_arg(object, "query")?,
+                        object
+                            .get("include_archived")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            tools.push(Tool::new(
+                "workspace_content_list",
+                "Call this tool after selecting a historical workspace to inspect what content exists there at a high level, without reading file bodies. Returns files and directories under the requested path.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "path": {"type": "string"},
+                        "depth": {"type": "integer"},
+                        "limit": {"type": "integer"}
+                    },
+                    "required": ["workspace_id"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    let workspace_id = string_arg_required(object, "workspace_id")?;
+                    let depth = object.get("depth").and_then(Value::as_u64).unwrap_or(2) as usize;
+                    let limit = object.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+                    runtime.list_workspace_contents(
+                        workspace_id,
+                        optional_string_arg(object, "path")?,
+                        depth,
+                        limit.clamp(1, 500),
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let mount_session = session.clone();
+            tools.push(Tool::new(
+                "workspace_mount",
+                "Call this tool to bring a historical workspace into the current workspace as a read-only snapshot so you can inspect or read its content safely. Returns the mount path relative to the current workspace root.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "mount_name": {"type": "string"}
+                    },
+                    "required": ["workspace_id"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.mount_workspace(
+                        &mount_session,
+                        string_arg_required(object, "workspace_id")?,
+                        optional_string_arg(object, "mount_name")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let move_session = session.clone();
+            tools.push(Tool::new(
+                "workspace_content_move",
+                "Call this tool to carry forward selected content from an older workspace into the current workspace. Source and target summaries can be updated when the move changes what the workspaces represent.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "source_workspace_id": {"type": "string"},
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "target_dir": {"type": "string"},
+                        "source_summary_update": {"type": "string"},
+                        "target_summary_update": {"type": "string"}
+                    },
+                    "required": ["source_workspace_id", "paths"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    let paths = object
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| anyhow!("paths must be an array"))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(ToOwned::to_owned)
+                                .filter(|value| !value.trim().is_empty())
+                                .ok_or_else(|| anyhow!("each path must be a non-empty string"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    runtime.move_workspace_contents(
+                        &move_session,
+                        string_arg_required(object, "source_workspace_id")?,
+                        paths,
+                        optional_string_arg(object, "target_dir")?,
+                        optional_string_arg(object, "source_summary_update")?,
+                        optional_string_arg(object, "target_summary_update")?,
+                    )
+                },
+            ));
+        }
+
         if matches!(
             kind,
             AgentPromptKind::MainForeground | AgentPromptKind::MainBackground
@@ -355,7 +615,7 @@ impl ServerRuntime {
             let session = session.clone();
             tools.push(Tool::new(
                 "run_subagent",
-                "Run delegated subagent work in the shared rundir. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
+                "Run delegated subagent work in the current workspace. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -752,7 +1012,7 @@ impl ServerRuntime {
         upstream_timeout_seconds: Option<f64>,
         execution_control: Option<SessionExecutionControl>,
     ) -> Result<agent_frame::SessionRunReport> {
-        let workspace_root = self.agent_workspace.rundir.clone();
+        let workspace_root = session.workspace_root.clone();
         let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
         let config = self.build_agent_frame_config(
             &session,
@@ -968,10 +1228,10 @@ impl ServerRuntime {
         );
         let assistant_text = extract_assistant_text(&report.messages);
         let (clean_text, attachments) =
-            extract_attachment_references(&assistant_text, &self.agent_workspace.rundir)?;
+            extract_attachment_references(&assistant_text, &session.workspace_root)?;
         let attachment_paths = attachments
             .iter()
-            .map(|item| relative_attachment_path(&self.agent_workspace.rundir, &item.path))
+            .map(|item| relative_attachment_path(&session.workspace_root, &item.path))
             .collect::<Result<Vec<_>>>()?;
         info!(
             log_stream = "agent",
@@ -1117,7 +1377,7 @@ impl ServerRuntime {
                 let outgoing = build_outgoing_message_for_session(
                     &job.session,
                     &assistant_text,
-                    &self.agent_workspace.rundir,
+                    &job.session.workspace_root,
                 )?;
                 log_turn_usage(
                     job.agent_id,
@@ -1259,7 +1519,7 @@ impl ServerRuntime {
                 let outgoing = build_outgoing_message_for_session(
                     &job.session,
                     &assistant_text,
-                    &self.agent_workspace.rundir,
+                    &job.session.workspace_root,
                 )?;
                 let sink_router = self.sink_router.read().await;
                 sink_router
@@ -1497,6 +1757,7 @@ impl ServerRuntime {
 pub struct Server {
     workdir: PathBuf,
     agent_workspace: AgentWorkspace,
+    workspace_manager: WorkspaceManager,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -1510,6 +1771,7 @@ pub struct Server {
     cron_poll_interval_seconds: u64,
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
+    summary_in_progress: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -1518,6 +1780,7 @@ impl Server {
         std::fs::create_dir_all(&workdir)
             .with_context(|| format!("failed to create workdir {}", workdir.display()))?;
         let agent_workspace = AgentWorkspace::initialize(&workdir)?;
+        let workspace_manager = WorkspaceManager::load_or_create(&workdir)?;
 
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         let mut command_catalog: HashMap<String, Vec<BotCommandConfig>> = HashMap::new();
@@ -1555,9 +1818,10 @@ impl Server {
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::load_or_create(&workdir)?));
 
         Ok(Self {
-            sessions: SessionManager::new(&workdir)?,
+            sessions: SessionManager::new(&workdir, workspace_manager.clone())?,
             workdir,
             agent_workspace,
+            workspace_manager,
             channels: Arc::new(channels),
             command_catalog,
             models: config.models,
@@ -1570,10 +1834,12 @@ impl Server {
             cron_poll_interval_seconds: config.cron_poll_interval_seconds,
             background_job_sender,
             background_job_receiver: Some(background_job_receiver),
+            summary_in_progress: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub async fn run(mut self) -> Result<()> {
+        self.retry_pending_workspace_summaries().await?;
         let (sender, mut receiver) = mpsc::channel::<IncomingMessage>(128);
         {
             let runtime = self.tool_runtime();
@@ -1653,6 +1919,15 @@ impl Server {
             }
         }
 
+        if let Err(error) = self.summarize_active_workspaces_on_shutdown().await {
+            warn!(
+                log_stream = "server",
+                kind = "workspace_shutdown_summary_failed",
+                error = %format!("{error:#}"),
+                "failed to summarize one or more active workspaces during shutdown"
+            );
+        }
+
         warn!(
             log_stream = "server",
             kind = "message_loop_ended",
@@ -1683,7 +1958,7 @@ impl Server {
 
             let config = runtime.build_agent_frame_config(
                 &session,
-                &self.agent_workspace.rundir,
+                &session.workspace_root,
                 AgentPromptKind::MainForeground,
                 &self.main_agent.model,
                 None,
@@ -1735,6 +2010,13 @@ impl Server {
     fn tool_runtime(&self) -> ServerRuntime {
         ServerRuntime {
             agent_workspace: self.agent_workspace.clone(),
+            workspace_manager: self.workspace_manager.clone(),
+            active_workspace_ids: self
+                .sessions
+                .list_foreground_snapshots()
+                .into_iter()
+                .map(|session| session.workspace_id)
+                .collect(),
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
@@ -1746,6 +2028,7 @@ impl Server {
             subagent_count: Arc::clone(&self.subagent_count),
             cron_poll_interval_seconds: self.cron_poll_interval_seconds,
             background_job_sender: self.background_job_sender.clone(),
+            summary_in_progress: Arc::clone(&self.summary_in_progress),
         }
     }
 
@@ -1763,6 +2046,14 @@ impl Server {
     }
 
     async fn handle_incoming(&mut self, incoming: IncomingMessage) -> Result<()> {
+        if let Err(error) = self.archive_stale_workspaces_if_needed() {
+            warn!(
+                log_stream = "server",
+                kind = "workspace_archive_pass_failed",
+                error = %format!("{error:#}"),
+                "failed to archive stale workspaces before handling message"
+            );
+        }
         info!(
             log_stream = "channel",
             log_key = %incoming.address.channel_id,
@@ -1786,6 +2077,30 @@ impl Server {
             .map(str::trim)
             .is_some_and(|text| text == "/new")
         {
+            if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address) {
+                self.sessions.mark_workspace_summary_state(
+                    &incoming.address,
+                    true,
+                    true,
+                )?;
+                if let Err(error) = self
+                    .summarize_workspace_before_destroy(&previous_session)
+                    .await
+                {
+                    warn!(
+                        log_stream = "session",
+                        log_key = %previous_session.id,
+                        kind = "workspace_summary_before_reset_failed",
+                        workspace_id = %previous_session.workspace_id,
+                        error = %format!("{error:#}"),
+                        "failed to summarize workspace before session reset"
+                    );
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+                self.sessions.destroy_foreground(&incoming.address)?;
+            }
             let session = self.sessions.reset_foreground(&incoming.address)?;
             let welcome = match self.initialize_foreground_session(&session, true).await {
                 Ok(welcome) => welcome,
@@ -1803,6 +2118,53 @@ impl Server {
                 conversation_id = %incoming.address.conversation_id,
                 "foreground session reset"
             );
+            channel.send(&incoming.address, welcome).await?;
+            return Ok(());
+        }
+
+        if let Some(workspace_id) = parse_oldspace_command(incoming.text.as_deref()) {
+            if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address)
+                && previous_session.workspace_id != workspace_id
+            {
+                self.sessions.mark_workspace_summary_state(
+                    &incoming.address,
+                    true,
+                    true,
+                )?;
+                if let Err(error) = self
+                    .summarize_workspace_before_destroy(&previous_session)
+                    .await
+                {
+                    warn!(
+                        log_stream = "session",
+                        log_key = %previous_session.id,
+                        kind = "workspace_summary_before_oldspace_failed",
+                        workspace_id = %previous_session.workspace_id,
+                        error = %format!("{error:#}"),
+                        "failed to summarize workspace before switching workspaces"
+                    );
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+                self.sessions.destroy_foreground(&incoming.address)?;
+            }
+            let session = match self.activate_existing_workspace(&incoming.address, &workspace_id) {
+                Ok(session) => session,
+                Err(error) => {
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let welcome = match self.initialize_foreground_session(&session, true).await {
+                Ok(welcome) => welcome,
+                Err(error) => {
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
             channel.send(&incoming.address, welcome).await?;
             return Ok(());
         }
@@ -1968,6 +2330,48 @@ impl Server {
         lines.join("\n")
     }
 
+    fn archive_stale_workspaces_if_needed(&self) -> Result<()> {
+        let protected = self
+            .sessions
+            .list_foreground_snapshots()
+            .into_iter()
+            .map(|session| session.workspace_id)
+            .collect::<Vec<_>>();
+        let archived = self
+            .workspace_manager
+            .archive_stale_workspaces(chrono::Duration::days(30), &protected)?;
+        if !archived.is_empty() {
+            info!(
+                log_stream = "server",
+                kind = "workspace_archived",
+                archived_count = archived.len() as u64,
+                "archived stale workspaces"
+            );
+        }
+        Ok(())
+    }
+
+    fn activate_existing_workspace(
+        &mut self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+    ) -> Result<SessionSnapshot> {
+        self.workspace_manager.reactivate_workspace(workspace_id)?;
+        let session = self
+            .sessions
+            .reset_foreground_to_workspace(address, workspace_id)?;
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "workspace_reactivated",
+            channel_id = %address.channel_id,
+            conversation_id = %address.conversation_id,
+            workspace_id = %session.workspace_id,
+            "reactivated existing workspace in a new foreground session"
+        );
+        Ok(session)
+    }
+
     async fn initialize_foreground_session(
         &mut self,
         session: &SessionSnapshot,
@@ -2001,12 +2405,173 @@ impl Server {
         Ok(outgoing)
     }
 
+    async fn summarize_active_workspaces_on_shutdown(&mut self) -> Result<()> {
+        let snapshots = self.sessions.list_foreground_snapshots();
+        let mut first_error = None;
+        for session in snapshots {
+            let _ = self
+                .sessions
+                .mark_workspace_summary_state(&session.address, true, false);
+            if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
+                warn!(
+                    log_stream = "session",
+                    log_key = %session.id,
+                    kind = "workspace_summary_on_shutdown_failed",
+                    workspace_id = %session.workspace_id,
+                    error = %format!("{error:#}"),
+                    "failed to summarize workspace on shutdown"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn summarize_workspace_before_destroy(&mut self, session: &SessionSnapshot) -> Result<()> {
+        let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_in_progress));
+        let entries =
+            self.workspace_manager
+                .list_workspace_contents(&session.workspace_id, None, 3, 200)?;
+        if session.agent_message_count == 0 && entries.is_empty() {
+            self.sessions
+                .mark_workspace_summary_state(&session.address, false, false)?;
+            return Ok(());
+        }
+
+        let mut previous_messages = session.agent_messages.clone();
+        if self.main_agent.enable_context_compression
+            && session.agent_message_count > self.main_agent.retain_recent_messages
+        {
+            let runtime = self.tool_runtime();
+            let config = runtime.build_agent_frame_config(
+                session,
+                &session.workspace_root,
+                AgentPromptKind::MainForeground,
+                &self.main_agent.model,
+                None,
+            )?;
+            let extra_tools = runtime.build_extra_tools(
+                session,
+                AgentPromptKind::MainForeground,
+                session.agent_id,
+            );
+            let compaction = run_backend_compaction(
+                self.main_model()?.backend,
+                previous_messages.clone(),
+                config,
+                extra_tools,
+            )?;
+            if compaction.compacted {
+                previous_messages = compaction.messages;
+            }
+        }
+
+        let workspace = self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)?;
+        let tree = entries
+            .iter()
+            .map(|entry| format!("- {} ({})", entry.path, entry.entry_type))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "You are about to stop working in the current workspace.\n\nSummarize the work that has been done here for future agents.\nWrite a concise durable summary in plain text.\nFocus on:\n1. what work this workspace is mainly about\n2. what kinds of changes or outputs now exist in the workspace at a high level\n3. recent progress and current status\n4. any important unfinished direction a future agent should know\n\nKeep the summary at the level of work content and broad impact on the workspace.\nDo not explain files or directories one by one, and avoid file-level detail unless a path is truly the single most important entry point.\n\nCurrent stored summary:\n{}\n\nWorkspace file tree snapshot:\n{}\n\nReturn only the summary text. Do not use attachment tags.",
+            workspace.summary,
+            if tree.trim().is_empty() {
+                "(workspace currently has no files)"
+            } else {
+                &tree
+            }
+        );
+        let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
+        let runtime = self.tool_runtime();
+        let outcome = runtime
+            .run_agent_turn_with_timeout(
+                session.clone(),
+                AgentPromptKind::MainForeground,
+                session.agent_id,
+                self.main_agent.model.clone(),
+                previous_messages,
+                prompt,
+                timeout_seconds,
+                Some(timeout_seconds),
+                "workspace summary",
+                "workspace summary task join failed",
+            )
+            .await?;
+        let report = match outcome {
+            TimedRunOutcome::Completed(report) => report,
+            TimedRunOutcome::TimedOut {
+                checkpoint: Some(report),
+                ..
+            } => report,
+            TimedRunOutcome::TimedOut {
+                checkpoint: None,
+                error,
+            } => return Err(error),
+        };
+        let summary_text = extract_assistant_text(&report.messages);
+        let (clean_summary, _) =
+            extract_attachment_references(&summary_text, &session.workspace_root)?;
+        let clean_summary = clean_summary.trim();
+        if clean_summary.is_empty() {
+            self.sessions
+                .mark_workspace_summary_state(&session.address, false, false)?;
+            return Ok(());
+        }
+        let updated = self.workspace_manager.update_summary(
+            &session.workspace_id,
+            clean_summary.to_string(),
+            None,
+        )?;
+        self.sessions
+            .mark_workspace_summary_state(&session.address, false, false)?;
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "workspace_summary_updated",
+            workspace_id = %session.workspace_id,
+            summary_path = %updated.summary_path.display(),
+            summary_len = clean_summary.len() as u64,
+            "updated workspace summary before destroy"
+        );
+        Ok(())
+    }
+
+    async fn retry_pending_workspace_summaries(&mut self) -> Result<()> {
+        let pending = self.sessions.pending_workspace_summary_snapshots();
+        for session in pending {
+            if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
+                warn!(
+                    log_stream = "session",
+                    log_key = %session.id,
+                    kind = "workspace_summary_retry_failed",
+                    workspace_id = %session.workspace_id,
+                    error = %format!("{error:#}"),
+                    "failed to retry pending workspace summary on startup"
+                );
+                continue;
+            }
+            self.sessions
+                .mark_workspace_summary_state(&session.address, false, false)?;
+            if session.close_after_summary {
+                self.sessions.destroy_foreground(&session.address)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn run_main_agent_turn(
         &self,
         session: &SessionSnapshot,
         next_user_message: ChatMessage,
     ) -> Result<(Vec<ChatMessage>, OutgoingMessage, TokenUsage, bool)> {
-        let workspace_root = self.agent_workspace.rundir.clone();
+        let workspace_root = session.workspace_root.clone();
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
         let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
@@ -2075,6 +2640,11 @@ impl Server {
             system_prompt: build_agent_system_prompt(
                 &self.agent_workspace,
                 session,
+                &self
+                    .workspace_manager
+                    .ensure_workspace_exists(&session.workspace_id)
+                    .map(|workspace| workspace.summary)
+                    .unwrap_or_default(),
                 AgentPromptKind::MainForeground,
                 &self.main_agent.model,
                 model,
@@ -2377,7 +2947,7 @@ fn resolve_outgoing_attachment(
     let candidate = PathBuf::from(relative_path);
     if candidate.is_absolute() {
         return Err(anyhow::anyhow!(
-            "attachment path must be relative to rundir, got absolute path {}",
+            "attachment path must be relative to workspace root, got absolute path {}",
             candidate.display()
         ));
     }
@@ -2389,7 +2959,7 @@ fn resolve_outgoing_attachment(
         .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
     if !canonical_file.starts_with(&canonical_root) {
         return Err(anyhow::anyhow!(
-            "attachment path escapes rundir: {}",
+            "attachment path escapes workspace root: {}",
             canonical_file.display()
         ));
     }
@@ -2693,8 +3263,14 @@ fn create_detached_session_snapshot(
     agent_id: uuid::Uuid,
 ) -> Result<SessionSnapshot> {
     let session_id = uuid::Uuid::new_v4();
+    let workspace_id = format!("detached-{}", session_id);
     let root_dir = workdir.join("sessions").join(session_id.to_string());
-    let attachments_dir = root_dir.join("attachments");
+    let workspace_root = workdir.join("workspaces").join(&workspace_id).join("files");
+    let attachments_dir = workspace_root.join("upload");
+    std::fs::create_dir_all(&root_dir)
+        .with_context(|| format!("failed to create {}", root_dir.display()))?;
+    std::fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("failed to create {}", workspace_root.display()))?;
     std::fs::create_dir_all(&attachments_dir)
         .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
     Ok(SessionSnapshot {
@@ -2703,6 +3279,8 @@ fn create_detached_session_snapshot(
         address,
         root_dir,
         attachments_dir,
+        workspace_id,
+        workspace_root,
         message_count: 0,
         agent_message_count: 0,
         agent_messages: Vec::new(),
@@ -2710,6 +3288,8 @@ fn create_detached_session_snapshot(
         last_compacted_at: None,
         turn_count: 0,
         last_compacted_turn_count: 0,
+        pending_workspace_summary: false,
+        close_after_summary: false,
     })
 }
 
@@ -2783,6 +3363,24 @@ fn user_facing_error_text(language: &str, error: &anyhow::Error) -> String {
     }
 }
 
+fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
+    let text = text?.trim();
+    let suffix = text.strip_prefix("/oldspace")?.trim();
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix.to_string())
+    }
+}
+
+fn workspace_visible_in_list(
+    workspace_id: &str,
+    active_workspace_ids: &[String],
+    is_archived: bool,
+) -> bool {
+    is_archived || !active_workspace_ids.iter().any(|id| id == workspace_id)
+}
+
 fn log_turn_usage(
     agent_id: uuid::Uuid,
     session: &SessionSnapshot,
@@ -2818,7 +3416,8 @@ mod tests {
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
         background_timeout_with_active_children_text, build_user_turn_message,
         channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like,
-        parse_sink_target, should_attempt_idle_context_compaction,
+        parse_oldspace_command, parse_sink_target, should_attempt_idle_context_compaction,
+        workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
@@ -2960,7 +3559,9 @@ mod tests {
                 display_name: Some("Telegram User".to_string()),
             },
             root_dir: PathBuf::from("/tmp/session"),
-            attachments_dir: PathBuf::from("/tmp/session/attachments"),
+            attachments_dir: PathBuf::from("/tmp/workspaces/workspace-1/files/upload"),
+            workspace_id: "workspace-1".to_string(),
+            workspace_root: PathBuf::from("/tmp/workspaces/workspace-1/files"),
             message_count: 0,
             agent_message_count: 3,
             agent_messages: Vec::new(),
@@ -2968,6 +3569,8 @@ mod tests {
             last_compacted_at: None,
             turn_count: 2,
             last_compacted_turn_count: 1,
+            pending_workspace_summary: false,
+            close_after_summary: false,
         };
 
         assert!(should_attempt_idle_context_compaction(
@@ -3019,5 +3622,26 @@ mod tests {
             background_timeout_with_active_children_text("en")
                 .contains("skipped automatic recovery")
         );
+    }
+
+    #[test]
+    fn parses_oldspace_command_with_workspace_id() {
+        assert_eq!(
+            parse_oldspace_command(Some("/oldspace workspace-123")),
+            Some("workspace-123".to_string())
+        );
+        assert_eq!(
+            parse_oldspace_command(Some("  /oldspace   abc-def  ")),
+            Some("abc-def".to_string())
+        );
+        assert_eq!(parse_oldspace_command(Some("/oldspace")), None);
+        assert_eq!(parse_oldspace_command(Some("hello")), None);
+    }
+
+    #[test]
+    fn hides_active_workspaces_from_list_results() {
+        assert!(workspace_visible_in_list("archived-1", &[], true));
+        assert!(workspace_visible_in_list("idle-1", &[String::from("active-1")], false));
+        assert!(!workspace_visible_in_list("active-1", &[String::from("active-1")], false));
     }
 }

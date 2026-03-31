@@ -60,7 +60,6 @@ pub struct AgentWorkspace {
     pub root_dir: PathBuf,
     pub agent_dir: PathBuf,
     pub rundir: PathBuf,
-    pub projects_dir: PathBuf,
     pub tmp_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub skill_creator_dir: PathBuf,
@@ -78,7 +77,6 @@ impl AgentWorkspace {
         let root_dir = workdir.as_ref().to_path_buf();
         let agent_dir = root_dir.join("agent");
         let rundir = root_dir.join("rundir");
-        let projects_dir = rundir.join("projects");
         let tmp_dir = rundir.join("tmp");
         let skills_dir = rundir.join(".skills");
         let skill_creator_dir = skills_dir.join("skill-creator");
@@ -86,8 +84,6 @@ impl AgentWorkspace {
             .with_context(|| format!("failed to create {}", agent_dir.display()))?;
         fs::create_dir_all(&rundir)
             .with_context(|| format!("failed to create {}", rundir.display()))?;
-        fs::create_dir_all(&projects_dir)
-            .with_context(|| format!("failed to create {}", projects_dir.display()))?;
         fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("failed to create {}", tmp_dir.display()))?;
         fs::create_dir_all(&skill_creator_dir)
@@ -115,7 +111,6 @@ impl AgentWorkspace {
             root_dir,
             agent_dir,
             rundir,
-            projects_dir,
             tmp_dir,
             skills_dir,
             skill_creator_dir,
@@ -182,7 +177,6 @@ mod tests {
         assert!(workspace.user_md_path.exists());
         assert!(workspace.identity_md_path.exists());
         assert!(workspace.agents_md_path.exists());
-        assert!(workspace.projects_dir.exists());
         assert!(workspace.tmp_dir.exists());
         assert!(
             workspace
@@ -207,7 +201,6 @@ mod tests {
 
         let workspace = AgentWorkspace::initialize(temp_dir.path()).unwrap();
         assert_eq!(workspace.identity_prompt, "You are Claw.\nWarm and direct.");
-        assert!(workspace.projects_dir.ends_with("rundir/projects"));
         assert!(workspace.tmp_dir.ends_with("rundir/tmp"));
     }
 }

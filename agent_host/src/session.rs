@@ -1,4 +1,5 @@
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
+use crate::workspace::WorkspaceManager;
 use agent_frame::ChatMessage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -16,6 +17,8 @@ pub struct SessionSnapshot {
     pub address: ChannelAddress,
     pub root_dir: PathBuf,
     pub attachments_dir: PathBuf,
+    pub workspace_id: String,
+    pub workspace_root: PathBuf,
     pub message_count: usize,
     pub agent_message_count: usize,
     pub agent_messages: Vec<ChatMessage>,
@@ -23,6 +26,8 @@ pub struct SessionSnapshot {
     pub last_compacted_at: Option<DateTime<Utc>>,
     pub turn_count: u64,
     pub last_compacted_turn_count: u64,
+    pub pending_workspace_summary: bool,
+    pub close_after_summary: bool,
 }
 
 #[derive(Debug)]
@@ -32,12 +37,17 @@ struct Session {
     address: ChannelAddress,
     root_dir: PathBuf,
     attachments_dir: PathBuf,
+    workspace_id: String,
+    workspace_root: PathBuf,
     history: Vec<SessionMessage>,
     agent_messages: Vec<ChatMessage>,
     last_agent_returned_at: Option<DateTime<Utc>>,
     last_compacted_at: Option<DateTime<Utc>>,
     turn_count: u64,
     last_compacted_turn_count: u64,
+    pending_workspace_summary: bool,
+    close_after_summary: bool,
+    closed_at: Option<DateTime<Utc>>,
 }
 
 impl Session {
@@ -52,6 +62,8 @@ impl Session {
             address: self.address.clone(),
             root_dir: self.root_dir.clone(),
             attachments_dir: self.attachments_dir.clone(),
+            workspace_id: self.workspace_id.clone(),
+            workspace_root: self.workspace_root.clone(),
             message_count: self.history.len(),
             agent_message_count: self.agent_messages.len(),
             agent_messages: self.agent_messages.clone(),
@@ -59,6 +71,8 @@ impl Session {
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
+            pending_workspace_summary: self.pending_workspace_summary,
+            close_after_summary: self.close_after_summary,
         }
     }
 
@@ -80,12 +94,16 @@ impl Session {
             id: self.id,
             agent_id: self.agent_id,
             address: self.address.clone(),
+            workspace_id: Some(self.workspace_id.clone()),
             history: self.history.clone(),
             agent_messages: self.agent_messages.clone(),
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
+            pending_workspace_summary: self.pending_workspace_summary,
+            close_after_summary: self.close_after_summary,
+            closed_at: self.closed_at,
         };
         let raw =
             serde_json::to_string_pretty(&state).context("failed to serialize session state")?;
@@ -93,8 +111,15 @@ impl Session {
             .with_context(|| format!("failed to write {}", self.state_path().display()))
     }
 
-    fn from_persisted(root_dir: PathBuf, persisted: PersistedSession) -> Result<Self> {
-        let attachments_dir = root_dir.join("attachments");
+    fn from_persisted(
+        root_dir: PathBuf,
+        persisted: PersistedSession,
+        workspace_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<Self> {
+        fs::create_dir_all(&root_dir)
+            .with_context(|| format!("failed to create {}", root_dir.display()))?;
+        let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
         Ok(Self {
@@ -103,12 +128,17 @@ impl Session {
             address: persisted.address,
             root_dir,
             attachments_dir,
+            workspace_id,
+            workspace_root,
             history: persisted.history,
             agent_messages: persisted.agent_messages,
             last_agent_returned_at: persisted.last_agent_returned_at,
             last_compacted_at: persisted.last_compacted_at,
             turn_count: persisted.turn_count,
             last_compacted_turn_count: persisted.last_compacted_turn_count,
+            pending_workspace_summary: persisted.pending_workspace_summary,
+            close_after_summary: persisted.close_after_summary,
+            closed_at: persisted.closed_at,
         })
     }
 }
@@ -118,6 +148,8 @@ struct PersistedSession {
     id: Uuid,
     agent_id: Uuid,
     address: ChannelAddress,
+    #[serde(default)]
+    workspace_id: Option<String>,
     #[serde(default)]
     history: Vec<SessionMessage>,
     #[serde(default)]
@@ -130,21 +162,29 @@ struct PersistedSession {
     turn_count: u64,
     #[serde(default)]
     last_compacted_turn_count: u64,
+    #[serde(default)]
+    pending_workspace_summary: bool,
+    #[serde(default)]
+    close_after_summary: bool,
+    #[serde(default)]
+    closed_at: Option<DateTime<Utc>>,
 }
 
 pub struct SessionManager {
     sessions_root: PathBuf,
+    workspace_manager: WorkspaceManager,
     foreground_sessions: HashMap<String, Session>,
 }
 
 impl SessionManager {
-    pub fn new(workdir: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(workdir: impl AsRef<Path>, workspace_manager: WorkspaceManager) -> Result<Self> {
         let sessions_root = workdir.as_ref().join("sessions");
         fs::create_dir_all(&sessions_root)
             .with_context(|| format!("failed to create {}", sessions_root.display()))?;
-        let foreground_sessions = load_persisted_sessions(&sessions_root)?;
+        let foreground_sessions = load_persisted_sessions(&sessions_root, &workspace_manager)?;
         Ok(Self {
             sessions_root,
+            workspace_manager,
             foreground_sessions,
         })
     }
@@ -176,9 +216,45 @@ impl SessionManager {
         self.ensure_foreground(address)
     }
 
+    pub fn reset_foreground_to_workspace(
+        &mut self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+    ) -> Result<SessionSnapshot> {
+        self.destroy_foreground(address)?;
+        self.ensure_foreground_in_workspace(address, workspace_id)
+    }
+
+    pub fn ensure_foreground_in_workspace(
+        &mut self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+    ) -> Result<SessionSnapshot> {
+        let key = address.session_key();
+        if !self.foreground_sessions.contains_key(&key) {
+            let session = self.create_session_with_workspace(address, workspace_id)?;
+            info!(
+                log_stream = "session",
+                log_key = %session.id,
+                kind = "session_created",
+                channel_id = %address.channel_id,
+                conversation_id = %address.conversation_id,
+                root_dir = %session.root_dir.display(),
+                workspace_id = %session.workspace_id,
+                "created foreground session in existing workspace"
+            );
+            self.foreground_sessions.insert(key.clone(), session);
+        }
+        Ok(self
+            .foreground_sessions
+            .get(&key)
+            .expect("foreground session inserted")
+            .snapshot())
+    }
+
     pub fn destroy_foreground(&mut self, address: &ChannelAddress) -> Result<()> {
         let key = address.session_key();
-        if let Some(session) = self.foreground_sessions.remove(&key) {
+        if let Some(mut session) = self.foreground_sessions.remove(&key) {
             info!(
                 log_stream = "session",
                 log_key = %session.id,
@@ -186,19 +262,14 @@ impl SessionManager {
                 root_dir = %session.root_dir.display(),
                 "destroying foreground session"
             );
-            if session.root_dir.exists() {
-                fs::remove_dir_all(&session.root_dir).with_context(|| {
-                    format!(
-                        "failed to remove session directory {}",
-                        session.root_dir.display()
-                    )
-                })?;
-            }
+            session.closed_at = Some(Utc::now());
+            session.persist()?;
             info!(
                 log_stream = "session",
                 log_key = %session.id,
                 kind = "session_destroyed",
-                "foreground session removed"
+                root_dir = %session.root_dir.display(),
+                "foreground session closed and retained on disk"
             );
         }
         Ok(())
@@ -233,6 +304,37 @@ impl SessionManager {
             .values()
             .map(Session::snapshot)
             .collect()
+    }
+
+    pub fn has_active_workspace(&self, workspace_id: &str) -> bool {
+        self.foreground_sessions
+            .values()
+            .any(|session| session.workspace_id == workspace_id)
+    }
+
+    pub fn pending_workspace_summary_snapshots(&self) -> Vec<SessionSnapshot> {
+        self.foreground_sessions
+            .values()
+            .filter(|session| session.pending_workspace_summary)
+            .map(Session::snapshot)
+            .collect()
+    }
+
+    pub fn mark_workspace_summary_state(
+        &mut self,
+        address: &ChannelAddress,
+        pending: bool,
+        close_after_summary: bool,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.pending_workspace_summary = pending;
+        session.close_after_summary = close_after_summary;
+        session.persist()?;
+        Ok(())
     }
 
     pub fn update_agent_messages(
@@ -337,11 +439,16 @@ impl SessionManager {
     fn create_session(&self, address: &ChannelAddress) -> Result<Session> {
         let session_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
+        let workspace = self
+            .workspace_manager
+            .create_workspace(agent_id, session_id, None)?;
         let root_dir = self.sessions_root.join(session_id.to_string());
-        let attachments_dir = root_dir.join("attachments");
+        fs::create_dir_all(&root_dir)
+            .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
+        let attachments_dir = workspace.files_dir.join("upload");
         fs::create_dir_all(&attachments_dir).with_context(|| {
             format!(
-                "failed to create session attachment directory {}",
+                "failed to create workspace upload directory {}",
                 attachments_dir.display()
             )
         })?;
@@ -351,19 +458,67 @@ impl SessionManager {
             address: address.clone(),
             root_dir,
             attachments_dir,
+            workspace_id: workspace.id,
+            workspace_root: workspace.files_dir,
             history: Vec::new(),
             agent_messages: Vec::new(),
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
             last_compacted_turn_count: 0,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+            closed_at: None,
+        };
+        session.persist()?;
+        Ok(session)
+    }
+
+    fn create_session_with_workspace(
+        &self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+    ) -> Result<Session> {
+        let session_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let workspace = self.workspace_manager.ensure_workspace_exists(workspace_id)?;
+        let root_dir = self.sessions_root.join(session_id.to_string());
+        fs::create_dir_all(&root_dir)
+            .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
+        let attachments_dir = workspace.files_dir.join("upload");
+        fs::create_dir_all(&attachments_dir).with_context(|| {
+            format!(
+                "failed to create workspace upload directory {}",
+                attachments_dir.display()
+            )
+        })?;
+        let session = Session {
+            id: session_id,
+            agent_id,
+            address: address.clone(),
+            root_dir,
+            attachments_dir,
+            workspace_id: workspace.id,
+            workspace_root: workspace.files_dir,
+            history: Vec::new(),
+            agent_messages: Vec::new(),
+            last_agent_returned_at: None,
+            last_compacted_at: None,
+            turn_count: 0,
+            last_compacted_turn_count: 0,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+            closed_at: None,
         };
         session.persist()?;
         Ok(session)
     }
 }
 
-fn load_persisted_sessions(sessions_root: &Path) -> Result<HashMap<String, Session>> {
+fn load_persisted_sessions(
+    sessions_root: &Path,
+    workspace_manager: &WorkspaceManager,
+) -> Result<HashMap<String, Session>> {
     let mut sessions = HashMap::new();
     for entry in fs::read_dir(sessions_root)
         .with_context(|| format!("failed to read {}", sessions_root.display()))?
@@ -377,8 +532,8 @@ fn load_persisted_sessions(sessions_root: &Path) -> Result<HashMap<String, Sessi
         if !state_path.exists() {
             continue;
         }
-        match load_single_session(&path, &state_path) {
-            Ok(session) => {
+        match load_single_session(&path, &state_path, workspace_manager) {
+            Ok(Some(session)) => {
                 let key = session.address.session_key();
                 info!(
                     log_stream = "session",
@@ -390,6 +545,14 @@ fn load_persisted_sessions(sessions_root: &Path) -> Result<HashMap<String, Sessi
                     "restored persisted foreground session"
                 );
                 sessions.insert(key, session);
+            }
+            Ok(None) => {
+                info!(
+                    log_stream = "session",
+                    kind = "session_restore_skipped",
+                    root_dir = %path.display(),
+                    "skipping closed persisted session"
+                );
             }
             Err(error) => {
                 warn!(
@@ -405,10 +568,46 @@ fn load_persisted_sessions(sessions_root: &Path) -> Result<HashMap<String, Sessi
     Ok(sessions)
 }
 
-fn load_single_session(root_dir: &Path, state_path: &Path) -> Result<Session> {
+fn load_single_session(
+    root_dir: &Path,
+    state_path: &Path,
+    workspace_manager: &WorkspaceManager,
+) -> Result<Option<Session>> {
     let raw = fs::read_to_string(state_path)
         .with_context(|| format!("failed to read {}", state_path.display()))?;
     let persisted: PersistedSession =
         serde_json::from_str(&raw).context("failed to parse session state")?;
-    Session::from_persisted(root_dir.to_path_buf(), persisted)
+    if persisted.closed_at.is_some() {
+        return Ok(None);
+    }
+    let (workspace_id, workspace_root) = match persisted.workspace_id.as_deref() {
+        Some(workspace_id) => (
+            workspace_id.to_string(),
+            workspace_manager.ensure_workspace_exists(workspace_id)?.files_dir,
+        ),
+        None => {
+            let workspace = workspace_manager.create_workspace(
+                persisted.agent_id,
+                persisted.id,
+                Some(&format!("migrated-{}", &persisted.id.to_string()[..8])),
+            )?;
+            info!(
+                log_stream = "session",
+                log_key = %persisted.id,
+                kind = "session_workspace_migrated",
+                workspace_id = %workspace.id,
+                root_dir = %root_dir.display(),
+                "migrated legacy session to a dedicated workspace"
+            );
+            (workspace.id, workspace.files_dir)
+        }
+    };
+    let session = Session::from_persisted(
+        root_dir.to_path_buf(),
+        persisted,
+        workspace_id,
+        workspace_root,
+    )?;
+    session.persist()?;
+    Ok(Some(session))
 }

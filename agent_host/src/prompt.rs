@@ -13,6 +13,7 @@ pub enum AgentPromptKind {
 pub fn build_agent_system_prompt(
     workspace: &AgentWorkspace,
     session: &SessionSnapshot,
+    workspace_summary: &str,
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -45,13 +46,9 @@ pub fn build_agent_system_prompt(
     let mut parts = vec![
         header.to_string(),
         role_line.to_string(),
-        "All agents share the same rundir workspace.".to_string(),
-        "Organize project-specific work under ./projects/<NAME>/.".to_string(),
-        "Every project directory must maintain ./projects/<NAME>/README.md and ./projects/<NAME>/ABSTRACT.md.".to_string(),
-        "README.md must remain the detailed project description. ABSTRACT.md must remain the short version, and if you do not know what a project is about you should check ABSTRACT.md before doing deeper reads.".to_string(),
-        "Any material project change must be reflected in both README.md and ABSTRACT.md before you finish the turn.".to_string(),
+        "Your primary writable workspace is the current workspace root for this session.".to_string(),
         skill_line.to_string(),
-        "If you need to send files or images back to the user, append one or more tags in your final reply using this format: <attachment>relative/path/from/rundir</attachment>. Each path must be relative to the current workspace root.".to_string(),
+        "If you need to send files or images back to the user, append one or more tags in your final reply using this format: <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the current workspace root.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
         "You are talking to the user inside a chat application. You may reply naturally, including structured Markdown when it helps.".to_string(),
         format!(
@@ -89,12 +86,14 @@ pub fn build_agent_system_prompt(
     match kind {
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
+            parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount to look up that history before saying you cannot remember.".to_string());
         }
         AgentPromptKind::MainBackground => {
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
             parts.push("If you delegate a chunk to one or more subagents, including parallel subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
+            parts.push("If you need historical information from earlier workspaces, use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount instead of assuming the information is unavailable.".to_string());
         }
         AgentPromptKind::SubAgent => {
             parts.push(
@@ -116,6 +115,12 @@ pub fn build_agent_system_prompt(
         parts.push(user_meta.trim().to_string());
     }
 
+    let workspace_summary = workspace_summary.trim();
+    if !workspace_summary.is_empty() {
+        parts.push("Current workspace summary:".to_string());
+        parts.push(workspace_summary.to_string());
+    }
+
     if !workspace.agents_markdown.trim().is_empty() {
         parts.push("Runtime notes:".to_string());
         parts.push(workspace.agents_markdown.trim().to_string());
@@ -124,12 +129,12 @@ pub fn build_agent_system_prompt(
     let _ = commands;
 
     parts.push(format!(
-        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_root={}, projects_root={}",
+        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}, workspace_root={}",
         session.address.channel_id,
         session.id,
         session.agent_id,
-        workspace.rundir.display(),
-        workspace.projects_dir.display(),
+        session.workspace_id,
+        session.workspace_root.display(),
     ));
 
     parts.join("\n")
@@ -187,7 +192,6 @@ mod tests {
             root_dir: PathBuf::from("/tmp/work"),
             rundir: PathBuf::from("/tmp/work/rundir"),
             agent_dir: PathBuf::from("/tmp/work/agent"),
-            projects_dir: PathBuf::from("/tmp/work/rundir/projects"),
             skills_dir: PathBuf::from("/tmp/work/rundir/.skills"),
             skill_creator_dir: PathBuf::from("/tmp/work/rundir/.skills/skill-creator"),
             tmp_dir: PathBuf::from("/tmp/work/rundir/tmp"),
@@ -209,7 +213,9 @@ mod tests {
                 display_name: None,
             },
             root_dir: PathBuf::from("/tmp/work/sessions/test"),
-            attachments_dir: PathBuf::from("/tmp/work/sessions/test/attachments"),
+            attachments_dir: PathBuf::from("/tmp/work/workspaces/workspace-1/files/upload"),
+            workspace_id: "workspace-1".to_string(),
+            workspace_root: PathBuf::from("/tmp/work/workspaces/workspace-1/files"),
             message_count: 0,
             agent_message_count: 0,
             agent_messages: Vec::new(),
@@ -217,6 +223,8 @@ mod tests {
             last_compacted_at: None,
             turn_count: 0,
             last_compacted_turn_count: 0,
+            pending_workspace_summary: false,
+            close_after_summary: false,
         };
         let model = ModelConfig {
             api_endpoint: "https://example.com/v1".to_string(),
@@ -255,6 +263,7 @@ mod tests {
         let prompt = build_agent_system_prompt(
             &workspace,
             &session,
+            "Current workspace summary.",
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -264,6 +273,11 @@ mod tests {
         );
 
         assert!(prompt.contains("append one or more tags in your final reply"));
+        assert!(prompt.contains("Current workspace summary."));
+        assert!(prompt.contains("workspace_id=workspace-1"));
+        assert!(prompt.contains(
+            "use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount"
+        ));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));

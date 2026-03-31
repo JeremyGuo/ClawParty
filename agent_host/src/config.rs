@@ -146,6 +146,7 @@ pub fn default_enabled_tools() -> Vec<String> {
         "apply_patch".to_string(),
         "exec".to_string(),
         "process".to_string(),
+        "download_file".to_string(),
         "web_fetch".to_string(),
         "web_search".to_string(),
         "image".to_string(),
@@ -193,6 +194,10 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
         BotCommandConfig {
             command: "new".to_string(),
             description: "Start a new session".to_string(),
+        },
+        BotCommandConfig {
+            command: "oldspace".to_string(),
+            description: "Reactivate an older workspace by id".to_string(),
         },
         BotCommandConfig {
             command: "help".to_string(),
