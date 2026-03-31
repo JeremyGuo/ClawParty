@@ -1,5 +1,9 @@
 use crate::agent_status::{AgentRegistry, ManagedAgentKind, ManagedAgentRecord, ManagedAgentState};
 use crate::agents::{ForegroundAgent, SubAgentSpec};
+use crate::backend::{
+    backend_supports_native_multimodal_input, compact_session_messages_with_report as run_backend_compaction,
+    run_session_with_report_controlled as run_backend_session,
+};
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::{Channel, IncomingMessage};
 use crate::channels::command_line::CommandLineChannel;
@@ -21,8 +25,7 @@ use crate::sink::{SinkRouter, SinkTarget};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
     ChatMessage, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
-    compact_session_messages_with_report, extract_assistant_text,
-    run_session_with_report_controlled,
+    extract_assistant_text,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -754,8 +757,10 @@ impl ServerRuntime {
             &model_key,
             upstream_timeout_seconds,
         )?;
+        let backend = self.model_config(&model_key)?.backend;
         let extra_tools = self.build_extra_tools(&session, kind, agent_id);
-        run_session_with_report_controlled(
+        run_backend_session(
+            backend,
             previous_messages,
             prompt,
             config,
@@ -1006,7 +1011,13 @@ impl ServerRuntime {
             let runtime = self.clone();
             let session = session.clone();
             let handle = std::thread::spawn(move || {
-                runtime.run_subagent(parent_agent_id, session, model_key, task, timeout_seconds)
+                runtime.run_subagent(
+                    parent_agent_id,
+                    session,
+                    model_key,
+                    task,
+                    timeout_seconds,
+                )
             });
             handles.push(handle);
         }
@@ -1535,6 +1546,7 @@ impl Server {
             agents_md_path = %agent_workspace.agents_md_path.display(),
             skills_dir = %agent_workspace.skills_dir.display(),
             main_model = %config.main_agent.model,
+            main_backend = ?config.models[&config.main_agent.model].backend,
             "server initialized"
         );
 
@@ -1650,7 +1662,7 @@ impl Server {
     }
 
     async fn run_idle_context_compaction_once(&mut self) -> Result<()> {
-        let model = self.main_model()?;
+        let model = self.main_model()?.clone();
         let Some(ttl) = model.cache_ttl.as_deref() else {
             return Ok(());
         };
@@ -1681,7 +1693,8 @@ impl Server {
                 AgentPromptKind::MainForeground,
                 session.agent_id,
             );
-            let report = compact_session_messages_with_report(
+            let report = run_backend_compaction(
+                model.backend,
                 session.agent_messages.clone(),
                 config,
                 extra_tools,
@@ -1834,6 +1847,7 @@ impl Server {
             incoming.text.as_deref(),
             &stored_attachments,
             self.main_model()?,
+            backend_supports_native_multimodal_input(self.main_model()?.backend),
         )?;
 
         channel
@@ -2182,12 +2196,16 @@ fn build_user_turn_message(
     text: Option<&str>,
     attachments: &[StoredAttachment],
     model: &ModelConfig,
+    backend_supports_native_multimodal: bool,
 ) -> Result<ChatMessage> {
     let image_attachments = attachments
         .iter()
         .filter(|attachment| attachment.kind == AttachmentKind::Image)
         .collect::<Vec<_>>();
-    if !model.supports_vision_input || image_attachments.is_empty() {
+    if !backend_supports_native_multimodal
+        || !model.supports_vision_input
+        || image_attachments.is_empty()
+    {
         return Ok(ChatMessage::text(
             "user",
             compose_user_prompt(text, attachments),
@@ -2795,9 +2813,11 @@ mod tests {
     use super::{
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
         background_timeout_with_active_children_text, build_user_turn_message,
-        channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like, parse_sink_target,
+        channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like,
+        parse_sink_target,
         should_attempt_idle_context_compaction,
     };
+    use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
     use crate::domain::{AttachmentKind, StoredAttachment};
     use crate::domain::ChannelAddress;
@@ -2846,6 +2866,7 @@ mod tests {
         let model = ModelConfig {
             api_endpoint: "https://example.com/v1".to_string(),
             model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
             image_tool_model: None,
             api_key: None,
@@ -2862,7 +2883,7 @@ mod tests {
         };
 
         let message =
-            build_user_turn_message(Some("看看这张图"), &[attachment], &model).unwrap();
+            build_user_turn_message(Some("看看这张图"), &[attachment], &model, true).unwrap();
 
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();

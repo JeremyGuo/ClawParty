@@ -1,3 +1,4 @@
+use crate::backend::AgentBackendKind;
 use agent_frame::config::{ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ pub struct TelegramChannelConfig {
 pub struct ModelConfig {
     pub api_endpoint: String,
     pub model: String,
+    #[serde(default)]
+    pub backend: AgentBackendKind,
     #[serde(default)]
     pub supports_vision_input: bool,
     #[serde(default)]
@@ -265,6 +268,15 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
                 model_name
             ));
         }
+        if model.backend == AgentBackendKind::Zgent
+            && model.chat_completions_path != default_chat_completions_path()
+        {
+            return Err(anyhow!(
+                "model '{}' uses zgent backend but chat_completions_path must be '{}'",
+                model_name,
+                default_chat_completions_path()
+            ));
+        }
         if let Some(image_tool_model) = &model.image_tool_model
             && image_tool_model != "self"
             && !config.models.contains_key(image_tool_model)
@@ -315,6 +327,7 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ChannelConfig, default_bot_commands, load_server_config_file};
+    use crate::backend::AgentBackendKind;
     use std::fs;
     use tempfile::TempDir;
 
@@ -463,5 +476,73 @@ mod tests {
 
         let error = load_server_config_file(&config_path).unwrap_err();
         assert!(error.to_string().contains("unknown image_tool_model"));
+    }
+
+    #[test]
+    fn model_backend_defaults_to_agent_frame() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.models["main"].backend, AgentBackendKind::AgentFrame);
+    }
+
+    #[test]
+    fn zgent_backend_rejects_custom_chat_completions_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "backend": "zgent",
+                  "chat_completions_path": "/custom/chat",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(error.to_string().contains("chat_completions_path"));
     }
 }

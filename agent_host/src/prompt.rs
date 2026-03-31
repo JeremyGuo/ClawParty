@@ -169,6 +169,7 @@ fn extract_frontmatter(markdown: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{AgentPromptKind, build_agent_system_prompt};
+    use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
     use crate::config::{MainAgentConfig, ModelConfig};
     use crate::domain::ChannelAddress;
@@ -217,6 +218,7 @@ mod tests {
         let model = ModelConfig {
             api_endpoint: "https://example.com/v1".to_string(),
             model: "example-model".to_string(),
+            backend: AgentBackendKind::AgentFrame,
             supports_vision_input: false,
             image_tool_model: None,
             api_key: None,
