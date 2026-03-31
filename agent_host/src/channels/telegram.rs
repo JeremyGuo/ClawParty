@@ -28,6 +28,8 @@ pub struct TelegramChannel {
 }
 
 impl TelegramChannel {
+    const MAX_POLL_BACKOFF_SECONDS: u64 = 30;
+
     pub fn from_config(config: TelegramChannelConfig) -> Result<Self> {
         let bot_token = match config.bot_token {
             Some(token) if !token.trim().is_empty() => token,
@@ -54,6 +56,10 @@ impl TelegramChannel {
         format!("{}/bot{}/{}", self.api_base_url, self.bot_token, method)
     }
 
+    fn redact_sensitive_text(&self, text: &str) -> String {
+        text.replace(&self.bot_token, "[REDACTED_TELEGRAM_BOT_TOKEN]")
+    }
+
     async fn call_api<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -65,18 +71,36 @@ impl TelegramChannel {
             .json(&payload)
             .send()
             .await
-            .with_context(|| format!("telegram API call {} failed", method))?;
+            .map_err(|error| {
+                anyhow!(
+                    "{}",
+                    self.redact_sensitive_text(&format!(
+                        "telegram API call {} failed: {error:#}",
+                        method
+                    ))
+                )
+            })?;
         let envelope: TelegramEnvelope<T> = response
             .json()
             .await
-            .with_context(|| format!("telegram API {} returned invalid JSON", method))?;
+            .map_err(|error| {
+                anyhow!(
+                    "{}",
+                    self.redact_sensitive_text(&format!(
+                        "telegram API {} returned invalid JSON: {error:#}",
+                        method
+                    ))
+                )
+            })?;
         if !envelope.ok {
             return Err(anyhow!(
                 "telegram API {} failed: {}",
                 method,
-                envelope
+                self.redact_sensitive_text(
+                    &envelope
                     .description
-                    .unwrap_or_else(|| "unknown error".to_string())
+                    .unwrap_or_else(|| "unknown error".to_string()),
+                )
             ));
         }
         envelope
@@ -91,18 +115,36 @@ impl TelegramChannel {
             .multipart(form)
             .send()
             .await
-            .with_context(|| format!("telegram multipart API call {} failed", method))?;
+            .map_err(|error| {
+                anyhow!(
+                    "{}",
+                    self.redact_sensitive_text(&format!(
+                        "telegram multipart API call {} failed: {error:#}",
+                        method
+                    ))
+                )
+            })?;
         let envelope: TelegramEnvelope<serde_json::Value> = response
             .json()
             .await
-            .with_context(|| format!("telegram API {} returned invalid JSON", method))?;
+            .map_err(|error| {
+                anyhow!(
+                    "{}",
+                    self.redact_sensitive_text(&format!(
+                        "telegram API {} returned invalid JSON: {error:#}",
+                        method
+                    ))
+                )
+            })?;
         if !envelope.ok {
             return Err(anyhow!(
                 "telegram API {} failed: {}",
                 method,
-                envelope
+                self.redact_sensitive_text(
+                    &envelope
                     .description
-                    .unwrap_or_else(|| "unknown error".to_string())
+                    .unwrap_or_else(|| "unknown error".to_string()),
+                )
             ));
         }
         envelope
@@ -378,13 +420,35 @@ impl Channel for TelegramChannel {
             poll_interval_ms = self.poll_interval_ms,
             "telegram polling loop started"
         );
+        let mut consecutive_failures = 0u32;
         loop {
             let payload = json!({
                 "timeout": self.poll_timeout_seconds,
                 "offset": offset,
                 "allowed_updates": ["message"],
             });
-            let updates: Vec<TelegramUpdate> = self.call_api("getUpdates", payload).await?;
+            let updates: Vec<TelegramUpdate> = match self.call_api("getUpdates", payload).await {
+                Ok(updates) => {
+                    consecutive_failures = 0;
+                    updates
+                }
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff_seconds =
+                        poll_backoff_seconds(consecutive_failures, Self::MAX_POLL_BACKOFF_SECONDS);
+                    warn!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_polling_retry",
+                        consecutive_failures = consecutive_failures,
+                        backoff_seconds = backoff_seconds,
+                        error = %format!("{error:#}"),
+                        "telegram getUpdates failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+                    continue;
+                }
+            };
             for update in updates {
                 offset = Some(update.update_id + 1);
                 let Some(message) = update.message else {
@@ -498,6 +562,11 @@ impl Channel for TelegramChannel {
             None
         }
     }
+}
+
+fn poll_backoff_seconds(consecutive_failures: u32, cap_seconds: u64) -> u64 {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    2_u64.saturating_pow(exponent).min(cap_seconds).max(1)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -727,7 +796,8 @@ fn escape_html_attribute(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::translate_markdown_to_telegram_html;
+    use super::{poll_backoff_seconds, translate_markdown_to_telegram_html, TelegramChannel};
+    use reqwest::Client;
 
     #[test]
     fn translates_basic_markdown_to_telegram_html() {
@@ -756,6 +826,33 @@ mod tests {
         assert!(translated.text.contains("<pre><code class=\"language-rust\">"));
         assert!(translated.text.contains("let x = 1 &lt; 2;"));
         assert!(translated.text.contains("<code>inline &lt;tag&gt;</code>"));
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(poll_backoff_seconds(1, 30), 1);
+        assert_eq!(poll_backoff_seconds(2, 30), 2);
+        assert_eq!(poll_backoff_seconds(3, 30), 4);
+        assert_eq!(poll_backoff_seconds(10, 30), 30);
+    }
+
+    #[test]
+    fn redacts_bot_token_from_errors() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+        };
+
+        let redacted = channel.redact_sensitive_text(
+            "https://api.telegram.org/botsecret-token/getUpdates failed",
+        );
+        assert!(!redacted.contains("secret-token"));
+        assert!(redacted.contains("[REDACTED_TELEGRAM_BOT_TOKEN]"));
     }
 }
 

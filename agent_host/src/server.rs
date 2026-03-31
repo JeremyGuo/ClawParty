@@ -41,6 +41,7 @@ use tracing::{error, info, warn};
 
 const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
 const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
+const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
 
 #[derive(Clone, Debug)]
 struct BackgroundJobRequest {
@@ -1574,26 +1575,7 @@ impl Server {
         }
 
         for channel in self.channels.values() {
-            let sender = sender.clone();
-            let channel = Arc::clone(channel);
-            info!(
-                log_stream = "channel",
-                log_key = %channel.id(),
-                kind = "channel_starting",
-                "starting channel task"
-            );
-            tokio::spawn(async move {
-                let channel_id = channel.id().to_string();
-                if let Err(error) = channel.run(sender).await {
-                    error!(
-                        log_stream = "channel",
-                        log_key = %channel_id,
-                        kind = "channel_stopped",
-                        error = %format!("{error:#}"),
-                        "channel task stopped with error"
-                    );
-                }
-            });
+            spawn_channel_supervisor(Arc::clone(channel), sender.clone());
         }
         drop(sender);
 
@@ -2090,6 +2072,56 @@ impl Server {
             None,
         );
     }
+}
+
+fn channel_restart_backoff_seconds(consecutive_failures: u32) -> u64 {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    2_u64
+        .saturating_pow(exponent)
+        .min(CHANNEL_RESTART_MAX_BACKOFF_SECONDS)
+        .max(1)
+}
+
+fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<IncomingMessage>) {
+    info!(
+        log_stream = "channel",
+        log_key = %channel.id(),
+        kind = "channel_starting",
+        "starting channel supervisor"
+    );
+    tokio::spawn(async move {
+        let channel_id = channel.id().to_string();
+        let mut consecutive_failures = 0u32;
+        loop {
+            match channel.clone().run(sender.clone()).await {
+                Ok(()) => {
+                    warn!(
+                        log_stream = "channel",
+                        log_key = %channel_id,
+                        kind = "channel_exited",
+                        "channel task exited without error; restarting"
+                    );
+                }
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff_seconds = channel_restart_backoff_seconds(consecutive_failures);
+                    error!(
+                        log_stream = "channel",
+                        log_key = %channel_id,
+                        kind = "channel_stopped",
+                        error = %format!("{error:#}"),
+                        consecutive_failures = consecutive_failures,
+                        backoff_seconds = backoff_seconds,
+                        "channel task stopped with error; restarting"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+                    continue;
+                }
+            }
+            let backoff_seconds = channel_restart_backoff_seconds(consecutive_failures.max(1));
+            tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+        }
+    });
 }
 
 fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttachment]) -> String {
@@ -2737,7 +2769,7 @@ mod tests {
     use super::{
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
         background_timeout_with_active_children_text, build_user_turn_message,
-        extract_attachment_references, is_timeout_like, parse_sink_target,
+        channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like, parse_sink_target,
         should_attempt_idle_context_compaction,
     };
     use crate::config::ModelConfig;
@@ -2811,6 +2843,14 @@ mod tests {
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn channel_restart_backoff_grows_and_caps() {
+        assert_eq!(channel_restart_backoff_seconds(1), 1);
+        assert_eq!(channel_restart_backoff_seconds(2), 2);
+        assert_eq!(channel_restart_backoff_seconds(3), 4);
+        assert_eq!(channel_restart_backoff_seconds(10), 30);
     }
 
     #[test]
