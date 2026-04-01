@@ -26,7 +26,7 @@ use crate::sink::{SinkRouter, SinkTarget};
 use crate::workspace::WorkspaceManager;
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
-    ChatMessage, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
+    ChatMessage, SessionEvent, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
     extract_assistant_text,
 };
 use anyhow::{Context, Result, anyhow};
@@ -120,16 +120,24 @@ impl ServerRuntime {
             .with_context(|| format!("unknown model {}", model_key))
     }
 
-    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<Option<f64>> {
         if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
-            return Ok(timeout_seconds);
+            return Ok((timeout_seconds > 0.0).then_some(timeout_seconds));
         }
-        Ok(background_agent_timeout_seconds(
+        Ok(Some(background_agent_timeout_seconds(
             self.models
                 .get(model_key)
                 .with_context(|| format!("unknown model {}", model_key))?
                 .timeout_seconds,
-        ))
+        )))
+    }
+
+    fn model_upstream_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+        Ok(self
+            .models
+            .get(model_key)
+            .with_context(|| format!("unknown model {}", model_key))?
+            .timeout_seconds)
     }
 
     fn register_managed_agent(
@@ -314,7 +322,12 @@ impl ServerRuntime {
         let mount_name = mount_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("workspace-{}", &source_workspace_id[..8.min(source_workspace_id.len())]));
+            .unwrap_or_else(|| {
+                format!(
+                    "workspace-{}",
+                    &source_workspace_id[..8.min(source_workspace_id.len())]
+                )
+            });
         let mount_path = self.workspace_manager.mount_workspace_snapshot(
             &session.workspace_id,
             &source_workspace_id,
@@ -343,7 +356,9 @@ impl ServerRuntime {
         target_summary_update: Option<String>,
     ) -> Result<Value> {
         if source_workspace_id == session.workspace_id {
-            return Err(anyhow!("source workspace must differ from the current workspace"));
+            return Err(anyhow!(
+                "source workspace must differ from the current workspace"
+            ));
         }
         let summary = self.workspace_manager.move_contents_between_workspaces(
             &source_workspace_id,
@@ -1041,7 +1056,7 @@ impl ServerRuntime {
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
-        timeout_seconds: f64,
+        timeout_seconds: Option<f64>,
         upstream_timeout_seconds: Option<f64>,
         timeout_label: &str,
         join_label: &str,
@@ -1049,26 +1064,39 @@ impl ServerRuntime {
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
         let join_label = join_label.to_string();
+        let event_session = session.clone();
+        let event_model_key = model_key.clone();
         let (checkpoint_sender, mut checkpoint_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
             let _ = checkpoint_sender.send(report);
+        })
+        .with_event_callback(move |event| {
+            let _ = event_sender.send(event);
         });
         let cancellation_handle = execution_control.clone();
+        let worker_session = session;
+        let worker_model_key = model_key;
         let join_handle = tokio::task::spawn_blocking(move || {
             runtime.run_agent_turn_sync(
-                session,
+                worker_session,
                 kind,
                 agent_id,
-                model_key,
+                worker_model_key,
                 previous_messages,
                 prompt,
                 upstream_timeout_seconds,
                 Some(execution_control),
             )
         });
-        let deadline = tokio::time::sleep(Duration::from_secs_f64(timeout_seconds));
-        tokio::pin!(deadline);
+        let soft_deadline = timeout_seconds
+            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs_f64(seconds));
+        let hard_deadline = timeout_seconds.map(|seconds| {
+            tokio::time::Instant::now()
+                + Duration::from_secs_f64(seconds + tool_phase_timeout_grace_seconds())
+        });
         let mut latest_checkpoint = None;
+        let mut soft_timeout_error = None;
         tokio::pin!(join_handle);
         loop {
             select! {
@@ -1078,20 +1106,45 @@ impl ServerRuntime {
                     }
                     latest_checkpoint = checkpoint;
                 }
+                event = event_receiver.recv() => {
+                    if let Some(event) = event {
+                        log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
+                    }
+                }
                 join_result = &mut join_handle => {
                     let report = join_result.context(join_label)?.context("agent turn failed")?;
+                    if let Some(error) = soft_timeout_error {
+                        return Ok(TimedRunOutcome::TimedOut {
+                            checkpoint: Some(report),
+                            error,
+                        });
+                    }
                     return Ok(TimedRunOutcome::Completed(report));
                 }
-                _ = &mut deadline => {
-                    cancellation_handle.request_cancel();
-                    return Ok(TimedRunOutcome::TimedOut {
-                        checkpoint: latest_checkpoint,
-                        error: anyhow!(
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if soft_timeout_error.is_none()
+                        && soft_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    {
+                        let timeout_seconds = timeout_seconds.expect("soft deadline exists");
+                        soft_timeout_error = Some(anyhow!(
                             "{} timed out after {:.1} seconds",
                             timeout_label,
                             timeout_seconds
-                        ),
-                    });
+                        ));
+                        cancellation_handle.request_timeout_observation();
+                    }
+                    if hard_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        let timeout_seconds = timeout_seconds.expect("hard deadline exists");
+                        cancellation_handle.request_cancel();
+                        return Ok(TimedRunOutcome::TimedOut {
+                            checkpoint: latest_checkpoint,
+                            error: anyhow!(
+                                "{} hard timed out after {:.1} seconds",
+                                timeout_label,
+                                timeout_seconds + tool_phase_timeout_grace_seconds()
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1105,32 +1158,53 @@ impl ServerRuntime {
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
-        timeout_seconds: f64,
+        timeout_seconds: Option<f64>,
         upstream_timeout_seconds: Option<f64>,
         timeout_label: &str,
     ) -> Result<TimedRunOutcome> {
+        let event_session = session.clone();
+        let event_model_key = model_key.clone();
         let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
             let _ = checkpoint_sender.send(report);
+        })
+        .with_event_callback(move |event| {
+            let _ = event_sender.send(event);
         });
         let cancellation_handle = execution_control.clone();
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
+        let worker_session = session;
+        let worker_model_key = model_key;
         let handle = std::thread::spawn(move || {
             runtime.run_agent_turn_sync(
-                session,
+                worker_session,
                 kind,
                 agent_id,
-                model_key,
+                worker_model_key,
                 previous_messages,
                 prompt,
                 upstream_timeout_seconds,
                 Some(execution_control),
             )
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds);
+        let soft_deadline = timeout_seconds
+            .map(|seconds| std::time::Instant::now() + Duration::from_secs_f64(seconds));
+        let hard_deadline = timeout_seconds.map(|seconds| {
+            std::time::Instant::now()
+                + Duration::from_secs_f64(seconds + tool_phase_timeout_grace_seconds())
+        });
         let mut latest_checkpoint = None;
+        let mut soft_timeout_error = None;
         loop {
+            match event_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(event) => {
+                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
             match checkpoint_receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(report) => latest_checkpoint = Some(report),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1140,16 +1214,34 @@ impl ServerRuntime {
                 let report = handle
                     .join()
                     .map_err(|_| anyhow!("agent worker thread panicked"))??;
+                if let Some(error) = soft_timeout_error {
+                    return Ok(TimedRunOutcome::TimedOut {
+                        checkpoint: Some(report),
+                        error,
+                    });
+                }
                 return Ok(TimedRunOutcome::Completed(report));
             }
-            if std::time::Instant::now() >= deadline {
+            if soft_timeout_error.is_none()
+                && soft_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                let timeout_seconds = timeout_seconds.expect("soft deadline exists");
+                soft_timeout_error = Some(anyhow!(
+                    "{} timed out after {:.1} seconds",
+                    timeout_label,
+                    timeout_seconds
+                ));
+                cancellation_handle.request_timeout_observation();
+            }
+            if hard_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                let timeout_seconds = timeout_seconds.expect("hard deadline exists");
                 cancellation_handle.request_cancel();
                 return Ok(TimedRunOutcome::TimedOut {
                     checkpoint: latest_checkpoint,
                     error: anyhow!(
-                        "{} timed out after {:.1} seconds",
+                        "{} hard timed out after {:.1} seconds",
                         timeout_label,
-                        timeout_seconds
+                        timeout_seconds + tool_phase_timeout_grace_seconds()
                     ),
                 });
             }
@@ -1195,7 +1287,7 @@ impl ServerRuntime {
             model_key.clone(),
             Vec::new(),
             prompt,
-            timeout_seconds,
+            Some(timeout_seconds),
             Some(timeout_seconds),
             "subagent",
         );
@@ -1356,6 +1448,7 @@ impl ServerRuntime {
             "background agent started"
         );
         let timeout_seconds = self.main_agent_timeout_seconds(&job.model_key)?;
+        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&job.model_key)?;
         let run_result = self
             .run_agent_turn_with_timeout(
                 job.session.clone(),
@@ -1365,7 +1458,7 @@ impl ServerRuntime {
                 Vec::new(),
                 job.prompt.clone(),
                 timeout_seconds,
-                Some(timeout_seconds),
+                Some(upstream_timeout_seconds),
                 "background agent",
                 "background agent task join failed",
             )
@@ -1491,9 +1584,18 @@ impl ServerRuntime {
         );
 
         let recovery_timeout = background_recovery_timeout_seconds(
-            self.main_agent_timeout_seconds(&job.model_key)?,
+            self.main_agent_timeout_seconds(&job.model_key)?
+                .unwrap_or_else(|| {
+                    background_agent_timeout_seconds(
+                        self.models
+                            .get(&job.model_key)
+                            .map(|model| model.timeout_seconds)
+                            .unwrap_or(120.0),
+                    )
+                }),
             error,
         );
+        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&job.model_key)?;
         let recovery_prompt = format!(
             "A previous main background agent failed before completing its work.\n\nOriginal task:\n{}\n\nFailure:\n{}\n\nYour job now:\n1. Diagnose the failure.\n2. If it is recoverable without user intervention, continue or retry the original task yourself now and produce the final user-facing result. Do not mention the failure unless it is relevant.\n3. If it is not recoverable, produce a concise user-facing explanation of the problem and what the user should do next.\n4. Do not say that you will continue later. Either complete the work now or explain the blocker clearly.",
             job.prompt, error
@@ -1506,8 +1608,8 @@ impl ServerRuntime {
                 job.model_key.clone(),
                 Vec::new(),
                 recovery_prompt,
-                recovery_timeout,
                 Some(recovery_timeout),
+                Some(upstream_timeout_seconds),
                 "background failure recovery",
                 "background failure recovery task join failed",
             )
@@ -2078,11 +2180,8 @@ impl Server {
             .is_some_and(|text| text == "/new")
         {
             if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address) {
-                self.sessions.mark_workspace_summary_state(
-                    &incoming.address,
-                    true,
-                    true,
-                )?;
+                self.sessions
+                    .mark_workspace_summary_state(&incoming.address, true, true)?;
                 if let Err(error) = self
                     .summarize_workspace_before_destroy(&previous_session)
                     .await
@@ -2126,11 +2225,8 @@ impl Server {
             if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address)
                 && previous_session.workspace_id != workspace_id
             {
-                self.sessions.mark_workspace_summary_state(
-                    &incoming.address,
-                    true,
-                    true,
-                )?;
+                self.sessions
+                    .mark_workspace_summary_state(&incoming.address, true, true)?;
                 if let Err(error) = self
                     .summarize_workspace_before_destroy(&previous_session)
                     .await
@@ -2432,7 +2528,10 @@ impl Server {
         Ok(())
     }
 
-    async fn summarize_workspace_before_destroy(&mut self, session: &SessionSnapshot) -> Result<()> {
+    async fn summarize_workspace_before_destroy(
+        &mut self,
+        session: &SessionSnapshot,
+    ) -> Result<()> {
         let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_in_progress));
         let entries =
             self.workspace_manager
@@ -2489,6 +2588,8 @@ impl Server {
             }
         );
         let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
+        let upstream_timeout_seconds =
+            self.model_upstream_timeout_seconds(&self.main_agent.model)?;
         let runtime = self.tool_runtime();
         let outcome = runtime
             .run_agent_turn_with_timeout(
@@ -2499,7 +2600,7 @@ impl Server {
                 previous_messages,
                 prompt,
                 timeout_seconds,
-                Some(timeout_seconds),
+                Some(upstream_timeout_seconds),
                 "workspace summary",
                 "workspace summary task join failed",
             )
@@ -2575,6 +2676,8 @@ impl Server {
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
         let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
+        let upstream_timeout_seconds =
+            self.model_upstream_timeout_seconds(&self.main_agent.model)?;
         let runtime = self.tool_runtime();
         let run_result = runtime
             .run_agent_turn_with_timeout(
@@ -2585,7 +2688,7 @@ impl Server {
                 previous_messages,
                 String::new(),
                 timeout_seconds,
-                Some(timeout_seconds),
+                Some(upstream_timeout_seconds),
                 "foreground agent turn",
                 "agent_frame task join failed",
             )
@@ -2614,16 +2717,24 @@ impl Server {
             .with_context(|| format!("unknown main_agent model {}", self.main_agent.model))
     }
 
-    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<Option<f64>> {
         if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
-            return Ok(timeout_seconds);
+            return Ok((timeout_seconds > 0.0).then_some(timeout_seconds));
         }
-        Ok(background_agent_timeout_seconds(
+        Ok(Some(background_agent_timeout_seconds(
             self.models
                 .get(model_key)
                 .with_context(|| format!("unknown model {}", model_key))?
                 .timeout_seconds,
-        ))
+        )))
+    }
+
+    fn model_upstream_timeout_seconds(&self, model_key: &str) -> Result<f64> {
+        Ok(self
+            .models
+            .get(model_key)
+            .with_context(|| format!("unknown model {}", model_key))?
+            .timeout_seconds)
     }
 
     fn build_foreground_agent(&self, session: &SessionSnapshot) -> Result<ForegroundAgent> {
@@ -3381,6 +3492,10 @@ fn workspace_visible_in_list(
     is_archived || !active_workspace_ids.iter().any(|id| id == workspace_id)
 }
 
+fn tool_phase_timeout_grace_seconds() -> f64 {
+    15.0
+}
+
 fn log_turn_usage(
     agent_id: uuid::Uuid,
     session: &SessionSnapshot,
@@ -3408,6 +3523,264 @@ fn log_turn_usage(
         cache_write_tokens = usage.cache_write_tokens,
         "recorded turn token usage"
     );
+}
+
+fn log_agent_frame_event(
+    agent_id: uuid::Uuid,
+    session: &SessionSnapshot,
+    kind: AgentPromptKind,
+    model_key: &str,
+    event: &SessionEvent,
+) {
+    let agent_kind = match kind {
+        AgentPromptKind::MainForeground => "main_foreground",
+        AgentPromptKind::MainBackground => "main_background",
+        AgentPromptKind::SubAgent => "subagent",
+    };
+    match event {
+        SessionEvent::SessionStarted {
+            previous_message_count,
+            prompt_len,
+            tool_definition_count,
+            skill_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_session_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            previous_message_count = *previous_message_count as u64,
+            prompt_len = *prompt_len as u64,
+            tool_definition_count = *tool_definition_count as u64,
+            skill_count = *skill_count as u64,
+            "agent_frame session started"
+        ),
+        SessionEvent::CompactionStarted {
+            phase,
+            message_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_compaction_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            phase,
+            message_count = *message_count as u64,
+            "agent_frame compaction started"
+        ),
+        SessionEvent::CompactionCompleted {
+            phase,
+            compacted,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            token_limit,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_compaction_completed",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            phase,
+            compacted = *compacted,
+            estimated_tokens_before = *estimated_tokens_before as u64,
+            estimated_tokens_after = *estimated_tokens_after as u64,
+            token_limit = *token_limit as u64,
+            "agent_frame compaction completed"
+        ),
+        SessionEvent::RoundStarted {
+            round_index,
+            message_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_round_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            round_index = *round_index as u64,
+            message_count = *message_count as u64,
+            "agent_frame round started"
+        ),
+        SessionEvent::ModelCallStarted {
+            round_index,
+            message_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_model_call_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            round_index = *round_index as u64,
+            message_count = *message_count as u64,
+            "agent_frame model call started"
+        ),
+        SessionEvent::ModelCallCompleted {
+            round_index,
+            tool_call_count,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_model_call_completed",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            round_index = *round_index as u64,
+            tool_call_count = *tool_call_count as u64,
+            prompt_tokens = *prompt_tokens,
+            completion_tokens = *completion_tokens,
+            total_tokens = *total_tokens,
+            "agent_frame model call completed"
+        ),
+        SessionEvent::CheckpointEmitted {
+            message_count,
+            total_tokens,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_checkpoint_emitted",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            message_count = *message_count as u64,
+            total_tokens = *total_tokens,
+            "agent_frame checkpoint emitted"
+        ),
+        SessionEvent::ToolWaitCompactionScheduled {
+            tool_name,
+            stable_prefix_message_count,
+            delay_ms,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_tool_wait_compaction_scheduled",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            tool_name,
+            stable_prefix_message_count = *stable_prefix_message_count as u64,
+            delay_ms = *delay_ms,
+            "agent_frame tool-wait compaction scheduled"
+        ),
+        SessionEvent::ToolWaitCompactionStarted {
+            tool_name,
+            stable_prefix_message_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_tool_wait_compaction_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            tool_name,
+            stable_prefix_message_count = *stable_prefix_message_count as u64,
+            "agent_frame tool-wait compaction started"
+        ),
+        SessionEvent::ToolWaitCompactionCompleted {
+            tool_name,
+            compacted,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            token_limit,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_tool_wait_compaction_completed",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            tool_name,
+            compacted = *compacted,
+            estimated_tokens_before = *estimated_tokens_before as u64,
+            estimated_tokens_after = *estimated_tokens_after as u64,
+            token_limit = *token_limit as u64,
+            "agent_frame tool-wait compaction completed"
+        ),
+        SessionEvent::ToolCallStarted {
+            round_index,
+            tool_name,
+            tool_call_id,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_tool_call_started",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            round_index = *round_index as u64,
+            tool_name,
+            tool_call_id,
+            "agent_frame tool call started"
+        ),
+        SessionEvent::ToolCallCompleted {
+            round_index,
+            tool_name,
+            tool_call_id,
+            output_len,
+            errored,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_tool_call_completed",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            round_index = *round_index as u64,
+            tool_name,
+            tool_call_id,
+            output_len = *output_len as u64,
+            errored = *errored,
+            "agent_frame tool call completed"
+        ),
+        SessionEvent::PrefixRewriteApplied {
+            previous_prefix_message_count,
+            replacement_prefix_message_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_prefix_rewrite_applied",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            previous_prefix_message_count = *previous_prefix_message_count as u64,
+            replacement_prefix_message_count = *replacement_prefix_message_count as u64,
+            "agent_frame prefix rewrite applied"
+        ),
+        SessionEvent::SessionCompleted {
+            message_count,
+            total_tokens,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_session_completed",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            message_count = *message_count as u64,
+            total_tokens = *total_tokens,
+            "agent_frame session completed"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3641,7 +4014,15 @@ mod tests {
     #[test]
     fn hides_active_workspaces_from_list_results() {
         assert!(workspace_visible_in_list("archived-1", &[], true));
-        assert!(workspace_visible_in_list("idle-1", &[String::from("active-1")], false));
-        assert!(!workspace_visible_in_list("active-1", &[String::from("active-1")], false));
+        assert!(workspace_visible_in_list(
+            "idle-1",
+            &[String::from("active-1")],
+            false
+        ));
+        assert!(!workspace_visible_in_list(
+            "active-1",
+            &[String::from("active-1")],
+            false
+        ));
     }
 }

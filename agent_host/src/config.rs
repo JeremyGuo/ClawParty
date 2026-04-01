@@ -114,6 +114,13 @@ pub struct ServerConfig {
     pub channels: Vec<ChannelConfig>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedModelApiKey {
+    pub model_name: String,
+    pub source: String,
+    pub api_key: Option<String>,
+}
+
 fn default_cli_prompt() -> String {
     "you> ".to_string()
 }
@@ -144,8 +151,10 @@ pub fn default_enabled_tools() -> Vec<String> {
         "write_file".to_string(),
         "edit".to_string(),
         "apply_patch".to_string(),
-        "exec".to_string(),
-        "process".to_string(),
+        "exec_start".to_string(),
+        "exec_observe".to_string(),
+        "exec_wait".to_string(),
+        "exec_kill".to_string(),
         "download_file".to_string(),
         "web_fetch".to_string(),
         "web_search".to_string(),
@@ -255,9 +264,11 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
     if config
         .main_agent
         .timeout_seconds
-        .is_some_and(|value| value <= 0.0)
+        .is_some_and(|value| value < 0.0)
     {
-        return Err(anyhow!("main_agent.timeout_seconds must be greater than 0"));
+        return Err(anyhow!(
+            "main_agent.timeout_seconds must be greater than or equal to 0"
+        ));
     }
     for channel in &config.channels {
         if let ChannelConfig::Telegram(telegram) = channel {
@@ -296,6 +307,48 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
     Ok(config)
 }
 
+pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey> {
+    config
+        .models
+        .iter()
+        .map(|(model_name, model)| {
+            let inline_key = model
+                .api_key
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(api_key) = inline_key {
+                return ResolvedModelApiKey {
+                    model_name: model_name.clone(),
+                    source: "config.api_key".to_string(),
+                    api_key: Some(api_key),
+                };
+            }
+
+            let env_name = model.api_key_env.trim();
+            let env_key = if env_name.is_empty() {
+                None
+            } else {
+                std::env::var(env_name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            };
+
+            ResolvedModelApiKey {
+                model_name: model_name.clone(),
+                source: if env_name.is_empty() {
+                    "missing".to_string()
+                } else {
+                    format!("env:{env_name}")
+                },
+                api_key: env_key,
+            }
+        })
+        .collect()
+}
+
 fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
     if commands.len() > 100 {
         return Err(anyhow!("telegram supports at most 100 commands"));
@@ -331,7 +384,9 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelConfig, default_bot_commands, load_server_config_file};
+    use super::{
+        ChannelConfig, default_bot_commands, load_server_config_file, resolve_model_api_keys,
+    };
     use crate::backend::AgentBackendKind;
     use std::fs;
     use tempfile::TempDir;
@@ -416,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_timeout_must_be_positive_when_present() {
+    fn main_agent_timeout_allows_zero_to_disable_external_timeout() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         fs::write(
@@ -433,6 +488,40 @@ mod tests {
               "main_agent": {
                 "model": "main",
                 "timeout_seconds": 0
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.main_agent.timeout_seconds, Some(0.0));
+    }
+
+    #[test]
+    fn main_agent_timeout_rejects_negative_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main",
+                "timeout_seconds": -1
               },
               "channels": [
                 {
@@ -549,5 +638,74 @@ mod tests {
 
         let error = load_server_config_file(&config_path).unwrap_err();
         assert!(error.to_string().contains("chat_completions_path"));
+    }
+
+    #[test]
+    fn resolve_model_api_keys_prefers_inline_and_falls_back_to_env() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "inline_model": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-inline",
+                  "description": "demo",
+                  "api_key": "inline-secret"
+                },
+                "env_model": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-env",
+                  "description": "demo",
+                  "api_key_env": "AGENT_HOST_TEST_API_KEY"
+                },
+                "missing_model": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-missing",
+                  "description": "demo",
+                  "api_key_env": "AGENT_HOST_TEST_MISSING"
+                }
+              },
+              "main_agent": {
+                "model": "inline_model"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        // Safe in unit test; restored below.
+        unsafe {
+            std::env::set_var("AGENT_HOST_TEST_API_KEY", "env-secret");
+            std::env::remove_var("AGENT_HOST_TEST_MISSING");
+        }
+
+        let config = load_server_config_file(&config_path).unwrap();
+        let resolved = resolve_model_api_keys(&config);
+
+        assert_eq!(resolved[0].model_name, "env_model");
+        assert_eq!(resolved[0].source, "env:AGENT_HOST_TEST_API_KEY");
+        assert_eq!(resolved[0].api_key.as_deref(), Some("env-secret"));
+
+        assert_eq!(resolved[1].model_name, "inline_model");
+        assert_eq!(resolved[1].source, "config.api_key");
+        assert_eq!(resolved[1].api_key.as_deref(), Some("inline-secret"));
+
+        assert_eq!(resolved[2].model_name, "missing_model");
+        assert_eq!(resolved[2].source, "env:AGENT_HOST_TEST_MISSING");
+        assert_eq!(resolved[2].api_key, None);
+
+        unsafe {
+            std::env::remove_var("AGENT_HOST_TEST_API_KEY");
+            std::env::remove_var("AGENT_HOST_TEST_MISSING");
+        }
     }
 }

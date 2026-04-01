@@ -3,7 +3,7 @@
     "main": {
       "backend": "agent_frame",
       "api_endpoint": "https://openrouter.ai/api/v1",
-      "model": "anthropic/claude-sonnet-4.6",
+      "model": "anthropic/claude-opus-4.6",
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "cache_ttl": "5m",
@@ -27,7 +27,7 @@
           "X-Title": "AgentHost External Search"
         }
       },
-      "image_tool_model": "qwen35-27B",
+      "image_tool_model": "self",
       "description": "Fast general-purpose chat model for the foreground agent."
     },
     "qwen35-27B": {
@@ -62,6 +62,7 @@
   },
   "main_agent": {
     "model": "main",
+    "timeout_seconds": 0,
     "language": "zh-CN"
   },
   "channels": [
