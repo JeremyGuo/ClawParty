@@ -1,5 +1,4 @@
 {
-  "_comment": "OpenAI API format example (default)",
   "enabled_tools": [
     "read_file",
     "write_file",
@@ -7,12 +6,14 @@
     "http_request"
   ],
   "upstream": {
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4.1",
-    "api_key_env": "OPENAI_API_KEY",
-    "api_format": "openai",
+    "base_url": "https://api.kimi.com/coding",
+    "model": "kimi-k2.5-coding",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "chat_completions_path": "/v1/messages",
+    "api_format": "claude",
     "timeout_seconds": 120,
-    "context_window_tokens": 128000
+    "context_window_tokens": 256000,
+    "supports_vision_input": true
   },
   "skills_dirs": [
     "./skills"

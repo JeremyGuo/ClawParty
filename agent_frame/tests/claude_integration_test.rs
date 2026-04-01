@@ -1,5 +1,16 @@
 //! Claude API integration tests
 //! Requires ANTHROPIC_API_KEY environment variable or .env.test file
+//!
+//! Supports:
+//! - Anthropic Claude API
+//! - Kimi Coding (Claude-compatible)
+//!
+//! Example .env.test:
+//! ```
+//! ANTHROPIC_BASE_URL=https://api.kimi.com/coding
+//! ANTHROPIC_API_KEY=sk-kimi-...
+//! TEST_MODEL=kimi-k2.5-coding
+//! ```
 
 use agent_frame::{
     create_chat_completion, ApiFormat, ChatMessage, Tool, UpstreamConfig,
@@ -7,19 +18,22 @@ use agent_frame::{
 use serde_json::json;
 use std::env;
 
+/// Load Claude/Kimi API configuration from environment
 fn load_claude_config() -> Option<UpstreamConfig> {
-    // 加载 .env.test 文件
+    // Load .env.test or .env file
     let _ = dotenvy::from_filename(".env.test")
         .or_else(|_| dotenvy::from_filename("../.env.test"))
         .or_else(|_| dotenvy::dotenv());
 
     let api_key = env::var("ANTHROPIC_API_KEY").ok()?;
     let base_url = env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string());
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let model = env::var("TEST_MODEL")
+        .unwrap_or_else(|_| "claude-3-5-sonnet-20241022".to_string());
 
     Some(UpstreamConfig {
         base_url,
-        model: "claude-3-5-sonnet-20241022".to_string(),
+        model,
         supports_vision_input: false,
         api_key: Some(api_key),
         api_key_env: "ANTHROPIC_API_KEY".to_string(),
@@ -39,15 +53,17 @@ fn load_claude_config() -> Option<UpstreamConfig> {
 #[ignore = "requires real API key"]
 fn test_claude_simple_completion() {
     let config = load_claude_config().expect(
-        "Failed to load Claude config. Set ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL in .env.test",
+        "Failed to load config. Set ANTHROPIC_API_KEY and optionally ANTHROPIC_BASE_URL in .env.test\n\
+         For Kimi Coding: ANTHROPIC_BASE_URL=https://api.kimi.com/coding",
     );
 
-    let messages = vec![ChatMessage::text("user", "Hello! Say 'Claude is working' and nothing else.")];
+    let messages = vec![ChatMessage::text("user", "Hello! Say 'Claude API is working' and nothing else.")];
 
     let result = create_chat_completion(&config, &messages, &[], None);
 
     match result {
         Ok(outcome) => {
+            println!("Model: {}", config.model);
             println!("Response: {:?}", outcome.message.content);
             println!("Usage: {:?}", outcome.usage);
             assert!(outcome.usage.total_tokens > 0);
@@ -62,10 +78,10 @@ fn test_claude_simple_completion() {
 #[ignore = "requires real API key"]
 fn test_claude_with_tool() {
     let config = load_claude_config().expect(
-        "Failed to load Claude config. Set ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL in .env.test",
+        "Failed to load config. Set ANTHROPIC_API_KEY in .env.test",
     );
 
-    // 定义一个测试工具
+    // Define a test tool
     let tools = vec![Tool::new(
         "get_weather",
         "Get the current weather for a location",
@@ -98,10 +114,11 @@ fn test_claude_with_tool() {
 
     match result {
         Ok(outcome) => {
+            println!("Model: {}", config.model);
             println!("Response: {:?}", outcome.message.content);
             println!("Tool calls: {:?}", outcome.message.tool_calls);
             
-            // 验证响应或工具调用
+            // Verify response or tool calls
             assert!(
                 outcome.message.content.is_some() || outcome.message.tool_calls.is_some(),
                 "Expected either content or tool calls"
@@ -117,20 +134,20 @@ fn test_claude_with_tool() {
 #[ignore = "requires real API key"]
 fn test_claude_multi_turn_conversation() {
     let config = load_claude_config().expect(
-        "Failed to load Claude config. Set ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL in .env.test",
+        "Failed to load config. Set ANTHROPIC_API_KEY in .env.test",
     );
 
     let mut messages = vec![
         ChatMessage::text("user", "My name is Alice."),
     ];
 
-    // 第一轮
+    // Turn 1
     let result1 = create_chat_completion(&config, &messages, &[], None)
         .expect("First turn failed");
     println!("Turn 1 response: {:?}", result1.message.content);
     messages.push(result1.message);
 
-    // 第二轮（测试记忆）
+    // Turn 2 (test memory)
     messages.push(ChatMessage::text("user", "What's my name?"));
     let result2 = create_chat_completion(&config, &messages, &[], None)
         .expect("Second turn failed");
@@ -152,12 +169,12 @@ fn test_claude_multi_turn_conversation() {
 }
 
 #[test]
-fn test_claude_config_loading() {
-    // 这个测试不需要 API key，验证配置加载逻辑
+fn test_config_loading() {
+    // This test doesn't need API key, verifies config loading logic
     let _ = dotenvy::from_filename(".env.test")
         .or_else(|_| dotenvy::from_filename("../.env.test"));
 
-    // 如果没有配置，应该返回 None
+    // If no config, should return None
     if env::var("ANTHROPIC_API_KEY").is_err() {
         println!("Skipping: ANTHROPIC_API_KEY not set");
         return;
@@ -166,5 +183,9 @@ fn test_claude_config_loading() {
     let config = load_claude_config().expect("Should load config when env vars are set");
     assert_eq!(config.api_format, ApiFormat::Claude);
     assert!(config.api_key.is_some());
-    println!("Config loaded successfully: base_url = {}", config.base_url);
+    assert!(config.chat_completions_path.contains("/messages"));
+    println!("Config loaded successfully:");
+    println!("  base_url: {}", config.base_url);
+    println!("  model: {}", config.model);
+    println!("  api_format: {:?}", config.api_format);
 }
