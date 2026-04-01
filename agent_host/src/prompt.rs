@@ -224,6 +224,7 @@ mod tests {
             turn_count: 0,
             last_compacted_turn_count: 0,
             cumulative_usage: agent_frame::TokenUsage::default(),
+            cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,

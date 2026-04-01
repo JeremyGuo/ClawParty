@@ -6,7 +6,7 @@ use agent_frame::message::{
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tooling::build_tool_registry_with_cancel;
 use agent_frame::{
-    SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
+    SessionCompactionStats, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
     compact_session_messages_with_report as frame_compact_session_messages_with_report,
     run_session_with_report_controlled as frame_run_session_with_report_controlled,
 };
@@ -185,7 +185,11 @@ fn run_zgent_session_with_report_controlled(
             _ => Vec::new(),
         };
         if tool_calls.is_empty() {
-            return Ok(SessionRunReport { messages, usage });
+            return Ok(SessionRunReport {
+                messages,
+                usage,
+                compaction: SessionCompactionStats::default(),
+            });
         }
 
         for tool_call in tool_calls {

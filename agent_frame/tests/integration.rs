@@ -858,6 +858,7 @@ fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
                     cache_read_tokens: 40,
                     cache_write_tokens: 60,
                 },
+                agent_frame::SessionCompactionStats::default(),
             );
             Ok(json!({"ok": true}))
         },
