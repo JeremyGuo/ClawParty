@@ -15,13 +15,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-#[derive(Clone, Debug)]
-pub struct SandboxBindMount {
-    pub source: PathBuf,
-    pub target: PathBuf,
-    pub read_only: bool,
-}
-
 fn write_json_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
     serde_json::to_writer(&mut *writer, value).context("failed to serialize RPC message")?;
     writer
@@ -139,7 +132,7 @@ pub fn run_child_stdio() -> Result<()> {
 
     let signal_control = control.clone();
     let pending_map = Arc::clone(&pending);
-    let inbound_thread = std::thread::spawn(move || -> Result<()> {
+    let _inbound_thread = std::thread::spawn(move || -> Result<()> {
         while let Some(message) = read_json_line::<ParentToChildMessage>(&mut reader)? {
             match message {
                 ParentToChildMessage::ToolResponse {
@@ -197,7 +190,6 @@ pub fn run_child_stdio() -> Result<()> {
         }
     }
 
-    let _ = inbound_thread.join();
     let _ = agent_frame::tooling::terminate_all_managed_processes();
     Ok(())
 }
@@ -209,7 +201,6 @@ pub fn run_turn_in_child_process(
     prompt: String,
     config: agent_frame::config::AgentConfig,
     skill_memory_source: PathBuf,
-    bind_mounts: Vec<SandboxBindMount>,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
 ) -> Result<SessionRunReport> {
@@ -225,17 +216,20 @@ pub fn run_turn_in_child_process(
             &config.workspace_root.join(".skill_memory"),
             &skill_memory_source,
             &config.skills_dirs,
-            &bind_mounts,
         )?,
     };
     command.arg("run-child");
-    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .context("failed to spawn child agent runner")?;
 
     let child_stdin = child.stdin.take().context("child stdin unavailable")?;
     let child_stdout = child.stdout.take().context("child stdout unavailable")?;
+    let mut child_stderr = Some(child.stderr.take().context("child stderr unavailable")?);
     let writer = Arc::new(Mutex::new(BufWriter::new(child_stdin)));
     {
         let init = ParentToChildMessage::Init(ChildInitPayload {
@@ -277,8 +271,53 @@ pub fn run_turn_in_child_process(
 
     let mut reader = BufReader::new(child_stdout);
     loop {
-        let message = read_json_line::<ChildToParentMessage>(&mut reader)?
-            .ok_or_else(|| anyhow!("child RPC stream closed unexpectedly"))?;
+        let message = match read_json_line::<ChildToParentMessage>(&mut reader) {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                let mut stderr_reader = BufReader::new(
+                    child_stderr
+                        .take()
+                        .ok_or_else(|| anyhow!("child stderr already consumed"))?,
+                );
+                let mut stderr_output = String::new();
+                let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
+                let status = child.wait().ok();
+                let stderr_output = stderr_output.trim();
+                return Err(anyhow!(
+                    "child RPC stream closed unexpectedly; exit_status={}; stderr={}",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    if stderr_output.is_empty() {
+                        "<empty>"
+                    } else {
+                        stderr_output
+                    }
+                ));
+            }
+            Err(error) => {
+                let mut stderr_reader = BufReader::new(
+                    child_stderr
+                        .take()
+                        .ok_or_else(|| anyhow!("child stderr already consumed"))?,
+                );
+                let mut stderr_output = String::new();
+                let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
+                let status = child.wait().ok();
+                let stderr_output = stderr_output.trim();
+                return Err(anyhow!(
+                    "failed to decode child RPC stream: {error:#}; exit_status={}; stderr={}",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    if stderr_output.is_empty() {
+                        "<empty>"
+                    } else {
+                        stderr_output
+                    }
+                ));
+            }
+        };
         match message {
             ChildToParentMessage::Started => {}
             ChildToParentMessage::SessionEvent(event) => {
@@ -334,8 +373,14 @@ pub fn run_turn_in_child_process(
                 return Ok(report);
             }
             ChildToParentMessage::Failed { error } => {
-                let _ = child.wait();
-                return Err(anyhow!(error));
+                let status = child.wait().ok();
+                return Err(anyhow!(
+                    "{}{}",
+                    error,
+                    status
+                        .map(|status| format!("; exit_status={status}"))
+                        .unwrap_or_default()
+                ));
             }
         }
     }
@@ -349,7 +394,6 @@ fn build_bubblewrap_command(
     skill_memory_target: &Path,
     skill_memory_source: &Path,
     skills_dirs: &[std::path::PathBuf],
-    bind_mounts: &[SandboxBindMount],
 ) -> Result<Command> {
     if !cfg!(target_os = "linux") {
         return Err(anyhow!(
@@ -394,11 +438,6 @@ fn build_bubblewrap_command(
     for skill_dir in skills_dirs {
         if skill_dir.exists() {
             bind_path(&mut command, skill_dir, false)?;
-        }
-    }
-    for mount in bind_mounts {
-        if mount.source.exists() {
-            bind_path_to(&mut command, &mount.source, &mount.target, mount.read_only)?;
         }
     }
     Ok(command)

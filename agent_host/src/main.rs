@@ -26,12 +26,19 @@ enum AgentHostCommand {
     RunChild,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
     if matches!(args.command, Some(AgentHostCommand::RunChild)) {
         return run_child_stdio();
     }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build Tokio runtime")?;
+    runtime.block_on(async move { run_server(args).await })
+}
+
+async fn run_server(args: Args) -> Result<()> {
     let config_path = args
         .config
         .as_ref()

@@ -75,5 +75,8 @@
       "poll_timeout_seconds": 30,
       "poll_interval_ms": 250
     }
-  ]
+  ],
+  "sandbox": {
+    "mode": "subprocess"
+  }
 }

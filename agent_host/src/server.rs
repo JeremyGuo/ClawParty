@@ -21,7 +21,7 @@ use crate::domain::{
     StoredAttachment,
 };
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
-use crate::sandbox::{SandboxBindMount, run_turn_in_child_process};
+use crate::sandbox::run_turn_in_child_process;
 use crate::session::{SessionManager, SessionSnapshot};
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
@@ -363,7 +363,7 @@ impl ServerRuntime {
             });
         let materialization = if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap)
         {
-            WorkspaceMountMaterialization::SandboxPlaceholder
+            WorkspaceMountMaterialization::HostSnapshotCopy
         } else {
             WorkspaceMountMaterialization::HostSymlink
         };
@@ -1074,28 +1074,13 @@ impl ServerRuntime {
     ) -> Result<agent_frame::SessionRunReport> {
         let workspace_root = session.workspace_root.clone();
         let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
-        let sandbox_mounts = if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap)
-        {
+        if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
+            self.workspace_manager
+                .cleanup_transient_mounts(&session.workspace_id)?;
             let _ = self
                 .workspace_manager
                 .prepare_bubblewrap_view(&session.workspace_id)?;
-            self.workspace_manager
-                .list_workspace_mounts(&session.workspace_id)?
-                .into_iter()
-                .map(|mount| {
-                    let source = self
-                        .workspace_manager
-                        .ensure_workspace_exists(&mount.source_workspace_id)?;
-                    Ok(SandboxBindMount {
-                        source: source.files_dir,
-                        target: session.workspace_root.join("mounts").join(mount.mount_name),
-                        read_only: mount.mode == "ro",
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
+        }
         let config = self.build_agent_frame_config(
             &session,
             &workspace_root,
@@ -1121,17 +1106,22 @@ impl ServerRuntime {
                 execution_control,
             )
         } else {
-            run_turn_in_child_process(
+            let result = run_turn_in_child_process(
                 &self.sandbox,
                 backend,
                 previous_messages,
                 prompt,
                 config,
                 self.agent_workspace.rundir.join("skill_memory"),
-                sandbox_mounts,
                 extra_tools,
                 execution_control,
-            )
+            );
+            if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
+                let _ = self
+                    .workspace_manager
+                    .cleanup_transient_mounts(&session.workspace_id);
+            }
+            result
         }
     }
 

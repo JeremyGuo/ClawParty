@@ -38,6 +38,7 @@ pub struct WorkspaceMountRecord {
 pub enum WorkspaceMountMaterialization {
     HostSymlink,
     SandboxPlaceholder,
+    HostSnapshotCopy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -386,7 +387,16 @@ impl WorkspaceManager {
             .registry
             .lock()
             .map_err(|_| anyhow!("workspace registry lock poisoned"))?;
-        if let Some(existing) = registry.mounts.iter_mut().find(|record| {
+        let original_len = registry.mounts.len();
+        if matches!(
+            materialization,
+            WorkspaceMountMaterialization::HostSnapshotCopy
+        ) {
+            registry.mounts.retain(|record| {
+                !(record.owner_workspace_id == owner_workspace_id
+                    && record.mount_name == mount_name)
+            });
+        } else if let Some(existing) = registry.mounts.iter_mut().find(|record| {
             record.owner_workspace_id == owner_workspace_id && record.mount_name == mount_name
         }) {
             existing.source_workspace_id = source_workspace_id.to_string();
@@ -402,7 +412,14 @@ impl WorkspaceManager {
                 updated_at: now,
             });
         }
-        self.persist_registry(&registry)?;
+        if registry.mounts.len() != original_len
+            || !matches!(
+                materialization,
+                WorkspaceMountMaterialization::HostSnapshotCopy
+            )
+        {
+            self.persist_registry(&registry)?;
+        }
         Ok(mount_path)
     }
 
@@ -433,10 +450,30 @@ impl WorkspaceManager {
     pub fn prepare_bubblewrap_view(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
         let workspace = self.ensure_workspace_exists(workspace_id)?;
         self.materialize_mount_placeholder(&workspace.files_dir.join(".skill_memory"))?;
-        for mount in self.list_workspace_mounts(workspace_id)? {
-            self.materialize_mount_placeholder(&workspace.mounts_dir.join(&mount.mount_name))?;
-        }
         Ok(workspace)
+    }
+
+    pub fn cleanup_transient_mounts(&self, workspace_id: &str) -> Result<()> {
+        let workspace = self.ensure_workspace_exists(workspace_id)?;
+        if !workspace.mounts_dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&workspace.mounts_dir)
+            .with_context(|| format!("failed to read {}", workspace.mounts_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn move_contents_between_workspaces(
@@ -621,6 +658,9 @@ impl WorkspaceManager {
             WorkspaceMountMaterialization::SandboxPlaceholder => {
                 self.materialize_mount_placeholder(mount_path)
             }
+            WorkspaceMountMaterialization::HostSnapshotCopy => {
+                self.materialize_snapshot_mount_path(mount_path, source_files_dir)
+            }
         }
     }
 
@@ -662,6 +702,24 @@ impl WorkspaceManager {
                 mount_path.display()
             )
         })
+    }
+
+    fn materialize_snapshot_mount_path(
+        &self,
+        mount_path: &Path,
+        source_files_dir: &Path,
+    ) -> Result<()> {
+        if let Ok(metadata) = fs::symlink_metadata(mount_path) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            }
+        }
+        copy_dir_recursive(source_files_dir, mount_path)?;
+        set_readonly_recursive(mount_path)
     }
 
     fn workspace_record_from_stored(&self, record: StoredWorkspaceRecord) -> WorkspaceRecord {
@@ -812,6 +870,27 @@ fn create_dir_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
     {
         std::os::windows::fs::symlink_dir(source, target)
     }
+}
+
+fn set_readonly_recursive(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to mark {} readonly", path.display()))?;
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            let entry = entry?;
+            set_readonly_recursive(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_workspace_entries(
@@ -1018,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn bubblewrap_view_materializes_placeholders_for_shared_mounts() {
+    fn bubblewrap_view_materializes_skill_memory_placeholder_only() {
         let temp_dir = TempDir::new().unwrap();
         let manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let source = manager
@@ -1042,17 +1121,11 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(
-            fs::symlink_metadata(target.mounts_dir.join("shared"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(target.mounts_dir.join("shared").exists());
 
         manager.prepare_bubblewrap_view(&target.id).unwrap();
 
         assert!(target.files_dir.join(".skill_memory").is_dir());
-        assert!(target.mounts_dir.join("shared").is_dir());
         assert!(
             !fs::symlink_metadata(target.files_dir.join(".skill_memory"))
                 .unwrap()
@@ -1060,10 +1133,54 @@ mod tests {
                 .is_symlink()
         );
         assert!(
-            !fs::symlink_metadata(target.mounts_dir.join("shared"))
+            fs::symlink_metadata(target.mounts_dir.join("shared"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[test]
+    fn host_snapshot_copy_mount_is_readonly_materialized_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let source = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Source"))
+            .unwrap();
+        let target = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Target"))
+            .unwrap();
+
+        fs::create_dir_all(source.files_dir.join("notes")).unwrap();
+        fs::write(source.files_dir.join("notes/hello.txt"), "hello").unwrap();
+
+        let mounted = manager
+            .mount_workspace_snapshot(
+                &target.id,
+                &source.id,
+                "copied",
+                WorkspaceMountMaterialization::HostSnapshotCopy,
+            )
+            .unwrap();
+
+        assert!(mounted.join("notes/hello.txt").exists());
+        assert!(
+            !fs::symlink_metadata(&mounted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::metadata(mounted.join("notes/hello.txt"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            manager
+                .list_workspace_mounts(&target.id)
+                .unwrap()
+                .is_empty()
         );
     }
 }
