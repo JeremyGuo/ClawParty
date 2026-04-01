@@ -6,7 +6,7 @@ use agent_frame::message::{FunctionCall as FrameFunctionCall, ToolCall as FrameT
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tooling::build_tool_registry_with_cancel;
 use agent_frame::{
-    SessionExecutionControl, SessionRunReport, Tool,
+    SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
     compact_session_messages_with_report as frame_compact_session_messages_with_report,
     run_session_with_report_controlled as frame_run_session_with_report_controlled,
 };
@@ -149,6 +149,7 @@ struct ZgentUsage {
 pub enum AgentBackendKind {
     #[default]
     AgentFrame,
+    Zgent,
 }
 
 pub fn backend_supports_native_multimodal_input(_kind: AgentBackendKind) -> bool {
@@ -156,7 +157,7 @@ pub fn backend_supports_native_multimodal_input(_kind: AgentBackendKind) -> bool
 }
 
 pub fn run_session_with_report_controlled(
-    _backend: AgentBackendKind,
+    backend: AgentBackendKind,
     previous_messages: Vec<ChatMessage>,
     prompt: impl Into<String>,
     config: FrameAgentConfig,
@@ -189,7 +190,7 @@ pub fn run_session_with_report_controlled(
 }
 
 pub fn compact_session_messages_with_report(
-    _backend: AgentBackendKind,
+    backend: AgentBackendKind,
     previous_messages: Vec<ChatMessage>,
     config: FrameAgentConfig,
     extra_tools: Vec<Tool>,
