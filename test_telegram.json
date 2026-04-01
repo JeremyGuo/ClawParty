@@ -29,7 +29,7 @@
         }
       },
       "image_tool_model": "self",
-      "description": "Fast general-purpose chat model for the foreground agent."
+      "description": "A model better at generating visual content."
     },
     "qwen35-27B": {
       "backend": "agent_frame",
@@ -58,11 +58,11 @@
           "X-Title": "AgentHost External Search"
         }
       },
-      "description": "A cheap model for background long context processing and web search."
+      "description": "A cheap model for background long context processing and web search, executing invsible tasks, etc."
     }
   },
   "main_agent": {
-    "model": "main",
+    "model": "qwen35-27B",
     "timeout_seconds": 0,
     "language": "zh-CN"
   },

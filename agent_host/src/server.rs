@@ -673,15 +673,18 @@ impl ServerRuntime {
         ) {
             let runtime = self.clone();
             let session = session.clone();
-            tools.push(Tool::new(
+            tools.push(Tool::new_timed(
                 "run_subagent",
-                "Run delegated subagent work in the current workspace. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
+                "Run delegated subagent work in the current workspace. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Set timeout_seconds to 0 to wait indefinitely for completion. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
                 json!({
                     "type": "object",
                     "properties": {
                         "task": {"type": "string"},
                         "model": {"type": "string"},
-                        "timeout_seconds": {"type": "number"},
+                        "timeout_seconds": {
+                            "type": "number",
+                            "description": "Maximum time to wait for the subagent in seconds. Use 0 to wait indefinitely until the subagent finishes."
+                        },
                         "tasks": {
                             "type": "array",
                             "items": {
@@ -689,7 +692,10 @@ impl ServerRuntime {
                                 "properties": {
                                     "task": {"type": "string"},
                                     "model": {"type": "string"},
-                                    "timeout_seconds": {"type": "number"}
+                                    "timeout_seconds": {
+                                        "type": "number",
+                                        "description": "Maximum time to wait for this subagent in seconds. Use 0 to wait indefinitely until it finishes."
+                                    }
                                 },
                                 "required": ["task", "timeout_seconds"],
                                 "additionalProperties": false
@@ -722,8 +728,8 @@ impl ServerRuntime {
                                 let timeout_seconds = item
                                     .get("timeout_seconds")
                                     .and_then(Value::as_f64)
-                                    .filter(|value| *value > 0.0)
-                                    .ok_or_else(|| anyhow!("timeout_seconds must be a positive number"))?;
+                                    .filter(|value| *value >= 0.0)
+                                    .ok_or_else(|| anyhow!("timeout_seconds must be a non-negative number"))?;
                                 Ok((task.to_string(), model_key, timeout_seconds))
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -745,8 +751,8 @@ impl ServerRuntime {
                         let timeout_seconds = object
                             .get("timeout_seconds")
                             .and_then(Value::as_f64)
-                            .filter(|value| *value > 0.0)
-                            .ok_or_else(|| anyhow!("timeout_seconds must be a positive number"))?;
+                            .filter(|value| *value >= 0.0)
+                            .ok_or_else(|| anyhow!("timeout_seconds must be a non-negative number"))?;
                         runtime.run_subagent(
                             agent_id,
                             session.clone(),
@@ -1458,6 +1464,11 @@ impl ServerRuntime {
             "subagent started"
         );
 
+        let timeout_override = if timeout_seconds > 0.0 {
+            Some(timeout_seconds)
+        } else {
+            None
+        };
         let report = self.run_agent_turn_with_timeout_blocking(
             session.clone(),
             AgentPromptKind::SubAgent,
@@ -1465,8 +1476,8 @@ impl ServerRuntime {
             model_key.clone(),
             Vec::new(),
             prompt,
-            Some(timeout_seconds),
-            Some(timeout_seconds),
+            timeout_override,
+            timeout_override,
             "subagent",
         );
         let (report, timed_out) = match report {

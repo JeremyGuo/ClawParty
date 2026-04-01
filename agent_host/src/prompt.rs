@@ -88,9 +88,13 @@ pub fn build_agent_system_prompt(
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
             parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount to look up that history before saying you cannot remember.".to_string());
+            parts.push("When a distinct chunk of work would be better handled by delegation, use subagents and choose the model whose description best matches the task instead of defaulting mechanically.".to_string());
+            parts.push("For subagents, timeout_seconds can usually be set to 0 so the delegated work can finish naturally. Use a positive timeout only when you specifically need a bounded wait.".to_string());
         }
         AgentPromptKind::MainBackground => {
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
+            parts.push("Match delegated work to the model that is most suited to it based on the model descriptions. Use subagents to exploit those strengths rather than routing everything through the current model.".to_string());
+            parts.push("For subagents, timeout_seconds can usually be set to 0 so the delegated work can finish naturally. Use a positive timeout only when you specifically need a bounded wait.".to_string());
             parts.push("If you delegate a chunk to one or more subagents, including parallel subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
@@ -281,6 +285,12 @@ mod tests {
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains(
             "use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount"
+        ));
+        assert!(prompt.contains(
+            "choose the model whose description best matches the task"
+        ));
+        assert!(prompt.contains(
+            "For subagents, timeout_seconds can usually be set to 0"
         ));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));

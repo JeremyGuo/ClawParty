@@ -33,26 +33,100 @@ const AGENTS_TEMPLATE: &str = "";
 
 const SKILL_CREATOR_TEMPLATE: &str = r#"---
 name: skill-creator
-description: Create or update a skill folder with a valid SKILL.md frontmatter/body format and keep the instructions concise.
+description: Create new skills or improve existing skills. Use when the user wants to turn a workflow into a reusable skill, revise a skill's trigger wording, reorganize skill resources, or persist a staged skill with skill_create or skill_update.
 ---
 
 # Skill Creator
 
 Use this skill when creating or revising a skill under the local runtime skills directory.
 
-Requirements:
-- Every skill must contain a SKILL.md file.
-- SKILL.md must begin with YAML frontmatter containing:
-  - name
-  - description
-- Keep the body concise and procedural.
-- Prefer putting durable workflow instructions in SKILL.md.
-- Do not create extra documentation files unless they are directly needed by the skill.
+## Workflow
+
+1. Capture intent before writing.
+Ask what the skill should do, when it should trigger, what outputs it should produce, and whether the user wants simple vibe-based iteration or explicit test prompts.
+
+2. Write the trigger description carefully.
+The `description` field is the main trigger mechanism. It should say both:
+- what the skill does
+- when to use it
+
+Be slightly pushy rather than timid. If a skill should trigger on dashboards, charts, reports, metrics, migrations, or similar contexts, say that directly in `description`.
+
+3. Keep the main skill file focused.
+Put the reusable workflow in `SKILL.md`. Keep it procedural, concrete, and easy to scan.
+
+4. Use progressive disclosure.
+Keep `SKILL.md` relatively compact. Put bulky material into bundled resources and reference them only when needed.
+
+5. Persist only after editing the staged skill.
+Edit the staged skill directory inside the current workspace first, then call:
+- `skill_create` for a new skill
+- `skill_update` for an existing skill
+
+## Required structure
+
+Every skill must contain `SKILL.md` with YAML frontmatter containing at least:
+- `name`
+- `description`
 
 Recommended layout:
-- SKILL.md
-- references/ only if extra material is truly needed
-- scripts/ only when deterministic execution is important
+- `SKILL.md`
+- `references/` for large docs or reference material loaded only when needed
+- `scripts/` for deterministic or repetitive work
+- `assets/` for templates or bundled output files when useful
+
+## Writing guidance
+
+- Prefer imperative instructions.
+- Explain why an instruction matters when that improves judgment.
+- Avoid overfitting the skill to one example conversation.
+- Prefer a general reusable workflow over brittle rules.
+- Keep examples realistic.
+- If the skill supports multiple domains or frameworks, organize by variant and clearly say when to read each reference file.
+
+## Skill memory rule
+
+If a skill needs durable shared data across runs, store that data under `./.skill_memory`.
+
+Rules:
+- Skill-owned persistent data belongs in `./.skill_memory/<skill-name>/...`
+- Do not store durable skill state in normal workspace files unless the user explicitly wants user-visible artifacts there
+- Do not tell the agent to use `./.skill_memory` for ordinary task output
+- Only use `./.skill_memory` when the skill itself explicitly requires it
+
+Examples of appropriate `.skill_memory` contents:
+- cached indexes
+- reusable extracted metadata
+- persistent registries owned by the skill
+- scratch data that should survive across sessions for that skill
+
+Examples of inappropriate `.skill_memory` contents:
+- normal reports for the user
+- task outputs that belong in the current workspace
+- arbitrary agent notes unrelated to the skill's operation
+
+## Evaluation and iteration
+
+After drafting a skill, propose 2-3 realistic test prompts when testing would be useful.
+Use them to check:
+- whether the skill triggers in the right situations
+- whether the instructions are clear enough
+- whether the output shape is what the user expects
+
+When improving an existing skill, look for:
+- weak or timid trigger wording in `description`
+- instructions that are too narrow or too vague
+- bulky content that should move into `references/` or `scripts/`
+- state that should live in `./.skill_memory` instead of the workspace
+
+## Before persisting
+
+Before calling `skill_create` or `skill_update`, verify:
+- `SKILL.md` exists
+- frontmatter `name` matches the folder name
+- frontmatter `description` clearly states trigger contexts
+- bundled resources are placed intentionally
+- any durable skill-owned data design points to `./.skill_memory/<skill-name>/...`
 "#;
 
 #[derive(Clone, Debug)]

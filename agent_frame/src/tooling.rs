@@ -23,11 +23,18 @@ use uuid::Uuid;
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    Immediate,
+    Timed,
+}
+
 #[derive(Clone)]
 pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    pub execution_mode: ToolExecutionMode,
     handler: Arc<ToolHandler>,
 }
 
@@ -38,20 +45,54 @@ impl Tool {
         parameters: Value,
         handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_mode(
+            ToolExecutionMode::Immediate,
+            name,
+            description,
+            parameters,
+            handler,
+        )
+    }
+
+    pub fn new_timed(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+        handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_mode(ToolExecutionMode::Timed, name, description, parameters, handler)
+    }
+
+    pub fn new_with_mode(
+        execution_mode: ToolExecutionMode,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+        handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             parameters,
+            execution_mode,
             handler: Arc::new(handler),
         }
     }
 
     pub fn as_openai_tool(&self) -> Value {
+        let execution_guidance = match self.execution_mode {
+            ToolExecutionMode::Immediate => {
+                "Execution mode: immediate. This tool returns promptly and does not use a top-level timeout parameter."
+            }
+            ToolExecutionMode::Timed => {
+                "Execution mode: timed. This tool manages its own timeout or wait parameters and returns when that budget is reached."
+            }
+        };
         json!({
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": format!("{} {}", execution_guidance, self.description),
                 "parameters": self.parameters,
             }
         })
@@ -399,7 +440,7 @@ fn wait_for_child_with_timeout(
 }
 
 fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "read_file",
         "Read a UTF-8 text file. The model must choose timeout_seconds.",
         json!({
@@ -453,7 +494,7 @@ fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
 }
 
 fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "write_file",
         "Write a UTF-8 text file. The model must choose timeout_seconds.",
         json!({
@@ -510,7 +551,7 @@ fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSig
 }
 
 fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "edit",
         "Edit a UTF-8 text file by replacing old_text with new_text. The model must choose timeout_seconds.",
         json!({
@@ -964,7 +1005,7 @@ fn exec_start_tool(
     runtime_state_root: PathBuf,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "exec_start",
         "Start a shell command. Wait for at most wait_timeout_seconds before returning. If it finishes in time, return the result immediately. Otherwise keep it running and return an exec_id.",
         json!({
@@ -1025,7 +1066,7 @@ fn exec_observe_tool(
     runtime_state_root: PathBuf,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "exec_observe",
         "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines.",
         json!({
@@ -1053,7 +1094,7 @@ fn exec_observe_tool(
 }
 
 fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "exec_wait",
         "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
         json!({
@@ -1108,7 +1149,7 @@ fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
 }
 
 fn exec_kill_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "exec_kill",
         "Immediately stop a previously started exec process by exec_id.",
         json!({
@@ -1163,7 +1204,7 @@ fn exec_tool(
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     let exec_start = exec_start_tool(workspace_root, runtime_state_root, cancel_flag);
-    Tool::new(
+    Tool::new_timed(
         "exec",
         "Deprecated alias for exec_start. Start a shell command and optionally wait for completion.",
         exec_start.parameters.clone(),
@@ -1172,7 +1213,7 @@ fn exec_tool(
 }
 
 fn process_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "process",
         "Deprecated compatibility wrapper around exec_observe and exec_kill.",
         json!({
@@ -1256,7 +1297,7 @@ fn process_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSi
 }
 
 fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "apply_patch",
         "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. The model must choose timeout_seconds.",
         json!({
@@ -1404,7 +1445,7 @@ fn image_tool(
     image_tool_upstream: Option<UpstreamConfig>,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "image",
         "Inspect a local image file with the model's multimodal capability and answer a focused question about it. Use this for local images that are not already directly visible in the current user turn. The model must choose timeout_seconds.",
         json!({
@@ -1480,7 +1521,7 @@ fn image_tool(
 }
 
 fn web_fetch_tool() -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "web_fetch",
         "Fetch a web page or HTTP resource and return a readable text body. The model must choose timeout_seconds.",
         json!({
@@ -1546,7 +1587,7 @@ fn web_fetch_tool() -> Tool {
 }
 
 fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "download_file",
         "Download an HTTP resource and save it to a local file. Use this for binary files such as images or PDFs. The model must choose timeout_seconds.",
         json!({
@@ -1674,7 +1715,7 @@ fn extract_text_content(value: &Value) -> String {
 }
 
 fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
-    Tool::new(
+    Tool::new_timed(
         "web_search",
         "Search the web using the configured search provider and return an answer plus citations. The model must choose timeout_seconds.",
         json!({
@@ -1788,7 +1829,7 @@ fn run_shell_tool(
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     let exec = exec_tool(workspace_root, runtime_state_root, cancel_flag);
-    Tool::new(
+    Tool::new_timed(
         "run_shell",
         "Deprecated alias for exec. Execute a shell command. The model must choose timeout_seconds.",
         exec.parameters.clone(),
@@ -1798,7 +1839,7 @@ fn run_shell_tool(
 
 fn http_request_tool() -> Tool {
     let fetch = web_fetch_tool();
-    Tool::new(
+    Tool::new_timed(
         "http_request",
         "Deprecated alias for web_fetch. Fetch an HTTP resource. The model must choose timeout_seconds.",
         fetch.parameters.clone(),
@@ -1812,7 +1853,7 @@ fn skill_load_tool(
 ) -> Result<Tool> {
     let skill_index = build_skill_index(skills)?;
     let available_skills = skill_index.keys().cloned().collect::<Vec<_>>();
-    Ok(Tool::new(
+    Ok(Tool::new_timed(
         "skill_load",
         "Load the SKILL.md instructions for a named skill. Use exact skill names from the preloaded metadata and choose timeout_seconds yourself.",
         json!({
@@ -1848,7 +1889,7 @@ fn load_skill_alias_tool(
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<Tool> {
     let primary = skill_load_tool(skills, cancel_flag)?;
-    Ok(Tool::new(
+    Ok(Tool::new_timed(
         "load_skill",
         "Deprecated alias for skill_load.",
         primary.parameters.clone(),
@@ -2145,6 +2186,46 @@ pub mod macro_support {
         arguments
             .as_object()
             .ok_or_else(|| anyhow!("tool arguments must be an object"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn openai_tool_description_includes_execution_mode_guidance() {
+        let immediate = Tool::new(
+            "immediate_demo",
+            "Immediate demo tool.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            |_| Ok(json!({"ok": true})),
+        );
+        let timed = Tool::new_timed(
+            "timed_demo",
+            "Timed demo tool.",
+            json!({"type": "object", "properties": {"timeout_seconds": {"type": "number"}}, "required": ["timeout_seconds"], "additionalProperties": false}),
+            |_| Ok(json!({"ok": true})),
+        );
+
+        let immediate_description = immediate
+            .as_openai_tool()
+            .get("function")
+            .and_then(|value| value.get("description"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let timed_description = timed
+            .as_openai_tool()
+            .get("function")
+            .and_then(|value| value.get("description"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(immediate_description.contains("Execution mode: immediate."));
+        assert!(timed_description.contains("Execution mode: timed."));
     }
 }
 
