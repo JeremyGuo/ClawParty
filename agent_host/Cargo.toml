@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 agent_frame = { path = "../agent_frame" }
-zgent-core = { path = "../zgent/crates/zgent-core" }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

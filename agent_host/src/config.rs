@@ -37,6 +37,8 @@ pub struct TelegramChannelConfig {
     pub commands: Vec<BotCommandConfig>,
 }
 
+use agent_frame::llm::ApiFormat;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub api_endpoint: String,
@@ -57,6 +59,8 @@ pub struct ModelConfig {
     pub timeout_seconds: f64,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: usize,
+    #[serde(default)]
+    pub api_format: ApiFormat,
     #[serde(default)]
     pub cache_ttl: Option<String>,
     #[serde(default)]
@@ -290,15 +294,6 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
             return Err(anyhow!(
                 "model '{}' must include api_endpoint and model",
                 model_name
-            ));
-        }
-        if model.backend == AgentBackendKind::Zgent
-            && model.chat_completions_path != default_chat_completions_path()
-        {
-            return Err(anyhow!(
-                "model '{}' uses zgent backend but chat_completions_path must be '{}'",
-                model_name,
-                default_chat_completions_path()
             ));
         }
         if let Some(image_tool_model) = &model.image_tool_model
@@ -611,41 +606,6 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.models["main"].backend, AgentBackendKind::AgentFrame);
-    }
-
-    #[test]
-    fn zgent_backend_rejects_custom_chat_completions_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"
-            {
-              "models": {
-                "main": {
-                  "api_endpoint": "https://example.com/v1",
-                  "model": "demo-model",
-                  "backend": "zgent",
-                  "chat_completions_path": "/custom/chat",
-                  "description": "demo"
-                }
-              },
-              "main_agent": {
-                "model": "main"
-              },
-              "channels": [
-                {
-                  "kind": "command_line",
-                  "id": "local-cli"
-                }
-              ]
-            }
-            "#,
-        )
-        .unwrap();
-
-        let error = load_server_config_file(&config_path).unwrap_err();
-        assert!(error.to_string().contains("chat_completions_path"));
     }
 
     #[test]

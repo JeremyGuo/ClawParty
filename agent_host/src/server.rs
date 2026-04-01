@@ -455,6 +455,7 @@ impl ServerRuntime {
                     headers: image_model.headers.clone(),
                     native_web_search: image_model.native_web_search.clone(),
                     external_web_search: image_model.external_web_search.clone(),
+                    api_format: image_model.api_format.clone(),
                 })
             }
         };
@@ -490,6 +491,7 @@ impl ServerRuntime {
                 headers: model.headers.clone(),
                 native_web_search: model.native_web_search.clone(),
                 external_web_search: model.external_web_search.clone(),
+                api_format: model.api_format.clone(),
             },
             image_tool_upstream,
             skills_dirs: vec![self.agent_workspace.skills_dir.clone()],
