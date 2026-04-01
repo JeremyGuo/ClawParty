@@ -102,6 +102,23 @@ pub struct MainAgentConfig {
     pub idle_context_compaction_poll_interval_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    #[default]
+    Disabled,
+    Subprocess,
+    Bubblewrap,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub mode: SandboxMode,
+    #[serde(default = "default_bubblewrap_binary")]
+    pub bubblewrap_binary: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelConfig {
@@ -113,6 +130,8 @@ pub enum ChannelConfig {
 pub struct ServerConfig {
     pub models: BTreeMap<String, ModelConfig>,
     pub main_agent: MainAgentConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     #[serde(default = "default_max_global_sub_agents")]
     pub max_global_sub_agents: usize,
     #[serde(default = "default_cron_poll_interval_seconds")]
@@ -169,7 +188,7 @@ pub fn default_enabled_tools() -> Vec<String> {
 }
 
 fn default_max_tool_roundtrips() -> usize {
-    12
+    120
 }
 
 fn default_enable_context_compression() -> bool {
@@ -237,6 +256,10 @@ fn default_max_global_sub_agents() -> usize {
     4
 }
 
+fn default_bubblewrap_binary() -> String {
+    "bwrap".to_string()
+}
+
 fn default_cron_poll_interval_seconds() -> u64 {
     5
 }
@@ -258,6 +281,16 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
     }
     if config.cron_poll_interval_seconds == 0 {
         return Err(anyhow!("cron_poll_interval_seconds must be at least 1"));
+    }
+    if config.sandbox.mode == SandboxMode::Bubblewrap {
+        if !cfg!(target_os = "linux") {
+            return Err(anyhow!(
+                "sandbox mode 'bubblewrap' requires Linux with bubblewrap installed"
+            ));
+        }
+        if config.sandbox.bubblewrap_binary.trim().is_empty() {
+            return Err(anyhow!("sandbox.bubblewrap_binary must not be empty"));
+        }
     }
     if config.main_agent.enable_idle_context_compaction
         && config

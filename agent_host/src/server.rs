@@ -10,7 +10,7 @@ use crate::channel::{Channel, IncomingMessage};
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
-    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, ServerConfig,
+    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, SandboxConfig, ServerConfig,
     default_bot_commands,
 };
 use crate::cron::{
@@ -21,9 +21,10 @@ use crate::domain::{
     StoredAttachment,
 };
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
+use crate::sandbox::{SandboxBindMount, run_turn_in_child_process};
 use crate::session::{SessionManager, SessionSnapshot};
 use crate::sink::{SinkRouter, SinkTarget};
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
     ChatMessage, SessionCompactionStats, SessionEvent, SessionExecutionControl, SessionRunReport,
@@ -68,6 +69,7 @@ struct ServerRuntime {
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
     main_agent: MainAgentConfig,
+    sandbox: SandboxConfig,
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
     agent_registry: Arc<Mutex<AgentRegistry>>,
@@ -359,10 +361,17 @@ impl ServerRuntime {
                     &source_workspace_id[..8.min(source_workspace_id.len())]
                 )
             });
+        let materialization = if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap)
+        {
+            WorkspaceMountMaterialization::SandboxPlaceholder
+        } else {
+            WorkspaceMountMaterialization::HostSymlink
+        };
         let mount_path = self.workspace_manager.mount_workspace_snapshot(
             &session.workspace_id,
             &source_workspace_id,
             &mount_name,
+            materialization,
         )?;
         let relative_mount = mount_path
             .strip_prefix(&session.workspace_root)
@@ -587,7 +596,7 @@ impl ServerRuntime {
             let mount_session = session.clone();
             tools.push(Tool::new(
                 "workspace_mount",
-                "Call this tool to bring a historical workspace into the current workspace as a read-only snapshot so you can inspect or read its content safely. Returns the mount path relative to the current workspace root.",
+                "Call this tool to bring a historical workspace into the current workspace as a read-only mount so you can inspect or read its content safely. Returns the mount path relative to the current workspace root.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1065,6 +1074,28 @@ impl ServerRuntime {
     ) -> Result<agent_frame::SessionRunReport> {
         let workspace_root = session.workspace_root.clone();
         let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
+        let sandbox_mounts = if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap)
+        {
+            let _ = self
+                .workspace_manager
+                .prepare_bubblewrap_view(&session.workspace_id)?;
+            self.workspace_manager
+                .list_workspace_mounts(&session.workspace_id)?
+                .into_iter()
+                .map(|mount| {
+                    let source = self
+                        .workspace_manager
+                        .ensure_workspace_exists(&mount.source_workspace_id)?;
+                    Ok(SandboxBindMount {
+                        source: source.files_dir,
+                        target: session.workspace_root.join("mounts").join(mount.mount_name),
+                        read_only: mount.mode == "ro",
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let config = self.build_agent_frame_config(
             &session,
             &workspace_root,
@@ -1072,16 +1103,36 @@ impl ServerRuntime {
             &model_key,
             upstream_timeout_seconds,
         )?;
+        std::fs::create_dir_all(&config.runtime_state_root).with_context(|| {
+            format!(
+                "failed to create runtime state root {}",
+                config.runtime_state_root.display()
+            )
+        })?;
         let backend = self.model_config(&model_key)?.backend;
         let extra_tools = self.build_extra_tools(&session, kind, agent_id);
-        run_backend_session(
-            backend,
-            previous_messages,
-            prompt,
-            config,
-            extra_tools,
-            execution_control,
-        )
+        if matches!(self.sandbox.mode, crate::config::SandboxMode::Disabled) {
+            run_backend_session(
+                backend,
+                previous_messages,
+                prompt,
+                config,
+                extra_tools,
+                execution_control,
+            )
+        } else {
+            run_turn_in_child_process(
+                &self.sandbox,
+                backend,
+                previous_messages,
+                prompt,
+                config,
+                self.agent_workspace.rundir.join("skill_memory"),
+                sandbox_mounts,
+                extra_tools,
+                execution_control,
+            )
+        }
     }
 
     async fn run_agent_turn_with_timeout(
@@ -2001,6 +2052,7 @@ pub struct Server {
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
     main_agent: MainAgentConfig,
+    sandbox: SandboxConfig,
     sessions: SessionManager,
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
@@ -2050,6 +2102,7 @@ impl Server {
             skills_dir = %agent_workspace.skills_dir.display(),
             main_model = %config.main_agent.model,
             main_backend = ?config.models[&config.main_agent.model].backend,
+            sandbox_mode = ?config.sandbox.mode,
             "server initialized"
         );
 
@@ -2067,6 +2120,7 @@ impl Server {
             command_catalog,
             models: config.models,
             main_agent: config.main_agent,
+            sandbox: config.sandbox,
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager,
             agent_registry,
@@ -2264,6 +2318,7 @@ impl Server {
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
             main_agent: self.main_agent.clone(),
+            sandbox: self.sandbox.clone(),
             sink_router: Arc::clone(&self.sink_router),
             cron_manager: Arc::clone(&self.cron_manager),
             agent_registry: Arc::clone(&self.agent_registry),

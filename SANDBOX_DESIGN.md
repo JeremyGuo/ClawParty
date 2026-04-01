@@ -1,526 +1,555 @@
 # Sandbox Design
 
+## Status
+
+This document replaces the previous `project_*`-centric sandbox design.
+The old design should be considered abandoned.
+
+The new direction is:
+
+- one sandboxed subprocess per agent turn
+- `bubblewrap` as the isolation primitive
+- real mounts instead of copied workspace snapshots
+- a small RPC bridge between `agent_host` and the child runtime
+
 ## Goals
 
-- Give Main Agent and Sub-Agent a real sandboxed working area instead of a shared writable `rundir`.
-- Make long-lived artifacts first-class `projects`, not loose files in a workspace.
-- Support collaborative access: many readers, at most one writer.
-- Keep project ownership and lifecycle explicit through tools instead of prompt conventions.
-- Preserve enough metadata and recovery state that crashes, timeouts, and preemption do not silently corrupt shared work.
+- Run every foreground/background/sub-agent turn in an isolated child process.
+- Prevent the child from seeing arbitrary files under the host user's home directory.
+- Keep the child's effective uid/gid the same as the launching user.
+- Preserve access to the agent's own workspace and explicitly granted mounts.
+- Support real read-only and read-write workspace mounts inside the sandbox.
+- Keep `agent_frame` and `zgent` selectable as backends without duplicating tool logic.
+- Keep host-owned tools available even after agent execution moves into a subprocess.
 
 ## Non-Goals
 
-- This is not a hostile multi-tenant security boundary.
-- This does not replace OS/container sandboxing.
-- This does not try to make all project operations fully distributed; one local host is the source of truth.
+- This is not a root sandbox.
+- This does not allow unprivileged code to install system packages that require root.
+- This does not try to make prompt rules a hard security boundary.
+- This does not solve hostile code execution against the current user account.
 
-## Design Summary
+## Important Clarification
 
-The recommended design is a hybrid:
+The sandboxed child keeps the same user identity as the launcher.
+That means:
 
-- Keep **OpenClaw-style per-agent isolation** as the base model.
-- Add a **Project Manager layer** for durable shared artifacts.
-- Add a **Project Maintainer Agent** for automatic organization and summarization.
+- if the host user can write somewhere, the sandbox may be allowed to write there only if that path is mounted into the sandbox
+- if the host user cannot write somewhere, `bubblewrap` does not magically grant that permission
 
-In other words:
+So a command like `apt install XXX` still requires root on the host and will fail unless the launcher itself is root.
 
-- Agents should run in their own scratch workspace.
-- Durable shared state should live in `projects/`.
-- Agents should never treat the shared durable store as their default temp directory.
+What this design does guarantee is:
 
-This is better than the current `shared rundir` model, and better than plain OpenClaw when you want explicit project collaboration. It is worse than OpenClaw if implemented only as soft conventions without a real lock and mount manager.
+- the child cannot see arbitrary paths from the host home directory
+- the child only sees the filesystem subtree that `agent_host` explicitly mounts
 
-## Comparison With OpenClaw
+## High-Level Model
 
-OpenClaw's public design is simpler:
+### Parent process
 
-- One agent gets one workspace.
-- Sandboxing can move tools into a sandbox workspace.
-- Multi-agent mode usually means multiple isolated workspaces, not one shared project store.
+`agent_host` remains the long-lived control plane:
 
-References:
+- channels
+- session state
+- workspace registry
+- mount policy
+- background scheduling
+- token accounting
+- user-visible logs
 
-- Agent Runtime: https://docs.openclaw.ai/concepts/agent
-- Agent Workspace: https://docs.openclaw.ai/agent-workspace
-- Multi-Agent Routing: https://docs.openclaw.ai/concepts/multi-agent
-- Sandboxing: https://docs.openclaw.ai/gateway/sandboxing
-- Security: https://docs.openclaw.ai/gateway/security
+### Child process
 
-OpenClaw is better at:
+Every agent turn runs in a fresh child process:
 
-- Simplicity
-- Predictable isolation
-- Lower coordination complexity
-- Easier failure recovery
+- one child for each foreground turn
+- one child for each background turn
+- one child for each sub-agent turn
 
-This proposed design is better at:
+This child is started through `bubblewrap`.
 
-- Shared long-lived project memory
-- Explicit collaboration between agents
-- Controlled writer ownership
-- Durable organization above raw files
+Inside the child we run exactly one backend runtime:
 
-So the answer is:
+- `agent_frame`
+- or `zgent`
 
-- **Better than OpenClaw for collaborative artifact management**
-- **Worse than OpenClaw for simplicity and implementation risk**
+The child is disposable.
+It should hold no authority that the parent cannot revoke by simply killing it.
 
-The design is only worth it if we commit to hard enforcement, not just prompt-level rules.
-
-## Core Abstractions
-
-### 1. Agent Scratch Workspace
-
-Every running agent gets its own private workspace:
-
-- `sandboxes/agents/<agent_id>/workspace/`
-
-This is the agent's actual cwd.
-
-The scratch workspace contains:
-
-- private temp files
-- mounted projects
-- local intermediate outputs
-- agent-private caches
-
-The agent should not write directly into the durable project store except through mounted views.
-
-### 2. Durable Project Store
-
-Every project is durable and addressable:
-
-- `projects/<project_id>/`
-
-Recommended contents:
-
-- `PROJECT.md` or `README.md`
-- `ABSTRACT.md`
-- project files
-
-Project content directories should not expose internal control metadata to ordinary agents.
-Metadata must live outside the project tree and be maintained only by the Project Manager layer.
-
-Suggested external project registry record:
-
-```json
-{
-  "id": "project-id",
-  "name": "human-readable-name",
-  "description": "one-sentence summary",
-  "created_at": "2026-03-31T00:00:00Z",
-  "updated_at": "2026-03-31T00:00:00Z",
-  "state": "active",
-  "writer_agent_id": null,
-  "writer_epoch": 0
-}
-```
-
-Recommended storage locations:
-
-- `sandbox/projects.json`
-- or a dedicated SQLite table
-
-Use a stable project id internally. Human-readable `name` should be unique at the UI/tool level, but identity should not depend on directory renames alone.
-Agents should see project metadata only through project tools, not by directly opening registry files.
-
-### 3. Mount Table
-
-A central mount/lease registry is required:
-
-- `sandbox/mounts.json` is acceptable to start
-- SQLite is better if concurrency grows
-
-Each mount record should track:
-
-- `project_id`
-- `agent_id`
-- `mode`: `read_only` or `read_write`
-- `state`: `active`, `preempting`, `revoked`, `released`
-- `epoch`
-- `created_at`
-- `heartbeat_at`
-- `wait_queue`
-
-This registry is the source of truth. Filesystem state is not.
-
-## Project Manager Agent
-
-This is the control-plane abstraction exposed as tools.
-
-### Required tools
-
-- `project_search`
-- `project_create`
-- `project_modify`
-- `project_remove`
-- `project_load`
-
-The tool list in the request included `project_load` twice. The second one should remain `project_load`; no extra alias is needed.
-
-### Tool semantics
-
-#### `project_search`
-
-Input:
-
-- natural-language query
-
-Output:
-
-- project id
-- name
-- one-sentence description
-- state
-- maybe relevance score
-
-This should search the external metadata registry first, not scan full project contents by default.
-
-#### `project_create`
-
-Input:
-
-- `name`
-- `description`
-
-Behavior:
-
-- create durable project metadata
-- create empty project directory
-- initialize `README.md` and `ABSTRACT.md`
-
-#### `project_modify`
-
-Input:
-
-- `project_id` or unique `name`
-- optional new `name`
-- optional new `description`
-
-Behavior:
-
-- metadata update only
-- reject invalid renames or name collisions
-- if name changes, update the external registry first and then perform the durable directory rename under the same lock or transaction
-
-#### `project_remove`
-
-Input:
-
-- `project_id`
-
-Rules:
-
-- only agents with write permission can request removal
-- removal is tombstone-first, not immediate physical delete
-
-Recommended lifecycle:
-
-1. mark project as `deleting`
-2. hide from normal `project_search`
-3. reject new loads
-4. wait until all active mounts are gone
-5. physically delete
-
-This is safer than immediate recursive deletion.
-
-#### `project_load`
-
-Input:
-
-- `project_id` or `name`
-- `mode`: `read_only` or `read_write`
-- `wait`: `true` or `false`
-- optional mount path override
-
-Behavior:
-
-- mount project into current agent scratch workspace
-- read-only loads can coexist
-- read-write load is exclusive
-
-### Read-write lock rules
-
-- many readers allowed
-- at most one writer
-- writer can be preempted only if not currently executing
-- preemption increments the writer epoch
-- a preempted writer is downgraded to read-only on next activation
-
-### Blocking vs immediate failure
-
-`project_load(mode=read_write)` should support:
-
-- `wait=false`: fail immediately if writer lock unavailable
-- `wait=true`: wait on a queue until granted or timeout
-
-The queue should be persisted in the mount table, not kept only in RAM.
-
-## Suggested Filesystem Layout
+## Filesystem Layout
 
 ```text
 <workdir>/
-  projects/
-    <project_id>/
-      README.md
-      ABSTRACT.md
-      ...
-  sandboxes/
-    agents/
-      <agent_id>/
-        workspace/
-          projects/
-            <mounted-project-name> -> mount or overlay view
-          tmp/
-          output/
+  rundir/
+    AGENTS.md
+    .skills/
+    skill_memory/
   sandbox/
-    projects.json
+    state/
+    workspace_meta/
     mounts.json
-    events.jsonl
+    workspaces.json
+  workspaces/
+    <workspace_id>/
+      files/
+      upload/
 ```
 
-## Mount Implementation Options
+### Meaning
 
-### Option A: Symlink / bind mount for read-only
+- `rundir/`
+  - template and shared control-plane content
+- `rundir/skill_memory/`
+  - shared RW memory for skills
+- `workspaces/<id>/files/`
+  - the agent's durable workspace root
+- `workspaces/<id>/upload/`
+  - uploaded files associated with that workspace
+- `sandbox/`
+  - host-owned metadata and registries, not visible for ordinary direct agent editing
 
-Good for:
+## Bubblewrap Sandbox Shape
 
-- simple read-only access
+Each turn subprocess is launched with a restricted mount namespace.
 
-Bad for:
+### Visible inside the child
 
-- write isolation
+The child should see:
 
-### Option B: Direct writable bind mount
+- a private `/tmp`
+- a private `/var/tmp`
+- read-only system runtime paths needed for execution:
+  - `/usr`
+  - `/bin`
+  - `/sbin`
+  - `/lib`
+  - `/lib64`
+  - `/etc`
+  - `/dev`
+- the selected workspace root mounted as the child working directory
+- the workspace upload directory
+- explicit workspace mounts granted by policy
+- `.skill_memory` mounted RW into the workspace
 
-Bad default.
+### Not visible inside the child
 
-Why:
+The child should not see:
 
-- no safe preemption
-- hard to reason about stale writers
-- weak rollback story
+- the rest of the host home directory
+- sibling workspaces unless explicitly mounted
+- host metadata registries such as `sandbox/workspaces.json`
+- arbitrary repository paths outside the mounted workspace subtree
 
-### Option C: Overlay / copy-on-write writable mount
+### Recommended internal sandbox paths
 
-Recommended.
+Inside the child, use a stable path model:
 
-For writable loads:
+```text
+/workspace
+/workspace/upload
+/workspace/.skill_memory
+/workspace/mounts/<mount_name>
+```
 
-- lower layer = durable project
-- upper layer = agent scratch writable layer
-- work dir = agent scratch mount workdir
+The agent's effective cwd should be:
 
-Commit path:
+```text
+/workspace
+```
 
-- when write lease is valid, merge upper layer into durable project
+This avoids leaking host absolute paths into prompts and model outputs.
 
-This gives better control for:
+## Skill Memory
 
-- preemption
-- rollback
-- crash cleanup
-- partial write detection
+### Goal
 
-If true overlayfs is too heavy initially, an acceptable v1 is:
+Introduce a shared skill-scoped memory directory:
 
-- copy durable project into agent writable mount dir
-- commit back under lock
+```text
+rundir/skill_memory
+```
 
-That is slower, but far safer than shared writes.
+This should be mounted RW into every sandboxed workspace as:
 
-## Preemption Semantics
+```text
+/workspace/.skill_memory
+```
 
-Preemption is useful, but dangerous unless strict.
+### Policy
 
-Recommended rules:
+This is not a hard filesystem ACL.
+It is a policy rule enforced primarily through prompt and skill design:
 
-- only preempt a writer with no active execution lease
-- mark current writer `preempting`
-- deny further commit from stale writer epoch
-- next time the old agent starts a turn, prepend a system notice:
-  - list preempted projects
-  - state that they are now mounted read-only
+- ordinary agents should not proactively use `.skill_memory`
+- skills may instruct the agent to use `.skill_memory`
+- if a skill requires persistent cross-workspace memory, it should use this directory explicitly
 
-Never allow:
+### Why this is acceptable
 
-- stale writer to continue committing after epoch mismatch
+The child already has the same uid as the launcher.
+So the strict boundary here is not OS permission, but mount visibility and policy.
+`skill_memory` is intentionally shared state, so prompt-level restriction is enough for v2.
 
-This must be enforced in the commit path, not only in prompt text.
+## Workspace Mounts
 
-## Agent Execution Lease
+The previous snapshot-copy mount model should be replaced by real mounts.
 
-To support safe preemption, agent runtime needs an execution lease table:
+### Supported modes
 
-- when agent starts executing: `running=true`
-- heartbeat every few seconds
-- when agent finishes: release execution lease
+- `ro`
+- `rw`
 
-Project write preemption is allowed only when:
+### Policy
 
-- agent has no active execution lease
-- or execution lease is stale past timeout
+- many readers are allowed
+- at most one writer is allowed
+- parent-owned registry decides whether a mount request is granted
+- the child cannot grant mounts to itself without parent approval
 
-This avoids racing a currently running agent.
+### Important behavior
 
-## Project Maintainer Agent
+Because mounts are real:
 
-This is a background organizer, not the main control plane.
+- if one workspace is mounted into another
+- and host-managed operations modify the source workspace
+- the mounted view updates immediately
 
-### Trigger
+This is the main reason to move away from copied snapshots.
 
-When an agent closes:
+## Turn Lifecycle
 
-1. if there were new turns since the last maintainer pass
-2. run context compression using the existing token-threshold logic
-3. ignore time-based compaction gating
-4. feed the compacted messages to Project Maintainer Agent
-5. let it call `project_create` and `project_modify`
+For each turn:
 
-### Purpose
+1. Parent resolves session and workspace state.
+2. Parent computes the mount plan for this turn.
+3. Parent launches a child with `bubblewrap`.
+4. Child starts the requested backend runtime.
+5. Child and parent communicate over a local RPC channel.
+6. Parent kills the child after:
+   - normal completion
+   - cancellation
+   - crash
+   - hard timeout
+7. No turn-local runtime state survives except files written to mounted locations.
 
-- discover durable projects from scratch outputs
-- update project metadata
-- keep `README.md` and `ABSTRACT.md` aligned
-- avoid losing useful work when scratch workspaces disappear
+This means:
 
-### Important constraint
+- sandbox state is reset every turn
+- hidden mount leakage across turns is avoided
+- mount plans are recomputed from parent-owned state every time
 
-Project Maintainer should not directly mutate arbitrary mounted project files without taking a write lease first. It should use the same project tools as everyone else.
+## Why Per-Turn Subprocesses
 
-## Consistency Requirements
+This is better than keeping one long-lived agent runtime process because:
 
-These are not optional.
+- mount plans are easy to rebuild
+- crash cleanup is trivial
+- leaked file descriptors and temp state die with the process
+- backend switching between `agent_frame` and `zgent` becomes symmetric
+- the parent remains the single source of truth
 
-### 1. Authoritative metadata store
+The tradeoff is startup overhead, but this is acceptable given the security and consistency benefits.
 
-Project metadata, lock state, and tombstones must be stored in one authoritative place outside the project content tree.
-Ordinary agents must not rely on direct filesystem reads of internal metadata files.
+## Tool Compatibility Problem
 
-### 2. Epoch-based write validation
+This is the key architectural issue.
 
-Every writable mount must carry an epoch.
+Today the system works like this:
 
-On commit:
+- `agent_host` constructs `Tool` closures in-process
+- `agent_frame` or `zgent` invokes them directly
 
-- if local epoch != current project writer epoch
-- reject commit as stale
+That breaks once the backend moves into a child process.
+Closures cannot be passed across the process boundary.
 
-### 3. Idempotent cleanup
+## Recommended Solution: Local RPC Bridge
 
-On startup, recover:
+Use a parent-child RPC protocol.
 
-- stale mount entries
-- stale execution leases
-- projects stuck in `deleting`
-- sandboxes from dead agents
+### Parent responsibilities
 
-### 4. Crash-safe removal
+- launch the sandbox child
+- own session state
+- own workspace registry
+- own mount policy
+- execute host-only tools
+- persist logs
+- surface checkpoints and events
 
-Never `rm -rf` immediately when a writer requests delete. Use tombstone + finalizer.
+### Child responsibilities
 
-### 5. Explicit commit boundary
+- run the selected backend
+- execute child-local builtin tools
+- forward host-owned tool calls over RPC
+- emit progress events and checkpoints back to parent
 
-If writable mounts are copy-on-write or overlay-based, writes are not durable until commit.
+## Transport Choice
 
-This is a feature, not a bug.
+The long-term preferred transport is a Unix domain socket pair or an inherited Unix socket FD.
 
-## Failure Modes To Design For
+Current implementation status:
 
-### Agent dies while holding read-write lease
+- the first working version uses `stdin/stdout`
+- messages are newline-delimited JSON
+- this keeps bring-up simple while the child runner contract stabilizes
 
-Recovery:
+Planned upgrade:
 
-- detect stale execution lease
-- revoke write lease
-- mark scratch mount recoverable or discardable
+- move to one duplex Unix socket
+- keep the same logical RPC schema
+- optionally move from JSON to MessagePack later if overhead matters
 
-### Agent is preempted while inactive
+### Why a socket is still the target
 
-Recovery:
+`stdin` and `stdout` work, but they mix badly with:
 
-- old writer epoch becomes stale
-- next activation gets a system notice
-- old scratch workspace becomes read-only or detached
+- backend debugging output
+- shell subprocess output
+- future streaming
 
-### Project remove requested while readers still exist
+So sockets remain the cleaner long-term transport even though the initial implementation uses stdio.
 
-Recovery:
+## RPC Message Types
 
-- mark `deleting`
-- deny new mounts
-- final delete only after all mounts gone
+Minimum set:
 
-### Project Maintainer makes bad inferences
+- `run_started`
+- `session_event`
+- `checkpoint`
+- `tool_request`
+- `tool_response`
+- `cancel_requested`
+- `soft_timeout_requested`
+- `turn_completed`
+- `turn_failed`
 
-Mitigation:
+Suggested `tool_request` payload:
 
-- restrict it to `project_create` and `project_modify`
-- do not let it delete by default
-- do not let it write internal registry files directly
-- optionally require confidence threshold or human review for project creation in early versions
+```json
+{
+  "id": "req-123",
+  "tool_name": "workspace_mount",
+  "arguments": {
+    "workspace_id": "abc",
+    "mount_name": "reference"
+  }
+}
+```
 
-### Concurrent restarts
+Suggested `tool_response` payload:
 
-Mitigation:
+```json
+{
+  "id": "req-123",
+  "ok": true,
+  "result": {
+    "mount_path": "/workspace/mounts/reference",
+    "mode": "ro"
+  }
+}
+```
 
-- mount and project operations must take a file lock or DB transaction
+## Tool Ownership Split
 
-## Why This Can Fail If Done Wrong
+### Child-local tools
 
-This design becomes worse than OpenClaw if:
+These can run entirely inside the sandbox:
 
-- agents still share one writable cwd
-- write ownership is only a prompt rule
-- preemption does not invalidate stale commits
-- removal is immediate delete
-- mount state is only in memory
+- file reads and writes within mounted paths
+- local `exec_*`
+- local `apply_patch`
+- local image inspection of files already present in the sandbox
+- local `web_fetch` and `download_file`
 
-If that happens, the system gets all the complexity of project management with none of the safety.
+### Parent-owned tools
 
-## Recommended Version 1
+These must stay in `agent_host`:
 
-Do not start with full overlayfs unless needed.
+- `run_subagent`
+- `start_background_agent`
+- cron management
+- session status tools
+- workspace registry queries
+- workspace mount / move authorization
+- agent stats and registry inspection
 
-Start with:
+### Why this split is good
 
-- per-agent scratch workspace
-- durable `projects/`
-- persisted project registry
-- explicit `project_load` read-only
-- explicit `project_load` read-write with copy-to-scratch
-- explicit commit-back with epoch check
-- tombstone delete
-- startup recovery of stale leases
+It keeps the parent authoritative for control-plane actions, while keeping data-plane file and process tools inside the sandbox where they belong.
 
-This is implementable and testable.
+## Real Mount Implementation
 
-## Recommended Version 2
+This is the hardest part.
 
-After v1 is stable:
+### Recommendation
 
-- overlayfs writable mounts
-- background cleanup workers
-- wait queues with fairness policy
-- Project Maintainer Agent
-- richer search index for projects
+Do not expose every workspace path into the child pre-emptively.
 
-## Final Recommendation
+Instead:
 
-This design is worth pursuing, but only as:
+1. Parent authorizes the mount request.
+2. Parent opens the source workspace root.
+3. Parent passes a directory FD over the Unix socket using `SCM_RIGHTS`.
+4. Child-side mount code attaches that FD under `/workspace/mounts/<mount_name>`.
+5. Child applies `ro` or `rw` flags according to the grant.
 
-- **isolated scratch workspace + durable project store + enforced mount manager**
+This avoids making all workspaces globally visible inside the sandbox.
 
-It is not worth pursuing as:
+### Why this is better than prebinding all workspaces
 
-- **shared rundir + extra project tools**
+If every workspace were prebound under a hidden internal path, an agent with shell access could still discover them.
+FD-passing keeps visibility demand-driven.
 
-OpenClaw's simpler isolation model is still better than a weak project system.
+## Workspace Content Move
 
-A strong project system can beat OpenClaw for collaborative coding workflows, but only if:
+`workspace_content_move` should remain parent-authorized.
 
-- writable access is lease-based
-- commits are epoch-validated
-- deletion is tombstoned
-- crash recovery is explicit
-- scratch and durable storage are clearly separated
+Recommended behavior:
+
+1. Parent validates permission.
+2. Parent performs the move on host-visible workspace roots.
+3. Parent updates workspace summaries and timestamps.
+4. Any live mounted view inside the current child reflects the change automatically because the mount is real.
+
+This keeps metadata consistency in one place.
+
+## Backends: `agent_frame` and `zgent`
+
+Both backends should run under the same child-runner protocol.
+
+The parent should not know backend-specific tool semantics.
+
+Instead, define one backend-neutral child runner contract:
+
+- input:
+  - backend kind
+  - prompt
+  - previous messages
+  - config
+  - visible tool schemas
+- output:
+  - session events
+  - checkpoints
+  - tool requests
+  - final report
+
+The child runner selects:
+
+- `agent_frame`
+- or `zgent`
+
+internally.
+
+This keeps the process isolation design from being coupled to one backend implementation.
+
+## Interaction With Current Tool System
+
+Today a tool is essentially:
+
+- metadata
+- JSON schema
+- a Rust closure
+
+That is fine in-process but not across a subprocess boundary.
+
+The migration path should be:
+
+### Step 1
+
+Keep the current `Tool` abstraction in the parent.
+
+### Step 2
+
+Add a serializable `RemoteToolDefinition`:
+
+- `name`
+- `description`
+- `parameters`
+
+### Step 3
+
+When launching the child:
+
+- parent sends only serializable tool definitions
+- child exposes them to the backend
+- any host-owned tool invocation becomes an RPC request back to the parent
+
+### Step 4
+
+For child-local builtin tools:
+
+- keep their implementation inside the child runtime
+
+This gives one compatibility model for both `agent_frame` and `zgent`.
+
+## Timeouts and Cancellation
+
+The timeout model should remain parent-owned.
+
+### Parent
+
+- soft timeout
+- hard timeout
+- final kill
+
+### Child
+
+- obey soft timeout signals
+- emit timeout observations back into backend flow
+- stop local tool execution on hard cancellation
+
+Because each turn is a separate subprocess, hard cancellation is simple:
+
+- kill the child process tree
+
+## Logging
+
+The child should not own durable logs.
+
+Instead:
+
+- child emits structured events over RPC
+- parent writes them into existing session and agent logs
+
+This keeps all durable observability in one place even after process isolation.
+
+## Design Choices Summary
+
+### Chosen
+
+- `bubblewrap`
+- one child per turn
+- same uid/gid as launcher
+- hidden host home except explicitly mounted paths
+- real mounts
+- `skill_memory` as shared RW mount
+- parent-child RPC over Unix socket
+- parent-owned control plane
+- child-owned local execution plane
+
+### Rejected
+
+- keeping the backend in-process
+- copied workspace mount snapshots
+- making prompt-only rules the main security mechanism
+- duplicating a second tool implementation just for subprocess mode
+- prebinding every workspace into the child
+
+## Risks
+
+- `bubblewrap` is Linux-specific
+- real mount updates are significantly more complex than copied snapshots
+- FD-passing mount setup requires careful low-level implementation
+- shell access still means code runs as the host user, just with reduced visibility
+
+## Recommended Implementation Order
+
+1. Introduce a child runner process without `bubblewrap` yet.
+2. Move backend execution and tool RPC onto that runner.
+3. Once RPC is stable, wrap the child runner with `bubblewrap`.
+4. Move child-local builtin tools into the sandboxed runner.
+5. Replace copied workspace mounts with parent-authorized real mounts.
+6. Add `skill_memory` mount and prompt rules.
+7. Finally remove old snapshot mount code and legacy sandbox assumptions.
+
+This order minimizes risk because process-boundary compatibility is the real prerequisite.

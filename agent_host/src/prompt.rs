@@ -48,6 +48,7 @@ pub fn build_agent_system_prompt(
         role_line.to_string(),
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
         skill_line.to_string(),
+        "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
         "If you need to send files or images back to the user, append one or more tags in your final reply using this format: <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the current workspace root.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
         "You are talking to the user inside a chat application. You may reply naturally, including structured Markdown when it helps.".to_string(),

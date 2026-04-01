@@ -3,30 +3,50 @@ use agent_host::Server;
 use agent_host::config::{load_server_config_file, resolve_model_api_keys};
 use agent_host::env::load_dotenv_files;
 use agent_host::logging::init_logging;
-use anyhow::Result;
-use clap::Parser;
+use agent_host::sandbox::run_child_stdio;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "agent_host")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<AgentHostCommand>,
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long)]
-    workdir: PathBuf,
+    workdir: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentHostCommand {
+    #[command(name = "run-child", hide = true)]
+    RunChild,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let loaded_dotenvs = load_dotenv_files(&args.config)?;
-    init_logging(&args.workdir)?;
+    if matches!(args.command, Some(AgentHostCommand::RunChild)) {
+        return run_child_stdio();
+    }
+    let config_path = args
+        .config
+        .as_ref()
+        .context("--config is required unless running run-child")?;
+    let workdir = args
+        .workdir
+        .as_ref()
+        .context("--workdir is required unless running run-child")?;
+    let loaded_dotenvs = load_dotenv_files(config_path)?;
+    init_logging(workdir)?;
     info!(
         log_stream = "server",
         kind = "startup",
-        workdir = %args.workdir.display(),
-        config = %args.config.display(),
+        workdir = %workdir.display(),
+        config = %config_path.display(),
         "starting agent_host"
     );
     for dotenv_path in loaded_dotenvs {
@@ -37,7 +57,7 @@ async fn main() -> Result<()> {
             "loaded .env file"
         );
     }
-    let config = load_server_config_file(&args.config)?;
+    let config = load_server_config_file(config_path)?;
     if std::env::var("DEBUG_API_KEY").ok().as_deref() == Some("1") {
         for item in resolve_model_api_keys(&config) {
             let value = item.api_key.unwrap_or_else(|| "<missing>".to_string());
@@ -47,7 +67,7 @@ async fn main() -> Result<()> {
             );
         }
     }
-    let server = Server::from_config(config, &args.workdir)?;
+    let server = Server::from_config(config, workdir)?;
     if let Err(error) = server.run().await {
         let _ = terminate_all_managed_processes();
         error!(

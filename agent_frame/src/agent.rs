@@ -9,6 +9,7 @@ use crate::tooling::{
     InterruptSignal, Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool,
 };
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -109,7 +110,7 @@ pub fn run_session(
     Ok(run_session_with_report(previous_messages, prompt, config, extra_tools)?.messages)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRunReport {
     pub messages: Vec<ChatMessage>,
     pub usage: TokenUsage,
@@ -141,7 +142,7 @@ impl SessionCompactionStats {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SessionEvent {
     SessionStarted {
         previous_message_count: usize,
@@ -150,11 +151,11 @@ pub enum SessionEvent {
         skill_count: usize,
     },
     CompactionStarted {
-        phase: &'static str,
+        phase: String,
         message_count: usize,
     },
     CompactionCompleted {
-        phase: &'static str,
+        phase: String,
         compacted: bool,
         estimated_tokens_before: usize,
         estimated_tokens_after: usize,
@@ -217,11 +218,19 @@ pub enum SessionEvent {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ExecutionSignal {
+    Cancel,
+    TimeoutObservation,
+}
+
 #[derive(Clone)]
 pub struct SessionExecutionControl {
     cancel_flag: Arc<AtomicBool>,
     tool_interrupt_flag: Arc<InterruptSignal>,
     timeout_observation_requested: Arc<AtomicBool>,
+    signal_sender: Sender<ExecutionSignal>,
+    signal_receiver: Receiver<ExecutionSignal>,
     checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
     event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
@@ -249,10 +258,13 @@ struct CompletedToolCall {
 
 impl SessionExecutionControl {
     pub fn new() -> Self {
+        let (signal_sender, signal_receiver) = unbounded();
         Self {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tool_interrupt_flag: Arc::new(InterruptSignal::new()),
             timeout_observation_requested: Arc::new(AtomicBool::new(false)),
+            signal_sender,
+            signal_receiver,
             checkpoint_callback: None,
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
@@ -263,10 +275,13 @@ impl SessionExecutionControl {
     pub fn with_checkpoint_callback(
         callback: impl Fn(SessionRunReport) + Send + Sync + 'static,
     ) -> Self {
+        let (signal_sender, signal_receiver) = unbounded();
         Self {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tool_interrupt_flag: Arc::new(InterruptSignal::new()),
             timeout_observation_requested: Arc::new(AtomicBool::new(false)),
+            signal_sender,
+            signal_receiver,
             checkpoint_callback: Some(Arc::new(callback)),
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
@@ -285,6 +300,7 @@ impl SessionExecutionControl {
     pub fn request_cancel(&self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
         self.tool_interrupt_flag.request();
+        let _ = self.signal_sender.send(ExecutionSignal::Cancel);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -295,10 +311,25 @@ impl SessionExecutionControl {
         self.timeout_observation_requested
             .store(true, Ordering::SeqCst);
         self.tool_interrupt_flag.request();
+        let _ = self.signal_sender.send(ExecutionSignal::TimeoutObservation);
+    }
+
+    pub fn signal_receiver(&self) -> Receiver<ExecutionSignal> {
+        self.signal_receiver.clone()
     }
 
     pub fn tool_interrupt_flag(&self) -> Arc<InterruptSignal> {
         Arc::clone(&self.tool_interrupt_flag)
+    }
+
+    pub fn emit_checkpoint_report(&self, report: SessionRunReport) {
+        if let Some(callback) = &self.checkpoint_callback {
+            callback(report);
+        }
+    }
+
+    pub fn emit_event_external(&self, event: SessionEvent) {
+        self.emit_event(event);
     }
 
     fn take_timeout_observation_requested(&self) -> bool {
@@ -431,7 +462,7 @@ pub fn run_session_with_report_controlled(
             skill_count: discovered_skills.len(),
         });
         control.emit_event(SessionEvent::CompactionStarted {
-            phase: "initial",
+            phase: "initial".to_string(),
             message_count: messages.len(),
         });
     }
@@ -440,7 +471,7 @@ pub fn run_session_with_report_controlled(
         maybe_compact_messages_with_report(&config, &messages, &tool_definitions, &prompt)?;
     if let Some(control) = &control {
         control.emit_event(SessionEvent::CompactionCompleted {
-            phase: "initial",
+            phase: "initial".to_string(),
             compacted: initial_compaction.compacted,
             estimated_tokens_before: initial_compaction.estimated_tokens_before,
             estimated_tokens_after: initial_compaction.estimated_tokens_after,
@@ -469,7 +500,7 @@ pub fn run_session_with_report_controlled(
         if round_index > 0 {
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::CompactionStarted {
-                    phase: "round",
+                    phase: "round".to_string(),
                     message_count: messages.len(),
                 });
             }
@@ -477,7 +508,7 @@ pub fn run_session_with_report_controlled(
                 maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::CompactionCompleted {
-                    phase: "round",
+                    phase: "round".to_string(),
                     compacted: round_compaction.compacted,
                     estimated_tokens_before: round_compaction.estimated_tokens_before,
                     estimated_tokens_after: round_compaction.estimated_tokens_after,

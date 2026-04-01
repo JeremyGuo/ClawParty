@@ -25,6 +25,22 @@ pub struct WorkspaceRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceMountRecord {
+    pub owner_workspace_id: String,
+    pub source_workspace_id: String,
+    pub mount_name: String,
+    pub mode: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceMountMaterialization {
+    HostSymlink,
+    SandboxPlaceholder,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceContentEntry {
     pub path: String,
     pub entry_type: String,
@@ -45,6 +61,8 @@ pub struct WorkspaceManager {
 struct WorkspaceRegistry {
     #[serde(default)]
     workspaces: Vec<StoredWorkspaceRecord>,
+    #[serde(default)]
+    mounts: Vec<StoredWorkspaceMountRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +76,16 @@ struct StoredWorkspaceRecord {
     last_content_modified_at: DateTime<Utc>,
     last_main_agent_id: Option<Uuid>,
     last_session_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredWorkspaceMountRecord {
+    owner_workspace_id: String,
+    source_workspace_id: String,
+    mount_name: String,
+    mode: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 impl WorkspaceManager {
@@ -347,17 +375,68 @@ impl WorkspaceManager {
         owner_workspace_id: &str,
         source_workspace_id: &str,
         mount_name: &str,
+        materialization: WorkspaceMountMaterialization,
     ) -> Result<PathBuf> {
         let owner = self.ensure_workspace_exists(owner_workspace_id)?;
         let source = self.ensure_workspace_exists(source_workspace_id)?;
-        let mount_dir = owner.mounts_dir.join(mount_name);
-        if mount_dir.exists() {
-            fs::remove_dir_all(&mount_dir)
-                .with_context(|| format!("failed to replace {}", mount_dir.display()))?;
+        let mount_path = owner.mounts_dir.join(mount_name);
+        self.materialize_mount_path(&mount_path, &source.files_dir, materialization)?;
+        let now = Utc::now();
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow!("workspace registry lock poisoned"))?;
+        if let Some(existing) = registry.mounts.iter_mut().find(|record| {
+            record.owner_workspace_id == owner_workspace_id && record.mount_name == mount_name
+        }) {
+            existing.source_workspace_id = source_workspace_id.to_string();
+            existing.mode = "ro".to_string();
+            existing.updated_at = now;
+        } else {
+            registry.mounts.push(StoredWorkspaceMountRecord {
+                owner_workspace_id: owner_workspace_id.to_string(),
+                source_workspace_id: source_workspace_id.to_string(),
+                mount_name: mount_name.to_string(),
+                mode: "ro".to_string(),
+                created_at: now,
+                updated_at: now,
+            });
         }
-        copy_dir_recursive(&source.files_dir, &mount_dir)?;
-        set_readonly_recursive(&mount_dir)?;
-        Ok(mount_dir)
+        self.persist_registry(&registry)?;
+        Ok(mount_path)
+    }
+
+    pub fn list_workspace_mounts(
+        &self,
+        owner_workspace_id: &str,
+    ) -> Result<Vec<WorkspaceMountRecord>> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow!("workspace registry lock poisoned"))?;
+        Ok(registry
+            .mounts
+            .iter()
+            .filter(|record| record.owner_workspace_id == owner_workspace_id)
+            .cloned()
+            .map(|record| WorkspaceMountRecord {
+                owner_workspace_id: record.owner_workspace_id,
+                source_workspace_id: record.source_workspace_id,
+                mount_name: record.mount_name,
+                mode: record.mode,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            })
+            .collect())
+    }
+
+    pub fn prepare_bubblewrap_view(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
+        let workspace = self.ensure_workspace_exists(workspace_id)?;
+        self.materialize_mount_placeholder(&workspace.files_dir.join(".skill_memory"))?;
+        for mount in self.list_workspace_mounts(workspace_id)? {
+            self.materialize_mount_placeholder(&workspace.mounts_dir.join(&mount.mount_name))?;
+        }
+        Ok(workspace)
     }
 
     pub fn move_contents_between_workspaces(
@@ -485,6 +564,7 @@ impl WorkspaceManager {
         })?;
         fs::create_dir_all(&record.mounts_dir)
             .with_context(|| format!("failed to create {}", record.mounts_dir.display()))?;
+        self.ensure_skill_memory_link(record)?;
         fs::create_dir_all(&record.host_dir)
             .with_context(|| format!("failed to create {}", record.host_dir.display()))?;
         if !record.summary_path.exists() {
@@ -514,6 +594,74 @@ impl WorkspaceManager {
             copy_path_recursive(&source_path, &target_path)?;
         }
         Ok(())
+    }
+
+    fn ensure_skill_memory_link(&self, record: &WorkspaceRecord) -> Result<()> {
+        let source = self.template_root.join("skill_memory");
+        fs::create_dir_all(&source)
+            .with_context(|| format!("failed to create {}", source.display()))?;
+        let target = record.files_dir.join(".skill_memory");
+        if target.exists() {
+            return Ok(());
+        }
+        create_dir_symlink(&source, &target)
+            .with_context(|| format!("failed to create skill memory link {}", target.display()))
+    }
+
+    fn materialize_mount_path(
+        &self,
+        mount_path: &Path,
+        source_files_dir: &Path,
+        materialization: WorkspaceMountMaterialization,
+    ) -> Result<()> {
+        match materialization {
+            WorkspaceMountMaterialization::HostSymlink => {
+                self.materialize_live_mount_path(mount_path, source_files_dir)
+            }
+            WorkspaceMountMaterialization::SandboxPlaceholder => {
+                self.materialize_mount_placeholder(mount_path)
+            }
+        }
+    }
+
+    fn materialize_live_mount_path(
+        &self,
+        mount_path: &Path,
+        source_files_dir: &Path,
+    ) -> Result<()> {
+        if let Ok(metadata) = fs::symlink_metadata(mount_path) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            }
+        }
+        if let Some(parent) = mount_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        create_dir_symlink(source_files_dir, mount_path)
+            .with_context(|| format!("failed to create mount link {}", mount_path.display()))
+    }
+
+    fn materialize_mount_placeholder(&self, mount_path: &Path) -> Result<()> {
+        if let Ok(metadata) = fs::symlink_metadata(mount_path) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(mount_path)
+                    .with_context(|| format!("failed to replace {}", mount_path.display()))?;
+            }
+        }
+        fs::create_dir_all(mount_path).with_context(|| {
+            format!(
+                "failed to create mount placeholder {}",
+                mount_path.display()
+            )
+        })
     }
 
     fn workspace_record_from_stored(&self, record: StoredWorkspaceRecord) -> WorkspaceRecord {
@@ -655,22 +803,15 @@ fn copy_path_recursive(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-fn set_readonly_recursive(path: &Path) -> Result<()> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to mark {} readonly", path.display()))?;
-    if metadata.is_dir() {
-        for entry in
-            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
-        {
-            let entry = entry?;
-            set_readonly_recursive(&entry.path())?;
-        }
+fn create_dir_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(source, target)
+    }
 }
 
 fn collect_workspace_entries(
@@ -730,7 +871,7 @@ fn collect_workspace_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::WorkspaceManager;
+    use super::{WorkspaceManager, WorkspaceMountMaterialization};
     use std::fs;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -843,7 +984,12 @@ mod tests {
         fs::write(source.files_dir.join("projects/demo/README.md"), "hello").unwrap();
 
         let mounted = manager
-            .mount_workspace_snapshot(&target.id, &source.id, "imported")
+            .mount_workspace_snapshot(
+                &target.id,
+                &source.id,
+                "imported",
+                WorkspaceMountMaterialization::HostSymlink,
+            )
             .unwrap();
         assert!(mounted.join("projects/demo/README.md").exists());
 
@@ -869,5 +1015,55 @@ mod tests {
 
         let reactivated = manager.reactivate_workspace(&source.id).unwrap();
         assert_eq!(reactivated.state, "active");
+    }
+
+    #[test]
+    fn bubblewrap_view_materializes_placeholders_for_shared_mounts() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let source = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Source"))
+            .unwrap();
+        let target = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Target"))
+            .unwrap();
+
+        manager
+            .mount_workspace_snapshot(
+                &target.id,
+                &source.id,
+                "shared",
+                WorkspaceMountMaterialization::HostSymlink,
+            )
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(target.files_dir.join(".skill_memory"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(target.mounts_dir.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        manager.prepare_bubblewrap_view(&target.id).unwrap();
+
+        assert!(target.files_dir.join(".skill_memory").is_dir());
+        assert!(target.mounts_dir.join("shared").is_dir());
+        assert!(
+            !fs::symlink_metadata(target.files_dir.join(".skill_memory"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !fs::symlink_metadata(target.mounts_dir.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }
