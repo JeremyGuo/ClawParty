@@ -184,6 +184,7 @@ fn test_upstream(base_url: &str) -> UpstreamConfig {
         headers: serde_json::Map::new(),
         native_web_search: None,
         external_web_search: None,
+        api_format: agent_frame::ApiFormat::Openai,
     }
 }
 

@@ -24,4 +24,5 @@ uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"
+dotenvy = "0.15"
 tempfile = "3.14"

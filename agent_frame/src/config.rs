@@ -1,3 +1,4 @@
+use crate::llm::ApiFormat;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,8 @@ pub struct UpstreamConfig {
     pub api_key_env: String,
     #[serde(default = "default_chat_completions_path")]
     pub chat_completions_path: String,
+    #[serde(default)]
+    pub api_format: ApiFormat,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
     #[serde(default = "default_context_window_tokens")]
@@ -155,6 +158,8 @@ struct UpstreamConfigRaw {
     #[serde(default)]
     headers: serde_json::Map<String, Value>,
     #[serde(default)]
+    api_format: ApiFormat,
+    #[serde(default)]
     native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
     external_web_search: Option<ExternalWebSearchConfig>,
@@ -249,6 +254,7 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         headers: raw.headers,
         native_web_search: raw.native_web_search,
         external_web_search: raw.external_web_search,
+        api_format: raw.api_format,
     }
 }
 

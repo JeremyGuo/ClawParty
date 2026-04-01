@@ -879,6 +879,7 @@ mod tests {
                 headers: serde_json::Map::new(),
                 native_web_search: None,
                 external_web_search: None,
+                api_format: crate::llm::ApiFormat::Openai,
             },
             image_tool_upstream: None,
             skills_dirs: Vec::new(),

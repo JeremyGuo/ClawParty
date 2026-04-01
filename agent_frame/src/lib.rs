@@ -19,6 +19,6 @@ pub use config::{
     AgentConfig, ExternalWebSearchConfig, NativeWebSearchConfig, UpstreamConfig, load_config_file,
     load_config_value,
 };
-pub use llm::TokenUsage;
+pub use llm::{ApiFormat, TokenUsage, create_chat_completion};
 pub use message::ChatMessage;
 pub use tooling::Tool;

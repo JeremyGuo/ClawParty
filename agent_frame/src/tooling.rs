@@ -1584,6 +1584,7 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
                 headers: search_config.headers.clone(),
                 native_web_search: None,
                 external_web_search: None,
+                api_format: crate::llm::ApiFormat::Openai,
             };
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs_f64(config.timeout_seconds))
