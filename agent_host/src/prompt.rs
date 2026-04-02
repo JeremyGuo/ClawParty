@@ -187,7 +187,7 @@ mod tests {
     use crate::config::{MainAgentConfig, ModelConfig};
     use crate::domain::ChannelAddress;
     use crate::session::SessionSnapshot;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -231,6 +231,7 @@ mod tests {
             cumulative_usage: agent_frame::TokenUsage::default(),
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
             pending_workspace_summary: false,
             close_after_summary: false,
         };

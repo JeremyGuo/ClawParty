@@ -10,6 +10,36 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionSkillState {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub last_loaded_turn: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionSkillObservation {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum SkillChangeNotice {
+    DescriptionChanged {
+        name: String,
+        description: String,
+    },
+    ContentChanged {
+        name: String,
+        description: String,
+        content: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub id: Uuid,
@@ -29,6 +59,7 @@ pub struct SessionSnapshot {
     pub cumulative_usage: TokenUsage,
     pub cumulative_compaction: SessionCompactionStats,
     pub api_timeout_override_seconds: Option<f64>,
+    pub skill_states: HashMap<String, SessionSkillState>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
 }
@@ -51,6 +82,7 @@ struct Session {
     cumulative_usage: TokenUsage,
     cumulative_compaction: SessionCompactionStats,
     api_timeout_override_seconds: Option<f64>,
+    skill_states: HashMap<String, SessionSkillState>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
@@ -80,6 +112,7 @@ impl Session {
             cumulative_usage: self.cumulative_usage.clone(),
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
+            skill_states: self.skill_states.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
         }
@@ -113,6 +146,7 @@ impl Session {
             cumulative_usage: self.cumulative_usage.clone(),
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
+            skill_states: self.skill_states.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             closed_at: self.closed_at,
@@ -151,6 +185,7 @@ impl Session {
             cumulative_usage: persisted.cumulative_usage,
             cumulative_compaction: persisted.cumulative_compaction,
             api_timeout_override_seconds: persisted.api_timeout_override_seconds,
+            skill_states: persisted.skill_states,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
@@ -183,6 +218,8 @@ struct PersistedSession {
     cumulative_compaction: SessionCompactionStats,
     #[serde(default)]
     api_timeout_override_seconds: Option<f64>,
+    #[serde(default)]
+    skill_states: HashMap<String, SessionSkillState>,
     #[serde(default)]
     pending_workspace_summary: bool,
     #[serde(default)]
@@ -395,6 +432,81 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn observe_skill_changes(
+        &mut self,
+        address: &ChannelAddress,
+        observed_skills: &[SessionSkillObservation],
+    ) -> Result<Vec<SkillChangeNotice>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut notices = Vec::new();
+        for observed in observed_skills {
+            match session.skill_states.get_mut(&observed.name) {
+                Some(state) => {
+                    let description_changed = state.description != observed.description;
+                    let content_changed = state.content != observed.content;
+                    if content_changed
+                        && state
+                            .last_loaded_turn
+                            .is_some_and(|turn| turn > session.last_compacted_turn_count)
+                    {
+                        notices.push(SkillChangeNotice::ContentChanged {
+                            name: observed.name.clone(),
+                            description: observed.description.clone(),
+                            content: observed.content.clone(),
+                        });
+                    } else if description_changed {
+                        notices.push(SkillChangeNotice::DescriptionChanged {
+                            name: observed.name.clone(),
+                            description: observed.description.clone(),
+                        });
+                    }
+                    state.description = observed.description.clone();
+                    state.content = observed.content.clone();
+                }
+                None => {
+                    session.skill_states.insert(
+                        observed.name.clone(),
+                        SessionSkillState {
+                            description: observed.description.clone(),
+                            content: observed.content.clone(),
+                            last_loaded_turn: None,
+                        },
+                    );
+                }
+            }
+        }
+        session.persist()?;
+        Ok(notices)
+    }
+
+    pub fn mark_skills_loaded_current_turn(
+        &mut self,
+        address: &ChannelAddress,
+        skill_names: &[String],
+    ) -> Result<()> {
+        if skill_names.is_empty() {
+            return Ok(());
+        }
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        for skill_name in skill_names {
+            session
+                .skill_states
+                .entry(skill_name.clone())
+                .or_insert_with(SessionSkillState::default)
+                .last_loaded_turn = Some(session.turn_count);
+        }
+        session.persist()?;
+        Ok(())
+    }
+
     pub fn record_agent_turn(
         &mut self,
         address: &ChannelAddress,
@@ -549,6 +661,7 @@ impl SessionManager {
             cumulative_usage: TokenUsage::default(),
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -594,6 +707,7 @@ impl SessionManager {
             cumulative_usage: TokenUsage::default(),
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -654,6 +768,113 @@ fn load_persisted_sessions(
         }
     }
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionManager, SessionSkillObservation, SkillChangeNotice};
+    use crate::domain::ChannelAddress;
+    use crate::workspace::WorkspaceManager;
+    use agent_frame::{SessionCompactionStats, TokenUsage};
+    use tempfile::TempDir;
+
+    fn test_address() -> ChannelAddress {
+        ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "123".to_string(),
+            user_id: Some("user-1".to_string()),
+            display_name: Some("Test User".to_string()),
+        }
+    }
+
+    #[test]
+    fn emits_content_change_notice_for_loaded_skill_after_baseline() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let session = sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-a".to_string(),
+                    description: "old desc".to_string(),
+                    content: "old content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        sessions
+            .record_agent_turn(
+                &address,
+                session.agent_messages.clone(),
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+        sessions
+            .mark_skills_loaded_current_turn(&address, &["skill-a".to_string()])
+            .unwrap();
+
+        let notices = sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-a".to_string(),
+                    description: "new desc".to_string(),
+                    content: "new content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            notices.as_slice(),
+            [SkillChangeNotice::ContentChanged {
+                name,
+                description,
+                content
+            }] if name == "skill-a" && description == "new desc" && content == "new content"
+        ));
+    }
+
+    #[test]
+    fn emits_description_only_notice_for_unloaded_skill_description_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-b".to_string(),
+                    description: "old desc".to_string(),
+                    content: "same content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let notices = sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-b".to_string(),
+                    description: "new desc".to_string(),
+                    content: "same content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            notices.as_slice(),
+            [SkillChangeNotice::DescriptionChanged { name, description }]
+                if name == "skill-b" && description == "new desc"
+        ));
+    }
 }
 
 fn load_single_session(

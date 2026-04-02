@@ -22,10 +22,11 @@ use crate::domain::{
 };
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
 use crate::sandbox::run_turn_in_child_process;
-use crate::session::{SessionManager, SessionSnapshot};
+use crate::session::{SessionManager, SessionSkillObservation, SessionSnapshot, SkillChangeNotice};
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
+use agent_frame::skills::discover_skills;
 use agent_frame::{
     ChatMessage, SessionCompactionStats, SessionEvent, SessionExecutionControl, SessionRunReport,
     TokenUsage, Tool, extract_assistant_text,
@@ -2580,8 +2581,10 @@ impl Server {
         let stored_attachments = self
             .materialize_attachments(&session.attachments_dir, incoming.attachments)
             .await?;
+        let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
         let user_message = build_user_turn_message(
             incoming.text.as_deref(),
+            skill_updates_prefix.as_deref(),
             &stored_attachments,
             self.main_model()?,
             backend_supports_native_multimodal_input(self.main_model()?.backend),
@@ -2614,9 +2617,12 @@ impl Server {
         }
         let (messages, outgoing, usage, compaction, timed_out) = turn_result?;
 
+        let loaded_skills = extract_loaded_skill_names(&messages, session.agent_message_count);
         self.sessions
             .record_agent_turn(&incoming.address, messages, &usage, &compaction)
             .context("failed to persist agent_frame messages")?;
+        self.sessions
+            .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
         self.sessions.append_user_message(
             &incoming.address,
             incoming.text.clone(),
@@ -3085,6 +3091,35 @@ impl Server {
         })
     }
 
+    fn current_runtime_skill_observations(&self) -> Result<Vec<SessionSkillObservation>> {
+        let discovered = discover_skills(std::slice::from_ref(&self.agent_workspace.skills_dir))?;
+        let mut observed = Vec::with_capacity(discovered.len());
+        for skill in discovered {
+            let skill_file = skill.path.join("SKILL.md");
+            let content = std::fs::read_to_string(&skill_file)
+                .with_context(|| format!("failed to read {}", skill_file.display()))?;
+            observed.push(SessionSkillObservation {
+                name: skill.name,
+                description: skill.description,
+                content,
+            });
+        }
+        observed.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(observed)
+    }
+
+    fn observe_runtime_skill_changes(
+        &mut self,
+        session: &SessionSnapshot,
+    ) -> Result<Option<String>> {
+        let observed = self.current_runtime_skill_observations()?;
+        let notices = self
+            .sessions
+            .observe_skill_changes(&session.address, &observed)?;
+        let rendered = render_skill_change_notices(&notices);
+        Ok((!rendered.is_empty()).then_some(rendered))
+    }
+
     fn should_auto_close_conversation_after_send_error(
         &self,
         address: &ChannelAddress,
@@ -3238,6 +3273,7 @@ fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttachment]) -> 
 
 fn build_user_turn_message(
     text: Option<&str>,
+    skill_updates_prefix: Option<&str>,
     attachments: &[StoredAttachment],
     model: &ModelConfig,
     backend_supports_native_multimodal: bool,
@@ -3250,14 +3286,15 @@ fn build_user_turn_message(
         || !model.supports_vision_input
         || image_attachments.is_empty()
     {
+        let merged_text = merge_user_text(skill_updates_prefix, text);
         return Ok(ChatMessage::text(
             "user",
-            compose_user_prompt(text, attachments),
+            compose_user_prompt(merged_text.as_deref(), attachments),
         ));
     }
 
     let mut text_sections = Vec::new();
-    if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(text) = merge_user_text(skill_updates_prefix, text) {
         text_sections.push(text.to_string());
     }
 
@@ -3318,6 +3355,82 @@ fn build_user_turn_message(
     })
 }
 
+fn merge_user_text<'a>(
+    skill_updates_prefix: Option<&'a str>,
+    text: Option<&'a str>,
+) -> Option<String> {
+    let skill_updates_prefix = skill_updates_prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let text = text.map(str::trim).filter(|value| !value.is_empty());
+    match (skill_updates_prefix, text) {
+        (Some(prefix), Some(text)) => Some(format!("{prefix}\n\n[User Message]\n{text}")),
+        (Some(prefix), None) => Some(prefix.to_string()),
+        (None, Some(text)) => Some(text.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> String {
+    if notices.is_empty() {
+        return String::new();
+    }
+    let mut sections = vec![
+        "[Runtime Skill Updates]".to_string(),
+        "The global skill registry changed since earlier in this session. Apply these updates before handling the user's new request.".to_string(),
+    ];
+    for notice in notices {
+        match notice {
+            SkillChangeNotice::DescriptionChanged { name, description } => {
+                sections.push(format!(
+                    "Skill \"{name}\" has an updated description:\n{description}"
+                ));
+            }
+            SkillChangeNotice::ContentChanged {
+                name,
+                description,
+                content,
+            } => {
+                sections.push(format!(
+                    "Skill \"{name}\" changed after it was loaded earlier in this session and before that load was compacted away. Use the refreshed skill immediately.\nUpdated description: {description}\nRefreshed SKILL.md content:\n{content}"
+                ));
+            }
+        }
+    }
+    sections.join("\n\n")
+}
+
+fn extract_loaded_skill_names(
+    messages: &[ChatMessage],
+    previous_message_count: usize,
+) -> Vec<String> {
+    let mut skill_names = Vec::new();
+    for message in messages.iter().skip(previous_message_count) {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(tool_name) = message.name.as_deref() else {
+            continue;
+        };
+        if tool_name != "skill_load" && tool_name != "load_skill" {
+            continue;
+        }
+        let Some(content) = message.content.as_ref().and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let Some(skill_name) = parsed.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !skill_names.iter().any(|existing| existing == skill_name) {
+            skill_names.push(skill_name.to_string());
+        }
+    }
+    skill_names
+}
+
 fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
     let bytes = std::fs::read(&attachment.path).with_context(|| {
         format!(
@@ -3365,18 +3478,18 @@ fn spawn_processing_keepalive(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = &mut stop_receiver => break,
-                _ = ticker.tick() => {
-                    if let Err(error) = channel.set_processing(&address, state).await {
-                        warn!(
-                            log_stream = "channel",
-                            log_key = %channel.id(),
-                            kind = "processing_keepalive_failed",
-                            conversation_id = %address.conversation_id,
-                            error = %format!("{error:#}"),
-                            "processing keepalive failed"
-                        );
-                        break;
+                        _ = &mut stop_receiver => break,
+                        _ = ticker.tick() => {
+                            if let Err(error) = channel.set_processing(&address, state).await {
+                                warn!(
+                                    log_stream = "channel",
+                                    log_key = %channel.id(),
+                                    kind = "processing_keepalive_failed",
+                                    conversation_id = %address.conversation_id,
+                                    error = %format!("{error:#}"),
+                                    "processing keepalive failed"
+                                );
+                                break;
                     }
                 }
             }
@@ -3770,6 +3883,7 @@ fn create_detached_session_snapshot(
         cumulative_usage: TokenUsage::default(),
         cumulative_compaction: SessionCompactionStats::default(),
         api_timeout_override_seconds: None,
+        skill_states: HashMap::new(),
         pending_workspace_summary: false,
         close_after_summary: false,
     })
@@ -4468,6 +4582,7 @@ mod tests {
     use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -4526,7 +4641,7 @@ mod tests {
         };
 
         let message =
-            build_user_turn_message(Some("看看这张图"), &[attachment], &model, true).unwrap();
+            build_user_turn_message(Some("看看这张图"), None, &[attachment], &model, true).unwrap();
 
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
@@ -4616,6 +4731,7 @@ mod tests {
             cumulative_usage: TokenUsage::default(),
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
             pending_workspace_summary: false,
             close_after_summary: false,
         };
