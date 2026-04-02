@@ -701,6 +701,19 @@ impl Channel for TelegramChannel {
                 };
                 let text = message.text.clone().or_else(|| message.caption.clone());
                 let attachments = self.collect_attachments(&message);
+                if text.as_deref().is_none_or(|value| value.trim().is_empty())
+                    && attachments.is_empty()
+                {
+                    info!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_ignored_empty_message",
+                        conversation_id = message.chat.id.to_string(),
+                        remote_message_id = message.message_id.to_string(),
+                        "ignoring telegram service/empty message without text or attachments"
+                    );
+                    continue;
+                }
                 let incoming = IncomingMessage {
                     remote_message_id: message.message_id.to_string(),
                     address: self.build_address(&message),
