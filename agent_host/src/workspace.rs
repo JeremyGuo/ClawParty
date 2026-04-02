@@ -532,9 +532,11 @@ impl WorkspaceManager {
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("failed to inspect {}", path.display()))?;
             if metadata.file_type().is_symlink() || metadata.is_file() {
+                clear_readonly_recursive(&path).ok();
                 fs::remove_file(&path)
                     .with_context(|| format!("failed to remove {}", path.display()))?;
             } else if metadata.is_dir() {
+                clear_readonly_recursive(&path).ok();
                 fs::remove_dir_all(&path)
                     .with_context(|| format!("failed to remove {}", path.display()))?;
             }
@@ -1004,6 +1006,36 @@ fn set_readonly_recursive(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn clear_readonly_recursive(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            let entry = entry?;
+            clear_readonly_recursive(&entry.path())?;
+        }
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        permissions.set_mode(mode);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to clear readonly on {}", path.display()))?;
+    Ok(())
+}
+
 fn collect_workspace_entries(
     workspace_root: &Path,
     current_dir: &Path,
@@ -1293,5 +1325,33 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cleanup_transient_mounts_removes_readonly_snapshot_mounts() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let source = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Source"))
+            .unwrap();
+        let target = manager
+            .create_workspace(Uuid::new_v4(), Uuid::new_v4(), Some("Target"))
+            .unwrap();
+
+        fs::create_dir_all(source.files_dir.join("notes")).unwrap();
+        fs::write(source.files_dir.join("notes/hello.txt"), "hello").unwrap();
+
+        let mounted = manager
+            .mount_workspace_snapshot(
+                &target.id,
+                &source.id,
+                "party_claw_history",
+                WorkspaceMountMaterialization::HostSnapshotCopy,
+            )
+            .unwrap();
+
+        assert!(mounted.exists());
+        manager.cleanup_transient_mounts(&target.id).unwrap();
+        assert!(!mounted.exists());
     }
 }
