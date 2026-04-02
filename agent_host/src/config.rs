@@ -254,15 +254,15 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Set session API timeout in seconds".to_string(),
         },
         BotCommandConfig {
-            command: "snap_save".to_string(),
+            command: "snapsave".to_string(),
             description: "Save a named global snapshot".to_string(),
         },
         BotCommandConfig {
-            command: "snap_load".to_string(),
+            command: "snapload".to_string(),
             description: "Load a named global snapshot".to_string(),
         },
         BotCommandConfig {
-            command: "snap_list".to_string(),
+            command: "snaplist".to_string(),
             description: "List saved global snapshots".to_string(),
         },
     ]

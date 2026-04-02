@@ -2694,14 +2694,14 @@ impl Server {
         }
 
         if matches!(
-            parse_optional_command_argument(incoming.text.as_deref(), "/snap_save"),
+            parse_optional_command_argument(incoming.text.as_deref(), "/snapsave"),
             Some(None)
         ) {
             self.send_channel_message(
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(
-                    "Usage: `/snap_save <name>`\nExample: `/snap_save demo`".to_string(),
+                    "Usage: `/snapsave <name>`\nExample: `/snapsave demo`".to_string(),
                 ),
             )
             .await?;
@@ -2737,7 +2737,7 @@ impl Server {
 
         if parse_snap_list_command(incoming.text.as_deref())
             || matches!(
-                parse_optional_command_argument(incoming.text.as_deref(), "/snap_load"),
+                parse_optional_command_argument(incoming.text.as_deref(), "/snapload"),
                 Some(None)
             )
         {
@@ -2747,7 +2747,7 @@ impl Server {
                     &channel,
                     &incoming.address,
                     OutgoingMessage::text(
-                        "There are no saved snapshots yet. Use `/snap_save <name>` first."
+                        "There are no saved snapshots yet. Use `/snapsave <name>` first."
                             .to_string(),
                     ),
                 )
@@ -2767,7 +2767,7 @@ impl Server {
                 .iter()
                 .map(|record| ShowOption {
                     label: record.name.clone(),
-                    value: format!("/snap_load {}", record.name),
+                    value: format!("/snapload {}", record.name),
                 })
                 .collect::<Vec<_>>();
             self.send_channel_message(
@@ -2775,7 +2775,7 @@ impl Server {
                 &incoming.address,
                 OutgoingMessage::with_options(
                     format!(
-                        "Saved global snapshots:\n{}\n\nChoose one below or send `/snap_load <name>`.",
+                        "Saved global snapshots:\n{}\n\nChoose one below or send `/snapload <name>`.",
                         lines.join("\n")
                     ),
                     "Choose a snapshot to load",
@@ -4662,15 +4662,15 @@ fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
 }
 
 fn parse_snap_save_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/snap_save")
+    parse_required_command_argument(text, "/snapsave")
 }
 
 fn parse_snap_load_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/snap_load")
+    parse_required_command_argument(text, "/snapload")
 }
 
 fn parse_snap_list_command(text: Option<&str>) -> bool {
-    matches!(parse_optional_command_argument(text, "/snap_list"), Some(_))
+    matches!(parse_optional_command_argument(text, "/snaplist"), Some(_))
 }
 
 fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {
@@ -5387,23 +5387,23 @@ mod tests {
     #[test]
     fn parses_snap_commands_with_bot_suffix() {
         assert_eq!(
-            parse_snap_save_command(Some("/snap_save demo-checkpoint")),
+            parse_snap_save_command(Some("/snapsave demo-checkpoint")),
             Some("demo-checkpoint".to_string())
         );
         assert_eq!(
-            parse_snap_save_command(Some("/snap_save@party_claw_bot demo-checkpoint")),
+            parse_snap_save_command(Some("/snapsave@party_claw_bot demo-checkpoint")),
             Some("demo-checkpoint".to_string())
         );
         assert_eq!(
-            parse_snap_load_command(Some("/snap_load restore-point")),
+            parse_snap_load_command(Some("/snapload restore-point")),
             Some("restore-point".to_string())
         );
         assert_eq!(
-            parse_snap_load_command(Some("/snap_load@party_claw_bot restore-point")),
+            parse_snap_load_command(Some("/snapload@party_claw_bot restore-point")),
             Some("restore-point".to_string())
         );
-        assert!(parse_snap_list_command(Some("/snap_list")));
-        assert!(parse_snap_list_command(Some("/snap_list@party_claw_bot")));
+        assert!(parse_snap_list_command(Some("/snaplist")));
+        assert!(parse_snap_list_command(Some("/snaplist@party_claw_bot")));
     }
 
     #[test]
