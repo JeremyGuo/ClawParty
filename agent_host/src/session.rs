@@ -448,6 +448,12 @@ impl SessionManager {
                 Some(state) => {
                     let description_changed = state.description != observed.description;
                     let content_changed = state.content != observed.content;
+                    if description_changed {
+                        notices.push(SkillChangeNotice::DescriptionChanged {
+                            name: observed.name.clone(),
+                            description: observed.description.clone(),
+                        });
+                    }
                     if content_changed
                         && state
                             .last_loaded_turn
@@ -457,11 +463,6 @@ impl SessionManager {
                             name: observed.name.clone(),
                             description: observed.description.clone(),
                             content: observed.content.clone(),
-                        });
-                    } else if description_changed {
-                        notices.push(SkillChangeNotice::DescriptionChanged {
-                            name: observed.name.clone(),
-                            description: observed.description.clone(),
                         });
                     }
                     state.description = observed.description.clone();
@@ -831,11 +832,18 @@ mod tests {
 
         assert!(matches!(
             notices.as_slice(),
-            [SkillChangeNotice::ContentChanged {
-                name,
-                description,
-                content
-            }] if name == "skill-a" && description == "new desc" && content == "new content"
+            [
+                SkillChangeNotice::DescriptionChanged { name, description },
+                SkillChangeNotice::ContentChanged {
+                    name: content_name,
+                    description: content_description,
+                    content,
+                }
+            ] if name == "skill-a"
+                && description == "new desc"
+                && content_name == "skill-a"
+                && content_description == "new desc"
+                && content == "new content"
         ));
     }
 
@@ -873,6 +881,65 @@ mod tests {
             notices.as_slice(),
             [SkillChangeNotice::DescriptionChanged { name, description }]
                 if name == "skill-b" && description == "new desc"
+        ));
+    }
+
+    #[test]
+    fn emits_description_then_content_notices_when_both_changed_for_loaded_skill() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let session = sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-c".to_string(),
+                    description: "old desc".to_string(),
+                    content: "old content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        sessions
+            .record_agent_turn(
+                &address,
+                session.agent_messages.clone(),
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+        sessions
+            .mark_skills_loaded_current_turn(&address, &["skill-c".to_string()])
+            .unwrap();
+
+        let notices = sessions
+            .observe_skill_changes(
+                &address,
+                &[SessionSkillObservation {
+                    name: "skill-c".to_string(),
+                    description: "new desc".to_string(),
+                    content: "new content".to_string(),
+                }],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            notices.as_slice(),
+            [
+                SkillChangeNotice::DescriptionChanged { name, description },
+                SkillChangeNotice::ContentChanged {
+                    name: content_name,
+                    description: content_description,
+                    content,
+                }
+            ] if name == "skill-c"
+                && description == "new desc"
+                && content_name == "skill-c"
+                && content_description == "new desc"
+                && content == "new content"
         ));
     }
 }

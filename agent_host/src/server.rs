@@ -2398,7 +2398,7 @@ impl Server {
             .text
             .as_deref()
             .map(str::trim)
-            .is_some_and(|text| text == "/new")
+            .is_some_and(|text| command_matches(text, "/new"))
         {
             if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address) {
                 self.sessions
@@ -2492,7 +2492,7 @@ impl Server {
             .text
             .as_deref()
             .map(str::trim)
-            .is_some_and(|text| text == "/help")
+            .is_some_and(|text| command_matches(text, "/help"))
         {
             let help_text = self.help_text_for_channel(&incoming.address.channel_id);
             info!(
@@ -2515,7 +2515,7 @@ impl Server {
             .text
             .as_deref()
             .map(str::trim)
-            .is_some_and(|text| text == "/status")
+            .is_some_and(|text| command_matches(text, "/status"))
         {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
             let status_text = self.status_text_for_session(&session)?;
@@ -2532,7 +2532,7 @@ impl Server {
             .text
             .as_deref()
             .map(str::trim)
-            .is_some_and(|text| text.starts_with("/set_api_timeout"))
+            .is_some_and(|text| command_starts_with(text, "/set_api_timeout"))
             && parse_set_api_timeout_command(incoming.text.as_deref()).is_none()
         {
             let usage = "Usage: /set_api_timeout <seconds|default>\nExamples:\n/set_api_timeout 300\n/set_api_timeout default";
@@ -4245,7 +4245,7 @@ fn format_api_timeout_update(
 }
 
 fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
-    let text = text?.trim();
+    let text = normalized_command_text(text?)?;
     let suffix = text.strip_prefix("/oldspace")?.trim();
     if suffix.is_empty() {
         None
@@ -4255,13 +4255,43 @@ fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
 }
 
 fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
-    let text = text?.trim();
+    let text = normalized_command_text(text?)?;
     let suffix = text.strip_prefix("/set_api_timeout")?.trim();
     if suffix.is_empty() {
         None
     } else {
         Some(suffix.to_string())
     }
+}
+
+fn normalized_command_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let first = parts.next()?;
+    let normalized_first = first_token_without_mention(first);
+    let rest = parts.next().map(str::trim_start).unwrap_or("");
+    if rest.is_empty() {
+        Some(normalized_first.to_string())
+    } else {
+        Some(format!("{normalized_first} {rest}"))
+    }
+}
+
+fn first_token_without_mention(token: &str) -> &str {
+    token.split_once('@').map_or(token, |(base, _)| base)
+}
+
+fn command_matches(text: &str, command: &str) -> bool {
+    normalized_command_text(text).as_deref() == Some(command)
+}
+
+fn command_starts_with(text: &str, command: &str) -> bool {
+    normalized_command_text(text)
+        .as_deref()
+        .is_some_and(|normalized| normalized.starts_with(command))
 }
 
 fn workspace_visible_in_list(
