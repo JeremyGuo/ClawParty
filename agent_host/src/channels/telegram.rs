@@ -1,4 +1,6 @@
-use crate::channel::{AttachmentSource, Channel, IncomingMessage, PendingAttachment};
+use crate::channel::{
+    AttachmentSource, Channel, IncomingControl, IncomingMessage, PendingAttachment,
+};
 use crate::config::{BotCommandConfig, TelegramChannelConfig};
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
@@ -10,10 +12,10 @@ use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
@@ -27,6 +29,8 @@ pub struct TelegramChannel {
     commands: Vec<BotCommandConfig>,
     client: Client,
     bot_username: Mutex<Option<String>>,
+    bot_user_id: Mutex<Option<i64>>,
+    chat_member_counts: Mutex<HashMap<i64, (u64, Instant)>>,
     pending_outbound: Mutex<VecDeque<PendingOutbound>>,
 }
 
@@ -62,6 +66,8 @@ impl TelegramChannel {
             commands: config.commands,
             client: Client::new(),
             bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         })
     }
@@ -331,6 +337,7 @@ impl TelegramChannel {
         match self.call_api::<TelegramUser>("getMe", json!({})).await {
             Ok(user) => {
                 let username = user.username.clone();
+                *self.bot_user_id.lock().await = Some(user.id);
                 *self.bot_username.lock().await = username.clone();
                 info!(
                     log_stream = "channel",
@@ -464,10 +471,14 @@ impl TelegramChannel {
         &self,
         message: &TelegramMessage,
         text: Option<&str>,
-        _attachments_count: usize,
+        attachments_count: usize,
     ) -> bool {
         if message.chat.kind == "private" {
             return true;
+        }
+        if self.group_behaves_like_direct_chat(message).await {
+            return text.map(str::trim).is_some_and(|value| !value.is_empty())
+                || attachments_count > 0;
         }
         let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) else {
             return false;
@@ -478,6 +489,59 @@ impl TelegramChannel {
         };
         let mention = format!("@{}", bot_username.to_ascii_lowercase());
         text.to_ascii_lowercase().contains(&mention)
+    }
+
+    async fn group_behaves_like_direct_chat(&self, message: &TelegramMessage) -> bool {
+        if !matches!(message.chat.kind.as_str(), "group" | "supergroup") {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some((count, observed_at)) = self
+            .chat_member_counts
+            .lock()
+            .await
+            .get(&message.chat.id)
+            .copied()
+            && now.duration_since(observed_at) <= Duration::from_secs(60)
+        {
+            return count <= 2;
+        }
+        match self
+            .call_api::<u64>(
+                "getChatMemberCount",
+                json!({
+                    "chat_id": message.chat.id,
+                }),
+            )
+            .await
+        {
+            Ok(count) => {
+                self.chat_member_counts
+                    .lock()
+                    .await
+                    .insert(message.chat.id, (count, now));
+                count <= 2
+            }
+            Err(error) => {
+                warn!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_chat_member_count_failed",
+                    conversation_id = message.chat.id.to_string(),
+                    error = %format!("{error:#}"),
+                    "failed to fetch telegram chat member count"
+                );
+                false
+            }
+        }
+    }
+
+    async fn bot_was_removed_from_chat(&self, message: &TelegramMessage) -> bool {
+        let Some(left_chat_member) = message.left_chat_member.as_ref() else {
+            return false;
+        };
+        let bot_user_id = *self.bot_user_id.lock().await;
+        bot_user_id.is_some_and(|bot_id| bot_id == left_chat_member.id)
     }
 
     async fn send_photo(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
@@ -747,6 +811,27 @@ impl Channel for TelegramChannel {
                 let Some(message) = update.message else {
                     continue;
                 };
+                if self.bot_was_removed_from_chat(&message).await {
+                    let incoming = IncomingMessage {
+                        remote_message_id: message.message_id.to_string(),
+                        address: self.build_address(&message),
+                        text: None,
+                        attachments: Vec::new(),
+                        control: Some(IncomingControl::ConversationClosed {
+                            reason: "telegram bot was removed from the chat".to_string(),
+                        }),
+                    };
+                    if sender.send(incoming).await.is_err() {
+                        warn!(
+                            log_stream = "channel",
+                            log_key = %self.id,
+                            kind = "telegram_receiver_closed",
+                            "telegram receiver closed; stopping polling loop"
+                        );
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let text = message.text.clone().or_else(|| message.caption.clone());
                 let attachments = self.collect_attachments(&message);
                 if text.as_deref().is_none_or(|value| value.trim().is_empty())
@@ -782,6 +867,7 @@ impl Channel for TelegramChannel {
                     address: self.build_address(&message),
                     text,
                     attachments,
+                    control: None,
                 };
                 if sender.send(incoming).await.is_err() {
                     warn!(
@@ -1230,7 +1316,8 @@ mod tests {
     };
     use anyhow::anyhow;
     use reqwest::Client;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
+    use std::time::Instant;
     use tokio::sync::Mutex;
 
     #[test]
@@ -1326,6 +1413,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
@@ -1346,6 +1435,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
@@ -1364,6 +1455,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
@@ -1382,6 +1475,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
         let message = TelegramMessage {
@@ -1391,6 +1486,7 @@ mod tests {
                 kind: "private".to_string(),
             },
             from: None,
+            left_chat_member: None,
             text: Some("介绍一下你自己".to_string()),
             caption: None,
             photo: None,
@@ -1416,6 +1512,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
         let message = TelegramMessage {
@@ -1425,6 +1523,7 @@ mod tests {
                 kind: "group".to_string(),
             },
             from: None,
+            left_chat_member: None,
             text: Some("/status".to_string()),
             caption: None,
             photo: None,
@@ -1450,6 +1549,8 @@ mod tests {
             commands: Vec::new(),
             client: Client::new(),
             bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
         let message = TelegramMessage {
@@ -1459,7 +1560,45 @@ mod tests {
                 kind: "supergroup".to_string(),
             },
             from: None,
+            left_chat_member: None,
             text: Some("@party_claw_bot 你好".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+            video: None,
+            audio: None,
+        };
+        assert!(
+            channel
+                .should_accept_message(&message, message.text.as_deref(), 0)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_two_person_group_messages_without_mention() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::from([(-5158767783, (2, Instant::now()))])),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            chat: TelegramChat {
+                id: -5158767783,
+                kind: "group".to_string(),
+            },
+            from: None,
+            left_chat_member: None,
+            text: Some("在吗".to_string()),
             caption: None,
             photo: None,
             document: None,
@@ -1559,6 +1698,7 @@ struct TelegramMessage {
     message_id: i64,
     chat: TelegramChat,
     from: Option<TelegramUser>,
+    left_chat_member: Option<TelegramUser>,
     text: Option<String>,
     caption: Option<String>,
     photo: Option<Vec<TelegramPhotoSize>>,

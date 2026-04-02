@@ -103,6 +103,12 @@ pub struct IncomingMessage {
     pub address: ChannelAddress,
     pub text: Option<String>,
     pub attachments: Vec<PendingAttachment>,
+    pub control: Option<IncomingControl>,
+}
+
+#[derive(Clone, Debug)]
+pub enum IncomingControl {
+    ConversationClosed { reason: String },
 }
 
 #[async_trait]

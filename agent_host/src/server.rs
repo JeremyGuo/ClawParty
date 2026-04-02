@@ -2376,6 +2376,23 @@ impl Server {
             .with_context(|| format!("unknown channel {}", incoming.address.channel_id))?
             .clone();
 
+        if let Some(control) = incoming.control.as_ref() {
+            match control {
+                crate::channel::IncomingControl::ConversationClosed { reason } => {
+                    info!(
+                        log_stream = "session",
+                        kind = "channel_conversation_closed",
+                        channel_id = %incoming.address.channel_id,
+                        conversation_id = %incoming.address.conversation_id,
+                        reason = reason,
+                        "channel reported that the conversation should be closed"
+                    );
+                    self.sessions.destroy_foreground(&incoming.address)?;
+                    return Ok(());
+                }
+            }
+        }
+
         if incoming
             .text
             .as_deref()
@@ -2420,7 +2437,8 @@ impl Server {
                 conversation_id = %incoming.address.conversation_id,
                 "foreground session reset"
             );
-            channel.send(&incoming.address, welcome).await?;
+            self.send_channel_message(&channel, &incoming.address, welcome)
+                .await?;
             return Ok(());
         }
 
@@ -2464,7 +2482,8 @@ impl Server {
                     return Err(error);
                 }
             };
-            channel.send(&incoming.address, welcome).await?;
+            self.send_channel_message(&channel, &incoming.address, welcome)
+                .await?;
             return Ok(());
         }
 
@@ -2482,9 +2501,12 @@ impl Server {
                 conversation_id = %incoming.address.conversation_id,
                 "rendering help text"
             );
-            channel
-                .send(&incoming.address, OutgoingMessage::text(help_text))
-                .await?;
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(help_text),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2496,9 +2518,12 @@ impl Server {
         {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
             let status_text = self.status_text_for_session(&session)?;
-            channel
-                .send(&incoming.address, OutgoingMessage::text(status_text))
-                .await?;
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(status_text),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2510,8 +2535,7 @@ impl Server {
             && parse_set_api_timeout_command(incoming.text.as_deref()).is_none()
         {
             let usage = "Usage: /set_api_timeout <seconds|default>\nExamples:\n/set_api_timeout 300\n/set_api_timeout default";
-            channel
-                .send(&incoming.address, OutgoingMessage::text(usage))
+            self.send_channel_message(&channel, &incoming.address, OutgoingMessage::text(usage))
                 .await?;
             return Ok(());
         }
@@ -2531,9 +2555,12 @@ impl Server {
                 };
             self.sessions
                 .set_api_timeout_override(&incoming.address, override_timeout)?;
-            channel
-                .send(&incoming.address, OutgoingMessage::text(status_text))
-                .await?;
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(status_text),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2616,7 +2643,8 @@ impl Server {
             "foreground agent produced reply"
         );
 
-        channel.send(&incoming.address, outgoing).await?;
+        self.send_channel_message(&channel, &incoming.address, outgoing)
+            .await?;
         channel
             .set_processing(&incoming.address, ProcessingState::Idle)
             .await
@@ -3057,14 +3085,58 @@ impl Server {
         })
     }
 
-    async fn send_user_error_message(
+    fn should_auto_close_conversation_after_send_error(
         &self,
+        address: &ChannelAddress,
+        error: &anyhow::Error,
+    ) -> bool {
+        if !address.conversation_id.starts_with('-') {
+            return false;
+        }
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("bot was kicked from the group chat")
+            || message.contains("chat not found")
+            || message.contains("group chat was deleted")
+            || message.contains("bot is not a member of the channel chat")
+            || message.contains("forbidden: bot was kicked")
+    }
+
+    async fn send_channel_message(
+        &mut self,
+        channel: &Arc<dyn Channel>,
+        address: &ChannelAddress,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        match channel.send(address, message).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self.should_auto_close_conversation_after_send_error(address, &error) {
+                    warn!(
+                        log_stream = "session",
+                        kind = "channel_send_closed_conversation",
+                        channel_id = %address.channel_id,
+                        conversation_id = %address.conversation_id,
+                        error = %format!("{error:#}"),
+                        "channel send indicates the conversation no longer exists; closing foreground session"
+                    );
+                    self.sessions.destroy_foreground(address)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn send_user_error_message(
+        &mut self,
         channel: &Arc<dyn Channel>,
         address: &ChannelAddress,
         error: &anyhow::Error,
     ) {
         let text = user_facing_error_text(&self.main_agent.language, error);
-        if let Err(send_error) = channel.send(address, OutgoingMessage::text(text)).await {
+        if let Err(send_error) = self
+            .send_channel_message(channel, address, OutgoingMessage::text(text))
+            .await
+        {
             error!(
                 log_stream = "server",
                 kind = "send_user_error_failed",
