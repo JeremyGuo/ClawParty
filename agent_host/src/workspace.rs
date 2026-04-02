@@ -163,6 +163,35 @@ impl WorkspaceManager {
         Ok(record)
     }
 
+    pub fn create_transient_workspace(
+        &self,
+        id: String,
+        title: Option<&str>,
+        main_agent_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<WorkspaceRecord> {
+        let now = Utc::now();
+        let record = self.workspace_record(
+            id.clone(),
+            title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("workspace-{}", &id[..id.len().min(8)])),
+            "Transient workspace.".to_string(),
+            "active".to_string(),
+            now,
+            now,
+            now,
+            Some(main_agent_id),
+            Some(session_id),
+        );
+        self.ensure_workspace_dirs(&record)?;
+        self.seed_workspace_from_template(&record)?;
+        self.persist_record(&record)?;
+        Ok(record)
+    }
+
     pub fn get_workspace(&self, id: &str) -> Result<Option<WorkspaceRecord>> {
         let registry = self
             .registry
@@ -369,6 +398,43 @@ impl WorkspaceManager {
             self.persist_registry(&registry)?;
         }
         Ok(archived)
+    }
+
+    pub fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
+        let record = self.get_workspace(workspace_id)?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow!("workspace registry lock poisoned"))?;
+        let original_workspaces_len = registry.workspaces.len();
+        registry.workspaces.retain(|entry| entry.id != workspace_id);
+        registry.mounts.retain(|entry| {
+            entry.owner_workspace_id != workspace_id && entry.source_workspace_id != workspace_id
+        });
+        if registry.workspaces.len() != original_workspaces_len {
+            self.persist_registry(&registry)?;
+        }
+        drop(registry);
+
+        if let Some(record) = record {
+            if record.root_dir.exists() {
+                fs::remove_dir_all(&record.root_dir).with_context(|| {
+                    format!(
+                        "failed to remove workspace root {}",
+                        record.root_dir.display()
+                    )
+                })?;
+            }
+            if record.host_dir.exists() {
+                fs::remove_dir_all(&record.host_dir).with_context(|| {
+                    format!(
+                        "failed to remove workspace host dir {}",
+                        record.host_dir.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     pub fn mount_workspace_snapshot(

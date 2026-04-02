@@ -1662,7 +1662,7 @@ impl ServerRuntime {
             )
             .await;
 
-        match run_result {
+        let outcome = match run_result {
             Ok(TimedRunOutcome::Completed(report)) => {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
@@ -1697,14 +1697,14 @@ impl ServerRuntime {
                     .context("failed to dispatch background agent reply")
                 {
                     self.mark_managed_agent_failed(job.agent_id, &report.usage, &error);
-                    cleanup_detached_session_root(&job).ok();
-                    return self
+                    let recovery = self
                         .handle_background_job_failure(&job, &error)
                         .await
                         .with_context(|| format!("{error:#}"));
+                    cleanup_detached_session_root(self, &job).ok();
+                    return recovery;
                 }
                 self.mark_managed_agent_completed(job.agent_id, &report.usage);
-                cleanup_detached_session_root(&job).ok();
                 Ok(())
             }
             Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
@@ -1713,15 +1713,15 @@ impl ServerRuntime {
                     .map(|report| report.usage.clone())
                     .unwrap_or_default();
                 self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
-                cleanup_detached_session_root(&job).ok();
                 self.handle_background_job_failure(&job, &error).await
             }
             Err(error) => {
                 self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
-                cleanup_detached_session_root(&job).ok();
                 self.handle_background_job_failure(&job, &error).await
             }
-        }
+        };
+        cleanup_detached_session_root(self, &job).ok();
+        outcome
     }
 
     async fn handle_background_job_failure(
@@ -2010,6 +2010,7 @@ impl ServerRuntime {
         self.model_config(&task.model_key)?;
         let background_agent_id = uuid::Uuid::new_v4();
         let session = create_detached_session_snapshot(
+            &self.workspace_manager,
             &self.agent_workspace.root_dir,
             task.address.clone(),
             background_agent_id,
@@ -4162,6 +4163,7 @@ fn evaluate_cron_checker(checker: &CronCheckerConfig, workspace_root: &Path) -> 
 }
 
 fn create_detached_session_snapshot(
+    workspace_manager: &WorkspaceManager,
     workdir: &Path,
     address: ChannelAddress,
     agent_id: uuid::Uuid,
@@ -4169,14 +4171,16 @@ fn create_detached_session_snapshot(
     let session_id = uuid::Uuid::new_v4();
     let workspace_id = format!("detached-{}", session_id);
     let root_dir = workdir.join("sessions").join(session_id.to_string());
-    let workspace_root = workdir.join("workspaces").join(&workspace_id).join("files");
-    let attachments_dir = workspace_root.join("upload");
     std::fs::create_dir_all(&root_dir)
         .with_context(|| format!("failed to create {}", root_dir.display()))?;
-    std::fs::create_dir_all(&workspace_root)
-        .with_context(|| format!("failed to create {}", workspace_root.display()))?;
-    std::fs::create_dir_all(&attachments_dir)
-        .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+    let workspace = workspace_manager.create_transient_workspace(
+        workspace_id.clone(),
+        Some("Detached Background Workspace"),
+        agent_id,
+        session_id,
+    )?;
+    let workspace_root = workspace.files_dir.clone();
+    let attachments_dir = workspace_root.join("upload");
     Ok(SessionSnapshot {
         id: session_id,
         agent_id,
@@ -4201,7 +4205,10 @@ fn create_detached_session_snapshot(
     })
 }
 
-fn cleanup_detached_session_root(job: &BackgroundJobRequest) -> Result<()> {
+fn cleanup_detached_session_root(
+    runtime: &ServerRuntime,
+    job: &BackgroundJobRequest,
+) -> Result<()> {
     if job.cron_task_id.is_some() && job.session.root_dir.exists() {
         std::fs::remove_dir_all(&job.session.root_dir).with_context(|| {
             format!(
@@ -4209,6 +4216,11 @@ fn cleanup_detached_session_root(job: &BackgroundJobRequest) -> Result<()> {
                 job.session.root_dir.display()
             )
         })?;
+    }
+    if job.cron_task_id.is_some() {
+        runtime
+            .workspace_manager
+            .delete_workspace(&job.session.workspace_id)?;
     }
     Ok(())
 }
