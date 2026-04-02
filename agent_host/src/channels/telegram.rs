@@ -10,11 +10,12 @@ use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 pub struct TelegramChannel {
@@ -25,10 +26,18 @@ pub struct TelegramChannel {
     poll_interval_ms: u64,
     commands: Vec<BotCommandConfig>,
     client: Client,
+    pending_outbound: Mutex<VecDeque<PendingOutbound>>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOutbound {
+    address: ChannelAddress,
+    message: OutgoingMessage,
 }
 
 impl TelegramChannel {
     const MAX_POLL_BACKOFF_SECONDS: u64 = 30;
+    const MAX_SEND_RETRIES: u32 = 3;
     const MAX_MESSAGE_CHARS: usize = 4096;
     const MAX_CAPTION_CHARS: usize = 1024;
 
@@ -51,6 +60,7 @@ impl TelegramChannel {
             poll_interval_ms: config.poll_interval_ms,
             commands: config.commands,
             client: Client::new(),
+            pending_outbound: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -67,44 +77,63 @@ impl TelegramChannel {
         method: &str,
         payload: serde_json::Value,
     ) -> Result<T> {
-        let response = self
-            .client
-            .post(self.method_url(method))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| {
+        let max_attempts = self.max_send_attempts(method);
+        for attempt in 1..=max_attempts {
+            let response = match self
+                .client
+                .post(self.method_url(method))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = anyhow!(
+                        "{}",
+                        self.redact_sensitive_text(&format!(
+                            "telegram API call {} failed: {error:#}",
+                            method
+                        ))
+                    );
+                    if attempt < max_attempts && self.should_retry_transport_error(method) {
+                        self.log_send_retry(method, attempt, max_attempts, &error);
+                        tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let envelope: TelegramEnvelope<T> = response.json().await.map_err(|error| {
                 anyhow!(
                     "{}",
                     self.redact_sensitive_text(&format!(
-                        "telegram API call {} failed: {error:#}",
+                        "telegram API {} returned invalid JSON: {error:#}",
                         method
                     ))
                 )
             })?;
-        let envelope: TelegramEnvelope<T> = response.json().await.map_err(|error| {
-            anyhow!(
-                "{}",
-                self.redact_sensitive_text(&format!(
-                    "telegram API {} returned invalid JSON: {error:#}",
-                    method
-                ))
-            )
-        })?;
-        if !envelope.ok {
-            return Err(anyhow!(
-                "telegram API {} failed: {}",
-                method,
-                self.redact_sensitive_text(
-                    &envelope
-                        .description
-                        .unwrap_or_else(|| "unknown error".to_string()),
-                )
-            ));
+            if !envelope.ok {
+                let error = anyhow!(
+                    "telegram API {} failed: {}",
+                    method,
+                    self.redact_sensitive_text(
+                        &envelope
+                            .description
+                            .unwrap_or_else(|| "unknown error".to_string()),
+                    )
+                );
+                if attempt < max_attempts && self.should_retry_api_error(method, &error) {
+                    self.log_send_retry(method, attempt, max_attempts, &error);
+                    tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            return envelope
+                .result
+                .ok_or_else(|| anyhow!("telegram API {} returned no result", method));
         }
-        envelope
-            .result
-            .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
+        unreachable!("telegram API retry loop exhausted without returning")
     }
 
     async fn call_multipart(&self, method: &str, form: Form) -> Result<serde_json::Value> {
@@ -147,6 +176,132 @@ impl TelegramChannel {
         envelope
             .result
             .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
+    }
+
+    fn max_send_attempts(&self, method: &str) -> u32 {
+        match method {
+            "sendMessage" | "sendPhoto" | "sendDocument" | "sendMediaGroup" | "sendChatAction" => {
+                Self::MAX_SEND_RETRIES
+            }
+            _ => 1,
+        }
+    }
+
+    fn should_retry_transport_error(&self, method: &str) -> bool {
+        self.max_send_attempts(method) > 1
+    }
+
+    fn should_retry_api_error(&self, method: &str, error: &anyhow::Error) -> bool {
+        if self.max_send_attempts(method) <= 1 {
+            return false;
+        }
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("too many requests")
+            || message.contains("retry after")
+            || message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("internal server error")
+            || message.contains("bad gateway")
+            || message.contains("gateway timeout")
+    }
+
+    fn log_send_retry(&self, method: &str, attempt: u32, max_attempts: u32, error: &anyhow::Error) {
+        warn!(
+            log_stream = "channel",
+            log_key = %self.id,
+            kind = "telegram_send_retry",
+            method = method,
+            attempt = attempt,
+            max_attempts = max_attempts,
+            error = %format!("{error:#}"),
+            "telegram send failed; retrying"
+        );
+    }
+
+    fn should_defer_outbound_message(&self, error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("telegram api call send")
+            || message.contains("telegram multipart api call send")
+            || message.contains("too many requests")
+            || message.contains("retry after")
+            || message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("temporary failure in name resolution")
+            || message.contains("dns error")
+            || message.contains("internal server error")
+            || message.contains("bad gateway")
+            || message.contains("gateway timeout")
+            || message.contains("service unavailable")
+            || message.contains("connection reset")
+            || message.contains("connection refused")
+            || message.contains("broken pipe")
+    }
+
+    async fn flush_pending_outbound_queue(&self, trigger: &str) {
+        let mut pending_outbound = self.pending_outbound.lock().await;
+        if pending_outbound.is_empty() {
+            return;
+        }
+        info!(
+            log_stream = "channel",
+            log_key = %self.id,
+            kind = "telegram_send_queue_flush_started",
+            trigger = trigger,
+            pending_count = pending_outbound.len() as u64,
+            "flushing queued telegram messages"
+        );
+        while let Some(next) = pending_outbound.front().cloned() {
+            match self
+                .deliver_outgoing_message(&next.address, next.message.clone())
+                .await
+            {
+                Ok(()) => {
+                    pending_outbound.pop_front();
+                    info!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_send_queue_item_delivered",
+                        trigger = trigger,
+                        conversation_id = %next.address.conversation_id,
+                        pending_count = pending_outbound.len() as u64,
+                        "delivered queued telegram message"
+                    );
+                }
+                Err(error) if self.should_defer_outbound_message(&error) => {
+                    warn!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_send_queue_blocked",
+                        trigger = trigger,
+                        conversation_id = %next.address.conversation_id,
+                        pending_count = pending_outbound.len() as u64,
+                        error = %format!("{error:#}"),
+                        "telegram send queue is still blocked"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    pending_outbound.pop_front();
+                    warn!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_send_queue_item_dropped",
+                        trigger = trigger,
+                        conversation_id = %next.address.conversation_id,
+                        pending_count = pending_outbound.len() as u64,
+                        error = %format!("{error:#}"),
+                        "dropping queued telegram message after non-retryable failure"
+                    );
+                }
+            }
+        }
+        info!(
+            log_stream = "channel",
+            log_key = %self.id,
+            kind = "telegram_send_queue_flushed",
+            trigger = trigger,
+            "finished flushing queued telegram messages"
+        );
     }
 
     async fn set_my_commands(&self) -> Result<()> {
@@ -420,6 +575,68 @@ impl TelegramChannel {
         }
         Ok(())
     }
+
+    async fn deliver_outgoing_message(
+        &self,
+        address: &ChannelAddress,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        let OutgoingMessage {
+            text,
+            images,
+            attachments,
+        } = message;
+        let mut trailing_text_chunks = Vec::new();
+        if images.len() >= 2 {
+            let (caption, trailing) = text
+                .as_deref()
+                .map(|value| {
+                    let chunks = split_markdown_message(value, Self::MAX_CAPTION_CHARS);
+                    let mut iter = chunks.into_iter();
+                    let caption = iter.next();
+                    let trailing = iter.collect::<Vec<_>>();
+                    (caption, trailing)
+                })
+                .unwrap_or((None, Vec::new()));
+            trailing_text_chunks = trailing;
+            self.send_media_group_with_caption(address, images, caption)
+                .await?;
+        } else {
+            let mut images = images;
+            let has_images = !images.is_empty();
+            if let Some(text) = text.as_deref()
+                && has_images
+            {
+                let chunks = split_markdown_message(text, Self::MAX_CAPTION_CHARS);
+                let mut iter = chunks.into_iter();
+                let caption = iter.next();
+                trailing_text_chunks = iter.collect();
+                if let Some(image) = images.first_mut()
+                    && image.caption.is_none()
+                {
+                    image.caption = caption;
+                }
+            }
+            self.send_photo_group(&address.conversation_id, images, None)
+                .await?;
+            if let Some(text) = text.as_deref()
+                && !has_images
+            {
+                self.send_text_chunks(&address.conversation_id, text)
+                    .await?;
+            }
+        }
+        for chunk in trailing_text_chunks {
+            self.send_text_chunks(&address.conversation_id, &chunk)
+                .await?;
+        }
+        for attachment in attachments {
+            self.send_document(&address.conversation_id, attachment)
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -457,6 +674,7 @@ impl Channel for TelegramChannel {
             let updates: Vec<TelegramUpdate> = match self.call_api("getUpdates", payload).await {
                 Ok(updates) => {
                     consecutive_failures = 0;
+                    self.flush_pending_outbound_queue("get_updates").await;
                     updates
                 }
                 Err(error) => {
@@ -504,6 +722,10 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, address: &ChannelAddress, message: OutgoingMessage) -> Result<()> {
+        let pending = PendingOutbound {
+            address: address.clone(),
+            message: message.clone(),
+        };
         let OutgoingMessage {
             text,
             images,
@@ -515,59 +737,66 @@ impl Channel for TelegramChannel {
             kind = "telegram_send",
             conversation_id = %address.conversation_id,
             has_text = text.is_some(),
+            text_preview = text.as_deref().map(summarize_for_log),
             image_count = images.len() as u64,
             attachment_count = attachments.len() as u64,
+            attachment_names = ?attachments
+                .iter()
+                .filter_map(|item| item.path.file_name().map(|name| name.to_string_lossy().to_string()))
+                .collect::<Vec<_>>(),
             "sending message to telegram user"
         );
-        let mut trailing_text_chunks = Vec::new();
-        if images.len() >= 2 {
-            let (caption, trailing) = text
-                .as_deref()
-                .map(|value| {
-                    let chunks = split_markdown_message(value, Self::MAX_CAPTION_CHARS);
-                    let mut iter = chunks.into_iter();
-                    let caption = iter.next();
-                    let trailing = iter.collect::<Vec<_>>();
-                    (caption, trailing)
-                })
-                .unwrap_or((None, Vec::new()));
-            trailing_text_chunks = trailing;
-            self.send_media_group_with_caption(address, images, caption)
-                .await?;
-        } else {
-            let mut images = images;
-            let has_images = !images.is_empty();
-            if let Some(text) = text.as_deref()
-                && has_images
-            {
-                let chunks = split_markdown_message(text, Self::MAX_CAPTION_CHARS);
-                let mut iter = chunks.into_iter();
-                let caption = iter.next();
-                trailing_text_chunks = iter.collect();
-                if let Some(image) = images.first_mut()
-                    && image.caption.is_none()
-                {
-                    image.caption = caption;
-                }
+        let queue_was_blocked = {
+            let mut pending_outbound = self.pending_outbound.lock().await;
+            let queue_was_blocked = !pending_outbound.is_empty();
+            if queue_was_blocked {
+                pending_outbound.push_back(pending.clone());
+                info!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_send_enqueued",
+                    conversation_id = %address.conversation_id,
+                    pending_count = pending_outbound.len() as u64,
+                    "queued telegram message behind blocked send queue"
+                );
             }
-            self.send_media_group(address, images).await?;
-            if let Some(text) = text.as_deref()
-                && !has_images
-            {
-                self.send_text_chunks(&address.conversation_id, text)
-                    .await?;
+            queue_was_blocked
+        };
+        if queue_was_blocked {
+            self.flush_pending_outbound_queue("send").await;
+            return Ok(());
+        }
+        match self
+            .deliver_outgoing_message(
+                address,
+                OutgoingMessage {
+                    text,
+                    images,
+                    attachments,
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if self.should_defer_outbound_message(&error) => {
+                let pending_count = {
+                    let mut pending_outbound = self.pending_outbound.lock().await;
+                    pending_outbound.push_back(pending);
+                    pending_outbound.len() as u64
+                };
+                warn!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_send_deferred",
+                    conversation_id = %address.conversation_id,
+                    pending_count = pending_count,
+                    error = %format!("{error:#}"),
+                    "telegram send failed after retries; message queued for FIFO retry"
+                );
+                Ok(())
             }
+            Err(error) => Err(error),
         }
-        for chunk in trailing_text_chunks {
-            self.send_text_chunks(&address.conversation_id, &chunk)
-                .await?;
-        }
-        for attachment in attachments {
-            self.send_document(&address.conversation_id, attachment)
-                .await?;
-        }
-
-        Ok(())
     }
 
     async fn send_media_group(
@@ -606,6 +835,18 @@ impl Channel for TelegramChannel {
         } else {
             None
         }
+    }
+}
+
+fn summarize_for_log(text: &str) -> String {
+    const LIMIT: usize = 160;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let summary: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{}...", summary)
+    } else {
+        summary
     }
 }
 
@@ -911,7 +1152,10 @@ mod tests {
         TelegramChannel, poll_backoff_seconds, split_markdown_message,
         translate_markdown_to_telegram_html,
     };
+    use anyhow::anyhow;
     use reqwest::Client;
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex;
 
     #[test]
     fn translates_basic_markdown_to_telegram_html() {
@@ -1005,12 +1249,47 @@ mod tests {
             poll_interval_ms: 250,
             commands: Vec::new(),
             client: Client::new(),
+            pending_outbound: Mutex::new(VecDeque::new()),
         };
 
         let redacted = channel
             .redact_sensitive_text("https://api.telegram.org/botsecret-token/getUpdates failed");
         assert!(!redacted.contains("secret-token"));
         assert!(redacted.contains("[REDACTED_TELEGRAM_BOT_TOKEN]"));
+    }
+
+    #[test]
+    fn defers_retryable_send_failures() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+
+        let error = anyhow!("telegram API sendMessage failed: Too Many Requests");
+        assert!(channel.should_defer_outbound_message(&error));
+    }
+
+    #[test]
+    fn does_not_defer_permanent_send_failures() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+
+        let error = anyhow!("telegram API sendMessage failed: Bad Request: chat not found");
+        assert!(!channel.should_defer_outbound_message(&error));
     }
 }
 
