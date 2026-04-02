@@ -79,7 +79,8 @@ pub struct ModelConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MainAgentConfig {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub timeout_seconds: Option<f64>,
     #[serde(default = "default_main_agent_language")]
@@ -322,10 +323,12 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
             "main_agent.idle_context_compaction_poll_interval_seconds must be at least 1"
         ));
     }
-    if !config.models.contains_key(&config.main_agent.model) {
+    if let Some(model) = config.main_agent.model.as_deref()
+        && !config.models.contains_key(model)
+    {
         return Err(anyhow!(
             "main_agent.model '{}' does not exist in models",
-            config.main_agent.model
+            model
         ));
     }
     if config

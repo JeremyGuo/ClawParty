@@ -237,6 +237,22 @@ impl CronManager {
         Ok(view)
     }
 
+    pub fn disable_for_address(&mut self, address: &ChannelAddress) -> Result<usize> {
+        let mut disabled = 0usize;
+        for task in self.tasks.values_mut() {
+            if task.address.session_key() == address.session_key() && task.enabled {
+                task.enabled = false;
+                task.updated_at = Utc::now();
+                task.last_trigger_outcome = Some("conversation closed; auto-disabled".to_string());
+                disabled += 1;
+            }
+        }
+        if disabled > 0 {
+            self.persist()?;
+        }
+        Ok(disabled)
+    }
+
     pub fn remove(&mut self, id: Uuid) -> Result<CronTaskView> {
         let task = self
             .tasks

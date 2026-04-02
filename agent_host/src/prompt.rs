@@ -256,7 +256,7 @@ mod tests {
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());
         let main_agent = MainAgentConfig {
-            model: "main".to_string(),
+            model: Some("main".to_string()),
             language: "zh-CN".to_string(),
             timeout_seconds: Some(60.0),
             enabled_tools: vec!["read_file".to_string()],

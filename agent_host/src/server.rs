@@ -68,6 +68,7 @@ struct ServerRuntime {
     agent_workspace: AgentWorkspace,
     workspace_manager: WorkspaceManager,
     active_workspace_ids: Vec<String>,
+    selected_main_model_key: Option<String>,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -147,6 +148,11 @@ impl SummaryTracker {
 }
 
 impl ServerRuntime {
+    fn effective_main_model_key(&self) -> Result<String> {
+        self.selected_main_model_key.clone().ok_or_else(|| {
+            anyhow!("this conversation does not have a main model yet; choose one with /model")
+        })
+    }
     fn model_config(&self, model_key: &str) -> Result<&ModelConfig> {
         self.models
             .get(model_key)
@@ -870,10 +876,9 @@ impl ServerRuntime {
                         "description": {"type": "string"},
                         "schedule": {"type": "string"},
                         "task": {"type": "string"},
-                        "model": {"type": "string"},
-                        "enabled": {"type": "boolean"},
-                        "sink": {"type": "object"},
-                        "checker_command": {"type": "string"},
+                                "enabled": {"type": "boolean"},
+                                "sink": {"type": "object"},
+                                "checker_command": {"type": "string"},
                         "checker_timeout_seconds": {"type": "number"},
                         "checker_cwd": {"type": "string"}
                     },
@@ -899,11 +904,7 @@ impl ServerRuntime {
                             name: string_arg_required(object, "name")?,
                             description: string_arg_required(object, "description")?,
                             schedule: string_arg_required(object, "schedule")?,
-                            model_key: object
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| runtime.main_agent.model.clone()),
+                            model_key: runtime.effective_main_model_key()?,
                             prompt: string_arg_required(object, "task")?,
                             sink,
                             address: create_session.address.clone(),
@@ -1450,7 +1451,10 @@ impl ServerRuntime {
     ) -> Result<Value> {
         let _slot = self.try_acquire_subagent_slot()?;
         let subagent_id = uuid::Uuid::new_v4();
-        let model_key = model_key.unwrap_or_else(|| self.main_agent.model.clone());
+        let model_key = match model_key {
+            Some(model_key) => model_key,
+            None => self.effective_main_model_key()?,
+        };
         self.model_config(&model_key)?;
         self.register_managed_agent(
             subagent_id,
@@ -1592,7 +1596,10 @@ impl ServerRuntime {
         sink: SinkTarget,
     ) -> Result<Value> {
         let background_agent_id = uuid::Uuid::new_v4();
-        let model_key = model_key.unwrap_or_else(|| self.main_agent.model.clone());
+        let model_key = match model_key {
+            Some(model_key) => model_key,
+            None => self.effective_main_model_key()?,
+        };
         self.model_config(&model_key)?;
         self.register_managed_agent(
             background_agent_id,
@@ -2112,8 +2119,7 @@ impl Server {
             user_profile_path = %agent_workspace.user_md_path.display(),
             agents_md_path = %agent_workspace.agents_md_path.display(),
             skills_dir = %agent_workspace.skills_dir.display(),
-            main_model = %config.main_agent.model,
-            main_backend = ?config.models[&config.main_agent.model].backend,
+            configured_main_model = ?config.main_agent.model,
             sandbox_mode = ?config.sandbox.mode,
             "server initialized"
         );
@@ -2329,6 +2335,7 @@ impl Server {
                 .into_iter()
                 .map(|session| session.workspace_id)
                 .collect(),
+            selected_main_model_key: None,
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
@@ -2354,7 +2361,9 @@ impl Server {
 
     fn tool_runtime_for_address(&self, address: &ChannelAddress) -> Result<ServerRuntime> {
         let sandbox_mode = self.effective_sandbox_mode(address)?;
-        Ok(self.tool_runtime_for_sandbox_mode(sandbox_mode))
+        let mut runtime = self.tool_runtime_for_sandbox_mode(sandbox_mode);
+        runtime.selected_main_model_key = self.selected_main_model_key(address)?;
+        Ok(runtime)
     }
 
     pub fn workdir(&self) -> &Path {
@@ -2409,6 +2418,17 @@ impl Server {
                         "channel reported that the conversation should be closed"
                     );
                     self.sessions.destroy_foreground(&incoming.address)?;
+                    let disabled = self.disable_cron_tasks_for_conversation(&incoming.address)?;
+                    if disabled > 0 {
+                        warn!(
+                            log_stream = "cron",
+                            kind = "cron_tasks_auto_disabled_for_closed_conversation",
+                            channel_id = %incoming.address.channel_id,
+                            conversation_id = %incoming.address.conversation_id,
+                            disabled_count = disabled as u64,
+                            "disabled cron tasks because the conversation was closed"
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -2442,14 +2462,6 @@ impl Server {
                 self.sessions.destroy_foreground(&incoming.address)?;
             }
             let session = self.sessions.reset_foreground(&incoming.address)?;
-            let welcome = match self.initialize_foreground_session(&session, true).await {
-                Ok(welcome) => welcome,
-                Err(error) => {
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
-                }
-            };
             info!(
                 log_stream = "session",
                 log_key = %session.id,
@@ -2458,8 +2470,28 @@ impl Server {
                 conversation_id = %incoming.address.conversation_id,
                 "foreground session reset"
             );
-            self.send_channel_message(&channel, &incoming.address, welcome)
+            if self.selected_main_model_key(&incoming.address)?.is_some() {
+                let welcome = match self.initialize_foreground_session(&session, true).await {
+                    Ok(welcome) => welcome,
+                    Err(error) => {
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                self.send_channel_message(&channel, &incoming.address, welcome)
+                    .await?;
+            } else {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    self.model_selection_message(
+                        &incoming.address,
+                        "This conversation has no model yet. Choose one to start a new session.",
+                    )?,
+                )
                 .await?;
+            }
             return Ok(());
         }
 
@@ -2495,16 +2527,28 @@ impl Server {
                     return Err(error);
                 }
             };
-            let welcome = match self.initialize_foreground_session(&session, true).await {
-                Ok(welcome) => welcome,
-                Err(error) => {
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
-                }
-            };
-            self.send_channel_message(&channel, &incoming.address, welcome)
+            if self.selected_main_model_key(&incoming.address)?.is_some() {
+                let welcome = match self.initialize_foreground_session(&session, true).await {
+                    Ok(welcome) => welcome,
+                    Err(error) => {
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                self.send_channel_message(&channel, &incoming.address, welcome)
+                    .await?;
+            } else {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    self.model_selection_message(
+                        &incoming.address,
+                        "Choose a model for this conversation before activating a workspace.",
+                    )?,
+                )
                 .await?;
+            }
             return Ok(());
         }
 
@@ -2537,8 +2581,19 @@ impl Server {
             .map(str::trim)
             .is_some_and(|text| command_matches(text, "/status"))
         {
+            let Some(effective_model_key) = self.selected_main_model_key(&incoming.address)? else {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    self.model_selection_message(
+                        &incoming.address,
+                        "Choose a model for this conversation before using `/status`.",
+                    )?,
+                )
+                .await?;
+                return Ok(());
+            };
             let session = self.sessions.ensure_foreground(&incoming.address)?;
-            let effective_model_key = self.effective_main_model_key(&incoming.address)?;
             let status_text = self.status_text_for_session(&session, &effective_model_key)?;
             self.send_channel_message(
                 &channel,
@@ -2551,31 +2606,30 @@ impl Server {
 
         if let Some(argument) = parse_model_command(incoming.text.as_deref()) {
             if let Some(model_key) = argument {
-                let selected_model = if model_key == "default" {
-                    None
+                if !self.models.contains_key(&model_key) {
+                    let error = anyhow!("unknown model {}", model_key);
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+                let compacted = if let Some(previous_model_key) =
+                    self.selected_main_model_key(&incoming.address)?
+                {
+                    let session = self.sessions.ensure_foreground(&incoming.address)?;
+                    self.compact_session_now(&session, &previous_model_key)
+                        .await
+                        .unwrap_or(false)
                 } else {
-                    if !self.models.contains_key(&model_key) {
-                        let error = anyhow!("unknown model {}", model_key);
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                    Some(model_key.clone())
+                    false
                 };
-                let previous_model_key = self.effective_main_model_key(&incoming.address)?;
-                let session = self.sessions.ensure_foreground(&incoming.address)?;
-                let compacted = self
-                    .compact_session_now(&session, &previous_model_key)
-                    .await
-                    .unwrap_or(false);
                 let conversation = self
                     .conversations
-                    .set_main_model(&incoming.address, selected_model.clone())?;
+                    .set_main_model(&incoming.address, Some(model_key.clone()))?;
                 let effective_model_key = conversation
                     .settings
                     .main_model
                     .clone()
-                    .unwrap_or_else(|| self.main_agent.model.clone());
+                    .expect("model just set");
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
@@ -2592,31 +2646,13 @@ impl Server {
                 .await?;
                 return Ok(());
             }
-            let current_model_key = self.effective_main_model_key(&incoming.address)?;
-            let options = self
-                .models
-                .keys()
-                .cloned()
-                .map(|model_key| ShowOption {
-                    label: model_key.clone(),
-                    value: format!("/model {}", model_key),
-                })
-                .chain(std::iter::once(ShowOption {
-                    label: "default".to_string(),
-                    value: "/model default".to_string(),
-                }))
-                .collect::<Vec<_>>();
             self.send_channel_message(
                 &channel,
                 &incoming.address,
-                OutgoingMessage::with_options(
-                    format!(
-                        "Current conversation model: `{}`\nChoose a model below or send `/model <name>`.",
-                        current_model_key
-                    ),
-                    "Choose a model",
-                    options,
-                ),
+                self.model_selection_message(
+                    &incoming.address,
+                    "Choose a model for this conversation.",
+                )?,
             )
             .await?;
             return Ok(());
@@ -2856,6 +2892,19 @@ impl Server {
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(status_text),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if self.selected_main_model_key(&incoming.address)?.is_none() {
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                self.model_selection_message(
+                    &incoming.address,
+                    "Choose a model for this conversation before sending messages.",
+                )?,
             )
             .await?;
             return Ok(());
@@ -3397,16 +3446,48 @@ impl Server {
             .unwrap_or_default())
     }
 
+    fn selected_main_model_key(&self, address: &ChannelAddress) -> Result<Option<String>> {
+        Ok(self.effective_conversation_settings(address)?.main_model)
+    }
+
     fn effective_main_model_key(&self, address: &ChannelAddress) -> Result<String> {
-        let settings = self.effective_conversation_settings(address)?;
-        Ok(settings
-            .main_model
-            .unwrap_or_else(|| self.main_agent.model.clone()))
+        self.selected_main_model_key(address)?.ok_or_else(|| {
+            anyhow!("this conversation does not have a main model yet; choose one with /model")
+        })
     }
 
     fn effective_sandbox_mode(&self, address: &ChannelAddress) -> Result<SandboxMode> {
         let settings = self.effective_conversation_settings(address)?;
         Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
+    }
+
+    fn model_selection_message(
+        &self,
+        address: &ChannelAddress,
+        intro: &str,
+    ) -> Result<OutgoingMessage> {
+        let current = self.selected_main_model_key(address)?;
+        let mut options = self
+            .models
+            .keys()
+            .cloned()
+            .map(|model_key| ShowOption {
+                label: model_key.clone(),
+                value: format!("/model {}", model_key),
+            })
+            .collect::<Vec<_>>();
+        options.sort_by(|left, right| left.label.cmp(&right.label));
+        Ok(OutgoingMessage::with_options(
+            format!(
+                "{}\nCurrent conversation model: {}\nChoose a model below or send `/model <name>`.",
+                intro,
+                current
+                    .map(|value| format!("`{}`", value))
+                    .unwrap_or_else(|| "`<not selected>`".to_string())
+            ),
+            "Choose a model",
+            options,
+        ))
     }
 
     fn model_config_or_main(&self, model_key: &str) -> Result<&ModelConfig> {
@@ -3532,10 +3613,29 @@ impl Server {
                         "channel send indicates the conversation no longer exists; closing foreground session"
                     );
                     self.sessions.destroy_foreground(address)?;
+                    let disabled = self.disable_cron_tasks_for_conversation(address)?;
+                    if disabled > 0 {
+                        warn!(
+                            log_stream = "cron",
+                            kind = "cron_tasks_auto_disabled_after_send_error",
+                            channel_id = %address.channel_id,
+                            conversation_id = %address.conversation_id,
+                            disabled_count = disabled as u64,
+                            "disabled cron tasks because the conversation no longer exists"
+                        );
+                    }
                 }
                 Err(error)
             }
         }
+    }
+
+    fn disable_cron_tasks_for_conversation(&self, address: &ChannelAddress) -> Result<usize> {
+        let mut manager = self
+            .cron_manager
+            .lock()
+            .map_err(|_| anyhow!("cron manager lock poisoned"))?;
+        manager.disable_for_address(address)
     }
 
     async fn send_user_error_message(
