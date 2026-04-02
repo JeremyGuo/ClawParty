@@ -60,7 +60,13 @@ impl Tool {
         parameters: Value,
         handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
     ) -> Self {
-        Self::new_with_mode(ToolExecutionMode::Timed, name, description, parameters, handler)
+        Self::new_with_mode(
+            ToolExecutionMode::Timed,
+            name,
+            description,
+            parameters,
+            handler,
+        )
     }
 
     pub fn new_with_mode(

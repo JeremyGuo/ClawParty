@@ -286,12 +286,8 @@ mod tests {
         assert!(prompt.contains(
             "use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount"
         ));
-        assert!(prompt.contains(
-            "choose the model whose description best matches the task"
-        ));
-        assert!(prompt.contains(
-            "For subagents, timeout_seconds can usually be set to 0"
-        ));
+        assert!(prompt.contains("choose the model whose description best matches the task"));
+        assert!(prompt.contains("For subagents, timeout_seconds can usually be set to 0"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));

@@ -856,7 +856,9 @@ fn merge_directory_contents_if_missing(source: &Path, target: &Path) -> Result<(
         return Ok(());
     }
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
-    for entry in fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))? {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
