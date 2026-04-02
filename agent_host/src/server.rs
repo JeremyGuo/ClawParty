@@ -2692,7 +2692,7 @@ impl Server {
             return Ok(());
         }
 
-        if let Some(checkpoint_name) = parse_save_command(incoming.text.as_deref()) {
+        if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
             let checkpoint = self.sessions.export_checkpoint(&incoming.address)?;
             let bundle = ConversationCheckpointBundle {
@@ -2718,7 +2718,50 @@ impl Server {
             return Ok(());
         }
 
-        if let Some(checkpoint_name) = parse_load_command(incoming.text.as_deref()) {
+        if parse_snap_list_command(incoming.text.as_deref()) {
+            let conversation = self.conversations.ensure_conversation(&incoming.address)?;
+            if conversation.checkpoints.is_empty() {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(
+                        "This conversation has no saved checkpoints yet. Use `/snap_save <name>` first."
+                            .to_string(),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let lines = conversation
+                .checkpoints
+                .iter()
+                .map(|record| format!("- `{}` ({})", record.name, record.saved_at))
+                .collect::<Vec<_>>();
+            let options = conversation
+                .checkpoints
+                .iter()
+                .map(|record| ShowOption {
+                    label: record.name.clone(),
+                    value: format!("/snap_load {}", record.name),
+                })
+                .collect::<Vec<_>>();
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::with_options(
+                    format!(
+                        "Saved checkpoints for this conversation:\n{}\n\nChoose one below or send `/snap_load <name>`.",
+                        lines.join("\n")
+                    ),
+                    "Choose a checkpoint to load",
+                    options,
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(checkpoint_name) = parse_snap_load_command(incoming.text.as_deref()) {
             let loaded = match self
                 .conversations
                 .load_checkpoint(&incoming.address, &checkpoint_name)
@@ -4596,12 +4639,16 @@ fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
     parse_optional_command_argument(text, "/sandbox")
 }
 
-fn parse_save_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/save")
+fn parse_snap_save_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/snap_save")
 }
 
-fn parse_load_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/load")
+fn parse_snap_load_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/snap_load")
+}
+
+fn parse_snap_list_command(text: Option<&str>) -> bool {
+    matches!(parse_optional_command_argument(text, "/snap_list"), Some(_))
 }
 
 fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {
@@ -5042,10 +5089,10 @@ mod tests {
         SinkTarget, TokenUsage, background_agent_timeout_seconds,
         background_recovery_timeout_seconds, background_timeout_with_active_children_text,
         build_user_turn_message, channel_restart_backoff_seconds, estimate_compaction_savings_usd,
-        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_load_command,
-        parse_model_command, parse_oldspace_command, parse_sandbox_command, parse_save_command,
-        parse_set_api_timeout_command, parse_sink_target, should_attempt_idle_context_compaction,
-        workspace_visible_in_list,
+        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_model_command,
+        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, should_attempt_idle_context_compaction, workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
@@ -5316,23 +5363,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_save_and_load_commands_with_bot_suffix() {
+    fn parses_snap_commands_with_bot_suffix() {
         assert_eq!(
-            parse_save_command(Some("/save demo-checkpoint")),
+            parse_snap_save_command(Some("/snap_save demo-checkpoint")),
             Some("demo-checkpoint".to_string())
         );
         assert_eq!(
-            parse_save_command(Some("/save@party_claw_bot demo-checkpoint")),
+            parse_snap_save_command(Some("/snap_save@party_claw_bot demo-checkpoint")),
             Some("demo-checkpoint".to_string())
         );
         assert_eq!(
-            parse_load_command(Some("/load restore-point")),
+            parse_snap_load_command(Some("/snap_load restore-point")),
             Some("restore-point".to_string())
         );
         assert_eq!(
-            parse_load_command(Some("/load@party_claw_bot restore-point")),
+            parse_snap_load_command(Some("/snap_load@party_claw_bot restore-point")),
             Some("restore-point".to_string())
         );
+        assert!(parse_snap_list_command(Some("/snap_list")));
+        assert!(parse_snap_list_command(Some("/snap_list@party_claw_bot")));
     }
 
     #[test]

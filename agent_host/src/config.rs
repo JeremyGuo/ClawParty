@@ -254,12 +254,16 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Set session API timeout in seconds".to_string(),
         },
         BotCommandConfig {
-            command: "save".to_string(),
+            command: "snap_save".to_string(),
             description: "Save a named checkpoint for this conversation".to_string(),
         },
         BotCommandConfig {
-            command: "load".to_string(),
+            command: "snap_load".to_string(),
             description: "Load a named checkpoint into this conversation".to_string(),
+        },
+        BotCommandConfig {
+            command: "snap_list".to_string(),
+            description: "List saved checkpoints for this conversation".to_string(),
         },
     ]
 }
