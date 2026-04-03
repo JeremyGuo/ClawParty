@@ -251,6 +251,10 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Show or set the conversation sandbox mode".to_string(),
         },
         BotCommandConfig {
+            command: "think".to_string(),
+            description: "Show or set the conversation reasoning effort".to_string(),
+        },
+        BotCommandConfig {
             command: "set_api_timeout".to_string(),
             description: "Set session API timeout in seconds".to_string(),
         },

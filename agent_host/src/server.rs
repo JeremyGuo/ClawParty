@@ -29,9 +29,10 @@ use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::skills::discover_skills;
+use agent_frame::tooling::build_tool_registry;
 use agent_frame::{
     ChatMessage, SessionCompactionStats, SessionEvent, SessionExecutionControl, SessionRunReport,
-    TokenUsage, Tool, extract_assistant_text,
+    TokenUsage, Tool, estimate_session_tokens, extract_assistant_text,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -69,6 +70,7 @@ struct ServerRuntime {
     workspace_manager: WorkspaceManager,
     active_workspace_ids: Vec<String>,
     selected_main_model_key: Option<String>,
+    selected_reasoning_effort: Option<String>,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -486,6 +488,8 @@ impl ServerRuntime {
             .ensure_workspace_exists(&session.workspace_id)
             .map(|workspace| workspace.summary)
             .unwrap_or_default();
+        let reasoning =
+            effective_reasoning_config(model, self.selected_reasoning_effort.as_deref());
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
@@ -504,7 +508,7 @@ impl ServerRuntime {
                     cache_type: "ephemeral".to_string(),
                     ttl: Some(ttl.clone()),
                 }),
-                reasoning: model.reasoning.clone(),
+                reasoning,
                 headers: model.headers.clone(),
                 native_web_search: model.native_web_search.clone(),
                 external_web_search: model.external_web_search.clone(),
@@ -2336,6 +2340,7 @@ impl Server {
                 .map(|session| session.workspace_id)
                 .collect(),
             selected_main_model_key: None,
+            selected_reasoning_effort: None,
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
@@ -2363,6 +2368,9 @@ impl Server {
         let sandbox_mode = self.effective_sandbox_mode(address)?;
         let mut runtime = self.tool_runtime_for_sandbox_mode(sandbox_mode);
         runtime.selected_main_model_key = self.selected_main_model_key(address)?;
+        runtime.selected_reasoning_effort = self
+            .effective_conversation_settings(address)?
+            .reasoning_effort;
         Ok(runtime)
     }
 
@@ -2729,6 +2737,64 @@ impl Server {
             return Ok(());
         }
 
+        if let Some(argument) = parse_think_command(incoming.text.as_deref()) {
+            if let Some(effort_name) = argument {
+                let selected_effort = if effort_name == "default" {
+                    None
+                } else {
+                    let parsed = parse_reasoning_effort_value(&effort_name)
+                        .ok_or_else(|| anyhow!("unknown reasoning effort {}", effort_name));
+                    let parsed = match parsed {
+                        Ok(effort) => effort,
+                        Err(error) => {
+                            self.send_user_error_message(&channel, &incoming.address, &error)
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                    Some(parsed.to_string())
+                };
+                let conversation = self
+                    .conversations
+                    .set_reasoning_effort(&incoming.address, selected_effort)?;
+                let effective_effort = conversation
+                    .settings
+                    .reasoning_effort
+                    .clone()
+                    .or_else(|| {
+                        self.selected_main_model_key(&incoming.address)
+                            .ok()
+                            .flatten()
+                            .and_then(|model_key| {
+                                self.models.get(&model_key).and_then(|model| {
+                                    model
+                                        .reasoning
+                                        .as_ref()
+                                        .and_then(|reasoning| reasoning.effort.clone())
+                                })
+                            })
+                    })
+                    .unwrap_or_else(|| "default".to_string());
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(format!(
+                        "Conversation reasoning effort updated to `{}`.",
+                        effective_effort
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                self.reasoning_effort_message(&incoming.address)?,
+            )
+            .await?;
+            return Ok(());
+        }
+
         if matches!(
             parse_optional_command_argument(incoming.text.as_deref(), "/snapsave"),
             Some(None)
@@ -3073,6 +3139,18 @@ impl Server {
         } else {
             "model default"
         };
+        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let current_context_estimate =
+            estimate_current_context_tokens_for_session(&runtime, session, model_key)?;
+        let current_reasoning_effort = self
+            .effective_conversation_settings(&session.address)?
+            .reasoning_effort
+            .or_else(|| {
+                model
+                    .reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort.clone())
+            });
         Ok(format_session_status(
             &self.main_agent.language,
             model_key,
@@ -3080,6 +3158,8 @@ impl Server {
             session,
             effective_api_timeout,
             timeout_source,
+            current_context_estimate,
+            current_reasoning_effort.as_deref(),
         ))
     }
 
@@ -3486,6 +3566,44 @@ impl Server {
                     .unwrap_or_else(|| "`<not selected>`".to_string())
             ),
             "Choose a model",
+            options,
+        ))
+    }
+
+    fn reasoning_effort_message(&self, address: &ChannelAddress) -> Result<OutgoingMessage> {
+        let settings = self.effective_conversation_settings(address)?;
+        let effective_effort = settings.reasoning_effort.clone().or_else(|| {
+            self.selected_main_model_key(address)
+                .ok()
+                .flatten()
+                .and_then(|model_key| {
+                    self.models.get(&model_key).and_then(|model| {
+                        model
+                            .reasoning
+                            .as_ref()
+                            .and_then(|reasoning| reasoning.effort.clone())
+                    })
+                })
+        });
+        let options = ["low", "medium", "high"]
+            .into_iter()
+            .map(|effort| ShowOption {
+                label: effort.to_string(),
+                value: format!("/think {}", effort),
+            })
+            .chain(std::iter::once(ShowOption {
+                label: "default".to_string(),
+                value: "/think default".to_string(),
+            }))
+            .collect::<Vec<_>>();
+        Ok(OutgoingMessage::with_options(
+            format!(
+                "Current conversation reasoning effort: {}\nChoose an option below or send `/think <level>`.",
+                effective_effort
+                    .map(|value| format!("`{}`", value))
+                    .unwrap_or_else(|| "`default`".to_string())
+            ),
+            "Choose a reasoning effort",
             options,
         ))
     }
@@ -4471,6 +4589,8 @@ fn format_session_status(
     session: &SessionSnapshot,
     effective_api_timeout_seconds: f64,
     timeout_source: &str,
+    current_context_estimate: usize,
+    current_reasoning_effort: Option<&str>,
 ) -> String {
     let usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
@@ -4491,7 +4611,15 @@ fn format_session_status(
                 "API timeout: {:.1}s ({})",
                 effective_api_timeout_seconds, timeout_source
             ),
+            format!(
+                "Reasoning effort: {}",
+                current_reasoning_effort.unwrap_or("default")
+            ),
             format!("Turns: {}", session.turn_count),
+            format!(
+                "Current context estimate: {} tokens (local estimate)",
+                current_context_estimate
+            ),
             String::new(),
             "Token 用量：".to_string(),
             format!("- llm_calls: {}", usage.llm_calls),
@@ -4514,7 +4642,7 @@ fn format_session_status(
             lines.push("价格估算：当前模型没有内置价格表，无法直接估算。".to_string());
         }
         lines.push(String::new());
-        lines.push("自动上下文压缩节省估算：".to_string());
+        lines.push("累计上下文压缩统计：".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
         lines.push(format!(
             "- compacted_runs: {}",
@@ -4560,7 +4688,15 @@ fn format_session_status(
                 "API timeout: {:.1}s ({})",
                 effective_api_timeout_seconds, timeout_source
             ),
+            format!(
+                "Reasoning effort: {}",
+                current_reasoning_effort.unwrap_or("default")
+            ),
             format!("Turns: {}", session.turn_count),
+            format!(
+                "Current context estimate: {} tokens (local estimate)",
+                current_context_estimate
+            ),
             String::new(),
             "Token usage:".to_string(),
             format!("- llm_calls: {}", usage.llm_calls),
@@ -4585,7 +4721,7 @@ fn format_session_status(
             );
         }
         lines.push(String::new());
-        lines.push("Automatic context compaction savings estimate:".to_string());
+        lines.push("Cumulative context compaction stats:".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
         lines.push(format!(
             "- compacted_runs: {}",
@@ -4761,6 +4897,10 @@ fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
     parse_optional_command_argument(text, "/sandbox")
 }
 
+fn parse_think_command(text: Option<&str>) -> Option<Option<String>> {
+    parse_optional_command_argument(text, "/think")
+}
+
 fn parse_snap_save_command(text: Option<&str>) -> Option<String> {
     parse_required_command_argument(text, "/snapsave")
 }
@@ -4845,6 +4985,63 @@ fn parse_sandbox_mode_value(value: &str) -> Option<SandboxMode> {
         "bubblewrap" => Some(SandboxMode::Bubblewrap),
         _ => None,
     }
+}
+
+fn parse_reasoning_effort_value(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
+fn effective_reasoning_config(
+    model: &ModelConfig,
+    conversation_effort: Option<&str>,
+) -> Option<agent_frame::config::ReasoningConfig> {
+    let mut reasoning = model.reasoning.clone().unwrap_or_default();
+    if let Some(effort) = conversation_effort {
+        reasoning.effort = Some(effort.to_string());
+    }
+    if reasoning.effort.is_none()
+        && reasoning.max_tokens.is_none()
+        && reasoning.exclude.is_none()
+        && reasoning.enabled.is_none()
+    {
+        None
+    } else {
+        Some(reasoning)
+    }
+}
+
+fn estimate_current_context_tokens_for_session(
+    runtime: &ServerRuntime,
+    session: &SessionSnapshot,
+    model_key: &str,
+) -> Result<usize> {
+    let frame_config = runtime.build_agent_frame_config(
+        session,
+        &session.workspace_root,
+        AgentPromptKind::MainForeground,
+        model_key,
+        None,
+    )?;
+    let skills = discover_skills(&frame_config.skills_dirs)?;
+    let extra_tools =
+        runtime.build_extra_tools(session, AgentPromptKind::MainForeground, session.agent_id);
+    let registry = build_tool_registry(
+        &frame_config.enabled_tools,
+        &frame_config.workspace_root,
+        &frame_config.runtime_state_root,
+        &frame_config.upstream,
+        frame_config.image_tool_upstream.as_ref(),
+        &frame_config.skills_dirs,
+        &skills,
+        &extra_tools,
+    )?;
+    let tools = registry.into_values().collect::<Vec<_>>();
+    Ok(estimate_session_tokens(&session.agent_messages, &tools, ""))
 }
 
 fn replace_directory_contents(target: &Path, source: &Path) -> Result<()> {
@@ -5214,7 +5411,8 @@ mod tests {
         estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_model_command,
         parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
         parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, should_attempt_idle_context_compaction, workspace_visible_in_list,
+        parse_snap_save_command, parse_think_command, should_attempt_idle_context_compaction,
+        workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
@@ -5462,7 +5660,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_model_and_sandbox_commands_with_optional_arguments() {
+    fn parses_model_sandbox_and_think_commands_with_optional_arguments() {
         assert_eq!(parse_model_command(Some("/model")), Some(None));
         assert_eq!(
             parse_model_command(Some("/model demo-model")),
@@ -5481,6 +5679,16 @@ mod tests {
         assert_eq!(
             parse_sandbox_command(Some("/sandbox@party_claw_bot bubblewrap")),
             Some(Some("bubblewrap".to_string()))
+        );
+
+        assert_eq!(parse_think_command(Some("/think")), Some(None));
+        assert_eq!(
+            parse_think_command(Some("/think high")),
+            Some(Some("high".to_string()))
+        );
+        assert_eq!(
+            parse_think_command(Some("/think@party_claw_bot medium")),
+            Some(Some("medium".to_string()))
         );
     }
 

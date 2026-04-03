@@ -13,6 +13,8 @@ pub struct ConversationSettings {
     pub main_model: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<SandboxMode>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +155,24 @@ impl ConversationManager {
         state.persist()?;
         Ok(state.snapshot())
     }
+
+    pub fn set_reasoning_effort(
+        &mut self,
+        address: &ChannelAddress,
+        reasoning_effort: Option<String>,
+    ) -> Result<ConversationSnapshot> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        let state = self
+            .conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.reasoning_effort = reasoning_effort;
+        state.persist()?;
+        Ok(state.snapshot())
+    }
 }
 
 fn load_persisted_conversations(root: &Path) -> Result<HashMap<String, ConversationState>> {
@@ -213,6 +233,9 @@ mod tests {
         manager
             .set_sandbox_mode(&address, Some(SandboxMode::Subprocess))
             .unwrap();
+        manager
+            .set_reasoning_effort(&address, Some("high".to_string()))
+            .unwrap();
 
         let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
         let snapshot = reloaded.get_snapshot(&address).unwrap();
@@ -221,5 +244,6 @@ mod tests {
             snapshot.settings.sandbox_mode,
             Some(SandboxMode::Subprocess)
         );
+        assert_eq!(snapshot.settings.reasoning_effort.as_deref(), Some("high"));
     }
 }
