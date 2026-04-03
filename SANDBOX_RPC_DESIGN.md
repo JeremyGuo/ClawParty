@@ -306,7 +306,12 @@ These remain in `agent_host`:
 - `workspace_content_list`
 - `workspace_mount`
 - `workspace_content_move`
-- `run_subagent`
+- `subagent_create`
+- `subagent_progress`
+- `subagent_charge`
+- `subagent_tell`
+- `subagent_destroy`
+- `subagent_wait`
 - `start_background_agent`
 - cron tools
 - agent stats tools

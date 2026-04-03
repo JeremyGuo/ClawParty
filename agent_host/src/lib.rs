@@ -17,6 +17,7 @@ pub mod server;
 pub mod session;
 pub mod sink;
 pub mod snapshot;
+pub mod subagent;
 pub mod workspace;
 
 pub use server::Server;

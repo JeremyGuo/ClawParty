@@ -365,7 +365,7 @@ These can run entirely inside the sandbox:
 
 These must stay in `agent_host`:
 
-- `run_subagent`
+- `subagent_create` / `subagent_progress` / `subagent_charge` / `subagent_tell` / `subagent_destroy` / `subagent_wait`
 - `start_background_agent`
 - cron management
 - session status tools

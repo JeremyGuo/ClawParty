@@ -1406,7 +1406,8 @@ fn list_active_file_download_summaries(runtime_state_root: &Path) -> Result<Vec<
 pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<Option<String>> {
     let active_execs = list_active_exec_summaries(runtime_state_root)?;
     let active_downloads = list_active_file_download_summaries(runtime_state_root)?;
-    if active_execs.is_empty() && active_downloads.is_empty() {
+    let active_subagents = list_active_subagent_summaries(runtime_state_root)?;
+    if active_execs.is_empty() && active_downloads.is_empty() && active_subagents.is_empty() {
         return Ok(None);
     }
     let mut sections = vec![
@@ -1421,7 +1422,57 @@ pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<
         sections.push("Active file downloads:".to_string());
         sections.extend(active_downloads);
     }
+    if !active_subagents.is_empty() {
+        sections.push("Active subagents:".to_string());
+        sections.extend(active_subagents);
+    }
     Ok(Some(sections.join("\n")))
+}
+
+fn list_active_subagent_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
+    let Some(dir) = background_task_dir_if_exists(runtime_state_root, "subagents") else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for path in iter_metadata_json_files(&dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&raw).context("failed to parse subagent state json")?;
+        let state = value
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(state, "running" | "waiting_for_charge" | "ready") {
+            continue;
+        }
+        let id = value
+            .get("id")
+            .or_else(|| value.get("agent_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let description = value
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let model = value
+            .get("model_key")
+            .or_else(|| value.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let mut line = format!("- id={} state={}", id, state);
+        if !description.is_empty() {
+            line.push_str(&format!(" description={:?}", description));
+        }
+        if !model.is_empty() {
+            line.push_str(&format!(" model={}", model));
+        }
+        entries.push(line);
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 fn iter_metadata_json_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -2443,8 +2494,10 @@ mod tests {
         let downloads_dir = runtime_state_root
             .join("agent_frame")
             .join("file_downloads");
+        let subagents_dir = runtime_state_root.join("agent_frame").join("subagents");
         fs::create_dir_all(&processes_dir).unwrap();
         fs::create_dir_all(&downloads_dir).unwrap();
+        fs::create_dir_all(&subagents_dir).unwrap();
 
         let exec_exit_path = processes_dir.join("exec-1.exit");
         let exec_metadata = ProcessMetadata {
@@ -2521,6 +2574,18 @@ mod tests {
         )
         .unwrap();
 
+        fs::write(
+            subagents_dir.join("subagent-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "subagent-1",
+                "description": "inspect logs and summarize the issue",
+                "model_key": "main",
+                "state": "ready"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
         let summary = active_runtime_state_summary(runtime_state_root)
             .unwrap()
             .expect("expected active runtime summary");
@@ -2529,6 +2594,8 @@ mod tests {
         assert!(!summary.contains("exec-finished"));
         assert!(summary.contains("Active file downloads:"));
         assert!(summary.contains("download_id=`download-1`"));
+        assert!(summary.contains("Active subagents:"));
+        assert!(summary.contains("subagent-1"));
     }
 
     #[test]

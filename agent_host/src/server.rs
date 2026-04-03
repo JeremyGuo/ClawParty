@@ -29,6 +29,7 @@ use crate::session::{
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
+use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::skills::discover_skills;
@@ -43,10 +44,12 @@ use chrono::Utc;
 use humantime::parse_duration;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use tokio::select;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -89,6 +92,7 @@ struct ServerRuntime {
     cron_poll_interval_seconds: u64,
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     summary_tracker: Arc<SummaryTracker>,
+    subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
 }
 
 struct SubAgentSlot {
@@ -225,6 +229,591 @@ impl ServerRuntime {
             "ok": true,
             "sent": true
         }))
+    }
+
+    fn default_subagent_charge_seconds(&self, model_key: &str) -> Result<f64> {
+        Ok(self.main_agent_timeout_seconds(model_key)?.unwrap_or(300.0))
+    }
+
+    fn subagent_prompt(description: &str, workbook_relative_path: &str) -> String {
+        format!(
+            "{description}\n\nWhile you work, keep {workbook_relative_path} updated with concise progress notes, current status, and anything the caller should know before continuing. Write to that workbook as the task evolves, not only at the end."
+        )
+    }
+
+    fn with_subagents<T>(
+        &self,
+        f: impl FnOnce(&mut HashMap<uuid::Uuid, Arc<HostedSubagent>>) -> Result<T>,
+    ) -> Result<T> {
+        let mut subagents = self
+            .subagents
+            .lock()
+            .map_err(|_| anyhow!("subagent manager lock poisoned"))?;
+        f(&mut subagents)
+    }
+
+    fn get_subagent_handle(&self, subagent_id: uuid::Uuid) -> Result<Arc<HostedSubagent>> {
+        self.with_subagents(|subagents| {
+            subagents
+                .get(&subagent_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown subagent {}", subagent_id))
+        })
+    }
+
+    fn subagent_state_view(subagent: &HostedSubagent, inner: &HostedSubagentInner) -> Value {
+        json!({
+            "agent_id": subagent.id,
+            "session_id": subagent.session_id,
+            "state": inner.persisted.state,
+            "model": inner.persisted.model_key,
+            "description": inner.persisted.description,
+            "workbook_path": inner.persisted.workbook_relative_path,
+            "available_charge_seconds": inner.persisted.available_charge_seconds,
+            "resume_pending": inner.persisted.resume_pending,
+            "last_result_text": inner.persisted.last_result_text,
+            "last_attachment_paths": inner.persisted.last_attachment_paths,
+            "last_error": inner.persisted.last_error,
+            "turn_count": inner.persisted.turn_count,
+        })
+    }
+
+    fn persist_subagent_locked(
+        subagent: &HostedSubagent,
+        inner: &HostedSubagentInner,
+    ) -> Result<()> {
+        subagent.persist_locked(inner)
+    }
+
+    fn create_subagent(
+        &self,
+        parent_agent_id: uuid::Uuid,
+        session: SessionSnapshot,
+        description: String,
+        model_key: Option<String>,
+        charge_seconds: Option<f64>,
+    ) -> Result<Value> {
+        let model_key = model_key.unwrap_or(self.effective_main_model_key()?);
+        self.model_config(&model_key)?;
+        let default_charge_seconds = self.default_subagent_charge_seconds(&model_key)?;
+        let initial_charge_seconds = charge_seconds.unwrap_or(default_charge_seconds);
+        if initial_charge_seconds <= 0.0 {
+            return Err(anyhow!("charge_seconds must be positive"));
+        }
+        let subagent_id = uuid::Uuid::new_v4();
+        let runtime_state_root = self
+            .agent_workspace
+            .root_dir
+            .join("runtime")
+            .join(&session.workspace_id);
+        let workbook_relative_path = format!(".subagent/{subagent_id}-workbook.md");
+        let initial_prompt = Self::subagent_prompt(&description, &workbook_relative_path);
+        let subagent = HostedSubagent::create(
+            subagent_id,
+            parent_agent_id,
+            session.id,
+            session.address.clone(),
+            session.workspace_id.clone(),
+            session.workspace_root.clone(),
+            runtime_state_root,
+            model_key.clone(),
+            description.clone(),
+            default_charge_seconds,
+            initial_charge_seconds,
+            initial_prompt,
+        )?;
+        self.register_managed_agent(
+            subagent_id,
+            ManagedAgentKind::Subagent,
+            model_key.clone(),
+            Some(parent_agent_id),
+            &session,
+            ManagedAgentState::Running,
+        );
+        self.with_subagents(|subagents| {
+            subagents.insert(subagent_id, Arc::clone(&subagent));
+            Ok(())
+        })?;
+        let runtime = self.clone();
+        thread::spawn(move || {
+            if let Err(error) = runtime.run_subagent_worker(subagent) {
+                error!(
+                    log_stream = "agent",
+                    kind = "subagent_worker_failed",
+                    agent_id = %subagent_id,
+                    error = %format!("{error:#}"),
+                    "subagent worker failed"
+                );
+            }
+        });
+        Ok(json!({
+            "agent_id": subagent_id,
+            "model": model_key,
+            "description": description,
+            "workbook_path": workbook_relative_path,
+            "initial_charge_seconds": initial_charge_seconds,
+        }))
+    }
+
+    fn subagent_progress(
+        &self,
+        session: &SessionSnapshot,
+        subagent_id: uuid::Uuid,
+    ) -> Result<Value> {
+        let persisted = HostedSubagent::load(
+            &self
+                .agent_workspace
+                .root_dir
+                .join("runtime")
+                .join(&session.workspace_id),
+            subagent_id,
+        )?;
+        if persisted.session_id != session.id {
+            return Err(anyhow!(
+                "subagent {} does not belong to this session",
+                subagent_id
+            ));
+        }
+        let path = session
+            .workspace_root
+            .join(&persisted.workbook_relative_path);
+        let content = if path.exists() {
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?
+        } else {
+            String::new()
+        };
+        Ok(json!({
+            "agent_id": subagent_id,
+            "workbook_path": persisted.workbook_relative_path,
+            "content": content
+        }))
+    }
+
+    fn subagent_charge(
+        &self,
+        session: &SessionSnapshot,
+        subagent_id: uuid::Uuid,
+        charge_seconds: f64,
+    ) -> Result<Value> {
+        if charge_seconds <= 0.0 {
+            return Err(anyhow!("charge_seconds must be positive"));
+        }
+        let subagent = self.get_subagent_handle(subagent_id)?;
+        if subagent.session_id != session.id {
+            return Err(anyhow!(
+                "subagent {} does not belong to this session",
+                subagent_id
+            ));
+        }
+        let mut inner = subagent
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+        if matches!(
+            inner.persisted.state,
+            SubagentState::Destroyed | SubagentState::Failed
+        ) {
+            return Err(anyhow!(
+                "subagent {} is {}",
+                subagent_id,
+                serde_json::to_string(&inner.persisted.state).unwrap_or_default()
+            ));
+        }
+        inner.persisted.available_charge_seconds += charge_seconds;
+        inner.persisted.updated_at = Utc::now();
+        Self::persist_subagent_locked(&subagent, &inner)?;
+        drop(inner);
+        subagent.condvar.notify_all();
+        let inner = subagent
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+        Ok(Self::subagent_state_view(&subagent, &inner))
+    }
+
+    fn subagent_tell(
+        &self,
+        session: &SessionSnapshot,
+        subagent_id: uuid::Uuid,
+        text: String,
+    ) -> Result<Value> {
+        let subagent = self.get_subagent_handle(subagent_id)?;
+        if subagent.session_id != session.id {
+            return Err(anyhow!(
+                "subagent {} does not belong to this session",
+                subagent_id
+            ));
+        }
+        let mut inner = subagent
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+        if inner.persisted.state != SubagentState::Ready || !inner.persisted.wait_has_returned_ready
+        {
+            return Err(anyhow!(
+                "subagent_tell requires subagent_wait to return a completed turn first"
+            ));
+        }
+        inner.queued_prompts.push_back(text.clone());
+        inner.persisted.pending_prompts = inner.queued_prompts.iter().cloned().collect();
+        inner.persisted.wait_has_returned_ready = false;
+        inner.persisted.updated_at = Utc::now();
+        Self::persist_subagent_locked(&subagent, &inner)?;
+        drop(inner);
+        subagent.condvar.notify_all();
+        Ok(json!({
+            "agent_id": subagent_id,
+            "queued": true,
+            "text": text
+        }))
+    }
+
+    fn subagent_destroy(
+        &self,
+        session: &SessionSnapshot,
+        subagent_id: uuid::Uuid,
+    ) -> Result<Value> {
+        let subagent = self.get_subagent_handle(subagent_id)?;
+        if subagent.session_id != session.id {
+            return Err(anyhow!(
+                "subagent {} does not belong to this session",
+                subagent_id
+            ));
+        }
+        {
+            let mut inner = subagent
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+            inner.persisted.state = SubagentState::Destroyed;
+            inner.persisted.updated_at = Utc::now();
+            inner.persisted.last_error = Some("destroyed".to_string());
+            if let Some(control) = inner.active_control.take() {
+                control.request_cancel();
+            }
+            Self::persist_subagent_locked(&subagent, &inner)?;
+        }
+        subagent.condvar.notify_all();
+        self.with_subagents(|subagents| {
+            subagents.remove(&subagent_id);
+            Ok(())
+        })?;
+        Ok(json!({
+            "agent_id": subagent_id,
+            "destroyed": true
+        }))
+    }
+
+    fn subagent_wait(
+        &self,
+        session: &SessionSnapshot,
+        subagent_id: uuid::Uuid,
+        timeout_seconds: f64,
+        control: Option<SessionExecutionControl>,
+    ) -> Result<Value> {
+        if timeout_seconds < 0.0 {
+            return Err(anyhow!("timeout_seconds must be non-negative"));
+        }
+        let subagent = self.get_subagent_handle(subagent_id)?;
+        if subagent.session_id != session.id {
+            return Err(anyhow!(
+                "subagent {} does not belong to this session",
+                subagent_id
+            ));
+        }
+        let deadline = (timeout_seconds > 0.0)
+            .then(|| std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds));
+        let signal_receiver = control
+            .as_ref()
+            .map(SessionExecutionControl::signal_receiver);
+        loop {
+            let mut inner = subagent
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+            match inner.persisted.state {
+                SubagentState::Ready => {
+                    inner.persisted.wait_has_returned_ready = true;
+                    inner.persisted.updated_at = Utc::now();
+                    Self::persist_subagent_locked(&subagent, &inner)?;
+                    return Ok(json!({
+                        "agent_id": subagent_id,
+                        "running": false,
+                        "completed": true,
+                        "reason": "completed",
+                        "text": inner.persisted.last_result_text,
+                        "attachment_paths": inner.persisted.last_attachment_paths,
+                    }));
+                }
+                SubagentState::WaitingForCharge => {
+                    return Ok(json!({
+                        "agent_id": subagent_id,
+                        "running": false,
+                        "completed": false,
+                        "reason": "charge_exhausted",
+                        "text": inner.persisted.last_result_text,
+                        "attachment_paths": inner.persisted.last_attachment_paths,
+                    }));
+                }
+                SubagentState::Failed => {
+                    return Ok(json!({
+                        "agent_id": subagent_id,
+                        "running": false,
+                        "completed": false,
+                        "reason": "failed",
+                        "error": inner.persisted.last_error,
+                    }));
+                }
+                SubagentState::Destroyed => {
+                    return Ok(json!({
+                        "agent_id": subagent_id,
+                        "running": false,
+                        "completed": false,
+                        "reason": "destroyed",
+                    }));
+                }
+                SubagentState::Running => {}
+            }
+            let wait_duration = deadline.map(|deadline| {
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(200))
+            });
+            drop(inner);
+            if let Some(receiver) = &signal_receiver
+                && receiver.try_recv().is_ok()
+            {
+                return Ok(json!({
+                    "agent_id": subagent_id,
+                    "running": true,
+                    "completed": false,
+                    "interrupted": true,
+                    "reason": "agent_turn_interrupted",
+                }));
+            }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Ok(json!({
+                    "agent_id": subagent_id,
+                    "running": true,
+                    "completed": false,
+                    "timed_out": true,
+                    "reason": "wait_timed_out",
+                }));
+            }
+            let inner = subagent
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+            let wait_duration = wait_duration.unwrap_or(Duration::from_millis(200));
+            let _ = subagent
+                .condvar
+                .wait_timeout(inner, wait_duration)
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+        }
+    }
+
+    fn subagent_list(&self, session: &SessionSnapshot) -> Result<Value> {
+        let runtime_state_root = self
+            .agent_workspace
+            .root_dir
+            .join("runtime")
+            .join(&session.workspace_id);
+        let entries = HostedSubagent::list(&runtime_state_root)?
+            .into_iter()
+            .filter(|state| state.session_id == session.id)
+            .map(|state| {
+                json!({
+                    "agent_id": state.id,
+                    "description": state.description,
+                    "state": state.state,
+                    "model": state.model_key,
+                    "workbook_path": state.workbook_relative_path,
+                    "available_charge_seconds": state.available_charge_seconds,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "subagents": entries,
+            "count": entries.len()
+        }))
+    }
+
+    fn destroy_subagents_for_session(&self, session_id: uuid::Uuid) -> Result<usize> {
+        let targets = self.with_subagents(|subagents| {
+            Ok(subagents
+                .values()
+                .filter(|subagent| subagent.session_id == session_id)
+                .cloned()
+                .collect::<Vec<_>>())
+        })?;
+        let mut destroyed = 0usize;
+        for subagent in targets {
+            {
+                let mut inner = subagent
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+                if inner.persisted.state == SubagentState::Destroyed {
+                    continue;
+                }
+                inner.persisted.state = SubagentState::Destroyed;
+                inner.persisted.updated_at = Utc::now();
+                inner.persisted.last_error = Some("session_destroyed".to_string());
+                if let Some(control) = inner.active_control.take() {
+                    control.request_cancel();
+                }
+                Self::persist_subagent_locked(&subagent, &inner)?;
+            }
+            subagent.condvar.notify_all();
+            self.with_subagents(|subagents| {
+                subagents.remove(&subagent.id);
+                Ok(())
+            })?;
+            destroyed = destroyed.saturating_add(1);
+        }
+        Ok(destroyed)
+    }
+
+    fn subagent_session_snapshot(
+        &self,
+        subagent: &HostedSubagent,
+        message_count: usize,
+        _model_key: &str,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            id: subagent.session_id,
+            agent_id: subagent.id,
+            address: subagent.address.clone(),
+            root_dir: self.agent_workspace.root_dir.join("subagent-sessions"),
+            attachments_dir: subagent.workspace_root.join("upload"),
+            workspace_id: subagent.workspace_id.clone(),
+            workspace_root: subagent.workspace_root.clone(),
+            message_count,
+            agent_message_count: message_count,
+            agent_messages: Vec::new(),
+            last_agent_returned_at: None,
+            last_compacted_at: None,
+            turn_count: 0,
+            last_compacted_turn_count: 0,
+            cumulative_usage: TokenUsage::default(),
+            cumulative_compaction: SessionCompactionStats::default(),
+            api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
+            pending_continue: None,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+        }
+    }
+
+    fn idle_compact_subagents_for_session(
+        &self,
+        session: &SessionSnapshot,
+        idle_threshold: Duration,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let subagents = self.with_subagents(|subagents| {
+            Ok(subagents
+                .values()
+                .filter(|subagent| subagent.session_id == session.id)
+                .cloned()
+                .collect::<Vec<_>>())
+        })?;
+        for subagent in subagents {
+            let (model_key, messages, turn_count) = {
+                let inner = subagent
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+                if !matches!(
+                    inner.persisted.state,
+                    SubagentState::Ready | SubagentState::WaitingForCharge
+                ) {
+                    continue;
+                }
+                let Some(last_returned_at) = inner.persisted.last_returned_at else {
+                    continue;
+                };
+                if now
+                    .signed_duration_since(last_returned_at)
+                    .to_std()
+                    .unwrap_or_default()
+                    < idle_threshold
+                {
+                    continue;
+                }
+                if inner.persisted.turn_count <= inner.persisted.last_compacted_turn_count
+                    || inner.persisted.messages.is_empty()
+                {
+                    continue;
+                }
+                (
+                    inner.persisted.model_key.clone(),
+                    inner.persisted.messages.clone(),
+                    inner.persisted.turn_count,
+                )
+            };
+            let model = self.model_config(&model_key)?;
+            let subagent_session =
+                self.subagent_session_snapshot(&subagent, messages.len(), &model_key);
+            let config = self.build_agent_frame_config(
+                &subagent_session,
+                &subagent.workspace_root,
+                AgentPromptKind::SubAgent,
+                &model_key,
+                None,
+            )?;
+            let extra_tools = self.build_extra_tools(
+                &subagent_session,
+                AgentPromptKind::SubAgent,
+                subagent.id,
+                None,
+            );
+            let report = run_backend_compaction(model.backend, messages, config, extra_tools)?;
+            if !report.compacted {
+                continue;
+            }
+            let stats = compaction_stats_from_report(&report);
+            let mut inner = subagent
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+            inner.persisted.messages = report.messages;
+            inner.persisted.last_compacted_turn_count = turn_count;
+            inner.persisted.updated_at = Utc::now();
+            inner.persisted.cumulative_compaction.run_count = inner
+                .persisted
+                .cumulative_compaction
+                .run_count
+                .saturating_add(stats.run_count);
+            inner.persisted.cumulative_compaction.compacted_run_count = inner
+                .persisted
+                .cumulative_compaction
+                .compacted_run_count
+                .saturating_add(stats.compacted_run_count);
+            inner
+                .persisted
+                .cumulative_compaction
+                .estimated_tokens_before = inner
+                .persisted
+                .cumulative_compaction
+                .estimated_tokens_before
+                .saturating_add(stats.estimated_tokens_before);
+            inner.persisted.cumulative_compaction.estimated_tokens_after = inner
+                .persisted
+                .cumulative_compaction
+                .estimated_tokens_after
+                .saturating_add(stats.estimated_tokens_after);
+            inner
+                .persisted
+                .cumulative_compaction
+                .usage
+                .add_assign(&stats.usage);
+            Self::persist_subagent_locked(&subagent, &inner)?;
+        }
+        Ok(())
     }
 
     fn register_managed_agent(
@@ -597,6 +1186,7 @@ impl ServerRuntime {
         session: &SessionSnapshot,
         kind: AgentPromptKind,
         agent_id: uuid::Uuid,
+        control: Option<SessionExecutionControl>,
     ) -> Vec<Tool> {
         let mut tools = Vec::new();
         {
@@ -758,95 +1348,154 @@ impl ServerRuntime {
             ));
 
             let runtime = self.clone();
-            let session = session.clone();
-            tools.push(Tool::new_interruptible(
-                "run_subagent",
-                "Run delegated subagent work in the current workspace. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Set timeout_seconds to 0 to wait indefinitely for completion. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
+            let create_session = session.clone();
+            tools.push(Tool::new(
+                "subagent_create",
+                "Start a session-bound subagent. Requires description. Optionally set model and charge_seconds.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "task": {"type": "string"},
+                        "description": {"type": "string"},
                         "model": {"type": "string"},
-                        "timeout_seconds": {
-                            "type": "number",
-                            "description": "Maximum time to wait for the subagent in seconds. Use 0 to wait indefinitely until the subagent finishes."
-                        },
-                        "tasks": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "task": {"type": "string"},
-                                    "model": {"type": "string"},
-                                    "timeout_seconds": {
-                                        "type": "number",
-                                        "description": "Maximum time to wait for this subagent in seconds. Use 0 to wait indefinitely until it finishes."
-                                    }
-                                },
-                                "required": ["task", "timeout_seconds"],
-                                "additionalProperties": false
-                            }
-                        }
+                        "charge_seconds": {"type": "number"}
                     },
+                    "required": ["description"],
                     "additionalProperties": false
                 }),
                 move |arguments| {
                     let object = arguments
                         .as_object()
                         .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-                    if let Some(tasks) = object.get("tasks").and_then(Value::as_array) {
-                        let requests = tasks
-                            .iter()
-                            .map(|task| {
-                                let item = task
-                                    .as_object()
-                                    .ok_or_else(|| anyhow!("each task must be an object"))?;
-                                let task = item
-                                    .get("task")
-                                    .and_then(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|value| !value.is_empty())
-                                    .ok_or_else(|| anyhow!("task must be a non-empty string"))?;
-                                let model_key = item
-                                    .get("model")
-                                    .and_then(Value::as_str)
-                                    .map(ToOwned::to_owned);
-                                let timeout_seconds = item
-                                    .get("timeout_seconds")
-                                    .and_then(Value::as_f64)
-                                    .filter(|value| *value >= 0.0)
-                                    .ok_or_else(|| anyhow!("timeout_seconds must be a non-negative number"))?;
-                                Ok((task.to_string(), model_key, timeout_seconds))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        if requests.is_empty() {
-                            return Err(anyhow!("tasks must not be empty"));
-                        }
-                        runtime.run_subagent_batch(agent_id, session.clone(), requests)
-                    } else {
-                        let task = object
-                            .get("task")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .ok_or_else(|| anyhow!("task must be a non-empty string"))?;
-                        let model_key = object
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        let timeout_seconds = object
-                            .get("timeout_seconds")
-                            .and_then(Value::as_f64)
-                            .filter(|value| *value >= 0.0)
-                            .ok_or_else(|| anyhow!("timeout_seconds must be a non-negative number"))?;
-                        runtime.run_subagent(
-                            agent_id,
-                            session.clone(),
-                            model_key,
-                            task.to_string(),
-                            timeout_seconds,
-                        )
-                    }
+                    runtime.create_subagent(
+                        agent_id,
+                        create_session.clone(),
+                        string_arg_required(object, "description")?,
+                        optional_string_arg(object, "model")?,
+                        object.get("charge_seconds").and_then(Value::as_f64),
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let progress_session = session.clone();
+            tools.push(Tool::new(
+                "subagent_progress",
+                "Read a subagent workbook.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"}
+                    },
+                    "required": ["agent_id"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime
+                        .subagent_progress(&progress_session, parse_uuid_arg(object, "agent_id")?)
+                },
+            ));
+
+            let runtime = self.clone();
+            let charge_session = session.clone();
+            tools.push(Tool::new(
+                "subagent_charge",
+                "Give a subagent more runtime. If the previous subagent_wait failed because of an upstream API timeout, recharge and retry at most once.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"},
+                        "charge_seconds": {"type": "number"}
+                    },
+                    "required": ["agent_id", "charge_seconds"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.subagent_charge(
+                        &charge_session,
+                        parse_uuid_arg(object, "agent_id")?,
+                        f64_arg_required(object, "charge_seconds")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let tell_session = session.clone();
+            tools.push(Tool::new(
+                "subagent_tell",
+                "Queue the next user turn for a subagent after subagent_wait has returned a completed turn.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"},
+                        "text": {"type": "string"}
+                    },
+                    "required": ["agent_id", "text"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.subagent_tell(
+                        &tell_session,
+                        parse_uuid_arg(object, "agent_id")?,
+                        string_arg_required(object, "text")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let destroy_session = session.clone();
+            tools.push(Tool::new(
+                "subagent_destroy",
+                "Destroy a subagent.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"}
+                    },
+                    "required": ["agent_id"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.subagent_destroy(&destroy_session, parse_uuid_arg(object, "agent_id")?)
+                },
+            ));
+
+            let runtime = self.clone();
+            let wait_session = session.clone();
+            let wait_control = control.clone();
+            tools.push(Tool::new_interruptible(
+                "subagent_wait",
+                "Wait until a subagent finishes its current turn or runs out of charge. Completed subagents stay alive. If it returns a failed upstream API timeout, you may recharge and retry once, but do not loop repeated retries.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"},
+                        "timeout_seconds": {"type": "number"}
+                    },
+                    "required": ["agent_id"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.subagent_wait(
+                        &wait_session,
+                        parse_uuid_arg(object, "agent_id")?,
+                        object.get("timeout_seconds").and_then(Value::as_f64).unwrap_or(0.0),
+                        wait_control.clone(),
+                    )
                 },
             ));
         }
@@ -1080,7 +1729,7 @@ impl ServerRuntime {
 
             let runtime = self.clone();
             tools.push(Tool::new(
-                "list_background_agents",
+                "background_agents_list",
                 "List tracked background agents with status, model, and token usage statistics.",
                 json!({
                     "type": "object",
@@ -1091,15 +1740,16 @@ impl ServerRuntime {
             ));
 
             let runtime = self.clone();
+            let session = session.clone();
             tools.push(Tool::new(
-                "list_subagents",
-                "List tracked subagents with status, model, parent relationships, and token usage statistics.",
+                "subagent_list",
+                "List session subagents.",
                 json!({
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false
                 }),
-                move |_| runtime.list_managed_agents(ManagedAgentKind::Subagent),
+                move |_| runtime.subagent_list(&session),
             ));
 
             let runtime = self.clone();
@@ -1182,7 +1832,8 @@ impl ServerRuntime {
             )
         })?;
         let backend = self.model_config(&model_key)?.backend;
-        let extra_tools = self.build_extra_tools(&session, kind, agent_id);
+        let extra_tools =
+            self.build_extra_tools(&session, kind, agent_id, execution_control.clone());
         if matches!(self.sandbox.mode, crate::config::SandboxMode::Disabled) {
             run_backend_session(
                 backend,
@@ -1544,163 +2195,236 @@ impl ServerRuntime {
         Err(anyhow!("agent turn driver channel closed unexpectedly"))
     }
 
-    fn run_subagent(
-        &self,
-        parent_agent_id: uuid::Uuid,
-        session: SessionSnapshot,
-        model_key: Option<String>,
-        prompt: String,
-        timeout_seconds: f64,
-    ) -> Result<Value> {
+    fn run_subagent_worker(&self, subagent: Arc<HostedSubagent>) -> Result<()> {
         let _slot = self.try_acquire_subagent_slot()?;
-        let subagent_id = uuid::Uuid::new_v4();
-        let model_key = match model_key {
-            Some(model_key) => model_key,
-            None => self.effective_main_model_key()?,
-        };
-        self.model_config(&model_key)?;
-        self.register_managed_agent(
-            subagent_id,
-            ManagedAgentKind::Subagent,
-            model_key.clone(),
-            Some(parent_agent_id),
-            &session,
-            ManagedAgentState::Running,
-        );
+        loop {
+            let (model_key, previous_messages, prompt, timeout_seconds) = {
+                let mut inner = subagent
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+                loop {
+                    match inner.persisted.state {
+                        SubagentState::Destroyed | SubagentState::Failed => {
+                            Self::persist_subagent_locked(&subagent, &inner)?;
+                            return Ok(());
+                        }
+                        SubagentState::Running => break,
+                        SubagentState::WaitingForCharge => {
+                            if inner.persisted.available_charge_seconds > 0.0 {
+                                inner.persisted.state = SubagentState::Running;
+                                break;
+                            }
+                        }
+                        SubagentState::Ready => {
+                            if inner.persisted.resume_pending
+                                && inner.persisted.available_charge_seconds > 0.0
+                            {
+                                inner.persisted.state = SubagentState::Running;
+                                break;
+                            }
+                            if !inner.queued_prompts.is_empty()
+                                && inner.persisted.available_charge_seconds > 0.0
+                            {
+                                inner.persisted.state = SubagentState::Running;
+                                break;
+                            }
+                        }
+                    }
+                    inner = subagent
+                        .condvar
+                        .wait(inner)
+                        .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+                }
 
-        info!(
-            log_stream = "agent",
-            log_key = %subagent_id,
-            kind = "subagent_started",
-            parent_agent_id = %parent_agent_id,
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            model = %model_key,
-            "subagent started"
-        );
+                let prompt = if inner.persisted.resume_pending {
+                    String::new()
+                } else {
+                    inner.queued_prompts.pop_front().unwrap_or_default()
+                };
+                inner.persisted.pending_prompts = inner.queued_prompts.iter().cloned().collect();
+                let timeout_seconds = inner.persisted.available_charge_seconds;
+                inner.persisted.available_charge_seconds = 0.0;
+                inner.persisted.updated_at = Utc::now();
+                Self::persist_subagent_locked(&subagent, &inner)?;
+                (
+                    inner.persisted.model_key.clone(),
+                    inner.persisted.messages.clone(),
+                    prompt,
+                    timeout_seconds,
+                )
+            };
 
-        let timeout_override = if timeout_seconds > 0.0 {
-            Some(timeout_seconds)
-        } else {
-            None
-        };
-        let report = self.run_agent_turn_with_timeout_blocking(
-            session.clone(),
-            AgentPromptKind::SubAgent,
-            subagent_id,
-            model_key.clone(),
-            Vec::new(),
-            prompt,
-            timeout_override,
-            timeout_override,
-            None,
-            "subagent",
-        );
-        let (report, timed_out) = match report {
-            Ok(TimedRunOutcome::Completed(report)) => {
-                self.mark_managed_agent_completed(subagent_id, &report.usage);
-                (report, false)
-            }
-            Ok(TimedRunOutcome::Yielded(report)) => {
-                self.mark_managed_agent_completed(subagent_id, &report.usage);
-                (report, false)
-            }
-            Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_timed_out(subagent_id, &usage, &error);
-                let report = checkpoint.ok_or(error)?;
-                (report, true)
-            }
-            Ok(TimedRunOutcome::Failed { checkpoint, error }) => {
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_failed(subagent_id, &usage, &error);
-                return Err(error);
-            }
-            Err(error) => {
-                self.mark_managed_agent_failed(subagent_id, &TokenUsage::default(), &error);
-                return Err(error);
-            }
-        };
-        log_turn_usage(
-            subagent_id,
-            &session,
-            &report.usage,
-            false,
-            "subagent",
-            Some(parent_agent_id),
-        );
-        let assistant_text = extract_assistant_text(&report.messages);
-        let (clean_text, attachments) =
-            extract_attachment_references(&assistant_text, &session.workspace_root)?;
-        let attachment_paths = attachments
-            .iter()
-            .map(|item| relative_attachment_path(&session.workspace_root, &item.path))
-            .collect::<Result<Vec<_>>>()?;
-        info!(
-            log_stream = "agent",
-            log_key = %subagent_id,
-            kind = "subagent_completed",
-            parent_agent_id = %parent_agent_id,
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            has_text = !clean_text.trim().is_empty(),
-            attachment_count = attachment_paths.len() as u64,
-            "subagent completed"
-        );
-        Ok(json!({
-            "agent_id": subagent_id,
-            "parent_agent_id": parent_agent_id,
-            "model": model_key,
-            "text": clean_text,
-            "attachment_paths": attachment_paths,
-            "timed_out": timed_out,
-            "usage": {
-                "llm_calls": report.usage.llm_calls,
-                "prompt_tokens": report.usage.prompt_tokens,
-                "completion_tokens": report.usage.completion_tokens,
-                "total_tokens": report.usage.total_tokens,
-                "cache_hit_tokens": report.usage.cache_hit_tokens,
-                "cache_miss_tokens": report.usage.cache_miss_tokens,
-                "cache_read_tokens": report.usage.cache_read_tokens,
-                "cache_write_tokens": report.usage.cache_write_tokens
-            }
-        }))
-    }
-
-    fn run_subagent_batch(
-        &self,
-        parent_agent_id: uuid::Uuid,
-        session: SessionSnapshot,
-        requests: Vec<(String, Option<String>, f64)>,
-    ) -> Result<Value> {
-        let mut handles = Vec::with_capacity(requests.len());
-        for (task, model_key, timeout_seconds) in requests {
+            self.mark_managed_agent_running(subagent.id);
             let runtime = self.clone();
-            let session = session.clone();
-            let handle = std::thread::spawn(move || {
-                runtime.run_subagent(parent_agent_id, session, model_key, task, timeout_seconds)
-            });
-            handles.push(handle);
+            let subagent_for_observer = Arc::clone(&subagent);
+            let control_observer: Arc<dyn Fn(SessionExecutionControl) + Send + Sync> =
+                Arc::new(move |control| {
+                    if let Ok(mut inner) = subagent_for_observer.inner.lock() {
+                        inner.active_control = Some(control);
+                    }
+                });
+            let session = SessionSnapshot {
+                id: subagent.session_id,
+                agent_id: subagent.id,
+                address: subagent.address.clone(),
+                root_dir: self.agent_workspace.root_dir.join("subagent-sessions"),
+                attachments_dir: subagent.workspace_root.join("upload"),
+                workspace_id: subagent.workspace_id.clone(),
+                workspace_root: subagent.workspace_root.clone(),
+                message_count: 0,
+                agent_message_count: previous_messages.len(),
+                agent_messages: previous_messages.clone(),
+                last_agent_returned_at: None,
+                last_compacted_at: None,
+                turn_count: 0,
+                last_compacted_turn_count: 0,
+                cumulative_usage: TokenUsage::default(),
+                cumulative_compaction: SessionCompactionStats::default(),
+                api_timeout_override_seconds: None,
+                skill_states: HashMap::new(),
+                pending_continue: None,
+                pending_workspace_summary: false,
+                close_after_summary: false,
+            };
+            let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&model_key)?;
+            let outcome = runtime.run_agent_turn_with_timeout_blocking(
+                session.clone(),
+                AgentPromptKind::SubAgent,
+                subagent.id,
+                model_key.clone(),
+                previous_messages,
+                prompt,
+                Some(timeout_seconds),
+                Some(upstream_timeout_seconds),
+                Some(control_observer),
+                "subagent",
+            )?;
+            let mut inner = subagent
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
+            inner.active_control = None;
+            match outcome {
+                TimedRunOutcome::Completed(report) | TimedRunOutcome::Yielded(report) => {
+                    inner.persisted.messages = report.messages;
+                    inner.persisted.resume_pending = false;
+                    inner.persisted.state = SubagentState::Ready;
+                    inner.persisted.updated_at = Utc::now();
+                    inner.persisted.last_returned_at = Some(Utc::now());
+                    inner.persisted.turn_count = inner.persisted.turn_count.saturating_add(1);
+                    inner.persisted.cumulative_usage.add_assign(&report.usage);
+                    inner.persisted.cumulative_compaction.run_count = inner
+                        .persisted
+                        .cumulative_compaction
+                        .run_count
+                        .saturating_add(report.compaction.run_count);
+                    inner.persisted.cumulative_compaction.compacted_run_count = inner
+                        .persisted
+                        .cumulative_compaction
+                        .compacted_run_count
+                        .saturating_add(report.compaction.compacted_run_count);
+                    inner
+                        .persisted
+                        .cumulative_compaction
+                        .estimated_tokens_before = inner
+                        .persisted
+                        .cumulative_compaction
+                        .estimated_tokens_before
+                        .saturating_add(report.compaction.estimated_tokens_before);
+                    inner.persisted.cumulative_compaction.estimated_tokens_after = inner
+                        .persisted
+                        .cumulative_compaction
+                        .estimated_tokens_after
+                        .saturating_add(report.compaction.estimated_tokens_after);
+                    inner
+                        .persisted
+                        .cumulative_compaction
+                        .usage
+                        .add_assign(&report.compaction.usage);
+                    let assistant_text = extract_assistant_text(&inner.persisted.messages);
+                    let (clean_text, attachments) =
+                        extract_attachment_references(&assistant_text, &subagent.workspace_root)?;
+                    inner.persisted.last_result_text = Some(clean_text);
+                    inner.persisted.last_attachment_paths = attachments
+                        .iter()
+                        .map(|item| relative_attachment_path(&subagent.workspace_root, &item.path))
+                        .collect::<Result<Vec<_>>>()?;
+                    inner.persisted.last_error = None;
+                    self.mark_managed_agent_completed(subagent.id, &report.usage);
+                    log_turn_usage(
+                        subagent.id,
+                        &session,
+                        &report.usage,
+                        false,
+                        "subagent",
+                        Some(inner.persisted.parent_agent_id),
+                    );
+                }
+                TimedRunOutcome::TimedOut { checkpoint, error } => {
+                    if let Some(report) = checkpoint {
+                        inner.persisted.messages = report.messages;
+                        inner.persisted.cumulative_usage.add_assign(&report.usage);
+                        inner.persisted.cumulative_compaction.run_count = inner
+                            .persisted
+                            .cumulative_compaction
+                            .run_count
+                            .saturating_add(report.compaction.run_count);
+                        inner.persisted.cumulative_compaction.compacted_run_count = inner
+                            .persisted
+                            .cumulative_compaction
+                            .compacted_run_count
+                            .saturating_add(report.compaction.compacted_run_count);
+                        inner
+                            .persisted
+                            .cumulative_compaction
+                            .estimated_tokens_before = inner
+                            .persisted
+                            .cumulative_compaction
+                            .estimated_tokens_before
+                            .saturating_add(report.compaction.estimated_tokens_before);
+                        inner.persisted.cumulative_compaction.estimated_tokens_after = inner
+                            .persisted
+                            .cumulative_compaction
+                            .estimated_tokens_after
+                            .saturating_add(report.compaction.estimated_tokens_after);
+                        inner
+                            .persisted
+                            .cumulative_compaction
+                            .usage
+                            .add_assign(&report.compaction.usage);
+                    }
+                    inner.persisted.resume_pending = true;
+                    inner.persisted.state = SubagentState::WaitingForCharge;
+                    inner.persisted.updated_at = Utc::now();
+                    inner.persisted.last_returned_at = Some(Utc::now());
+                    inner.persisted.last_error = Some(format!("{error:#}"));
+                    self.mark_managed_agent_timed_out(
+                        subagent.id,
+                        &inner.persisted.cumulative_usage,
+                        &error,
+                    );
+                }
+                TimedRunOutcome::Failed { checkpoint, error } => {
+                    if let Some(report) = checkpoint {
+                        inner.persisted.messages = report.messages;
+                        inner.persisted.cumulative_usage.add_assign(&report.usage);
+                    }
+                    inner.persisted.resume_pending = false;
+                    inner.persisted.state = SubagentState::Failed;
+                    inner.persisted.updated_at = Utc::now();
+                    inner.persisted.last_error = Some(format!("{error:#}"));
+                    self.mark_managed_agent_failed(
+                        subagent.id,
+                        &inner.persisted.cumulative_usage,
+                        &error,
+                    );
+                }
+            }
+            Self::persist_subagent_locked(&subagent, &inner)?;
+            drop(inner);
+            subagent.condvar.notify_all();
         }
-
-        let mut results = Vec::new();
-        for handle in handles {
-            let result = handle
-                .join()
-                .map_err(|_| anyhow!("subagent worker thread panicked"))??;
-            results.push(result);
-        }
-
-        Ok(json!({
-            "results": results,
-            "count": results.len()
-        }))
     }
 
     fn start_background_agent(
@@ -2299,6 +3023,7 @@ pub struct Server {
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
+    subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
 }
 
 impl Server {
@@ -2398,6 +3123,7 @@ impl Server {
             background_job_receiver: Some(background_job_receiver),
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2623,6 +3349,7 @@ impl Server {
             if !should_attempt_idle_context_compaction(&session, now, idle_threshold) {
                 continue;
             }
+            runtime.idle_compact_subagents_for_session(&session, idle_threshold)?;
 
             let config = runtime.build_agent_frame_config(
                 &session,
@@ -2635,6 +3362,7 @@ impl Server {
                 &session,
                 AgentPromptKind::MainForeground,
                 session.agent_id,
+                None,
             );
             let report = run_backend_compaction(
                 model.backend,
@@ -2708,6 +3436,7 @@ impl Server {
             cron_poll_interval_seconds: self.cron_poll_interval_seconds,
             background_job_sender: self.background_job_sender.clone(),
             summary_tracker: Arc::clone(&self.summary_tracker),
+            subagents: Arc::clone(&self.subagents),
         }
     }
 
@@ -2748,13 +3477,17 @@ impl Server {
         }
         self.unregister_active_foreground_control(address)?;
         if let Some(session) = snapshot {
+            let destroyed_subagents = self
+                .tool_runtime()
+                .destroy_subagents_for_session(session.id)?;
             let runtime_state_root = self
                 .agent_workspace
                 .root_dir
                 .join("runtime")
                 .join(&session.workspace_id);
             let report = terminate_runtime_state_tasks(&runtime_state_root)?;
-            if report.exec_processes_killed > 0
+            if destroyed_subagents > 0
+                || report.exec_processes_killed > 0
                 || report.file_downloads_cancelled > 0
                 || report.image_tasks_cancelled > 0
             {
@@ -2763,6 +3496,7 @@ impl Server {
                     log_key = %session.id,
                     kind = "session_runtime_tasks_destroyed",
                     workspace_id = %session.workspace_id,
+                    subagents_destroyed = destroyed_subagents as u64,
                     exec_processes_killed = report.exec_processes_killed as u64,
                     file_downloads_cancelled = report.file_downloads_cancelled as u64,
                     image_tasks_cancelled = report.image_tasks_cancelled as u64,
@@ -3966,8 +4700,12 @@ impl Server {
             model_key,
             None,
         )?;
-        let extra_tools =
-            runtime.build_extra_tools(session, AgentPromptKind::MainForeground, session.agent_id);
+        let extra_tools = runtime.build_extra_tools(
+            session,
+            AgentPromptKind::MainForeground,
+            session.agent_id,
+            None,
+        );
         let model = self.model_config_or_main(model_key)?;
         let report = run_backend_compaction(
             model.backend,
@@ -4107,6 +4845,7 @@ impl Server {
                 session,
                 AgentPromptKind::MainForeground,
                 session.agent_id,
+                None,
             );
             let compaction = run_backend_compaction(
                 effective_model.backend,
@@ -5495,6 +6234,13 @@ fn create_detached_session_snapshot(
     })
 }
 
+fn f64_arg_required(arguments: &serde_json::Map<String, Value>, key: &str) -> Result<f64> {
+    arguments
+        .get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("{} must be a number", key))
+}
+
 fn cleanup_detached_session_root(
     runtime: &ServerRuntime,
     job: &BackgroundJobRequest,
@@ -6153,8 +6899,12 @@ fn estimate_current_context_tokens_for_session(
         None,
     )?;
     let skills = discover_skills(&frame_config.skills_dirs)?;
-    let extra_tools =
-        runtime.build_extra_tools(session, AgentPromptKind::MainForeground, session.agent_id);
+    let extra_tools = runtime.build_extra_tools(
+        session,
+        AgentPromptKind::MainForeground,
+        session.agent_id,
+        None,
+    );
     let registry = build_tool_registry(
         &frame_config.enabled_tools,
         &frame_config.workspace_root,

@@ -37,10 +37,10 @@ pub fn build_agent_system_prompt(
     };
     let skill_line = match kind {
         AgentPromptKind::SubAgent => {
-            "Skills may be available. If a skill seems relevant, inspect the preloaded skill metadata and call skill_load before relying on the skill's detailed instructions."
+            "Skills may be available. If a skill seems relevant, inspect the preloaded skill metadata and load the relevant skill before relying on its detailed instructions."
         }
         AgentPromptKind::MainForeground | AgentPromptKind::MainBackground => {
-            "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and call skill_load before relying on the skill's detailed instructions."
+            "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and load the relevant skill before relying on its detailed instructions."
         }
     };
     let mut parts = vec![
@@ -49,7 +49,6 @@ pub fn build_agent_system_prompt(
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
-        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe.".to_string(),
         "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as an interruption signal. Give immediate visible feedback. If you can stop and answer directly, do that. If you will continue doing more work after acknowledging it, send the acknowledgement with user_tell before continuing.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat the newest items as the latest steering, and give immediate visible feedback. If you continue working after that acknowledgement, use user_tell for the acknowledgement instead of hiding it inside an assistant message with tool_calls.".to_string(),
@@ -95,18 +94,16 @@ pub fn build_agent_system_prompt(
     match kind {
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
-            parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount to look up that history before saying you cannot remember.".to_string());
+            parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use the available workspace history tools before saying you cannot remember.".to_string());
             parts.push("When a distinct chunk of work would be better handled by delegation, use subagents and choose the model whose description best matches the task instead of defaulting mechanically.".to_string());
-            parts.push("For subagents, timeout_seconds can usually be set to 0 so the delegated work can finish naturally. Use a positive timeout only when you specifically need a bounded wait.".to_string());
         }
         AgentPromptKind::MainBackground => {
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
             parts.push("Match delegated work to the model that is most suited to it based on the model descriptions. Use subagents to exploit those strengths rather than routing everything through the current model.".to_string());
-            parts.push("For subagents, timeout_seconds can usually be set to 0 so the delegated work can finish naturally. Use a positive timeout only when you specifically need a bounded wait.".to_string());
-            parts.push("If you delegate a chunk to one or more subagents, including parallel subagents, wait until all required subagent results are available before you return your final answer.".to_string());
+            parts.push("If you delegate a chunk to one or more subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
-            parts.push("If you need historical information from earlier workspaces, use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount instead of assuming the information is unavailable.".to_string());
+            parts.push("If you need historical information from earlier workspaces, use the available workspace history tools instead of assuming the information is unavailable.".to_string());
         }
         AgentPromptKind::SubAgent => {
             parts.push(
@@ -295,14 +292,13 @@ mod tests {
         assert!(prompt.contains("Some system-wide software packages are installed under /opt."));
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
-        assert!(prompt.contains(
-            "use workspace tools such as workspaces_list, workspace_content_list, and workspace_mount"
-        ));
+        assert!(prompt.contains("use the available workspace history tools"));
         assert!(prompt.contains("choose the model whose description best matches the task"));
-        assert!(prompt.contains("For subagents, timeout_seconds can usually be set to 0"));
         assert!(prompt.contains("you must use the user_tell tool"));
         assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
         assert!(prompt.contains("If a user message starts with [Queued User Updates]"));
+        assert!(!prompt.contains("Use subagent_create to start delegated work"));
+        assert!(!prompt.contains("prefer leaving stdout/stderr unredirected"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));

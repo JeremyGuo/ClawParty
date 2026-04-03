@@ -53,7 +53,7 @@ A self-contained Rust library and CLI binary for running a single LLM agent sess
 | ⚡ **Parallel tool calls** | Multiple independent tool calls in the same round execute concurrently |
 | 🛑 **Cancellation** | New user input requests a `yield` and interrupts interruptible tools; immediate tools finish quickly and return the turn to a safe boundary |
 | 💾 **Checkpoint callback** | Optional callback fired after each tool round for mid-session state persistence |
-| 🤖 **Subagents** | `run_subagent` with model selection and `timeout_seconds=0` for unbounded wait |
+| 🤖 **Subagents** | Session-bound subagents with `subagent_create` / `subagent_wait` / `subagent_charge` / `subagent_tell` / `subagent_progress` / `subagent_destroy` and workbook tracking under `.subagent/` |
 | 🎛️ **Modes** | CLI binary (`run_agent`) or embedded library |
 
 ### 🔨 Build & Test
@@ -75,6 +75,7 @@ See [`agent_frame/example_config.json`](agent_frame/example_config.json) and [`a
 - `image_wait` and `file_download_wait` return immediately when interrupted and leave the background task running.
 - `web_search` and `web_fetch` are cancelled when interrupted.
 - `file_download` / `image` work is executed in worker subprocesses so it can survive across turns and be cancelled explicitly.
+- Active `exec`, `file_download`, and alive subagents are appended to compaction summaries so later turns can keep reusing them.
 
 ---
 
@@ -117,7 +118,7 @@ Channel (e.g. Telegram)
 - `/compact` performs a one-off compaction; `/compact_mode` shows or toggles automatic compaction for the current conversation.
 - `/continue` retries the latest interrupted turn from its stored resume context. If the user keeps talking instead, the follow-up message is appended to that stored resume context.
 - Cron tasks and background agents inherit the creating conversation's model.
-- Session destroy paths such as `/new` tear down session-bound `exec`, `file_download`, and `image` runtime tasks.
+- Session destroy paths such as `/new` tear down session-bound `exec`, `file_download`, `image`, and subagent runtime tasks.
 
 ---
 

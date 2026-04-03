@@ -27,10 +27,6 @@ fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> Stri
     let mut parts = vec![
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
-        "Only tools that explicitly expose timeout fields require the model to choose timeout_seconds."
-            .to_string(),
-        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe."
-            .to_string(),
     ];
     if config
         .upstream
