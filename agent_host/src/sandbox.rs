@@ -440,12 +440,12 @@ fn build_bubblewrap_command(
         Path::new("/__agent_host/bin/agent_host"),
         true,
     )?;
-    bind_path(&mut command, workspace_root, false)?;
-    bind_path(&mut command, runtime_state_root, false)?;
     if let Some(home_dir) = discover_home_dir() {
         let home_skeleton = prepare_sandbox_home_skeleton(runtime_state_root, &home_dir)?;
         bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
     }
+    bind_path(&mut command, workspace_root, false)?;
+    bind_path(&mut command, runtime_state_root, false)?;
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
