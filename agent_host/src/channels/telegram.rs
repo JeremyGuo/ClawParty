@@ -558,6 +558,33 @@ impl TelegramChannel {
         bot_user_id.is_some_and(|bot_id| bot_id == left_chat_member.id)
     }
 
+    fn is_terminal_chat_error(&self, error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("chat not found")
+            || message.contains("group chat was deleted")
+            || message.contains("bot was kicked from the group chat")
+            || message.contains("bot is not a member of the channel chat")
+            || message.contains("forbidden: bot was kicked")
+    }
+
+    async fn conversation_is_unavailable(&self, message: &TelegramMessage) -> bool {
+        if !matches!(message.chat.kind.as_str(), "group" | "supergroup") {
+            return false;
+        }
+        match self
+            .call_api::<serde_json::Value>(
+                "getChat",
+                json!({
+                    "chat_id": message.chat.id,
+                }),
+            )
+            .await
+        {
+            Ok(_) => false,
+            Err(error) => self.is_terminal_chat_error(&error),
+        }
+    }
+
     async fn send_photo(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
         let file_name = attachment
             .path
@@ -867,6 +894,27 @@ impl Channel for TelegramChannel {
                 if text.as_deref().is_none_or(|value| value.trim().is_empty())
                     && attachments.is_empty()
                 {
+                    if self.conversation_is_unavailable(&message).await {
+                        let incoming = IncomingMessage {
+                            remote_message_id: message.message_id.to_string(),
+                            address: self.build_address(&message),
+                            text: None,
+                            attachments: Vec::new(),
+                            control: Some(IncomingControl::ConversationClosed {
+                                reason: "telegram chat is no longer available".to_string(),
+                            }),
+                        };
+                        if sender.send(incoming).await.is_err() {
+                            warn!(
+                                log_stream = "channel",
+                                log_key = %self.id,
+                                kind = "telegram_receiver_closed",
+                                "telegram receiver closed; stopping polling loop"
+                            );
+                            return Ok(());
+                        }
+                        continue;
+                    }
                     info!(
                         log_stream = "channel",
                         log_key = %self.id,
@@ -1658,6 +1706,34 @@ mod tests {
 
         let error = anyhow!("telegram API sendMessage failed: Bad Request: chat not found");
         assert!(!channel.should_defer_outbound_message(&error));
+    }
+
+    #[test]
+    fn detects_terminal_chat_errors() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+
+        assert!(channel.is_terminal_chat_error(&anyhow!(
+            "telegram API getChat failed: Bad Request: chat not found"
+        )));
+        assert!(channel.is_terminal_chat_error(&anyhow!(
+            "telegram API getChat failed: Bad Request: group chat was deleted"
+        )));
+        assert!(
+            !channel
+                .is_terminal_chat_error(&anyhow!("telegram API getChat failed: Too Many Requests"))
+        );
     }
 
     #[tokio::test]
