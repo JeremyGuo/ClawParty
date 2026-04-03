@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -440,6 +441,9 @@ fn build_bubblewrap_command(
     )?;
     bind_path(&mut command, workspace_root, false)?;
     bind_path(&mut command, runtime_state_root, false)?;
+    if let Some(home_ssh_dir) = discover_home_ssh_dir() {
+        bind_path(&mut command, &home_ssh_dir, false)?;
+    }
     if skill_memory_source.exists() {
         bind_path_to(
             &mut command,
@@ -455,6 +459,12 @@ fn build_bubblewrap_command(
     }
     command.arg("/__agent_host/bin/agent_host");
     Ok(command)
+}
+
+fn discover_home_ssh_dir() -> Option<PathBuf> {
+    let home_dir = env::var_os("HOME").map(PathBuf::from)?;
+    let ssh_dir = home_dir.join(".ssh");
+    ssh_dir.exists().then_some(ssh_dir)
 }
 
 fn bind_path(command: &mut Command, path: &Path, read_only: bool) -> Result<()> {
