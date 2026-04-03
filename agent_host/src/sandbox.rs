@@ -512,12 +512,9 @@ fn ensure_home_skeleton_parent_for_target(
     let Ok(relative_target) = target.strip_prefix(home_dir) else {
         return Ok(());
     };
-    let Some(parent) = relative_target.parent() else {
-        return Ok(());
-    };
-    fs::create_dir_all(home_skeleton.join(parent)).with_context(|| {
+    fs::create_dir_all(home_skeleton.join(relative_target)).with_context(|| {
         format!(
-            "failed to prepare sandbox home parent directories for {}",
+            "failed to prepare sandbox home mountpoint for {}",
             target.display()
         )
     })?;
