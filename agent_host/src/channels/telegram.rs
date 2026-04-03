@@ -1069,6 +1069,15 @@ struct TelegramFormattedText {
     text: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TableState {
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    header_rows: usize,
+    in_header: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextContainer {
     Paragraph,
@@ -1086,10 +1095,30 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
     let mut code_block_language: Option<String> = None;
     let mut code_block_buffer: Option<String> = None;
     let mut need_paragraph_break = false;
+    let mut table_state: Option<TableState> = None;
 
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
+                Tag::Table(_) => {
+                    ensure_block_break(&mut output, &mut need_paragraph_break);
+                    table_state = Some(TableState::default());
+                }
+                Tag::TableHead => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.in_header = true;
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.current_row.clear();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.current_cell.clear();
+                    }
+                }
                 Tag::Paragraph => {
                     ensure_block_break(&mut output, &mut need_paragraph_break);
                     text_stack.push(TextContainer::Paragraph);
@@ -1153,6 +1182,36 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                 _ => {}
             },
             Event::End(tag) => match tag {
+                TagEnd::Table => {
+                    if let Some(table) = table_state.take() {
+                        output.push_str(&render_table_for_telegram(&table));
+                        need_paragraph_break = true;
+                    }
+                }
+                TagEnd::TableHead => {
+                    if let Some(table) = table_state.as_mut() {
+                        if !table.current_row.is_empty() {
+                            table.rows.push(std::mem::take(&mut table.current_row));
+                        }
+                        table.header_rows = table.rows.len();
+                        table.in_header = false;
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(table) = table_state.as_mut()
+                        && !table.current_row.is_empty()
+                    {
+                        table.rows.push(std::mem::take(&mut table.current_row));
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(table) = table_state.as_mut() {
+                        table
+                            .current_row
+                            .push(normalize_table_cell(&table.current_cell));
+                        table.current_cell.clear();
+                    }
+                }
                 TagEnd::Paragraph => {
                     let _ = text_stack.pop();
                     need_paragraph_break = true;
@@ -1194,7 +1253,9 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(buffer) = code_block_buffer.as_mut() {
+                if let Some(table) = table_state.as_mut() {
+                    table.current_cell.push_str(&text);
+                } else if let Some(buffer) = code_block_buffer.as_mut() {
                     buffer.push_str(&text);
                 } else {
                     if blockquote_depth > 0 && starts_new_block_line(&output) && !pending_list_item
@@ -1205,12 +1266,20 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                 }
             }
             Event::Code(code) => {
-                output.push_str("<code>");
-                output.push_str(&escape_html_text(&code));
-                output.push_str("</code>");
+                if let Some(table) = table_state.as_mut() {
+                    table.current_cell.push_str(&code);
+                } else {
+                    output.push_str("<code>");
+                    output.push_str(&escape_html_text(&code));
+                    output.push_str("</code>");
+                }
             }
             Event::SoftBreak => {
-                if code_block_buffer.is_some() {
+                if let Some(table) = table_state.as_mut() {
+                    if !table.current_cell.ends_with(' ') {
+                        table.current_cell.push(' ');
+                    }
+                } else if code_block_buffer.is_some() {
                     if let Some(buffer) = code_block_buffer.as_mut() {
                         buffer.push('\n');
                     }
@@ -1220,8 +1289,14 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                 }
             }
             Event::HardBreak => {
-                output.push('\n');
-                pending_list_item = false;
+                if let Some(table) = table_state.as_mut() {
+                    if !table.current_cell.ends_with(' ') {
+                        table.current_cell.push(' ');
+                    }
+                } else {
+                    output.push('\n');
+                    pending_list_item = false;
+                }
             }
             Event::Rule => {
                 ensure_block_break(&mut output, &mut need_paragraph_break);
@@ -1280,6 +1355,64 @@ fn ensure_block_break(output: &mut String, need_paragraph_break: &mut bool) {
 
 fn starts_new_block_line(output: &str) -> bool {
     output.is_empty() || output.ends_with('\n')
+}
+
+fn normalize_table_cell(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn pad_table_cell(value: &str, width: usize) -> String {
+    let cell_width = value.chars().count();
+    if cell_width >= width {
+        value.to_string()
+    } else {
+        format!("{}{}", value, " ".repeat(width - cell_width))
+    }
+}
+
+fn render_table_for_telegram(table: &TableState) -> String {
+    if table.rows.is_empty() {
+        return String::new();
+    }
+
+    let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return String::new();
+    }
+
+    let widths = (0..column_count)
+        .map(|column| {
+            table
+                .rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = Vec::new();
+    for (index, row) in table.rows.iter().enumerate() {
+        let rendered = (0..column_count)
+            .map(|column| {
+                let value = row.get(column).cloned().unwrap_or_default();
+                pad_table_cell(&value, widths[column])
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        lines.push(rendered);
+        if table.header_rows > 0 && index + 1 == table.header_rows {
+            let separator = widths
+                .iter()
+                .map(|width| "─".repeat(*width))
+                .collect::<Vec<_>>()
+                .join("─┼─");
+            lines.push(separator);
+        }
+    }
+
+    format!("<pre>{}</pre>", escape_html_text(&lines.join("\n")))
 }
 
 fn escape_html_text(value: &str) -> String {
@@ -1397,6 +1530,22 @@ mod tests {
         );
         assert!(translated.text.contains("let x = 1 &lt; 2;"));
         assert!(translated.text.contains("<code>inline &lt;tag&gt;</code>"));
+    }
+
+    #[test]
+    fn translates_markdown_tables_into_preformatted_text() {
+        let translated = translate_markdown_to_telegram_html(
+            "| Name | Status | GPU |\n|------|--------|-----|\n| job-a | running | 8xH100 |\n| job-b | failed | 4xH100 |",
+        );
+
+        assert!(translated.text.contains("<pre>"));
+        assert!(translated.text.contains("Name"));
+        assert!(translated.text.contains("Status"));
+        assert!(translated.text.contains("GPU"));
+        assert!(translated.text.contains("job-a"));
+        assert!(translated.text.contains("running"));
+        assert!(translated.text.contains("8xH100"));
+        assert!(translated.text.contains("┼") || translated.text.contains("─"));
     }
 
     #[test]
