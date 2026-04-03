@@ -31,6 +31,7 @@ pub enum ParentToChildMessage {
         error: Option<String>,
     },
     SoftTimeout,
+    Yield,
     Cancel,
 }
 

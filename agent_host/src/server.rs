@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::select;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
@@ -105,6 +105,7 @@ struct SummaryTracker {
 
 enum TimedRunOutcome {
     Completed(SessionRunReport),
+    Yielded(SessionRunReport),
     TimedOut {
         checkpoint: Option<SessionRunReport>,
         error: anyhow::Error,
@@ -122,6 +123,11 @@ enum ForegroundTurnOutcome {
         usage: TokenUsage,
         compaction: SessionCompactionStats,
         timed_out: bool,
+    },
+    Yielded {
+        messages: Vec<ChatMessage>,
+        usage: TokenUsage,
+        compaction: SessionCompactionStats,
     },
     Failed {
         pending_continue: PendingContinueState,
@@ -1214,6 +1220,7 @@ impl ServerRuntime {
         prompt: String,
         timeout_seconds: Option<f64>,
         upstream_timeout_seconds: Option<f64>,
+        control_observer: Option<Arc<dyn Fn(SessionExecutionControl) + Send + Sync>>,
         timeout_label: &str,
         join_label: &str,
     ) -> Result<TimedRunOutcome> {
@@ -1238,6 +1245,9 @@ impl ServerRuntime {
         .with_event_callback(move |event| {
             let _ = event_sender.send(event);
         });
+        if let Some(observer) = control_observer {
+            observer(execution_control.clone());
+        }
         let cancellation_handle = execution_control.clone();
         let worker_session = session;
         let worker_model_key = model_key;
@@ -1323,6 +1333,9 @@ impl ServerRuntime {
                             });
                         }
                     };
+                    if report.yielded {
+                        return Ok(TimedRunOutcome::Yielded(report));
+                    }
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
                             checkpoint: Some(report),
@@ -1372,6 +1385,7 @@ impl ServerRuntime {
         prompt: String,
         timeout_seconds: Option<f64>,
         upstream_timeout_seconds: Option<f64>,
+        control_observer: Option<Arc<dyn Fn(SessionExecutionControl) + Send + Sync>>,
         timeout_label: &str,
     ) -> Result<TimedRunOutcome> {
         enum DriverEvent {
@@ -1392,6 +1406,9 @@ impl ServerRuntime {
         .with_event_callback(move |event| {
             let _ = event_sender.send(event);
         });
+        if let Some(observer) = control_observer {
+            observer(execution_control.clone());
+        }
         let cancellation_handle = execution_control.clone();
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
@@ -1485,6 +1502,9 @@ impl ServerRuntime {
                             });
                         }
                     };
+                    if report.yielded {
+                        return Ok(TimedRunOutcome::Yielded(report));
+                    }
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
                             checkpoint: Some(report),
@@ -1570,10 +1590,15 @@ impl ServerRuntime {
             prompt,
             timeout_override,
             timeout_override,
+            None,
             "subagent",
         );
         let (report, timed_out) = match report {
             Ok(TimedRunOutcome::Completed(report)) => {
+                self.mark_managed_agent_completed(subagent_id, &report.usage);
+                (report, false)
+            }
+            Ok(TimedRunOutcome::Yielded(report)) => {
                 self.mark_managed_agent_completed(subagent_id, &report.usage);
                 (report, false)
             }
@@ -1751,6 +1776,7 @@ impl ServerRuntime {
                 job.prompt.clone(),
                 timeout_seconds,
                 Some(upstream_timeout_seconds),
+                None,
                 "background agent",
                 "background agent task join failed",
             )
@@ -1798,6 +1824,29 @@ impl ServerRuntime {
                     cleanup_detached_session_root(self, &job).ok();
                     return recovery;
                 }
+                self.mark_managed_agent_completed(job.agent_id, &report.usage);
+                Ok(())
+            }
+            Ok(TimedRunOutcome::Yielded(report)) => {
+                let assistant_text = extract_assistant_text(&report.messages);
+                let outgoing = build_outgoing_message_for_session(
+                    &job.session,
+                    &assistant_text,
+                    &job.session.workspace_root,
+                )?;
+                log_turn_usage(
+                    job.agent_id,
+                    &job.session,
+                    &report.usage,
+                    false,
+                    "main_background",
+                    job.parent_agent_id,
+                );
+                let sink_router = self.sink_router.read().await;
+                sink_router
+                    .dispatch(&self.channels, &job.sink, outgoing)
+                    .await
+                    .context("failed to dispatch yielded background agent reply")?;
                 self.mark_managed_agent_completed(job.agent_id, &report.usage);
                 Ok(())
             }
@@ -1910,6 +1959,7 @@ impl ServerRuntime {
                 recovery_prompt,
                 Some(recovery_timeout),
                 Some(upstream_timeout_seconds),
+                None,
                 "background failure recovery",
                 "background failure recovery task join failed",
             )
@@ -1936,6 +1986,21 @@ impl ServerRuntime {
                     failed_agent_id = %job.agent_id,
                     "background failure recovery agent completed"
                 );
+                Ok(())
+            }
+            Ok(TimedRunOutcome::Yielded(report)) => {
+                let assistant_text = extract_assistant_text(&report.messages);
+                let outgoing = build_outgoing_message_for_session(
+                    &job.session,
+                    &assistant_text,
+                    &job.session.workspace_root,
+                )?;
+                let sink_router = self.sink_router.read().await;
+                sink_router
+                    .dispatch(&self.channels, &job.sink, outgoing)
+                    .await
+                    .context("failed to dispatch yielded recovered background agent reply")?;
+                self.mark_managed_agent_completed(recovery_agent_id, &report.usage);
                 Ok(())
             }
             Ok(TimedRunOutcome::TimedOut {
@@ -2204,6 +2269,7 @@ pub struct Server {
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
     summary_tracker: Arc<SummaryTracker>,
+    active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
 }
 
 impl Server {
@@ -2272,6 +2338,7 @@ impl Server {
             background_job_sender,
             background_job_receiver: Some(background_job_receiver),
             summary_tracker: Arc::new(SummaryTracker::new()),
+            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2325,15 +2392,35 @@ impl Server {
                 .idle_context_compaction_poll_interval_seconds,
         ));
         idle_compaction_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut pending_messages = VecDeque::new();
+        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_notify = Arc::new(Notify::new());
+        let receiver_closed = Arc::new(AtomicBool::new(false));
+        let active_controls = Arc::clone(&self.active_foreground_controls);
+        let pump_queue = Arc::clone(&pending_messages);
+        let pump_notify = Arc::clone(&pending_notify);
+        let pump_closed = Arc::clone(&receiver_closed);
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                request_yield_for_incoming(&active_controls, &message);
+                if let Ok(mut queue) = pump_queue.lock() {
+                    queue.push_back(message);
+                }
+                pump_notify.notify_one();
+            }
+            pump_closed.store(true, Ordering::SeqCst);
+            pump_notify.notify_waiters();
+        });
 
         loop {
-            while let Ok(message) = receiver.try_recv() {
-                pending_messages.push_back(message);
-            }
-            if let Some(message) = pending_messages.pop_front() {
-                let message =
-                    coalesce_buffered_conversation_messages(message, &mut pending_messages);
+            let next_message = {
+                let mut queue = pending_messages
+                    .lock()
+                    .map_err(|_| anyhow!("pending messages lock poisoned"))?;
+                queue
+                    .pop_front()
+                    .map(|message| coalesce_buffered_conversation_messages(message, &mut queue))
+            };
+            if let Some(message) = next_message {
                 if let Err(error) = self.handle_incoming(message).await {
                     error!(
                         log_stream = "server",
@@ -2344,6 +2431,11 @@ impl Server {
                 }
                 continue;
             }
+
+            if receiver_closed.load(Ordering::SeqCst) {
+                break;
+            }
+
             select! {
                 _ = idle_compaction_ticker.tick() => {
                     if self.main_agent.enable_idle_context_compaction
@@ -2357,12 +2449,7 @@ impl Server {
                         );
                     }
                 }
-                maybe_message = receiver.recv() => {
-                    let Some(message) = maybe_message else {
-                        break;
-                    };
-                    pending_messages.push_back(message);
-                }
+                _ = pending_notify.notified() => {}
             }
         }
 
@@ -2499,6 +2586,15 @@ impl Server {
             .effective_conversation_settings(address)?
             .reasoning_effort;
         Ok(runtime)
+    }
+
+    fn unregister_active_foreground_control(&self, address: &ChannelAddress) -> Result<()> {
+        let mut controls = self
+            .active_foreground_controls
+            .lock()
+            .map_err(|_| anyhow!("active foreground controls lock poisoned"))?;
+        controls.remove(&address.session_key());
+        Ok(())
     }
 
     pub fn workdir(&self) -> &Path {
@@ -3185,6 +3281,24 @@ impl Server {
                         .ok();
                     return Ok(());
                 }
+                ForegroundTurnOutcome::Yielded {
+                    messages,
+                    usage,
+                    compaction,
+                } => {
+                    let loaded_skills =
+                        extract_loaded_skill_names(&messages, session.agent_message_count);
+                    self.sessions
+                        .record_yielded_turn(&incoming.address, messages, &usage, &compaction)
+                        .context("failed to persist yielded continued agent_frame messages")?;
+                    self.sessions
+                        .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
+                    channel
+                        .set_processing(&incoming.address, ProcessingState::Idle)
+                        .await
+                        .ok();
+                    return Ok(());
+                }
                 ForegroundTurnOutcome::Failed {
                     pending_continue,
                     error,
@@ -3290,6 +3404,29 @@ impl Server {
                 compaction,
                 timed_out,
             } => (messages, outgoing, usage, compaction, timed_out),
+            ForegroundTurnOutcome::Yielded {
+                messages,
+                usage,
+                compaction,
+            } => {
+                let loaded_skills =
+                    extract_loaded_skill_names(&messages, session.agent_message_count);
+                self.sessions
+                    .record_yielded_turn(&incoming.address, messages, &usage, &compaction)
+                    .context("failed to persist yielded agent_frame messages")?;
+                self.sessions
+                    .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
+                self.sessions.append_user_message(
+                    &incoming.address,
+                    incoming.text.clone(),
+                    stored_attachments.clone(),
+                )?;
+                channel
+                    .set_processing(&incoming.address, ProcessingState::Idle)
+                    .await
+                    .ok();
+                return Ok(());
+            }
             ForegroundTurnOutcome::Failed {
                 pending_continue,
                 error,
@@ -3553,6 +3690,19 @@ impl Server {
                 compaction,
                 timed_out,
             } => (messages, outgoing, usage, compaction, timed_out),
+            ForegroundTurnOutcome::Yielded {
+                messages,
+                usage,
+                compaction,
+            } => {
+                self.sessions.record_yielded_turn(
+                    &session.address,
+                    messages,
+                    &usage,
+                    &compaction,
+                )?;
+                return Ok(OutgoingMessage::default());
+            }
             ForegroundTurnOutcome::Failed { error, .. } => return Err(error),
         };
         self.sessions
@@ -3679,12 +3829,14 @@ impl Server {
                 prompt,
                 timeout_seconds,
                 Some(upstream_timeout_seconds),
+                None,
                 "workspace summary",
                 "workspace summary task join failed",
             )
             .await?;
         let report = match outcome {
             TimedRunOutcome::Completed(report) => report,
+            TimedRunOutcome::Yielded(report) => report,
             TimedRunOutcome::TimedOut {
                 checkpoint: Some(report),
                 ..
@@ -3769,6 +3921,14 @@ impl Server {
             .api_timeout_override_seconds
             .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
         let runtime = self.tool_runtime_for_address(&session.address)?;
+        let active_controls = Arc::clone(&self.active_foreground_controls);
+        let session_key = session.address.session_key();
+        let control_observer: Arc<dyn Fn(SessionExecutionControl) + Send + Sync> =
+            Arc::new(move |control| {
+                if let Ok(mut controls) = active_controls.lock() {
+                    controls.insert(session_key.clone(), control);
+                }
+            });
         let run_result = runtime
             .run_agent_turn_with_timeout(
                 session.clone(),
@@ -3779,10 +3939,13 @@ impl Server {
                 String::new(),
                 timeout_seconds,
                 Some(upstream_timeout_seconds),
+                Some(control_observer),
                 "foreground agent turn",
                 "agent_frame task join failed",
             )
-            .await?;
+            .await;
+        self.unregister_active_foreground_control(&session.address)?;
+        let run_result = run_result?;
 
         match run_result {
             TimedRunOutcome::Completed(report) => {
@@ -3797,6 +3960,11 @@ impl Server {
                     timed_out: false,
                 })
             }
+            TimedRunOutcome::Yielded(report) => Ok(ForegroundTurnOutcome::Yielded {
+                messages: report.messages,
+                usage: report.usage,
+                compaction: report.compaction,
+            }),
             TimedRunOutcome::TimedOut { checkpoint, error } => {
                 let report = checkpoint.ok_or(error)?;
                 let assistant_text = extract_assistant_text(&report.messages);
@@ -4252,6 +4420,23 @@ fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> Stri
         sections.push(format!("Follow-up {}:\n{}", index + 1, body));
     }
     sections.join("\n\n")
+}
+
+fn request_yield_for_incoming(
+    active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
+    message: &IncomingMessage,
+) {
+    if message.control.is_some() {
+        return;
+    }
+    let session_key = message.address.session_key();
+    let control = active_controls
+        .lock()
+        .ok()
+        .and_then(|controls| controls.get(&session_key).cloned());
+    if let Some(control) = control {
+        control.request_yield();
+    }
 }
 
 fn build_user_turn_message(
@@ -5854,6 +6039,23 @@ fn log_agent_frame_event(
             output_len = *output_len as u64,
             errored = *errored,
             "agent_frame tool call completed"
+        ),
+        SessionEvent::SessionYielded {
+            phase,
+            message_count,
+            total_tokens,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_session_yielded",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            phase,
+            message_count = *message_count as u64,
+            total_tokens = *total_tokens,
+            "agent_frame session yielded at a safe boundary"
         ),
         SessionEvent::PrefixRewriteApplied {
             previous_prefix_message_count,

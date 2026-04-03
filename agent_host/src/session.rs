@@ -700,6 +700,54 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn record_yielded_turn(
+        &mut self,
+        address: &ChannelAddress,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.agent_messages = messages;
+        session.last_agent_returned_at = Some(Utc::now());
+        session.turn_count = session.turn_count.saturating_add(1);
+        session.cumulative_usage.add_assign(usage);
+        session.cumulative_compaction.run_count = session
+            .cumulative_compaction
+            .run_count
+            .saturating_add(compaction.run_count);
+        session.cumulative_compaction.compacted_run_count = session
+            .cumulative_compaction
+            .compacted_run_count
+            .saturating_add(compaction.compacted_run_count);
+        session.cumulative_compaction.estimated_tokens_before = session
+            .cumulative_compaction
+            .estimated_tokens_before
+            .saturating_add(compaction.estimated_tokens_before);
+        session.cumulative_compaction.estimated_tokens_after = session
+            .cumulative_compaction
+            .estimated_tokens_after
+            .saturating_add(compaction.estimated_tokens_after);
+        session
+            .cumulative_compaction
+            .usage
+            .add_assign(&compaction.usage);
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "agent_turn_yielded",
+            agent_message_count = session.agent_messages.len() as u64,
+            turn_count = session.turn_count,
+            "recorded yielded agent turn"
+        );
+        session.persist()?;
+        Ok(())
+    }
+
     pub fn record_idle_compaction(
         &mut self,
         address: &ChannelAddress,

@@ -115,6 +115,8 @@ pub struct SessionRunReport {
     pub messages: Vec<ChatMessage>,
     pub usage: TokenUsage,
     pub compaction: SessionCompactionStats,
+    #[serde(default)]
+    pub yielded: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -208,6 +210,11 @@ pub enum SessionEvent {
         output_len: usize,
         errored: bool,
     },
+    SessionYielded {
+        phase: String,
+        message_count: usize,
+        total_tokens: u64,
+    },
     PrefixRewriteApplied {
         previous_prefix_message_count: usize,
         replacement_prefix_message_count: usize,
@@ -222,6 +229,7 @@ pub enum SessionEvent {
 pub enum ExecutionSignal {
     Cancel,
     TimeoutObservation,
+    Yield,
 }
 
 #[derive(Clone)]
@@ -229,6 +237,7 @@ pub struct SessionExecutionControl {
     cancel_flag: Arc<AtomicBool>,
     tool_interrupt_flag: Arc<InterruptSignal>,
     timeout_observation_requested: Arc<AtomicBool>,
+    yield_requested: Arc<AtomicBool>,
     signal_sender: Sender<ExecutionSignal>,
     signal_receiver: Receiver<ExecutionSignal>,
     checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
@@ -263,6 +272,7 @@ impl SessionExecutionControl {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tool_interrupt_flag: Arc::new(InterruptSignal::new()),
             timeout_observation_requested: Arc::new(AtomicBool::new(false)),
+            yield_requested: Arc::new(AtomicBool::new(false)),
             signal_sender,
             signal_receiver,
             checkpoint_callback: None,
@@ -280,6 +290,7 @@ impl SessionExecutionControl {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tool_interrupt_flag: Arc::new(InterruptSignal::new()),
             timeout_observation_requested: Arc::new(AtomicBool::new(false)),
+            yield_requested: Arc::new(AtomicBool::new(false)),
             signal_sender,
             signal_receiver,
             checkpoint_callback: Some(Arc::new(callback)),
@@ -314,6 +325,11 @@ impl SessionExecutionControl {
         let _ = self.signal_sender.send(ExecutionSignal::TimeoutObservation);
     }
 
+    pub fn request_yield(&self) {
+        self.yield_requested.store(true, Ordering::SeqCst);
+        let _ = self.signal_sender.send(ExecutionSignal::Yield);
+    }
+
     pub fn signal_receiver(&self) -> Receiver<ExecutionSignal> {
         self.signal_receiver.clone()
     }
@@ -340,6 +356,10 @@ impl SessionExecutionControl {
             self.tool_interrupt_flag.clear();
         }
         requested
+    }
+
+    pub fn take_yield_requested(&self) -> bool {
+        self.yield_requested.swap(false, Ordering::SeqCst)
     }
 
     pub fn stable_prefix_snapshot(&self) -> Vec<ChatMessage> {
@@ -379,6 +399,7 @@ impl SessionExecutionControl {
                 messages: messages.to_vec(),
                 usage: usage.clone(),
                 compaction: SessionCompactionStats::default(),
+                yielded: false,
             });
         }
         self.emit_event(SessionEvent::CheckpointEmitted {
@@ -492,6 +513,19 @@ pub fn run_session_with_report_controlled(
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
+            if control.take_yield_requested() {
+                control.emit_event(SessionEvent::SessionYielded {
+                    phase: "round_start".to_string(),
+                    message_count: messages.len(),
+                    total_tokens: usage.total_tokens,
+                });
+                return Ok(SessionRunReport {
+                    messages,
+                    usage,
+                    compaction: compaction_stats,
+                    yielded: true,
+                });
+            }
             control.emit_event(SessionEvent::RoundStarted {
                 round_index,
                 message_count: messages.len(),
@@ -557,10 +591,40 @@ pub fn run_session_with_report_controlled(
                 messages,
                 usage,
                 compaction: compaction_stats,
+                yielded: false,
             });
         }
 
         if let Some(control) = &control {
+            if control.take_yield_requested() {
+                for tool_call in &tool_calls {
+                    let yielded_result =
+                        synthesize_tool_yield_observation(&tool_call.function.name);
+                    messages.push(ChatMessage::tool_output(
+                        tool_call.id.clone(),
+                        tool_call.function.name.clone(),
+                        yielded_result,
+                    ));
+                    control.emit_event(SessionEvent::ToolCallCompleted {
+                        round_index,
+                        tool_name: tool_call.function.name.clone(),
+                        tool_call_id: tool_call.id.clone(),
+                        output_len: 0,
+                        errored: true,
+                    });
+                }
+                control.emit_event(SessionEvent::SessionYielded {
+                    phase: "after_model_before_tools".to_string(),
+                    message_count: messages.len(),
+                    total_tokens: usage.total_tokens,
+                });
+                return Ok(SessionRunReport {
+                    messages,
+                    usage,
+                    compaction: compaction_stats,
+                    yielded: true,
+                });
+            }
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
@@ -649,6 +713,21 @@ pub fn run_session_with_report_controlled(
                     errored: tool_result_looks_like_error(&result),
                 });
             }
+        }
+        if let Some(control) = &control
+            && control.take_yield_requested()
+        {
+            control.emit_event(SessionEvent::SessionYielded {
+                phase: "after_tool_batch".to_string(),
+                message_count: messages.len(),
+                total_tokens: usage.total_tokens,
+            });
+            return Ok(SessionRunReport {
+                messages,
+                usage,
+                compaction: compaction_stats,
+                yielded: true,
+            });
         }
     }
 
@@ -819,6 +898,16 @@ fn synthesize_tool_timeout_observation(
             "inspect the partial observation and continue with a different tool",
             "explain the timeout to the user"
         ]
+    })
+    .to_string()
+}
+
+fn synthesize_tool_yield_observation(tool_name: &str) -> String {
+    json!({
+        "cancelled": true,
+        "yielded": true,
+        "tool": tool_name,
+        "reason": "a newer user message arrived before this tool call was executed; re-plan using the latest user input"
     })
     .to_string()
 }

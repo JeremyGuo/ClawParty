@@ -301,6 +301,7 @@ fn run_zgent_session_with_report_controlled(
                 messages,
                 usage,
                 compaction: SessionCompactionStats::default(),
+                yielded: false,
             });
         }
 

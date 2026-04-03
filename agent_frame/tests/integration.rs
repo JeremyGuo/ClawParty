@@ -1626,6 +1626,89 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
 }
 
 #[test]
+fn controlled_run_yields_at_safe_boundary_before_tools() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "checking environment",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\",\"timeout_seconds\":30}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 6,
+            "total_tokens": 24
+        }
+    }));
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": ["read_file"],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
+    let events = Arc::new(Mutex::new(Vec::<SessionEvent>::new()));
+    let control = {
+        let control_holder = Arc::clone(&control_holder);
+        let events = Arc::clone(&events);
+        SessionExecutionControl::new().with_event_callback(move |event| {
+            events.lock().unwrap().push(event.clone());
+            if matches!(event, SessionEvent::ModelCallCompleted { .. })
+                && let Some(control) = control_holder.lock().unwrap().as_ref()
+            {
+                control.request_yield();
+            }
+        })
+    };
+    *control_holder.lock().unwrap() = Some(control.clone());
+
+    let report = run_session_with_report_controlled(
+        Vec::new(),
+        "Check the environment",
+        config,
+        Vec::new(),
+        Some(control),
+    )?;
+    assert!(report.yielded);
+    let tool_messages = report
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 1);
+    let tool_json: Value = serde_json::from_str(
+        tool_messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .unwrap(),
+    )?;
+    assert_eq!(tool_json["yielded"], json!(true));
+    assert_eq!(tool_json["cancelled"], json!(true));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::SessionYielded { phase, .. } if phase == "after_model_before_tools"))
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_reads_prompt_argument() -> Result<()> {
     let server = TestServer::start();
     server.push_response(json!({

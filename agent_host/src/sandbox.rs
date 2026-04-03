@@ -158,6 +158,9 @@ pub fn run_child_stdio() -> Result<()> {
                 ParentToChildMessage::SoftTimeout => {
                     signal_control.request_timeout_observation();
                 }
+                ParentToChildMessage::Yield => {
+                    signal_control.request_yield();
+                }
                 ParentToChildMessage::Cancel => {
                     signal_control.request_cancel();
                     break;
@@ -262,6 +265,7 @@ pub fn run_turn_in_child_process(
                 let message = match signal {
                     ExecutionSignal::Cancel => ParentToChildMessage::Cancel,
                     ExecutionSignal::TimeoutObservation => ParentToChildMessage::SoftTimeout,
+                    ExecutionSignal::Yield => ParentToChildMessage::Yield,
                 };
                 if let Ok(mut writer) = writer.lock() {
                     let _ = write_json_line(&mut *writer, &message);
