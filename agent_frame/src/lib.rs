@@ -5,6 +5,7 @@ pub mod config;
 pub mod llm;
 pub mod message;
 pub mod skills;
+pub mod tool_worker;
 pub mod tooling;
 
 pub use serde_json;

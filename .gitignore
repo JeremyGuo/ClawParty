@@ -14,3 +14,5 @@ agent_host/example_config_workdir/
 logs/
 sessions/
 **/.agent_frame/
+
+deploy*

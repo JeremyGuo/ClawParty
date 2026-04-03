@@ -49,6 +49,7 @@ pub fn build_agent_system_prompt(
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
+        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root

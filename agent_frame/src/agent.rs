@@ -27,7 +27,9 @@ fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> Stri
     let mut parts = vec![
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
-        "The model is responsible for choosing timeout_seconds for any built-in tool call."
+        "Only tools that explicitly expose timeout fields require the model to choose timeout_seconds."
+            .to_string(),
+        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe."
             .to_string(),
     ];
     if config
@@ -256,7 +258,7 @@ struct PendingPrefixRewrite {
 
 struct PendingToolWaitCompaction {
     cancel_sender: mpsc::Sender<()>,
-    join_handle: thread::JoinHandle<Result<Option<PendingPrefixRewrite>>>,
+    join_handle: thread::JoinHandle<()>,
 }
 
 struct CompletedToolCall {
@@ -327,6 +329,7 @@ impl SessionExecutionControl {
 
     pub fn request_yield(&self) {
         self.yield_requested.store(true, Ordering::SeqCst);
+        self.tool_interrupt_flag.request();
         let _ = self.signal_sender.send(ExecutionSignal::Yield);
     }
 
@@ -359,7 +362,11 @@ impl SessionExecutionControl {
     }
 
     pub fn take_yield_requested(&self) -> bool {
-        self.yield_requested.swap(false, Ordering::SeqCst)
+        let requested = self.yield_requested.swap(false, Ordering::SeqCst);
+        if requested {
+            self.tool_interrupt_flag.clear();
+        }
+        requested
     }
 
     pub fn stable_prefix_snapshot(&self) -> Vec<ChatMessage> {
@@ -596,35 +603,6 @@ pub fn run_session_with_report_controlled(
         }
 
         if let Some(control) = &control {
-            if control.take_yield_requested() {
-                for tool_call in &tool_calls {
-                    let yielded_result =
-                        synthesize_tool_yield_observation(&tool_call.function.name);
-                    messages.push(ChatMessage::tool_output(
-                        tool_call.id.clone(),
-                        tool_call.function.name.clone(),
-                        yielded_result,
-                    ));
-                    control.emit_event(SessionEvent::ToolCallCompleted {
-                        round_index,
-                        tool_name: tool_call.function.name.clone(),
-                        tool_call_id: tool_call.id.clone(),
-                        output_len: 0,
-                        errored: true,
-                    });
-                }
-                control.emit_event(SessionEvent::SessionYielded {
-                    phase: "after_model_before_tools".to_string(),
-                    message_count: messages.len(),
-                    total_tokens: usage.total_tokens,
-                });
-                return Ok(SessionRunReport {
-                    messages,
-                    usage,
-                    compaction: compaction_stats,
-                    yielded: true,
-                });
-            }
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
@@ -639,7 +617,6 @@ pub fn run_session_with_report_controlled(
         let pending_compaction = start_pending_tool_wait_compaction(
             &config,
             &messages,
-            &extra_tools,
             control.as_ref(),
             "tool_batch",
             Some(last_model_response_at),
@@ -674,17 +651,7 @@ pub fn run_session_with_report_controlled(
                     .map_err(|_| anyhow!("tool worker thread panicked"))?,
             );
         }
-        if let Some(control) = &control
-            && let Some(rewrite) = finish_pending_tool_wait_compaction(pending_compaction)?
-        {
-            control.request_prefix_rewrite(
-                rewrite.expected_prefix,
-                rewrite.replacement_prefix,
-                rewrite.usage,
-                rewrite.compaction,
-            );
-            apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
-        }
+        finish_pending_tool_wait_compaction(pending_compaction)?;
 
         let timeout_observation_requested = control
             .as_ref()
@@ -714,6 +681,31 @@ pub fn run_session_with_report_controlled(
                 });
             }
         }
+        if timeout_observation_requested {
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::ToolWaitCompactionStarted {
+                    tool_name: "tool_batch".to_string(),
+                    stable_prefix_message_count: messages.len(),
+                });
+            }
+            let post_tool_compaction =
+                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::ToolWaitCompactionCompleted {
+                    tool_name: "tool_batch".to_string(),
+                    compacted: post_tool_compaction.compacted,
+                    estimated_tokens_before: post_tool_compaction.estimated_tokens_before,
+                    estimated_tokens_after: post_tool_compaction.estimated_tokens_after,
+                    token_limit: post_tool_compaction.token_limit,
+                });
+            }
+            usage.add_assign(&post_tool_compaction.usage);
+            compaction_stats.record_report(&post_tool_compaction);
+            messages = post_tool_compaction.messages;
+            if let Some(control) = &control {
+                control.set_stable_prefix_messages(&messages);
+            }
+        }
         if let Some(control) = &control
             && control.take_yield_requested()
         {
@@ -740,7 +732,6 @@ pub fn run_session_with_report_controlled(
 fn start_pending_tool_wait_compaction(
     config: &AgentConfig,
     stable_prefix: &[ChatMessage],
-    extra_tools: &[Tool],
     control: Option<&SessionExecutionControl>,
     tool_name: &str,
     last_model_response_at: Option<Instant>,
@@ -766,8 +757,7 @@ fn start_pending_tool_wait_compaction(
         return Ok(None);
     };
     let delay = idle_threshold.saturating_sub(last_model_response_at.elapsed());
-    let control = control.cloned();
-    if let Some(control) = &control {
+    if let Some(control) = control {
         control.emit_event(SessionEvent::ToolWaitCompactionScheduled {
             tool_name: tool_name.to_string(),
             stable_prefix_message_count: stable_prefix.len(),
@@ -775,46 +765,16 @@ fn start_pending_tool_wait_compaction(
         });
     }
 
-    let config = config.clone();
-    let stable_prefix = stable_prefix.to_vec();
-    let extra_tools = extra_tools.to_vec();
-    let tool_name = tool_name.to_string();
+    let control = control.cloned().expect("checked above");
     let (cancel_sender, cancel_receiver) = mpsc::channel();
-    let join_handle = thread::spawn(move || -> Result<Option<PendingPrefixRewrite>> {
+    let join_handle = thread::spawn(move || {
         if !delay.is_zero() {
             match cancel_receiver.recv_timeout(delay) {
-                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
-        if let Some(control) = &control {
-            control.emit_event(SessionEvent::ToolWaitCompactionStarted {
-                tool_name: tool_name.clone(),
-                stable_prefix_message_count: stable_prefix.len(),
-            });
-        }
-        let report =
-            compact_session_messages_with_report(stable_prefix.clone(), config, extra_tools)?;
-        if let Some(control) = &control {
-            control.emit_event(SessionEvent::ToolWaitCompactionCompleted {
-                tool_name: tool_name.clone(),
-                compacted: report.compacted,
-                estimated_tokens_before: report.estimated_tokens_before,
-                estimated_tokens_after: report.estimated_tokens_after,
-                token_limit: report.token_limit,
-            });
-        }
-        if !report.compacted {
-            return Ok(None);
-        }
-        let mut compaction = SessionCompactionStats::default();
-        compaction.record_report(&report);
-        Ok(Some(PendingPrefixRewrite {
-            expected_prefix: stable_prefix,
-            replacement_prefix: report.messages,
-            usage: report.usage,
-            compaction,
-        }))
+        control.request_timeout_observation();
     });
 
     Ok(Some(PendingToolWaitCompaction {
@@ -823,17 +783,16 @@ fn start_pending_tool_wait_compaction(
     }))
 }
 
-fn finish_pending_tool_wait_compaction(
-    pending: Option<PendingToolWaitCompaction>,
-) -> Result<Option<PendingPrefixRewrite>> {
+fn finish_pending_tool_wait_compaction(pending: Option<PendingToolWaitCompaction>) -> Result<()> {
     let Some(pending) = pending else {
-        return Ok(None);
+        return Ok(());
     };
     let _ = pending.cancel_sender.send(());
     pending
         .join_handle
         .join()
-        .map_err(|_| anyhow!("tool wait compaction worker thread panicked"))?
+        .map_err(|_| anyhow!("tool wait compaction worker thread panicked"))?;
+    Ok(())
 }
 
 fn apply_pending_prefix_rewrite(
@@ -902,145 +861,24 @@ fn synthesize_tool_timeout_observation(
     .to_string()
 }
 
-fn synthesize_tool_yield_observation(tool_name: &str) -> String {
-    json!({
-        "cancelled": true,
-        "yielded": true,
-        "tool": tool_name,
-        "reason": "a newer user message arrived before this tool call was executed; re-plan using the latest user input"
-    })
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPACTION_MARKER, SessionExecutionControl, finish_pending_tool_wait_compaction,
+        ExecutionSignal, SessionExecutionControl, finish_pending_tool_wait_compaction,
         start_pending_tool_wait_compaction,
     };
     use crate::config::{AgentConfig, CacheControlConfig, UpstreamConfig};
     use crate::message::ChatMessage;
-    use crate::tooling::Tool;
-    use serde_json::{Value, json};
-    use std::collections::VecDeque;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    struct TestServer {
-        address: String,
-        responses: Arc<Mutex<VecDeque<Value>>>,
-        shutdown: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            listener
-                .set_nonblocking(true)
-                .expect("set_nonblocking on test server");
-            let address = format!("http://{}", listener.local_addr().expect("local addr"));
-            let responses = Arc::new(Mutex::new(VecDeque::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let handle = {
-                let responses = Arc::clone(&responses);
-                let shutdown = Arc::clone(&shutdown);
-                thread::spawn(move || {
-                    loop {
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match listener.accept() {
-                            Ok((stream, _)) => handle_stream(stream, &responses),
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            Err(error) => panic!("accept failed: {}", error),
-                        }
-                    }
-                })
-            };
-            Self {
-                address,
-                responses,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-
-        fn push_response(&self, response: Value) {
-            self.responses.lock().unwrap().push_back(response);
-        }
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::Relaxed);
-            let _ = TcpStream::connect(self.address.trim_start_matches("http://"));
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn handle_stream(mut stream: TcpStream, responses: &Arc<Mutex<VecDeque<Value>>>) {
-        stream
-            .set_nonblocking(false)
-            .expect("set blocking mode on accepted stream");
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let bytes_read = stream.read(&mut buffer).expect("read request");
-        let request_text = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        let header_end = request_text.find("\r\n\r\n").expect("header end");
-        let headers = &request_text[..header_end];
-        let body = &request_text[header_end + 4..];
-        let request_line = headers.lines().next().expect("request line");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().expect("method");
-        let response = responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("queued response");
-        if method != "GET" {
-            let _: Value = serde_json::from_str(body).expect("parse request body");
-        }
-        let response_body = response.to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    }
-
     #[test]
-    fn pending_tool_wait_compaction_returns_prefix_rewrite_after_deadline() {
-        let server = TestServer::start();
-        server.push_response(json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "Goals\n- Preserve context"
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 120,
-                "completion_tokens": 12,
-                "total_tokens": 132
-            }
-        }));
-
+    fn pending_tool_wait_compaction_requests_timeout_observation_after_deadline() {
         let config = AgentConfig {
             enabled_tools: Vec::new(),
             upstream: UpstreamConfig {
-                base_url: server.address.clone(),
+                base_url: "http://127.0.0.1:1".to_string(),
                 model: "fake-model".to_string(),
                 supports_vision_input: false,
                 api_key: None,
@@ -1081,28 +919,24 @@ mod tests {
                 tool_calls: Some(Vec::new()),
             },
         ];
+        let control = SessionExecutionControl::new();
+        let signal_receiver = control.signal_receiver();
 
         let pending = start_pending_tool_wait_compaction(
             &config,
             &stable_prefix,
-            &Vec::<Tool>::new(),
-            Some(&SessionExecutionControl::new()),
+            Some(&control),
             "test_tool",
             Some(Instant::now() - Duration::from_secs(2)),
         )
         .unwrap();
 
-        let rewrite = finish_pending_tool_wait_compaction(pending)
-            .unwrap()
-            .expect("expected compaction rewrite");
-        assert!(rewrite.usage.llm_calls >= 1);
-        assert!(rewrite.replacement_prefix.iter().any(|message| {
-            message
-                .content
-                .as_ref()
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains(COMPACTION_MARKER))
-        }));
+        thread::sleep(Duration::from_millis(50));
+        finish_pending_tool_wait_compaction(pending).unwrap();
+        assert!(matches!(
+            signal_receiver.recv_timeout(Duration::from_millis(50)),
+            Ok(ExecutionSignal::TimeoutObservation)
+        ));
     }
 }
 

@@ -254,10 +254,15 @@ fn builtin_tools_work() -> Result<()> {
             "exec_observe".to_string(),
             "exec_wait".to_string(),
             "exec_kill".to_string(),
-            "download_file".to_string(),
+            "file_download_start".to_string(),
+            "file_download_progress".to_string(),
+            "file_download_wait".to_string(),
+            "file_download_cancel".to_string(),
             "web_fetch".to_string(),
             "web_search".to_string(),
-            "image".to_string(),
+            "image_start".to_string(),
+            "image_wait".to_string(),
+            "image_cancel".to_string(),
         ],
         temp_dir.path(),
         temp_dir.path(),
@@ -271,14 +276,14 @@ fn builtin_tools_work() -> Result<()> {
     let write_result = execute_tool_call(
         &registry,
         "write_file",
-        Some(r#"{"path":"note.txt","content":"alpha\nbeta\n","timeout_seconds":2}"#),
+        Some(r#"{"path":"note.txt","content":"alpha\nbeta\n"}"#),
     );
     assert!(write_result.contains("note.txt"));
 
     let read_result = execute_tool_call(
         &registry,
         "read_file",
-        Some(r#"{"path":"note.txt","timeout_seconds":2,"offset_lines":0,"limit_lines":10}"#),
+        Some(r#"{"path":"note.txt","offset_lines":0,"limit_lines":10}"#),
     );
     assert!(read_result.contains("1: alpha"));
     assert!(read_result.contains("2: beta"));
@@ -286,28 +291,25 @@ fn builtin_tools_work() -> Result<()> {
     let edit_result = execute_tool_call(
         &registry,
         "edit",
-        Some(r#"{"path":"note.txt","old_text":"alpha","new_text":"gamma","timeout_seconds":2}"#),
+        Some(r#"{"path":"note.txt","old_text":"alpha","new_text":"gamma"}"#),
     );
     assert!(edit_result.contains("\"replacements\": 1"));
 
     let read_after_edit = execute_tool_call(
         &registry,
         "read_file",
-        Some(r#"{"path":"note.txt","timeout_seconds":2,"offset_lines":0,"limit_lines":10}"#),
+        Some(r#"{"path":"note.txt","offset_lines":0,"limit_lines":10}"#),
     );
     assert!(read_after_edit.contains("1: gamma"));
 
-    let shell_result = execute_tool_call(
-        &registry,
-        "exec_start",
-        Some(r#"{"command":"printf 123","wait_timeout_seconds":2}"#),
-    );
-    assert!(shell_result.contains("\"stdout\": \"123\""));
+    let shell_result =
+        execute_tool_call(&registry, "exec_start", Some(r#"{"command":"printf 123"}"#));
+    assert!(shell_result.contains("\"exec_id\""));
 
     let background_process = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"sleep 0.2; printf bg","wait_timeout_seconds":0.05}"#),
+        Some(r#"{"command":"sleep 0.2; printf bg"}"#),
     );
     let background_json: Value = serde_json::from_str(&background_process)?;
     let background_exec_id = background_json
@@ -335,7 +337,7 @@ fn builtin_tools_work() -> Result<()> {
     let cat_process = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"cat","wait_timeout_seconds":0.05,"include_stdout":false}"#),
+        Some(r#"{"command":"cat","include_stdout":false}"#),
     );
     let cat_json: Value = serde_json::from_str(&cat_process)?;
     let cat_wait = execute_tool_call(
@@ -380,7 +382,7 @@ fn builtin_tools_work() -> Result<()> {
         &registry,
         "apply_patch",
         Some(&format!(
-            r#"{{"patch":{},"timeout_seconds":2,"strip":1}}"#,
+            r#"{{"patch":{},"strip":1}}"#,
             serde_json::to_string(patch)?
         )),
     );
@@ -395,15 +397,24 @@ fn builtin_tools_work() -> Result<()> {
             server.address
         )),
     );
-    assert!(fetch_result.contains("\"status\": 200"));
-    assert!(fetch_result.contains("/ping"));
+    assert!(fetch_result.contains("\"status\": 200"), "{fetch_result}");
+    assert!(fetch_result.contains("/ping"), "{fetch_result}");
 
+    let download_start = execute_tool_call(
+        &registry,
+        "file_download_start",
+        Some(&format!(
+            r#"{{"url":"{}/binary","path":"downloads/cat.png"}}"#,
+            server.address
+        )),
+    );
+    let download_start_json: Value = serde_json::from_str(&download_start)?;
     let download_result = execute_tool_call(
         &registry,
-        "download_file",
+        "file_download_wait",
         Some(&format!(
-            r#"{{"url":"{}/binary","path":"downloads/cat.png","timeout_seconds":2}}"#,
-            server.address
+            r#"{{"download_id":"{}"}}"#,
+            download_start_json["download_id"].as_str().unwrap()
         )),
     );
     assert!(download_result.contains("\"content_type\": \"image/png\""));
@@ -421,12 +432,19 @@ fn builtin_tools_work() -> Result<()> {
 
     let image_path = temp_dir.path().join("diagram.png");
     fs::write(&image_path, [1_u8, 2, 3, 4])?;
+    let image_start = execute_tool_call(
+        &registry,
+        "image_start",
+        Some(r#"{"path":"diagram.png","question":"What does this image show?"}"#),
+    );
+    let image_start_json: Value = serde_json::from_str(&image_start)?;
     let image_result = execute_tool_call(
         &registry,
-        "image",
-        Some(
-            r#"{"path":"diagram.png","question":"What does this image show?","timeout_seconds":2}"#,
-        ),
+        "image_wait",
+        Some(&format!(
+            r#"{{"image_id":"{}"}}"#,
+            image_start_json["image_id"].as_str().unwrap()
+        )),
     );
     assert!(image_result.contains("handwritten note"));
 
@@ -452,11 +470,11 @@ fn builtin_tools_work() -> Result<()> {
         &registry,
         "exec_start",
         Some(&format!(
-            r#"{{"command":"sleep 1; printf late > {}","wait_timeout_seconds":0.1}}"#,
+            r#"{{"command":"sleep 1; printf late > {}"}}"#,
             timeout_target.display()
         )),
     );
-    assert!(timeout_result.contains("\"wait_timed_out\": true"));
+    assert!(timeout_result.contains("\"exec_id\""));
     thread::sleep(std::time::Duration::from_millis(1200));
     assert!(timeout_target.exists());
     Ok(())
@@ -484,7 +502,7 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
     let started = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"sleep 10","wait_timeout_seconds":0.05,"include_stdout":false}"#),
+        Some(r#"{"command":"sleep 10","include_stdout":false}"#),
     );
     let started_json: Value = serde_json::from_str(&started)?;
     let exec_id = started_json["exec_id"].as_str().unwrap();
@@ -538,7 +556,7 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
     let result = execute_tool_call(
         &registry,
         "skill_load",
-        Some(r#"{"skill_name":"demo-skill","timeout_seconds":2}"#),
+        Some(r#"{"skill_name":"demo-skill"}"#),
     );
 
     assert!(result.contains("\"name\": \"demo-skill\""));
@@ -698,7 +716,6 @@ fn run_session_registers_load_skill_without_exposing_skill_paths() -> Result<()>
         .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"skill_load".to_string()));
-    assert!(tool_names.contains(&"load_skill".to_string()));
     Ok(())
 }
 
@@ -1537,7 +1554,32 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
 #[test]
 fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -> Result<()> {
     let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
     let server = TestServer::start();
+    let registry = build_tool_registry(
+        &[
+            "exec_start".to_string(),
+            "exec_wait".to_string(),
+            "exec_kill".to_string(),
+        ],
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream(&server.address),
+        None,
+        &[],
+        &[],
+        &[],
+    )?;
+    let exec_start = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(r#"{"command":"sleep 10","include_stdout":false}"#),
+    );
+    let exec_start_json: Value = serde_json::from_str(&exec_start)?;
+    let exec_id = exec_start_json["exec_id"]
+        .as_str()
+        .expect("exec_start should return exec_id")
+        .to_string();
     server.push_response(json!({
         "choices": [{
             "message": {
@@ -1547,8 +1589,12 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
                     "id": "call-1",
                     "type": "function",
                     "function": {
-                        "name": "exec",
-                        "arguments": "{\"command\":\"sleep 10\",\"wait_timeout_seconds\":30}"
+                        "name": "exec_wait",
+                        "arguments": serde_json::to_string(&json!({
+                            "exec_id": exec_id,
+                            "wait_timeout_seconds": 30,
+                            "include_stdout": false
+                        })).unwrap()
                     }
                 }]
             }
@@ -1575,11 +1621,12 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
 
     let config = load_config_value(
         json!({
-            "enabled_tools": ["exec"],
+            "enabled_tools": ["exec_wait"],
             "upstream": {"base_url": server.address, "model": "fake-model"},
-            "system_prompt": "Test system prompt."
+            "system_prompt": "Test system prompt.",
+            "workspace_root": temp_dir.path()
         }),
-        ".",
+        temp_dir.path(),
     )?;
 
     let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
@@ -1606,6 +1653,11 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         Vec::new(),
         Some(control),
     )?;
+    let _ = execute_tool_call(
+        &registry,
+        "exec_kill",
+        Some(&format!(r#"{{"exec_id":"{}"}}"#, exec_id)),
+    );
     let assistant_text = extract_assistant_text(&report.messages);
     assert!(assistant_text.contains("tool timed out"));
     let tool_messages = report
@@ -1621,12 +1673,17 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         .unwrap();
     let tool_json: Value = serde_json::from_str(tool_content)?;
     assert_eq!(tool_json["timed_out"], json!(true));
-    assert!(tool_content.contains("\"tool\":\"exec\""));
+    assert_eq!(tool_json["tool"], json!("exec_wait"));
     Ok(())
 }
 
 #[test]
-fn controlled_run_yields_at_safe_boundary_before_tools() -> Result<()> {
+fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    fs::write(
+        temp_dir.path().join("README.md"),
+        "# Test Workspace\nThis file is here for read_file.\n",
+    )?;
     let server = TestServer::start();
     server.push_response(json!({
         "choices": [{
@@ -1638,7 +1695,7 @@ fn controlled_run_yields_at_safe_boundary_before_tools() -> Result<()> {
                     "type": "function",
                     "function": {
                         "name": "read_file",
-                        "arguments": "{\"path\":\"README.md\",\"timeout_seconds\":30}"
+                        "arguments": "{\"path\":\"README.md\"}"
                     }
                 }]
             }
@@ -1649,14 +1706,29 @@ fn controlled_run_yields_at_safe_boundary_before_tools() -> Result<()> {
             "total_tokens": 24
         }
     }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "unexpected second round"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+        }
+    }));
 
     let config = load_config_value(
         json!({
             "enabled_tools": ["read_file"],
+            "enable_context_compression": false,
             "upstream": {"base_url": server.address, "model": "fake-model"},
-            "system_prompt": "Test system prompt."
+            "system_prompt": "Test system prompt.",
+            "workspace_root": temp_dir.path()
         }),
-        ".",
+        temp_dir.path(),
     )?;
 
     let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
@@ -1696,15 +1768,27 @@ fn controlled_run_yields_at_safe_boundary_before_tools() -> Result<()> {
             .and_then(|value| value.as_str())
             .unwrap(),
     )?;
-    assert_eq!(tool_json["yielded"], json!(true));
-    assert_eq!(tool_json["cancelled"], json!(true));
+    assert!(
+        tool_json["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("README.md"))
+    );
+    assert!(tool_json["content"].as_str().is_some());
     assert!(
         events
             .lock()
             .unwrap()
             .iter()
-            .any(|event| matches!(event, SessionEvent::SessionYielded { phase, .. } if phase == "after_model_before_tools"))
+            .any(|event| matches!(event, SessionEvent::ToolCallStarted { tool_name, .. } if tool_name == "read_file"))
     );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::SessionYielded { phase, .. } if phase == "after_tool_batch"))
+    );
+    assert_eq!(server.requests().len(), 1);
     Ok(())
 }
 

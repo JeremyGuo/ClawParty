@@ -195,7 +195,6 @@ pub fn run_child_stdio() -> Result<()> {
         }
     }
 
-    let _ = agent_frame::tooling::terminate_all_managed_processes();
     Ok(())
 }
 

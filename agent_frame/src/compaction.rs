@@ -3,6 +3,7 @@ use crate::llm::TokenUsage;
 use crate::llm::create_chat_completion;
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
+use crate::tooling::active_runtime_state_summary;
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 
@@ -240,11 +241,17 @@ fn compact_history_once(
     let messages_to_summarize = &body[..split_index];
     let recent_messages = &body[split_index..];
     let (summary_text, usage) = generate_summary(config, messages_to_summarize)?;
+    let summary_with_runtime_state =
+        if let Some(runtime_state) = active_runtime_state_summary(&config.runtime_state_root)? {
+            format!("{summary_text}\n\n{runtime_state}")
+        } else {
+            summary_text
+        };
     let summary_message = ChatMessage::text(
         "assistant",
         format!(
             "{COMPACTION_MARKER}\n\nOlder conversation history has been compacted into the summary below.\n\n{}",
-            summary_text
+            summary_with_runtime_state
         ),
     );
     let mut compacted = system_prefix;

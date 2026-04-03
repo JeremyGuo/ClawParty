@@ -191,10 +191,15 @@ pub fn default_enabled_tools() -> Vec<String> {
         "exec_observe".to_string(),
         "exec_wait".to_string(),
         "exec_kill".to_string(),
-        "download_file".to_string(),
+        "file_download_start".to_string(),
+        "file_download_progress".to_string(),
+        "file_download_wait".to_string(),
+        "file_download_cancel".to_string(),
         "web_fetch".to_string(),
         "web_search".to_string(),
-        "image".to_string(),
+        "image_start".to_string(),
+        "image_wait".to_string(),
+        "image_cancel".to_string(),
     ]
 }
 
@@ -251,6 +256,14 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
         BotCommandConfig {
             command: "status".to_string(),
             description: "Show current session usage and timeout settings".to_string(),
+        },
+        BotCommandConfig {
+            command: "compact".to_string(),
+            description: "Compact the current conversation context now".to_string(),
+        },
+        BotCommandConfig {
+            command: "compact_mode".to_string(),
+            description: "Show or set automatic context compaction".to_string(),
         },
         BotCommandConfig {
             command: "model".to_string(),

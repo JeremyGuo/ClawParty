@@ -45,13 +45,13 @@ A self-contained Rust library and CLI binary for running a single LLM agent sess
 
 | Feature | Details |
 |:--------|:--------|
-| 🛠️ **Built-in tools** | File I/O, patch apply, shell execution (`exec_start` / `exec_observe` / `exec_wait` / `exec_kill`), web fetch, web search, image inspection |
+| 🛠️ **Built-in tools** | File I/O (`read_file` / `write_file` / `edit` / `apply_patch`), shell execution (`exec_start` / `exec_observe` / `exec_wait` / `exec_kill`), interruptible `web_fetch` / `web_search`, image workers (`image_start` / `image_wait` / `image_cancel`), and file download workers (`file_download_start` / `file_download_progress` / `file_download_wait` / `file_download_cancel`) |
 | 📚 **Skill system** | `SKILL.md`-based skill discovery with `skill_load` / `skill_create` / `skill_update` tools |
-| 🗜️ **Context compaction** | Automatic compression when context approaches model limits; safe handling of tool_use/tool_result boundaries |
+| 🗜️ **Context compaction** | Automatic compression when context approaches model limits; tool-wait compaction only runs after all outstanding tool results are appended, with running `exec` / `file_download` state preserved in summaries |
 | 📊 **Token accounting** | Tracks `cache_read` / `cache_write` / `cache_hit` / `cache_miss` per request |
-| ⏱️ **Tool timeouts** | Every tool call has an explicit timeout budget; tools categorized as `immediate` or `timed` |
+| ⏱️ **Tool execution modes** | Built-in tools are either `immediate` or `interruptible`; interruptible tools expose their own timeout or wait parameters when needed |
 | ⚡ **Parallel tool calls** | Multiple independent tool calls in the same round execute concurrently |
-| 🛑 **Cancellation** | `SessionExecutionControl` with `AtomicBool` cancel flag — checked before every LLM call and tool execution |
+| 🛑 **Cancellation** | New user input requests a `yield` and interrupts interruptible tools; immediate tools finish quickly and return the turn to a safe boundary |
 | 💾 **Checkpoint callback** | Optional callback fired after each tool round for mid-session state persistence |
 | 🤖 **Subagents** | `run_subagent` with model selection and `timeout_seconds=0` for unbounded wait |
 | 🎛️ **Modes** | CLI binary (`run_agent`) or embedded library |
@@ -68,6 +68,14 @@ See [`agent_frame/example_config.json`](agent_frame/example_config.json) and [`a
 
 > **Web search**: set either `native_web_search.enabled = true` (suppresses standalone `web_search` tool) or configure an external search provider under `external_web_search`. Only one should be active per model.
 
+### 🧭 Tool Behavior Notes
+
+- `exec_start`, `image_start`, and `file_download_start` start long-lived work and return immediately with an id.
+- `exec_wait`, `image_wait`, `file_download_wait`, `web_fetch`, and `web_search` are interruptible.
+- `image_wait` and `file_download_wait` return immediately when interrupted and leave the background task running.
+- `web_search` and `web_fetch` are cancelled when interrupted.
+- `file_download` / `image` work is executed in worker subprocesses so it can survive across turns and be cancelled explicitly.
+
 ---
 
 ## 🚀 `agent_host` — Service Host
@@ -78,17 +86,19 @@ The production layer that wraps `agent_frame` into a long-running, multi-channel
 
 | Feature | Description |
 |:--------|:------------|
-| 💬 **Conversation management** | Channel → Conversation → Session → Agent layered model; per-conversation model and sandbox settings |
+| 💬 **Conversation management** | Channel → Conversation → Session → Agent layered model; per-conversation model, sandbox, and compaction settings |
 | 💾 **Session persistence** | State survives process restarts; attachment lifecycle managed automatically |
 | 📋 **Agent registry** | Background and subagent state persisted across restarts |
 | ⏰ **Cron tasks** | Scheduled work with optional checker commands, stored durably; inherits creator conversation's model |
 | 📡 **Background sinks** | Direct routing, broadcast topics, multi-target fan-out |
 | 🔄 **Model switching** | `/model` to switch mid-conversation with automatic context compression |
+| ⚙️ **Conversation-scoped controls** | `/think`, `/sandbox`, `/compact`, `/compact_mode`, `/set_api_timeout` |
 | 📸 **Snapshots** | `/snapsave`, `/snapload`, `/snaplist` for global conversation state snapshots |
 | 🔒 **Sandbox execution** | Three modes: `disabled`, `subprocess`, `bubblewrap` — per-conversation configurable via `/sandbox` |
 | 📝 **Structured logging** | JSONL logs with per-agent / per-session / per-channel views |
 | 📊 **Status & billing** | `/status` shows token usage, cache hits, price estimation, compression savings |
-| 🔄 **Failure recovery** | Automatic handling of timeouts, upstream errors, and restart scenarios |
+| 🔄 **Failure recovery** | Automatic handling of timeouts, upstream errors, restart scenarios, and `\continue` resume state |
+| 🧵 **Parallel conversations** | Different conversations run concurrently; messages within the same conversation remain serialized and follow-up messages are coalesced |
 
 ---
 
@@ -104,7 +114,10 @@ Channel (e.g. Telegram)
 - `/new` starts a fresh conversation. If no model is selected, prompts the user first.
 - `/model` switches the main model with automatic context compression.
 - `/sandbox` toggles sandbox mode (`disabled` / `subprocess` / `bubblewrap`).
+- `/compact` performs a one-off compaction; `/compact_mode` shows or toggles automatic compaction for the current conversation.
+- `/continue` retries the latest interrupted turn from its stored resume context. If the user keeps talking instead, the follow-up message is appended to that stored resume context.
 - Cron tasks and background agents inherit the creating conversation's model.
+- Session destroy paths such as `/new` tear down session-bound `exec`, `file_download`, and `image` runtime tasks.
 
 ---
 
@@ -134,7 +147,7 @@ Skills are `SKILL.md`-based reusable workflows discovered at runtime.
 
 | Tool | Purpose |
 |:-----|:--------|
-| `skill_load` | Load a skill's instructions (renamed from `load_skill`, alias preserved) |
+| `skill_load` | Load a skill's instructions |
 | `skill_create` | Persist a new skill from `.skills/<name>/` |
 | `skill_update` | Update an existing skill |
 
@@ -209,11 +222,11 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 | `timeout_seconds` | float | null | Wall-clock timeout for a full agent turn (`0` = disabled, `null` = unlimited) |
 | `enabled_tools` | string[] | all built-ins | Tools made available to the agent |
 | `max_tool_roundtrips` | int | `12` | Max LLM → tool → LLM cycles per turn |
-| `enable_context_compression` | bool | `true` | Enable automatic mid-turn compaction |
+| `enable_context_compression` | bool | `true` | Enable automatic turn compaction |
 | `effective_context_window_percent` | float | `0.9` | Fraction of `context_window_tokens` before compaction triggers |
 | `auto_compact_token_limit` | int | null | Hard token budget that triggers compaction |
 | `retain_recent_messages` | int | `8` | Minimum recent messages preserved during compaction |
-| `enable_idle_context_compaction` | bool | `false` | Run compaction in the background between turns |
+| `enable_idle_context_compaction` | bool | `false` | Run compaction between turns when a conversation is idle |
 | `idle_context_compaction_poll_interval_seconds` | int | `15` | How often to check for idle compaction opportunity |
 
 </details>
@@ -227,7 +240,7 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 | **Long message splitting** | Auto-splits replies that exceed Telegram's length limit |
 | **Group chat** | Recognizes `@botname`-suffixed commands; two-person groups treated as direct chat |
 | **Retry & queuing** | Send-side retry with FIFO fallback on failure |
-| **Interactive commands** | `/model`, `/sandbox`, `/status`, `/new`, `/snapsave`, `/snapload`, `/snaplist`, `/set_api_timeout` |
+| **Interactive commands** | `/new`, `/oldspace`, `/help`, `/status`, `/compact`, `/compact_mode`, `/model`, `/sandbox`, `/think`, `/set_api_timeout`, `/snapsave`, `/snapload`, `/snaplist`, `/continue` |
 
 ---
 
@@ -296,6 +309,14 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
 
 ```bash
 ./run_test.sh test_telegram.json
+```
+
+### 4. Direct Binary Run
+
+```bash
+cargo run --release --manifest-path agent_host/Cargo.toml -- \
+  --config /path/to/config.json \
+  --workdir /path/to/workdir
 ```
 
 > See [`agent_host/example_config.json`](agent_host/example_config.json) and [`agent_host/example_telegram_config.json`](agent_host/example_telegram_config.json) for full examples.

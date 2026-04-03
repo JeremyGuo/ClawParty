@@ -1,4 +1,3 @@
-use agent_frame::tooling::terminate_all_managed_processes;
 use agent_host::Server;
 use agent_host::config::{load_server_config_file, resolve_model_api_keys};
 use agent_host::env::load_dotenv_files;
@@ -24,12 +23,21 @@ struct Args {
 enum AgentHostCommand {
     #[command(name = "run-child", hide = true)]
     RunChild,
+    #[command(name = "run-tool-worker", hide = true)]
+    RunToolWorker {
+        #[arg(long)]
+        job_file: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if matches!(args.command, Some(AgentHostCommand::RunChild)) {
-        return run_child_stdio();
+    match args.command {
+        Some(AgentHostCommand::RunChild) => return run_child_stdio(),
+        Some(AgentHostCommand::RunToolWorker { job_file }) => {
+            return agent_frame::tool_worker::run_job_file(&job_file);
+        }
+        None => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -76,7 +84,6 @@ async fn run_server(args: Args) -> Result<()> {
     }
     let server = Server::from_config(config, workdir)?;
     if let Err(error) = server.run().await {
-        let _ = terminate_all_managed_processes();
         error!(
             log_stream = "server",
             kind = "fatal_error",
@@ -85,7 +92,6 @@ async fn run_server(args: Args) -> Result<()> {
         );
         return Err(error);
     }
-    let _ = terminate_all_managed_processes();
     info!(
         log_stream = "server",
         kind = "shutdown",

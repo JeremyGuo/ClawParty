@@ -1,20 +1,18 @@
 use crate::config::{ExternalWebSearchConfig, UpstreamConfig};
-use crate::llm::create_chat_completion;
-use crate::message::ChatMessage;
 use crate::skills::{
     SkillMetadata, build_skill_index, load_skill_by_name, validate_skill_markdown,
 };
+use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
 use crossbeam_channel::{self, Receiver};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -26,7 +24,7 @@ type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolExecutionMode {
     Immediate,
-    Timed,
+    Interruptible,
 }
 
 #[derive(Clone)]
@@ -54,14 +52,14 @@ impl Tool {
         )
     }
 
-    pub fn new_timed(
+    pub fn new_interruptible(
         name: impl Into<String>,
         description: impl Into<String>,
         parameters: Value,
         handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
     ) -> Self {
         Self::new_with_mode(
-            ToolExecutionMode::Timed,
+            ToolExecutionMode::Interruptible,
             name,
             description,
             parameters,
@@ -90,8 +88,8 @@ impl Tool {
             ToolExecutionMode::Immediate => {
                 "Execution mode: immediate. This tool returns promptly and does not use a top-level timeout parameter."
             }
-            ToolExecutionMode::Timed => {
-                "Execution mode: timed. This tool manages its own timeout or wait parameters and returns when that budget is reached."
+            ToolExecutionMode::Interruptible => {
+                "Execution mode: interruptible. This tool may wait, but the runtime can interrupt it when a newer user message arrives or the turn hits its timeout observation boundary."
             }
         };
         json!({
@@ -330,135 +328,19 @@ impl InterruptSignal {
     }
 }
 
-fn with_timeout_and_cancel<T: Send + 'static>(
-    timeout_seconds: f64,
-    cancel_flag: Option<Arc<InterruptSignal>>,
-    operation: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    enum OperationEvent<T> {
-        Completed(Result<T>),
-    }
-
-    let (sender, receiver) = crossbeam_channel::bounded(1);
-    thread::spawn(move || {
-        let _ = sender.send(OperationEvent::Completed(operation()));
-    });
-
-    let cancel_receiver = cancel_flag.as_ref().map(|signal| signal.subscribe());
-    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(timeout_seconds));
-    match cancel_receiver {
-        Some(cancel_receiver) => {
-            crossbeam_channel::select! {
-                recv(receiver) -> result => match result {
-                    Ok(OperationEvent::Completed(result)) => result,
-                    Err(_) => Err(anyhow!("operation worker disconnected")),
-                },
-                recv(cancel_receiver) -> _ => Err(anyhow!("operation cancelled")),
-                recv(timeout_receiver) -> _ => Err(anyhow!(
-                    "operation timed out after {} seconds",
-                    timeout_seconds
-                )),
-            }
-        }
-        None => {
-            crossbeam_channel::select! {
-                recv(receiver) -> result => match result {
-                    Ok(OperationEvent::Completed(result)) => result,
-                    Err(_) => Err(anyhow!("operation worker disconnected")),
-                },
-                recv(timeout_receiver) -> _ => Err(anyhow!(
-                    "operation timed out after {} seconds",
-                    timeout_seconds
-                )),
-            }
-        }
-    }
-}
-
-fn wait_for_child_with_timeout(
-    child: Child,
-    timeout_seconds: f64,
-    timeout_label: &str,
-    cancel_flag: Option<&Arc<InterruptSignal>>,
-) -> Result<Output> {
-    let pid = child.id();
-    let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
-    thread::spawn(move || {
-        let mut child = child;
-        let result = (|| -> Result<Output> {
-            let status = child.wait().context("failed to finalize child process")?;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(pipe) = child.stdout.as_mut() {
-                pipe.read_to_end(&mut stdout)
-                    .context("failed to read child stdout")?;
-            }
-            if let Some(pipe) = child.stderr.as_mut() {
-                pipe.read_to_end(&mut stderr)
-                    .context("failed to read child stderr")?;
-            }
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        })();
-        let _ = result_sender.send(result);
-    });
-
-    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
-    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(timeout_seconds));
-    let outcome = match cancel_receiver {
-        Some(cancel_receiver) => crossbeam_channel::select! {
-            recv(result_receiver) -> result => Some(result),
-            recv(cancel_receiver) -> _ => {
-                terminate_process_pid(pid);
-                None
-            }
-            recv(timeout_receiver) -> _ => {
-                terminate_process_pid(pid);
-                None
-            }
-        },
-        None => crossbeam_channel::select! {
-            recv(result_receiver) -> result => Some(result),
-            recv(timeout_receiver) -> _ => {
-                terminate_process_pid(pid);
-                None
-            }
-        },
-    };
-
-    if let Some(result) = outcome {
-        return result.context("child process worker disconnected")?;
-    }
-
-    let _ = result_receiver.recv_timeout(Duration::from_secs(5));
-    if cancel_flag.is_some_and(|signal| signal.is_requested()) {
-        Err(anyhow!("{} cancelled", timeout_label))
-    } else {
-        Err(anyhow!(
-            "{} timed out after {} seconds",
-            timeout_label,
-            timeout_seconds
-        ))
-    }
-}
-
-fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+fn read_file_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
         "read_file",
-        "Read a UTF-8 text file. The model must choose timeout_seconds.",
+        "Read a UTF-8 text file.",
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "timeout_seconds": {"type": "number"},
                 "offset_lines": {"type": "integer"},
                 "limit_lines": {"type": "integer"},
                 "encoding": {"type": "string"}
             },
-            "required": ["path", "timeout_seconds"],
+            "required": ["path"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -466,53 +348,49 @@ fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let offset_lines = usize_arg_with_default(arguments, "offset_lines", 0)?;
             let limit_lines = usize_arg_with_default(arguments, "limit_lines", 200)?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                if encoding.to_lowercase() != "utf-8" {
-                    return Err(anyhow!("only utf-8 encoding is supported"));
-                }
-                let text = fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?;
-                let lines: Vec<&str> = text.lines().collect();
-                let selected = lines
-                    .iter()
-                    .skip(offset_lines)
-                    .take(limit_lines)
-                    .enumerate()
-                    .map(|(index, line)| format!("{}: {}", offset_lines + index + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Ok(json!({
-                    "path": path.display().to_string(),
-                    "start_line": offset_lines + 1,
-                    "end_line": offset_lines + lines.iter().skip(offset_lines).take(limit_lines).count(),
-                    "total_lines": lines.len(),
-                    "truncated": offset_lines + limit_lines < lines.len(),
-                    "content": selected
-                }))
-            })
+            if encoding.to_lowercase() != "utf-8" {
+                return Err(anyhow!("only utf-8 encoding is supported"));
+            }
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let lines: Vec<&str> = text.lines().collect();
+            let selected = lines
+                .iter()
+                .skip(offset_lines)
+                .take(limit_lines)
+                .enumerate()
+                .map(|(index, line)| format!("{}: {}", offset_lines + index + 1, line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(json!({
+                "path": path.display().to_string(),
+                "start_line": offset_lines + 1,
+                "end_line": offset_lines + lines.iter().skip(offset_lines).take(limit_lines).count(),
+                "total_lines": lines.len(),
+                "truncated": offset_lines + limit_lines < lines.len(),
+                "content": selected
+            }))
         },
     )
 }
 
-fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+fn write_file_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
         "write_file",
-        "Write a UTF-8 text file. The model must choose timeout_seconds.",
+        "Write a UTF-8 text file.",
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"]},
-                "timeout_seconds": {"type": "number"},
                 "encoding": {"type": "string"}
             },
-            "required": ["path", "content", "timeout_seconds"],
+            "required": ["path", "content"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -522,44 +400,41 @@ fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSig
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let content = string_arg(arguments, "content")?;
             let mode = string_arg_with_default(arguments, "mode", "overwrite")?;
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                if encoding.to_lowercase() != "utf-8" {
-                    return Err(anyhow!("only utf-8 encoding is supported"));
-                }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create {}", parent.display()))?;
-                }
-                let mut options = fs::OpenOptions::new();
-                options.create(true).write(true);
-                if mode == "append" {
-                    options.append(true);
-                } else {
-                    options.truncate(true);
-                }
-                use std::io::Write;
-                let mut file = options
-                    .open(&path)
-                    .with_context(|| format!("failed to open {}", path.display()))?;
-                file.write_all(content.as_bytes())
-                    .with_context(|| format!("failed to write {}", path.display()))?;
-                Ok(json!({
-                    "path": path.display().to_string(),
-                    "mode": mode,
-                    "bytes_written": content.len()
-                }))
-            })
+            if encoding.to_lowercase() != "utf-8" {
+                return Err(anyhow!("only utf-8 encoding is supported"));
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let mut options = fs::OpenOptions::new();
+            options.create(true).write(true);
+            if mode == "append" {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+            use std::io::Write;
+            let mut file = options
+                .open(&path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(json!({
+                "path": path.display().to_string(),
+                "mode": mode,
+                "bytes_written": content.len()
+            }))
         },
     )
 }
 
-fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
         "edit",
-        "Edit a UTF-8 text file by replacing old_text with new_text. The model must choose timeout_seconds.",
+        "Edit a UTF-8 text file by replacing old_text with new_text.",
         json!({
             "type": "object",
             "properties": {
@@ -568,10 +443,9 @@ fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>)
                 "new_text": {"type": "string"},
                 "replace_all": {"type": "boolean"},
                 "create_if_missing": {"type": "boolean"},
-                "timeout_seconds": {"type": "number"},
                 "encoding": {"type": "string"}
             },
-            "required": ["path", "old_text", "new_text", "timeout_seconds"],
+            "required": ["path", "old_text", "new_text"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -589,53 +463,55 @@ fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>)
                 .get("create_if_missing")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
 
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                if encoding.to_lowercase() != "utf-8" {
-                    return Err(anyhow!("only utf-8 encoding is supported"));
+            if encoding.to_lowercase() != "utf-8" {
+                return Err(anyhow!("only utf-8 encoding is supported"));
+            }
+            if !path.exists() && create_if_missing {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
                 }
-                if !path.exists() && create_if_missing {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("failed to create {}", parent.display()))?;
-                    }
-                    fs::write(&path, &new_text)
-                        .with_context(|| format!("failed to write {}", path.display()))?;
-                    return Ok(json!({
-                        "path": path.display().to_string(),
-                        "created": true,
-                        "replacements": 1,
-                        "bytes_written": new_text.len()
-                    }));
-                }
-                let content = fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?;
-                let replacements = content.matches(&old_text).count();
-                if replacements == 0 {
-                    return Err(anyhow!("old_text was not found in {}", path.display()));
-                }
-                let updated = if replace_all {
-                    content.replace(&old_text, &new_text)
-                } else {
-                    content.replacen(&old_text, &new_text, 1)
-                };
-                fs::write(&path, updated.as_bytes())
+                fs::write(&path, &new_text)
                     .with_context(|| format!("failed to write {}", path.display()))?;
-                Ok(json!({
+                return Ok(json!({
                     "path": path.display().to_string(),
-                    "created": false,
-                    "replacements": if replace_all { replacements } else { 1 },
-                    "bytes_written": updated.len()
-                }))
-            })
+                    "created": true,
+                    "replacements": 1,
+                    "bytes_written": new_text.len()
+                }));
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let replacements = content.matches(&old_text).count();
+            if replacements == 0 {
+                return Err(anyhow!("old_text was not found in {}", path.display()));
+            }
+            let updated = if replace_all {
+                content.replace(&old_text, &new_text)
+            } else {
+                content.replacen(&old_text, &new_text, 1)
+            };
+            fs::write(&path, updated.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(json!({
+                "path": path.display().to_string(),
+                "created": false,
+                "replacements": if replace_all { replacements } else { 1 },
+                "bytes_written": updated.len()
+            }))
         },
     )
 }
 
 fn process_state_dir(runtime_state_root: &Path) -> PathBuf {
     runtime_state_root.join("agent_frame").join("processes")
+}
+
+fn process_state_dir_if_exists(runtime_state_root: &Path) -> Option<PathBuf> {
+    let path = process_state_dir(runtime_state_root);
+    path.exists().then_some(path)
 }
 
 fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
@@ -658,7 +534,6 @@ struct ProcessMetadata {
 struct LiveManagedProcess {
     stdin: Option<ChildStdin>,
     metadata: ProcessMetadata,
-    completion_receiver: Option<Receiver<i32>>,
 }
 
 static LIVE_PROCESSES: OnceLock<Mutex<BTreeMap<String, LiveManagedProcess>>> = OnceLock::new();
@@ -719,18 +594,6 @@ fn terminate_process_pid(pid: u32) {
         .status();
 }
 
-fn spawn_pipe_copy_thread<R>(mut reader: R, path: PathBuf)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        if let Ok(mut file) = fs::File::create(&path) {
-            let _ = std::io::copy(&mut reader, &mut file);
-            let _ = file.flush();
-        }
-    });
-}
-
 fn record_exit_code(path: &Path, code: i32) -> Result<()> {
     fs::write(path, code.to_string())
         .with_context(|| format!("failed to write exit code to {}", path.display()))
@@ -741,23 +604,25 @@ fn spawn_managed_process(state_dir: &Path, command: &str, cwd: &Path) -> Result<
     let stdout_path = state_dir.join(format!("{}.stdout", exec_id));
     let stderr_path = state_dir.join(format!("{}.stderr", exec_id));
     let exit_code_path = state_dir.join(format!("{}.exit", exec_id));
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg(command)
+        .arg(
+            "eval \"$AGENT_FRAME_EXEC_COMMAND\"; code=$?; printf '%s' \"$code\" > \"$AGENT_FRAME_EXIT_CODE_PATH\"; exit $code",
+        )
         .current_dir(cwd)
+        .env("AGENT_FRAME_EXEC_COMMAND", command)
+        .env("AGENT_FRAME_EXIT_CODE_PATH", &exit_code_path)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
     let stdin = child.stdin.take();
     let pid = child.id();
-    if let Some(stdout) = child.stdout.take() {
-        spawn_pipe_copy_thread(stdout, stdout_path.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_pipe_copy_thread(stderr, stderr_path.clone());
-    }
     let metadata = ProcessMetadata {
         exec_id: exec_id.clone(),
         pid,
@@ -768,26 +633,7 @@ fn spawn_managed_process(state_dir: &Path, command: &str, cwd: &Path) -> Result<
         exit_code_path: exit_code_path.display().to_string(),
     };
     write_process_metadata(state_dir, &metadata)?;
-    let completion_receiver = {
-        let (completion_sender, completion_receiver) = crossbeam_channel::bounded(1);
-        let exec_id = metadata.exec_id.clone();
-        let exit_code_path = metadata.exit_code_path.clone();
-        thread::spawn(move || {
-            let code = child
-                .wait()
-                .ok()
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let _ = record_exit_code(Path::new(&exit_code_path), code);
-            let _ = completion_sender.send(code);
-            let mut registry = live_processes().lock().unwrap();
-            if let Some(process) = registry.get_mut(&exec_id) {
-                process.completion_receiver = None;
-            }
-            registry.remove(&exec_id);
-        });
-        completion_receiver
-    };
+    drop(child);
     live_processes().lock().unwrap().insert(
         exec_id,
         LiveManagedProcess {
@@ -801,7 +647,6 @@ fn spawn_managed_process(state_dir: &Path, command: &str, cwd: &Path) -> Result<
                 stderr_path: metadata.stderr_path.clone(),
                 exit_code_path: metadata.exit_code_path.clone(),
             },
-            completion_receiver: Some(completion_receiver),
         },
     );
     Ok(metadata)
@@ -846,6 +691,36 @@ fn read_process_snapshot(
     }))
 }
 
+fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
+    let Some(state_dir) = process_state_dir_if_exists(runtime_state_root) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&state_dir)
+        .with_context(|| format!("failed to read {}", state_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata: ProcessMetadata =
+            serde_json::from_str(&raw).context("failed to parse process metadata")?;
+        let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
+        if exit_code.is_some() || !process_is_running(metadata.pid) {
+            continue;
+        }
+        entries.push(format!(
+            "- exec_id=`{}` pid={} cwd=`{}` command=`{}`",
+            metadata.exec_id, metadata.pid, metadata.cwd, metadata.command
+        ));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
 pub fn terminate_all_managed_processes() -> Result<()> {
     let mut registry = live_processes().lock().unwrap();
     let processes = std::mem::take(&mut *registry)
@@ -877,154 +752,96 @@ fn wait_for_managed_process(
     limit: usize,
     cancel_flag: Option<&Arc<InterruptSignal>>,
 ) -> Result<Value> {
-    let mut pending_input = input.map(ToOwned::to_owned);
-    if let Some(cancel_flag) = cancel_flag
-        && cancel_flag.is_requested()
-    {
-        let snapshot = read_process_snapshot(state_dir, exec_id, start, limit)?;
-        return Ok(json!({
-            "interrupted": true,
-            "reason": "agent_turn_timeout_observation_requested",
-            "process": snapshot
-        }));
-    }
-
-    let (metadata, completion_receiver) = {
+    if let Some(input) = input {
         let mut registry = live_processes().lock().unwrap();
         let Some(process) = registry.get_mut(exec_id) else {
-            drop(registry);
-            return read_process_snapshot(state_dir, exec_id, start, limit)
-                .or_else(|_| Err(process_missing_error(exec_id)));
+            return Err(anyhow!(
+                "stdin is unavailable for exec process {}; it may have been started by a previous agent child",
+                exec_id
+            ));
         };
-        if let Some(input) = pending_input.take()
-            && let Some(stdin) = process.stdin.as_mut()
-        {
-            stdin
-                .write_all(input.as_bytes())
-                .with_context(|| format!("failed to write stdin for exec process {}", exec_id))?;
-            stdin
-                .flush()
-                .with_context(|| format!("failed to flush stdin for exec process {}", exec_id))?;
-        }
-        let metadata = ProcessMetadata {
-            exec_id: process.metadata.exec_id.clone(),
-            pid: process.metadata.pid,
-            command: process.metadata.command.clone(),
-            cwd: process.metadata.cwd.clone(),
-            stdout_path: process.metadata.stdout_path.clone(),
-            stderr_path: process.metadata.stderr_path.clone(),
-            exit_code_path: process.metadata.exit_code_path.clone(),
-        };
-        let completion_receiver = process
-            .completion_receiver
-            .take()
-            .ok_or_else(|| anyhow!("exec process {} is already being awaited", exec_id))?;
-        (metadata, completion_receiver)
-    };
+        let stdin = process
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("stdin is closed for exec process {}", exec_id))?;
+        stdin
+            .write_all(input.as_bytes())
+            .with_context(|| format!("failed to write stdin for exec process {}", exec_id))?;
+        stdin
+            .flush()
+            .with_context(|| format!("failed to flush stdin for exec process {}", exec_id))?;
+    }
 
-    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(wait_timeout_seconds));
     let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
-    let completed = match cancel_receiver {
-        Some(cancel_receiver) => crossbeam_channel::select! {
-            recv(completion_receiver) -> exit_code => Some(exit_code),
-            recv(cancel_receiver) -> _ => None,
-            recv(timeout_receiver) -> _ => None,
-        },
-        None => crossbeam_channel::select! {
-            recv(completion_receiver) -> exit_code => Some(exit_code),
-            recv(timeout_receiver) -> _ => None,
-        },
-    };
-
-    if let Some(exit_code) = completed {
-        let code = exit_code.context("exec process worker disconnected")?;
-        return Ok(json!({
-            "exec_id": metadata.exec_id,
-            "pid": metadata.pid,
-            "command": metadata.command,
-            "cwd": metadata.cwd,
-            "running": false,
-            "completed": true,
-            "returncode": code,
-            "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
-            "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
-        }));
-    }
-
-    if let Ok(code) = completion_receiver.try_recv() {
-        return Ok(json!({
-            "exec_id": metadata.exec_id,
-            "pid": metadata.pid,
-            "command": metadata.command,
-            "cwd": metadata.cwd,
-            "running": false,
-            "completed": true,
-            "returncode": code,
-            "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
-            "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
-        }));
-    }
-
-    {
-        let mut registry = live_processes().lock().unwrap();
-        if let Some(process) = registry.get_mut(exec_id) {
-            process.completion_receiver = Some(completion_receiver);
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(wait_timeout_seconds);
+    loop {
+        let snapshot = read_process_snapshot(state_dir, exec_id, start, limit)?;
+        let completed = snapshot
+            .get("completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if completed {
+            live_processes().lock().unwrap().remove(exec_id);
+            return Ok(snapshot);
+        }
+        if let Some(signal) = cancel_flag
+            && signal.is_requested()
+        {
+            return Ok(json!({
+                "interrupted": true,
+                "reason": "agent_turn_interrupted",
+                "process": snapshot
+            }));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(json!({
+                "exec_id": snapshot["exec_id"].clone(),
+                "pid": snapshot["pid"].clone(),
+                "command": snapshot["command"].clone(),
+                "cwd": snapshot["cwd"].clone(),
+                "running": true,
+                "completed": false,
+                "returncode": Value::Null,
+                "wait_timed_out": true,
+                "stdout": snapshot["stdout"].clone(),
+                "stderr": snapshot["stderr"].clone(),
+            }));
+        }
+        if let Some(cancel_receiver) = &cancel_receiver {
+            crossbeam_channel::select! {
+                recv(cancel_receiver) -> _ => {
+                    return Ok(json!({
+                        "interrupted": true,
+                        "reason": "agent_turn_interrupted",
+                        "process": snapshot
+                    }));
+                }
+                recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(200));
         }
     }
-
-    let snapshot = json!({
-        "exec_id": metadata.exec_id,
-        "pid": metadata.pid,
-        "command": metadata.command,
-        "cwd": metadata.cwd,
-        "running": true,
-        "completed": false,
-        "returncode": Value::Null,
-        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
-        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
-    });
-
-    if cancel_flag.is_some_and(|signal| signal.is_requested()) {
-        return Ok(json!({
-            "interrupted": true,
-            "reason": "agent_turn_timeout_observation_requested",
-            "process": snapshot
-        }));
-    }
-
-    Ok(json!({
-        "exec_id": metadata.exec_id,
-        "pid": metadata.pid,
-        "command": metadata.command,
-        "cwd": metadata.cwd,
-        "running": true,
-        "completed": false,
-        "returncode": Value::Null,
-        "wait_timed_out": true,
-        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
-        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
-    }))
 }
 
 fn exec_start_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
-    cancel_flag: Option<Arc<InterruptSignal>>,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new_timed(
+    Tool::new(
         "exec_start",
-        "Start a shell command. Wait for at most wait_timeout_seconds before returning. If it finishes in time, return the result immediately. Otherwise keep it running and return an exec_id.",
+        "Start a shell command or executable and return immediately with an exec_id plus the latest observable stdout/stderr window. Prefer commands that write progress directly to stdout/stderr instead of redirecting output to files so exec_observe can inspect progress.",
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "wait_timeout_seconds": {"type": "number"},
                 "cwd": {"type": "string"},
                 "include_stdout": {"type": "boolean"},
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"}
             },
-            "required": ["command", "wait_timeout_seconds"],
+            "required": ["command"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -1032,7 +849,6 @@ fn exec_start_tool(
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let command = string_arg(arguments, "command")?;
-            let wait_timeout_seconds = f64_arg(arguments, "wait_timeout_seconds")?;
             let include_stdout = arguments
                 .get("include_stdout")
                 .and_then(Value::as_bool)
@@ -1046,15 +862,7 @@ fn exec_start_tool(
                 .unwrap_or_else(|| workspace_root.clone());
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let metadata = spawn_managed_process(&state_dir, &command, &cwd)?;
-            let mut result = wait_for_managed_process(
-                &state_dir,
-                &metadata.exec_id,
-                wait_timeout_seconds,
-                None,
-                start,
-                limit,
-                cancel_flag.as_ref(),
-            )?;
+            let mut result = read_process_snapshot(&state_dir, &metadata.exec_id, start, limit)?;
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
                 object.remove("stderr");
@@ -1070,9 +878,9 @@ fn exec_start_tool(
 
 fn exec_observe_tool(
     runtime_state_root: PathBuf,
-    cancel_flag: Option<Arc<InterruptSignal>>,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new_timed(
+    Tool::new(
         "exec_observe",
         "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines.",
         json!({
@@ -1093,16 +901,15 @@ fn exec_observe_tool(
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let _ = &cancel_flag;
             read_process_snapshot(&state_dir, &exec_id, start, limit)
         },
     )
 }
 
 fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+    Tool::new_interruptible(
         "exec_wait",
-        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
+        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
         json!({
             "type": "object",
             "properties": {
@@ -1154,8 +961,8 @@ fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
     )
 }
 
-fn exec_kill_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
         "exec_kill",
         "Immediately stop a previously started exec process by exec_id.",
         json!({
@@ -1171,23 +978,10 @@ fn exec_kill_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let exec_id = string_arg(arguments, "exec_id")?;
-            let _state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let _ = &cancel_flag;
-            let metadata = {
-                let mut registry = live_processes().lock().unwrap();
-                let Some(process) = registry.remove(&exec_id) else {
-                    return Err(process_missing_error(&exec_id));
-                };
-                ProcessMetadata {
-                    exec_id: process.metadata.exec_id,
-                    pid: process.metadata.pid,
-                    command: process.metadata.command,
-                    cwd: process.metadata.cwd,
-                    stdout_path: process.metadata.stdout_path,
-                    stderr_path: process.metadata.stderr_path,
-                    exit_code_path: process.metadata.exit_code_path,
-                }
-            };
+            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
+            let _ = live_processes().lock().unwrap().remove(&exec_id);
+            let metadata = read_process_metadata(&state_dir, &exec_id)
+                .map_err(|_| process_missing_error(&exec_id))?;
             terminate_process_pid(metadata.pid);
             record_exit_code(Path::new(&metadata.exit_code_path), -9)?;
             Ok(json!({
@@ -1204,118 +998,19 @@ fn exec_kill_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
     )
 }
 
-fn exec_tool(
-    workspace_root: PathBuf,
-    runtime_state_root: PathBuf,
-    cancel_flag: Option<Arc<InterruptSignal>>,
-) -> Tool {
-    let exec_start = exec_start_tool(workspace_root, runtime_state_root, cancel_flag);
-    Tool::new_timed(
-        "exec",
-        "Deprecated alias for exec_start. Start a shell command and optionally wait for completion.",
-        exec_start.parameters.clone(),
-        move |arguments| exec_start.invoke(arguments),
-    )
-}
-
-fn process_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
-        "process",
-        "Deprecated compatibility wrapper around exec_observe and exec_kill.",
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list", "inspect", "terminate"]},
-                "exec_id": {"type": "string"},
-                "process_id": {"type": "string"},
-                "start": {"type": "integer"},
-                "limit": {"type": "integer"}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }),
-        move |arguments| {
-            let arguments = arguments
-                .as_object()
-                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let action = string_arg(arguments, "action")?;
-            let exec_id = arguments
-                .get("exec_id")
-                .and_then(Value::as_str)
-                .or_else(|| arguments.get("process_id").and_then(Value::as_str))
-                .map(ToOwned::to_owned);
-            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            match action.as_str() {
-                "list" => {
-                    let mut items = Vec::new();
-                    for entry in fs::read_dir(&state_dir)
-                        .with_context(|| format!("failed to read {}", state_dir.display()))?
-                    {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                            continue;
-                        }
-                        let metadata = read_process_metadata(
-                            &state_dir,
-                            path.file_stem()
-                                .and_then(|value| value.to_str())
-                                .unwrap_or_default(),
-                        )?;
-                        let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
-                        let running = if exit_code.is_some() {
-                            false
-                        } else {
-                            process_is_running(metadata.pid)
-                        };
-                        items.push(json!({
-                            "exec_id": metadata.exec_id,
-                            "pid": metadata.pid,
-                            "command": metadata.command,
-                            "cwd": metadata.cwd,
-                            "running": running,
-                            "completed": !running,
-                            "returncode": exit_code
-                        }));
-                    }
-                    Ok(json!({ "processes": items }))
-                }
-                "inspect" => {
-                    let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
-                    exec_observe_tool(runtime_state_root.clone(), cancel_flag.clone()).invoke(
-                        json!({
-                            "exec_id": exec_id,
-                            "start": usize_arg_with_default(arguments, "start", 0)?,
-                            "limit": usize_arg_with_default(arguments, "limit", 20)?,
-                        }),
-                    )
-                }
-                "terminate" => {
-                    let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
-                    exec_kill_tool(runtime_state_root.clone(), cancel_flag.clone()).invoke(json!({
-                        "exec_id": exec_id,
-                    }))
-                }
-                _ => Err(anyhow!("unsupported process action {}", action)),
-            }
-        },
-    )
-}
-
-fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
+fn apply_patch_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
         "apply_patch",
-        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. The model must choose timeout_seconds.",
+        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff.",
         json!({
             "type": "object",
             "properties": {
                 "patch": {"type": "string"},
-                "timeout_seconds": {"type": "number"},
                 "strip": {"type": "integer"},
                 "reverse": {"type": "boolean"},
                 "check": {"type": "boolean"}
             },
-            "required": ["patch", "timeout_seconds"],
+            "required": ["patch"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -1323,7 +1018,6 @@ fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSi
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let patch = string_arg(arguments, "patch")?;
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let strip = usize_arg_with_default(arguments, "strip", 0)?;
             let reverse = arguments
                 .get("reverse")
@@ -1335,133 +1029,554 @@ fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSi
                 .unwrap_or(false);
             let patch_workspace_root = workspace_root.clone();
 
-            let patch_cancel_flag = cancel_flag.clone();
-            with_timeout_and_cancel(timeout_seconds + 1.0, cancel_flag.clone(), move || {
-                let mut command = Command::new("git");
-                command
-                    .arg("apply")
-                    .arg("--recount")
-                    .arg("--whitespace=nowarn")
-                    .arg(format!("-p{}", strip))
-                    .current_dir(&patch_workspace_root)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                if reverse {
-                    command.arg("--reverse");
-                }
-                if check {
-                    command.arg("--check");
-                }
-                let mut child = command.spawn().context("failed to spawn git apply")?;
-                child
-                    .stdin
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("failed to open git apply stdin"))?
-                    .write_all(patch.as_bytes())
-                    .context("failed to write patch to git apply stdin")?;
-                let _ = child.stdin.take();
-                let output = wait_for_child_with_timeout(
-                    child,
-                    timeout_seconds,
-                    "git apply",
-                    patch_cancel_flag.as_ref(),
-                )?;
-                Ok(json!({
-                    "applied": output.status.success(),
-                    "returncode": output.status.code().unwrap_or(-1),
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr)
-                }))
-            })
+            let mut command = Command::new("git");
+            command
+                .arg("apply")
+                .arg("--recount")
+                .arg("--whitespace=nowarn")
+                .arg(format!("-p{}", strip))
+                .current_dir(&patch_workspace_root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if reverse {
+                command.arg("--reverse");
+            }
+            if check {
+                command.arg("--check");
+            }
+            let mut child = command.spawn().context("failed to spawn git apply")?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("failed to open git apply stdin"))?
+                .write_all(patch.as_bytes())
+                .context("failed to write patch to git apply stdin")?;
+            let _ = child.stdin.take();
+            let output = child
+                .wait_with_output()
+                .context("failed to wait for git apply")?;
+            Ok(json!({
+                "applied": output.status.success(),
+                "returncode": output.status.code().unwrap_or(-1),
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr)
+            }))
         },
     )
 }
 
-fn strip_html_tags(body: &str) -> String {
-    let mut output = String::with_capacity(body.len());
-    let mut in_tag = false;
-    for ch in body.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                output.push(' ');
-            }
-            _ if !in_tag => output.push(ch),
-            _ => {}
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct BackgroundTaskMetadata {
+    task_id: String,
+    pid: u32,
+    label: String,
+    status_path: String,
+    stdout_path: String,
+    stderr_path: String,
+    exit_code_path: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeTaskCleanupReport {
+    pub exec_processes_killed: usize,
+    pub file_downloads_cancelled: usize,
+    pub image_tasks_cancelled: usize,
+}
+
+fn tool_worker_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
+    let path = runtime_state_root.join("agent_frame").join("tool_workers");
+    fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(path)
+}
+
+fn background_task_dir(runtime_state_root: &Path, kind: &str) -> Result<PathBuf> {
+    let path = runtime_state_root.join("agent_frame").join(kind);
+    fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(path)
+}
+
+fn background_task_dir_if_exists(runtime_state_root: &Path, kind: &str) -> Option<PathBuf> {
+    let path = runtime_state_root.join("agent_frame").join(kind);
+    path.exists().then_some(path)
+}
+
+fn background_task_meta_path(dir: &Path, task_id: &str) -> PathBuf {
+    dir.join(format!("{}.json", task_id))
+}
+
+fn write_background_task_metadata(dir: &Path, metadata: &BackgroundTaskMetadata) -> Result<()> {
+    fs::write(
+        background_task_meta_path(dir, &metadata.task_id),
+        serde_json::to_vec_pretty(metadata).context("failed to serialize background task")?,
+    )
+    .with_context(|| format!("failed to write metadata for {}", metadata.task_id))
+}
+
+fn read_background_task_metadata(dir: &Path, task_id: &str) -> Result<BackgroundTaskMetadata> {
+    let path = background_task_meta_path(dir, task_id);
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).context("failed to parse background task metadata")
+}
+
+fn background_task_is_running(metadata: &BackgroundTaskMetadata) -> bool {
+    read_exit_code(Path::new(&metadata.exit_code_path)).is_none()
+        && process_is_running(metadata.pid)
+}
+
+fn resolve_tool_worker_executable() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("AGENT_TOOL_WORKER_BIN") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
         }
     }
-    output.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn infer_image_media_type(path: &Path) -> String {
-    match path
-        .extension()
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_run_agent") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    let current = std::env::current_exe().context("failed to resolve current executable")?;
+    if current
+        .file_stem()
         .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
+        .is_some_and(|name| name == "agent_host" || name == "run_agent")
     {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "image/png",
+        return Ok(current);
     }
-    .to_string()
-}
-
-fn image_to_data_url(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!(
-        "data:{};base64,{}",
-        infer_image_media_type(path),
-        encoded
-    ))
-}
-
-fn chat_message_text(message: &ChatMessage) -> String {
-    match &message.content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| {
-                let object = item.as_object()?;
-                let item_type = object.get("type")?.as_str()?;
-                match item_type {
-                    "text" | "input_text" | "output_text" => {
-                        object.get("text")?.as_str().map(ToOwned::to_owned)
-                    }
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(other) => other.to_string(),
-        None => String::new(),
+    let mut candidates = Vec::new();
+    if let Some(parent) = current.parent() {
+        candidates.push(parent.join("run_agent"));
+        candidates.push(parent.join("agent_host"));
+        if parent.file_name().and_then(|value| value.to_str()) == Some("deps")
+            && let Some(grandparent) = parent.parent()
+        {
+            candidates.push(grandparent.join("run_agent"));
+            candidates.push(grandparent.join("agent_host"));
+        }
     }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            anyhow!("failed to locate tool worker executable; set AGENT_TOOL_WORKER_BIN")
+        })
 }
 
-fn image_tool(
+fn write_tool_worker_job_file(runtime_state_root: &Path, job: &ToolWorkerJob) -> Result<PathBuf> {
+    let dir = tool_worker_state_dir(runtime_state_root)?;
+    let path = dir.join(format!("job-{}.json", Uuid::new_v4()));
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(job).context("failed to serialize tool worker job")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn run_interruptible_worker_job(
+    runtime_state_root: &Path,
+    job: &ToolWorkerJob,
+    timeout_seconds: f64,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
+) -> Result<Value> {
+    let job_file = write_tool_worker_job_file(runtime_state_root, job)?;
+    let worker_executable = resolve_tool_worker_executable()?;
+    let child = Command::new(worker_executable)
+        .arg("run-tool-worker")
+        .arg("--job-file")
+        .arg(&job_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn tool worker")?;
+    let pid = child.id();
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(timeout_seconds));
+    let output = match cancel_receiver {
+        Some(cancel_receiver) => crossbeam_channel::select! {
+            recv(receiver) -> result => Some(result),
+            recv(cancel_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+            recv(timeout_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+        },
+        None => crossbeam_channel::select! {
+            recv(receiver) -> result => Some(result),
+            recv(timeout_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+        },
+    };
+    let _ = fs::remove_file(&job_file);
+    let Some(output) = output else {
+        let _ = receiver.recv_timeout(Duration::from_secs(5));
+        if cancel_flag.is_some_and(|signal| signal.is_requested()) {
+            return Err(anyhow!("operation cancelled"));
+        }
+        return Err(anyhow!(
+            "operation timed out after {} seconds",
+            timeout_seconds
+        ));
+    };
+    let output = output
+        .context("tool worker completion channel disconnected")?
+        .context("failed to wait for tool worker process")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tool worker failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).context("failed to parse tool worker output")
+}
+
+fn spawn_background_worker_process(
+    runtime_state_root: &Path,
+    label: &str,
+    task_id: &str,
+    job: &ToolWorkerJob,
+) -> Result<BackgroundTaskMetadata> {
+    let worker_dir = tool_worker_state_dir(runtime_state_root)?;
+    let job_file = worker_dir.join(format!("{}-{}.job.json", label, task_id));
+    fs::write(
+        &job_file,
+        serde_json::to_vec_pretty(job).context("failed to serialize background worker job")?,
+    )
+    .with_context(|| format!("failed to write {}", job_file.display()))?;
+    let stdout_path = worker_dir.join(format!("{}-{}.stdout", label, task_id));
+    let stderr_path = worker_dir.join(format!("{}-{}.stderr", label, task_id));
+    let exit_code_path = worker_dir.join(format!("{}-{}.exit", label, task_id));
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let worker_executable = resolve_tool_worker_executable()?;
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg("\"$@\"; code=$?; printf '%s' \"$code\" > \"$AGENT_FRAME_EXIT_CODE_PATH\"; exit $code")
+        .arg("sh")
+        .arg(&worker_executable)
+        .arg("run-tool-worker")
+        .arg("--job-file")
+        .arg(&job_file)
+        .current_dir(runtime_state_root)
+        .env("AGENT_FRAME_EXIT_CODE_PATH", &exit_code_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .context("failed to spawn background tool worker")?;
+    Ok(BackgroundTaskMetadata {
+        task_id: task_id.to_string(),
+        pid: child.id(),
+        label: label.to_string(),
+        status_path: match job {
+            ToolWorkerJob::Image { status_path, .. } => status_path.clone(),
+            ToolWorkerJob::FileDownload { status_path, .. } => status_path.clone(),
+            _ => String::new(),
+        },
+        stdout_path: stdout_path.display().to_string(),
+        stderr_path: stderr_path.display().to_string(),
+        exit_code_path: exit_code_path.display().to_string(),
+    })
+}
+
+fn read_status_json(path: &Path) -> Result<Value> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).context("failed to parse status json")
+}
+
+fn read_image_task_snapshot(runtime_state_root: &Path, image_id: &str) -> Result<Value> {
+    let metadata = read_background_task_metadata(
+        &background_task_dir(runtime_state_root, "image_tasks")?,
+        image_id,
+    )?;
+    let mut snapshot = read_status_json(Path::new(&metadata.status_path))?;
+    if snapshot
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && (read_exit_code(Path::new(&metadata.exit_code_path)).is_some()
+            || !process_is_running(metadata.pid))
+    {
+        snapshot = json!({
+            "image_id": image_id,
+            "path": snapshot["path"].clone(),
+            "question": snapshot["question"].clone(),
+            "running": false,
+            "completed": false,
+            "cancelled": false,
+            "failed": true,
+            "error": "image worker exited unexpectedly",
+        });
+    }
+    Ok(snapshot)
+}
+
+fn read_file_download_snapshot(runtime_state_root: &Path, download_id: &str) -> Result<Value> {
+    let metadata = read_background_task_metadata(
+        &background_task_dir(runtime_state_root, "file_downloads")?,
+        download_id,
+    )?;
+    let mut snapshot = read_status_json(Path::new(&metadata.status_path))?;
+    if snapshot
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && (read_exit_code(Path::new(&metadata.exit_code_path)).is_some()
+            || !process_is_running(metadata.pid))
+    {
+        snapshot = json!({
+            "download_id": download_id,
+            "url": snapshot["url"].clone(),
+            "path": snapshot["path"].clone(),
+            "running": false,
+            "completed": false,
+            "cancelled": false,
+            "failed": true,
+            "error": "file download worker exited unexpectedly",
+        });
+    }
+    Ok(snapshot)
+}
+
+fn list_active_file_download_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
+    let Some(task_dir) = background_task_dir_if_exists(runtime_state_root, "file_downloads") else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(&task_dir).with_context(|| format!("failed to read {}", task_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".json") || file_name.ends_with(".status.json") {
+            continue;
+        }
+        let Some(download_id) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let snapshot = read_file_download_snapshot(runtime_state_root, download_id)?;
+        if !snapshot
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let url = snapshot
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let target_path = snapshot
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let bytes_downloaded = snapshot
+            .get("bytes_downloaded")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        entries.push(format!(
+            "- download_id=`{}` path=`{}` bytes_downloaded={} url=`{}`",
+            download_id, target_path, bytes_downloaded, url
+        ));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<Option<String>> {
+    let active_execs = list_active_exec_summaries(runtime_state_root)?;
+    let active_downloads = list_active_file_download_summaries(runtime_state_root)?;
+    if active_execs.is_empty() && active_downloads.is_empty() {
+        return Ok(None);
+    }
+    let mut sections = vec![
+        "[Active Runtime Tasks]".to_string(),
+        "These tasks are still in progress across turns. Reuse their ids with observe/wait/cancel tools instead of starting duplicates.".to_string(),
+    ];
+    if !active_execs.is_empty() {
+        sections.push("Active exec processes:".to_string());
+        sections.extend(active_execs);
+    }
+    if !active_downloads.is_empty() {
+        sections.push("Active file downloads:".to_string());
+        sections.extend(active_downloads);
+    }
+    Ok(Some(sections.join("\n")))
+}
+
+fn iter_metadata_json_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".json") || file_name.ends_with(".status.json") {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize> {
+    let Some(state_dir) = process_state_dir_if_exists(runtime_state_root) else {
+        return Ok(0);
+    };
+    let mut killed = 0usize;
+    for path in iter_metadata_json_files(&state_dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata: ProcessMetadata =
+            serde_json::from_str(&raw).context("failed to parse process metadata")?;
+        live_processes().lock().unwrap().remove(&metadata.exec_id);
+        if read_exit_code(Path::new(&metadata.exit_code_path)).is_none()
+            && process_is_running(metadata.pid)
+        {
+            terminate_process_pid(metadata.pid);
+            let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+            killed = killed.saturating_add(1);
+        }
+    }
+    Ok(killed)
+}
+
+fn cleanup_image_tasks(runtime_state_root: &Path) -> Result<usize> {
+    let Some(task_dir) = background_task_dir_if_exists(runtime_state_root, "image_tasks") else {
+        return Ok(0);
+    };
+    let mut cancelled = 0usize;
+    for path in iter_metadata_json_files(&task_dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata: BackgroundTaskMetadata =
+            serde_json::from_str(&raw).context("failed to parse background task metadata")?;
+        if !background_task_is_running(&metadata) {
+            continue;
+        }
+        let previous = read_status_json(Path::new(&metadata.status_path)).ok();
+        terminate_process_pid(metadata.pid);
+        let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+        let snapshot = json!({
+            "image_id": metadata.task_id,
+            "path": previous.as_ref().and_then(|value| value.get("path")).cloned().unwrap_or(Value::String(String::new())),
+            "question": previous.as_ref().and_then(|value| value.get("question")).cloned().unwrap_or(Value::String(String::new())),
+            "running": false,
+            "completed": false,
+            "cancelled": true,
+            "failed": false,
+            "reason": "session_destroyed",
+        });
+        fs::write(
+            Path::new(&metadata.status_path),
+            serde_json::to_vec_pretty(&snapshot)
+                .context("failed to serialize image cleanup snapshot")?,
+        )
+        .with_context(|| format!("failed to write {}", metadata.status_path))?;
+        cancelled = cancelled.saturating_add(1);
+    }
+    Ok(cancelled)
+}
+
+fn cleanup_file_downloads(runtime_state_root: &Path) -> Result<usize> {
+    let Some(task_dir) = background_task_dir_if_exists(runtime_state_root, "file_downloads") else {
+        return Ok(0);
+    };
+    let mut cancelled = 0usize;
+    for path in iter_metadata_json_files(&task_dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata: BackgroundTaskMetadata =
+            serde_json::from_str(&raw).context("failed to parse background task metadata")?;
+        if !background_task_is_running(&metadata) {
+            continue;
+        }
+        let previous = read_status_json(Path::new(&metadata.status_path)).ok();
+        terminate_process_pid(metadata.pid);
+        let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+        let snapshot = json!({
+            "download_id": metadata.task_id,
+            "url": previous.as_ref().and_then(|value| value.get("url")).cloned().unwrap_or(Value::String(String::new())),
+            "path": previous.as_ref().and_then(|value| value.get("path")).cloned().unwrap_or(Value::String(String::new())),
+            "running": false,
+            "completed": false,
+            "cancelled": true,
+            "failed": false,
+            "bytes_downloaded": previous.as_ref().and_then(|value| value.get("bytes_downloaded")).cloned().unwrap_or(Value::from(0_u64)),
+            "total_bytes": previous.as_ref().and_then(|value| value.get("total_bytes")).cloned().unwrap_or(Value::Null),
+            "http_status": previous.as_ref().and_then(|value| value.get("http_status")).cloned().unwrap_or(Value::Null),
+            "final_url": previous.as_ref().and_then(|value| value.get("final_url")).cloned().unwrap_or(Value::Null),
+            "content_type": previous.as_ref().and_then(|value| value.get("content_type")).cloned().unwrap_or(Value::Null),
+            "reason": "session_destroyed",
+        });
+        fs::write(
+            Path::new(&metadata.status_path),
+            serde_json::to_vec_pretty(&snapshot)
+                .context("failed to serialize file download cleanup snapshot")?,
+        )
+        .with_context(|| format!("failed to write {}", metadata.status_path))?;
+        cancelled = cancelled.saturating_add(1);
+    }
+    Ok(cancelled)
+}
+
+pub fn terminate_runtime_state_tasks(
+    runtime_state_root: &Path,
+) -> Result<RuntimeTaskCleanupReport> {
+    Ok(RuntimeTaskCleanupReport {
+        exec_processes_killed: cleanup_exec_processes(runtime_state_root)?,
+        file_downloads_cancelled: cleanup_file_downloads(runtime_state_root)?,
+        image_tasks_cancelled: cleanup_image_tasks(runtime_state_root)?,
+    })
+}
+
+fn download_temp_path(path: &Path, download_id: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    path.with_file_name(format!(".{}.{}.part", file_name, download_id))
+}
+
+fn image_start_tool(
     workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
     upstream: UpstreamConfig,
     image_tool_upstream: Option<UpstreamConfig>,
-    cancel_flag: Option<Arc<InterruptSignal>>,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new_timed(
-        "image",
-        "Inspect a local image file with the model's multimodal capability and answer a focused question about it. Use this for local images that are not already directly visible in the current user turn. The model must choose timeout_seconds.",
+    Tool::new(
+        "image_start",
+        "Start inspecting a local image file with the model's multimodal capability and return immediately with an image_id.",
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "question": {"type": "string"},
-                "timeout_seconds": {"type": "number"}
+                "question": {"type": "string"}
             },
-            "required": ["path", "question", "timeout_seconds"],
+            "required": ["path", "question"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -1470,66 +1585,140 @@ fn image_tool(
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let question = string_arg(arguments, "question")?;
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let upstream = image_tool_upstream
                 .clone()
                 .unwrap_or_else(|| upstream.clone());
-
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                if !upstream.supports_vision_input {
-                    return Err(anyhow!(
-                        "the configured upstream model does not support multimodal image input"
-                    ));
-                }
-                let data_url = image_to_data_url(&path)?;
-                let outcome = create_chat_completion(
-                    &UpstreamConfig {
-                        timeout_seconds,
-                        ..upstream.clone()
-                    },
-                    &[
-                        ChatMessage::text(
-                            "system",
-                            "You inspect a local image for an agent runtime. Answer the user's question about the image directly and concisely. If relevant visible text appears in the image, quote or transcribe it accurately.",
-                        ),
-                        ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(Value::Array(vec![
-                                json!({
-                                    "type": "text",
-                                    "text": question
-                                }),
-                                json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": data_url
-                                    }
-                                }),
-                            ])),
-                            name: None,
-                            tool_call_id: None,
-                            tool_calls: None,
-                        },
-                    ],
-                    &[],
-                    Some(Map::from_iter([(
-                        "max_completion_tokens".to_string(),
-                        Value::from(800_u64),
-                    )])),
-                )?;
-                Ok(json!({
-                    "path": path.display().to_string(),
-                    "answer": chat_message_text(&outcome.message),
-                }))
-            })
+            let image_id = Uuid::new_v4().to_string();
+            let task_dir = background_task_dir(&runtime_state_root, "image_tasks")?;
+            let status_path = task_dir.join(format!("{}.status.json", image_id));
+            let initial = json!({
+                "image_id": image_id,
+                "path": path.display().to_string(),
+                "question": question,
+                "running": true,
+                "completed": false,
+                "cancelled": false,
+                "failed": false,
+            });
+            fs::write(
+                &status_path,
+                serde_json::to_vec_pretty(&initial).context("failed to serialize image status")?,
+            )
+            .with_context(|| format!("failed to write {}", status_path.display()))?;
+            let job = ToolWorkerJob::Image {
+                image_id: image_id.clone(),
+                path: path.display().to_string(),
+                question: question.to_string(),
+                upstream,
+                status_path: status_path.display().to_string(),
+            };
+            let metadata =
+                spawn_background_worker_process(&runtime_state_root, "image", &image_id, &job)?;
+            write_background_task_metadata(&task_dir, &metadata)?;
+            read_image_task_snapshot(&runtime_state_root, &image_id)
         },
     )
 }
 
-fn web_fetch_tool() -> Tool {
-    Tool::new_timed(
+fn image_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new_interruptible(
+        "image_wait",
+        "Wait for a previously started image task by image_id. If interrupted by a newer user message or timeout observation, return immediately without cancelling the image task.",
+        json!({
+            "type": "object",
+            "properties": {
+                "image_id": {"type": "string"}
+            },
+            "required": ["image_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let image_id = string_arg(arguments, "image_id")?;
+            let cancel_receiver = cancel_flag.as_ref().map(|signal| signal.subscribe());
+            loop {
+                let snapshot = read_image_task_snapshot(&runtime_state_root, &image_id)?;
+                let finished = snapshot
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|running| !running);
+                if finished {
+                    return Ok(snapshot);
+                }
+                if let Some(cancel_receiver) = &cancel_receiver {
+                    crossbeam_channel::select! {
+                        recv(cancel_receiver) -> _ => {
+                            return Ok(json!({
+                                "interrupted": true,
+                                "image": snapshot,
+                            }));
+                        }
+                        recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        },
+    )
+}
+
+fn image_cancel_tool(
+    runtime_state_root: PathBuf,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "image_cancel",
+        "Cancel a previously started image task by image_id.",
+        json!({
+            "type": "object",
+            "properties": {
+                "image_id": {"type": "string"}
+            },
+            "required": ["image_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let image_id = string_arg(arguments, "image_id")?;
+            let task_dir = background_task_dir(&runtime_state_root, "image_tasks")?;
+            let metadata = read_background_task_metadata(&task_dir, &image_id)?;
+            terminate_process_pid(metadata.pid);
+            let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+            let snapshot = json!({
+                "image_id": image_id,
+                "path": read_image_task_snapshot(&runtime_state_root, &image_id)
+                    .ok()
+                    .and_then(|value| value.get("path").cloned())
+                    .unwrap_or(Value::String(String::new())),
+                "question": read_image_task_snapshot(&runtime_state_root, &image_id)
+                    .ok()
+                    .and_then(|value| value.get("question").cloned())
+                    .unwrap_or(Value::String(String::new())),
+                "running": false,
+                "completed": false,
+                "cancelled": true,
+                "failed": false,
+            });
+            fs::write(
+                Path::new(&metadata.status_path),
+                serde_json::to_vec_pretty(&snapshot)
+                    .context("failed to serialize image cancel snapshot")?,
+            )
+            .with_context(|| format!("failed to write {}", metadata.status_path))?;
+            Ok(snapshot)
+        },
+    )
+}
+
+fn web_fetch_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new_interruptible(
         "web_fetch",
-        "Fetch a web page or HTTP resource and return a readable text body. The model must choose timeout_seconds.",
+        "Fetch a web page or HTTP resource and return a readable text body. If interrupted by a newer user message or timeout observation, cancel the in-flight fetch. The model must choose timeout_seconds.",
         json!({
             "type": "object",
             "properties": {
@@ -1553,59 +1742,51 @@ fn web_fetch_tool() -> Tool {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs_f64(timeout_seconds))
-                .build()
-                .context("failed to construct http client")?;
-            let mut request = client.get(&url);
-            for (key, value) in headers {
-                if let Some(value) = value.as_str() {
-                    request = request.header(&key, value);
-                }
+            let result = run_interruptible_worker_job(
+                &runtime_state_root,
+                &ToolWorkerJob::WebFetch {
+                    url: url.clone(),
+                    max_chars,
+                    headers,
+                },
+                timeout_seconds,
+                cancel_flag.as_ref(),
+            );
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) if error.to_string() == "operation cancelled" => Ok(json!({
+                    "url": url,
+                    "interrupted": true,
+                    "cancelled": true,
+                })),
+                Err(error) if error.to_string().contains("timed out") => Ok(json!({
+                    "url": url,
+                    "timed_out": true,
+                    "cancelled": true,
+                })),
+                Err(error) => Err(error),
             }
-            let response = request.send().context("web fetch failed")?;
-            let status = response.status().as_u16();
-            let final_url = response.url().to_string();
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let body = response.text().context("failed to read fetched body")?;
-            let cleaned = if content_type.contains("html") {
-                strip_html_tags(&body)
-            } else {
-                body
-            };
-            let truncated = cleaned.chars().count() > max_chars;
-            let content = cleaned.chars().take(max_chars).collect::<String>();
-            Ok(json!({
-                "status": status,
-                "url": final_url,
-                "content_type": content_type,
-                "content": content,
-                "truncated": truncated
-            }))
         },
     )
 }
 
-fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    Tool::new_timed(
-        "download_file",
-        "Download an HTTP resource and save it to a local file. Use this for binary files such as images or PDFs. The model must choose timeout_seconds.",
+fn file_download_start_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "file_download_start",
+        "Start downloading an HTTP resource to a local file and return immediately with a download_id.",
         json!({
             "type": "object",
             "properties": {
                 "url": {"type": "string"},
                 "path": {"type": "string"},
-                "timeout_seconds": {"type": "number"},
                 "headers": {"type": "object"},
                 "overwrite": {"type": "boolean"}
             },
-            "required": ["url", "path", "timeout_seconds"],
+            "required": ["url", "path"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -1614,7 +1795,6 @@ fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let url = string_arg(arguments, "url")?;
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let overwrite = arguments
                 .get("overwrite")
                 .and_then(Value::as_bool)
@@ -1624,58 +1804,181 @@ fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                if path.exists() && !overwrite {
-                    return Err(anyhow!(
-                        "destination already exists and overwrite=false: {}",
-                        path.display()
-                    ));
-                }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create parent directory {}", parent.display())
-                    })?;
-                }
-
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs_f64(timeout_seconds))
-                    .build()
-                    .context("failed to construct http client")?;
-                let mut request = client.get(&url);
-                for (key, value) in headers {
-                    if let Some(value) = value.as_str() {
-                        request = request.header(&key, value);
-                    }
-                }
-                let response = request.send().context("download request failed")?;
-                let status = response.status();
-                let final_url = response.url().to_string();
-                if !status.is_success() {
-                    let status_text = status.to_string();
-                    let body = response
-                        .text()
-                        .unwrap_or_else(|_| "<unreadable error body>".to_string());
-                    return Err(anyhow!("download failed with {}: {}", status_text, body));
-                }
-                let content_type = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let bytes = response.bytes().context("failed to read downloaded body")?;
-                fs::write(&path, &bytes).with_context(|| {
-                    format!("failed to write downloaded file {}", path.display())
+            if path.exists() && !overwrite {
+                return Err(anyhow!(
+                    "destination already exists and overwrite=false: {}",
+                    path.display()
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
                 })?;
-                Ok(json!({
-                    "status": status.as_u16(),
-                    "url": final_url,
-                    "content_type": content_type,
-                    "path": path.display().to_string(),
-                    "size_bytes": bytes.len(),
-                }))
-            })
+            }
+            let download_id = Uuid::new_v4().to_string();
+            let temp_path = download_temp_path(&path, &download_id);
+            let task_dir = background_task_dir(&runtime_state_root, "file_downloads")?;
+            let status_path = task_dir.join(format!("{}.status.json", download_id));
+            let initial = json!({
+                "download_id": download_id,
+                "url": url,
+                "path": path.display().to_string(),
+                "running": true,
+                "completed": false,
+                "cancelled": false,
+                "failed": false,
+                "bytes_downloaded": 0,
+                "total_bytes": Value::Null,
+                "http_status": Value::Null,
+                "final_url": Value::Null,
+                "content_type": Value::Null,
+            });
+            fs::write(
+                &status_path,
+                serde_json::to_vec_pretty(&initial)
+                    .context("failed to serialize file download status")?,
+            )
+            .with_context(|| format!("failed to write {}", status_path.display()))?;
+            let job = ToolWorkerJob::FileDownload {
+                download_id: download_id.clone(),
+                url: url.clone(),
+                path: path.display().to_string(),
+                temp_path: temp_path.display().to_string(),
+                headers,
+                status_path: status_path.display().to_string(),
+            };
+            let metadata = spawn_background_worker_process(
+                &runtime_state_root,
+                "file-download",
+                &download_id,
+                &job,
+            )?;
+            write_background_task_metadata(&task_dir, &metadata)?;
+            read_file_download_snapshot(&runtime_state_root, &download_id)
+        },
+    )
+}
+
+fn file_download_progress_tool(
+    runtime_state_root: PathBuf,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "file_download_progress",
+        "Read the latest progress snapshot for a previously started download by download_id.",
+        json!({
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string"}
+            },
+            "required": ["download_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let download_id = string_arg(arguments, "download_id")?;
+            read_file_download_snapshot(&runtime_state_root, &download_id)
+        },
+    )
+}
+
+fn file_download_wait_tool(
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new_interruptible(
+        "file_download_wait",
+        "Wait for a previously started download by download_id. If interrupted by a newer user message or timeout observation, return immediately without cancelling the download.",
+        json!({
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string"}
+            },
+            "required": ["download_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let download_id = string_arg(arguments, "download_id")?;
+            let cancel_receiver = cancel_flag.as_ref().map(|signal| signal.subscribe());
+            loop {
+                let snapshot = read_file_download_snapshot(&runtime_state_root, &download_id)?;
+                let finished = snapshot
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|running| !running);
+                if finished {
+                    return Ok(snapshot);
+                }
+                if let Some(cancel_receiver) = &cancel_receiver {
+                    crossbeam_channel::select! {
+                        recv(cancel_receiver) -> _ => {
+                            return Ok(json!({
+                                "interrupted": true,
+                                "download": snapshot,
+                            }));
+                        }
+                        recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        },
+    )
+}
+
+fn file_download_cancel_tool(
+    runtime_state_root: PathBuf,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "file_download_cancel",
+        "Cancel a previously started download by download_id.",
+        json!({
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string"}
+            },
+            "required": ["download_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let download_id = string_arg(arguments, "download_id")?;
+            let task_dir = background_task_dir(&runtime_state_root, "file_downloads")?;
+            let metadata = read_background_task_metadata(&task_dir, &download_id)?;
+            let previous = read_file_download_snapshot(&runtime_state_root, &download_id).ok();
+            terminate_process_pid(metadata.pid);
+            let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+            let snapshot = json!({
+                "download_id": download_id,
+                "url": previous
+                    .as_ref()
+                    .and_then(|value| value.get("url").cloned())
+                    .unwrap_or(Value::String(String::new())),
+                "path": previous
+                    .as_ref()
+                    .and_then(|value| value.get("path").cloned())
+                    .unwrap_or(Value::String(String::new())),
+                "running": false,
+                "completed": false,
+                "cancelled": true,
+                "failed": false,
+            });
+            fs::write(
+                Path::new(&metadata.status_path),
+                serde_json::to_vec_pretty(&snapshot)
+                    .context("failed to serialize file download cancel snapshot")?,
+            )
+            .with_context(|| format!("failed to write {}", metadata.status_path))?;
+            Ok(snapshot)
         },
     )
 }
@@ -1692,38 +1995,14 @@ fn default_external_web_search_config() -> ExternalWebSearchConfig {
     }
 }
 
-fn extract_text_content(value: &Value) -> String {
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .map(|content| match content {
-            Value::String(text) => text.clone(),
-            Value::Array(items) => items
-                .iter()
-                .filter_map(|item| {
-                    let object = item.as_object()?;
-                    let item_type = object.get("type")?.as_str()?;
-                    match item_type {
-                        "text" | "input_text" | "output_text" => {
-                            object.get("text")?.as_str().map(ToOwned::to_owned)
-                        }
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            other => other.to_string(),
-        })
-        .unwrap_or_default()
-}
-
-fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
-    Tool::new_timed(
+fn web_search_tool(
+    runtime_state_root: PathBuf,
+    search_config: ExternalWebSearchConfig,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new_interruptible(
         "web_search",
-        "Search the web using the configured search provider and return an answer plus citations. The model must choose timeout_seconds.",
+        "Search the web using the configured search provider and return an answer plus citations. If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
         json!({
             "type": "object",
             "properties": {
@@ -1741,134 +2020,52 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
             let query = string_arg(arguments, "query")?;
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let max_results = usize_arg_with_default(arguments, "max_results", 8)?;
-            let config = UpstreamConfig {
-                base_url: search_config.base_url.clone(),
-                model: search_config.model.clone(),
-                supports_vision_input: false,
-                api_key: search_config.api_key.clone(),
-                api_key_env: search_config.api_key_env.clone(),
-                chat_completions_path: search_config.chat_completions_path.clone(),
+            let mut runtime_search_config = search_config.clone();
+            runtime_search_config.timeout_seconds = timeout_seconds;
+            let search_result = run_interruptible_worker_job(
+                &runtime_state_root,
+                &ToolWorkerJob::WebSearch {
+                    search_config: runtime_search_config,
+                    query: query.clone(),
+                    max_results,
+                },
                 timeout_seconds,
-                context_window_tokens: 32_000,
-                cache_control: None,
-                reasoning: None,
-                headers: search_config.headers.clone(),
-                native_web_search: None,
-                external_web_search: None,
-            };
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs_f64(config.timeout_seconds))
-                .build()
-                .context("failed to construct web search client")?;
-            let mut payload = Map::new();
-            payload.insert("model".to_string(), Value::String(config.model.clone()));
-            payload.insert(
-                "messages".to_string(),
-                json!([
-                    {
-                        "role": "system",
-                        "content": "Search the web and answer the query. Include source URLs in the answer when available."
-                    },
-                    {
-                        "role": "user",
-                        "content": query
-                    }
-                ]),
+                cancel_flag.as_ref(),
             );
-            let mut request = client
-                .post(format!(
-                    "{}{}",
-                    config.base_url.trim_end_matches('/'),
-                    if config.chat_completions_path.starts_with('/') {
-                        config.chat_completions_path.clone()
-                    } else {
-                        format!("/{}", config.chat_completions_path)
-                    }
-                ))
-                .json(&Value::Object(payload));
-            if let Some(api_key) = config
-                .api_key
-                .clone()
-                .or_else(|| std::env::var(&config.api_key_env).ok())
-            {
-                request = request.bearer_auth(api_key);
+
+            match search_result {
+                Ok(value) => Ok(value),
+                Err(error) if error.to_string() == "operation cancelled" => Ok(json!({
+                    "query": query,
+                    "interrupted": true,
+                    "cancelled": true,
+                })),
+                Err(error) if error.to_string().contains("timed out") => Ok(json!({
+                    "query": query,
+                    "timed_out": true,
+                    "cancelled": true,
+                })),
+                Err(error) => Err(error),
             }
-            for (key, value) in &config.headers {
-                if let Some(value) = value.as_str() {
-                    request = request.header(key, value);
-                }
-            }
-            let response = request.send().context("web search request failed")?;
-            let status = response.status();
-            let body = response
-                .text()
-                .context("failed to read web search response")?;
-            if !status.is_success() {
-                return Err(anyhow!(
-                    "web search upstream failed with {}: {}",
-                    status,
-                    body
-                ));
-            }
-            let value: Value =
-                serde_json::from_str(&body).context("failed to parse web search response")?;
-            let citations = value
-                .get("citations")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .take(max_results)
-                .collect::<Vec<_>>();
-            Ok(json!({
-                "query": arguments.get("query").and_then(Value::as_str).unwrap_or_default(),
-                "answer": extract_text_content(&value),
-                "citations": citations
-            }))
         },
-    )
-}
-
-fn run_shell_tool(
-    workspace_root: PathBuf,
-    runtime_state_root: PathBuf,
-    cancel_flag: Option<Arc<InterruptSignal>>,
-) -> Tool {
-    let exec = exec_tool(workspace_root, runtime_state_root, cancel_flag);
-    Tool::new_timed(
-        "run_shell",
-        "Deprecated alias for exec. Execute a shell command. The model must choose timeout_seconds.",
-        exec.parameters.clone(),
-        move |arguments| exec.invoke(arguments),
-    )
-}
-
-fn http_request_tool() -> Tool {
-    let fetch = web_fetch_tool();
-    Tool::new_timed(
-        "http_request",
-        "Deprecated alias for web_fetch. Fetch an HTTP resource. The model must choose timeout_seconds.",
-        fetch.parameters.clone(),
-        move |arguments| fetch.invoke(arguments),
     )
 }
 
 fn skill_load_tool(
     skills: &[SkillMetadata],
-    cancel_flag: Option<Arc<InterruptSignal>>,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<Tool> {
     let skill_index = build_skill_index(skills)?;
     let available_skills = skill_index.keys().cloned().collect::<Vec<_>>();
-    Ok(Tool::new_timed(
+    Ok(Tool::new(
         "skill_load",
-        "Load the SKILL.md instructions for a named skill. Use exact skill names from the preloaded metadata and choose timeout_seconds yourself.",
+        "Load the SKILL.md instructions for a named skill. Use exact skill names from the preloaded metadata.",
         json!({
             "type": "object",
             "properties": {
-                "skill_name": {"type": "string", "enum": available_skills},
-                "timeout_seconds": {"type": "number"}
+                "skill_name": {"type": "string", "enum": available_skills}
             },
-            "required": ["skill_name", "timeout_seconds"],
+            "required": ["skill_name"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -1876,30 +2073,13 @@ fn skill_load_tool(
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let skill_name = string_arg(arguments, "skill_name")?;
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
-            let skill_index = skill_index.clone();
-            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
-                let (skill, content) = load_skill_by_name(&skill_index, &skill_name)?;
-                Ok(json!({
-                    "name": skill.name,
-                    "description": skill.description,
-                    "content": content
-                }))
-            })
+            let (skill, content) = load_skill_by_name(&skill_index, &skill_name)?;
+            Ok(json!({
+                "name": skill.name,
+                "description": skill.description,
+                "content": content
+            }))
         },
-    ))
-}
-
-fn load_skill_alias_tool(
-    skills: &[SkillMetadata],
-    cancel_flag: Option<Arc<InterruptSignal>>,
-) -> Result<Tool> {
-    let primary = skill_load_tool(skills, cancel_flag)?;
-    Ok(Tool::new_timed(
-        "load_skill",
-        "Deprecated alias for skill_load.",
-        primary.parameters.clone(),
-        move |arguments| primary.invoke(arguments),
     ))
 }
 
@@ -1991,14 +2171,6 @@ pub fn build_tool_registry_with_cancel(
             write_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
-            "run_shell".to_string(),
-            run_shell_tool(
-                workspace_root.to_path_buf(),
-                runtime_state_root.to_path_buf(),
-                cancel_flag.clone(),
-            ),
-        ),
-        (
             "edit".to_string(),
             edit_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
@@ -2023,36 +2195,51 @@ pub fn build_tool_registry_with_cancel(
             exec_kill_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
-            "exec".to_string(),
-            exec_tool(
-                workspace_root.to_path_buf(),
-                runtime_state_root.to_path_buf(),
-                cancel_flag.clone(),
-            ),
-        ),
-        (
-            "process".to_string(),
-            process_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
-        ),
-        (
             "apply_patch".to_string(),
             apply_patch_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
-            "image".to_string(),
-            image_tool(
+            "image_start".to_string(),
+            image_start_tool(
                 workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
                 upstream.clone(),
                 image_tool_upstream.cloned(),
                 cancel_flag.clone(),
             ),
         ),
         (
-            "download_file".to_string(),
-            download_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            "image_wait".to_string(),
+            image_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
-        ("web_fetch".to_string(), web_fetch_tool()),
-        ("http_request".to_string(), http_request_tool()),
+        (
+            "image_cancel".to_string(),
+            image_cancel_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "file_download_start".to_string(),
+            file_download_start_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
+        ),
+        (
+            "file_download_progress".to_string(),
+            file_download_progress_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "file_download_wait".to_string(),
+            file_download_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "file_download_cancel".to_string(),
+            file_download_cancel_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "web_fetch".to_string(),
+            web_fetch_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        ),
     ]);
     let native_web_search_enabled = upstream
         .native_web_search
@@ -2063,7 +2250,14 @@ pub fn build_tool_registry_with_cancel(
             .external_web_search
             .clone()
             .unwrap_or_else(default_external_web_search_config);
-        builtins.insert("web_search".to_string(), web_search_tool(web_search_config));
+        builtins.insert(
+            "web_search".to_string(),
+            web_search_tool(
+                runtime_state_root.to_path_buf(),
+                web_search_config,
+                cancel_flag.clone(),
+            ),
+        );
     }
 
     let mut registry = BTreeMap::new();
@@ -2081,8 +2275,6 @@ pub fn build_tool_registry_with_cancel(
     if !skills.is_empty() {
         let skill_tool = skill_load_tool(skills, cancel_flag.clone())?;
         registry.insert(skill_tool.name.clone(), skill_tool);
-        let alias = load_skill_alias_tool(skills, cancel_flag)?;
-        registry.insert(alias.name.clone(), alias);
     }
 
     if !skill_roots.is_empty() {
@@ -2197,8 +2389,17 @@ pub mod macro_support {
 
 #[cfg(test)]
 mod tests {
-    use super::Tool;
+    use super::{
+        BackgroundTaskMetadata, ProcessMetadata, Tool, active_runtime_state_summary,
+        process_is_running, process_meta_path, record_exit_code, terminate_runtime_state_tasks,
+        write_background_task_metadata,
+    };
     use serde_json::json;
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn openai_tool_description_includes_execution_mode_guidance() {
@@ -2208,10 +2409,10 @@ mod tests {
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
             |_| Ok(json!({"ok": true})),
         );
-        let timed = Tool::new_timed(
-            "timed_demo",
-            "Timed demo tool.",
-            json!({"type": "object", "properties": {"timeout_seconds": {"type": "number"}}, "required": ["timeout_seconds"], "additionalProperties": false}),
+        let interruptible = Tool::new_interruptible(
+            "interruptible_demo",
+            "Interruptible demo tool.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
             |_| Ok(json!({"ok": true})),
         );
 
@@ -2222,7 +2423,7 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
-        let timed_description = timed
+        let interruptible_description = interruptible
             .as_openai_tool()
             .get("function")
             .and_then(|value| value.get("description"))
@@ -2231,7 +2432,261 @@ mod tests {
             .to_string();
 
         assert!(immediate_description.contains("Execution mode: immediate."));
-        assert!(timed_description.contains("Execution mode: timed."));
+        assert!(interruptible_description.contains("Execution mode: interruptible."));
+    }
+
+    #[test]
+    fn active_runtime_state_summary_lists_running_execs_and_downloads() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_state_root = temp_dir.path();
+        let processes_dir = runtime_state_root.join("agent_frame").join("processes");
+        let downloads_dir = runtime_state_root
+            .join("agent_frame")
+            .join("file_downloads");
+        fs::create_dir_all(&processes_dir).unwrap();
+        fs::create_dir_all(&downloads_dir).unwrap();
+
+        let exec_exit_path = processes_dir.join("exec-1.exit");
+        let exec_metadata = ProcessMetadata {
+            exec_id: "exec-1".to_string(),
+            pid: std::process::id(),
+            command: "sleep 10".to_string(),
+            cwd: "/tmp/demo".to_string(),
+            stdout_path: processes_dir.join("exec-1.stdout").display().to_string(),
+            stderr_path: processes_dir.join("exec-1.stderr").display().to_string(),
+            exit_code_path: exec_exit_path.display().to_string(),
+        };
+        fs::write(
+            process_meta_path(&processes_dir, "exec-1"),
+            serde_json::to_vec_pretty(&exec_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let finished_exit_path = processes_dir.join("exec-finished.exit");
+        let finished_metadata = ProcessMetadata {
+            exec_id: "exec-finished".to_string(),
+            pid: std::process::id(),
+            command: "echo done".to_string(),
+            cwd: "/tmp/finished".to_string(),
+            stdout_path: processes_dir
+                .join("exec-finished.stdout")
+                .display()
+                .to_string(),
+            stderr_path: processes_dir
+                .join("exec-finished.stderr")
+                .display()
+                .to_string(),
+            exit_code_path: finished_exit_path.display().to_string(),
+        };
+        fs::write(
+            process_meta_path(&processes_dir, "exec-finished"),
+            serde_json::to_vec_pretty(&finished_metadata).unwrap(),
+        )
+        .unwrap();
+        record_exit_code(&finished_exit_path, 0).unwrap();
+
+        let download_status_path = downloads_dir.join("download-1.status.json");
+        let download_exit_path = downloads_dir.join("download-1.exit");
+        fs::write(
+            &download_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "download_id": "download-1",
+                "url": "https://example.com/file.bin",
+                "path": "/tmp/file.bin",
+                "running": true,
+                "completed": false,
+                "cancelled": false,
+                "bytes_downloaded": 128
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_background_task_metadata(
+            &downloads_dir,
+            &BackgroundTaskMetadata {
+                task_id: "download-1".to_string(),
+                pid: std::process::id(),
+                label: "file-download".to_string(),
+                status_path: download_status_path.display().to_string(),
+                stdout_path: downloads_dir
+                    .join("download-1.stdout")
+                    .display()
+                    .to_string(),
+                stderr_path: downloads_dir
+                    .join("download-1.stderr")
+                    .display()
+                    .to_string(),
+                exit_code_path: download_exit_path.display().to_string(),
+            },
+        )
+        .unwrap();
+
+        let summary = active_runtime_state_summary(runtime_state_root)
+            .unwrap()
+            .expect("expected active runtime summary");
+        assert!(summary.contains("Active exec processes:"));
+        assert!(summary.contains("exec_id=`exec-1`"));
+        assert!(!summary.contains("exec-finished"));
+        assert!(summary.contains("Active file downloads:"));
+        assert!(summary.contains("download_id=`download-1`"));
+    }
+
+    #[test]
+    fn terminate_runtime_state_tasks_kills_running_tasks() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_state_root = temp_dir.path();
+        let processes_dir = runtime_state_root.join("agent_frame").join("processes");
+        let downloads_dir = runtime_state_root
+            .join("agent_frame")
+            .join("file_downloads");
+        let images_dir = runtime_state_root.join("agent_frame").join("image_tasks");
+        fs::create_dir_all(&processes_dir).unwrap();
+        fs::create_dir_all(&downloads_dir).unwrap();
+        fs::create_dir_all(&images_dir).unwrap();
+
+        let mut exec_child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let exec_metadata = ProcessMetadata {
+            exec_id: "exec-cleanup".to_string(),
+            pid: exec_child.id(),
+            command: "sleep 30".to_string(),
+            cwd: "/tmp".to_string(),
+            stdout_path: processes_dir
+                .join("exec-cleanup.stdout")
+                .display()
+                .to_string(),
+            stderr_path: processes_dir
+                .join("exec-cleanup.stderr")
+                .display()
+                .to_string(),
+            exit_code_path: processes_dir
+                .join("exec-cleanup.exit")
+                .display()
+                .to_string(),
+        };
+        fs::write(
+            process_meta_path(&processes_dir, "exec-cleanup"),
+            serde_json::to_vec_pretty(&exec_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let mut download_child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let download_status_path = downloads_dir.join("download-cleanup.status.json");
+        fs::write(
+            &download_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "download_id": "download-cleanup",
+                "url": "https://example.com/archive.tar",
+                "path": "/tmp/archive.tar",
+                "running": true,
+                "completed": false,
+                "cancelled": false,
+                "failed": false,
+                "bytes_downloaded": 64
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_background_task_metadata(
+            &downloads_dir,
+            &BackgroundTaskMetadata {
+                task_id: "download-cleanup".to_string(),
+                pid: download_child.id(),
+                label: "file-download".to_string(),
+                status_path: download_status_path.display().to_string(),
+                stdout_path: downloads_dir
+                    .join("download-cleanup.stdout")
+                    .display()
+                    .to_string(),
+                stderr_path: downloads_dir
+                    .join("download-cleanup.stderr")
+                    .display()
+                    .to_string(),
+                exit_code_path: downloads_dir
+                    .join("download-cleanup.exit")
+                    .display()
+                    .to_string(),
+            },
+        )
+        .unwrap();
+
+        let mut image_child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let image_status_path = images_dir.join("image-cleanup.status.json");
+        fs::write(
+            &image_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "image_id": "image-cleanup",
+                "path": "/tmp/demo.png",
+                "question": "what is in the image?",
+                "running": true,
+                "completed": false,
+                "cancelled": false,
+                "failed": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_background_task_metadata(
+            &images_dir,
+            &BackgroundTaskMetadata {
+                task_id: "image-cleanup".to_string(),
+                pid: image_child.id(),
+                label: "image".to_string(),
+                status_path: image_status_path.display().to_string(),
+                stdout_path: images_dir
+                    .join("image-cleanup.stdout")
+                    .display()
+                    .to_string(),
+                stderr_path: images_dir
+                    .join("image-cleanup.stderr")
+                    .display()
+                    .to_string(),
+                exit_code_path: images_dir.join("image-cleanup.exit").display().to_string(),
+            },
+        )
+        .unwrap();
+
+        let report = terminate_runtime_state_tasks(runtime_state_root).unwrap();
+        assert_eq!(report.exec_processes_killed, 1);
+        assert_eq!(report.file_downloads_cancelled, 1);
+        assert_eq!(report.image_tasks_cancelled, 1);
+
+        let download_snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(download_status_path).unwrap()).unwrap();
+        assert_eq!(download_snapshot["cancelled"], json!(true));
+        assert_eq!(download_snapshot["reason"], json!("session_destroyed"));
+        let image_snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(image_status_path).unwrap()).unwrap();
+        assert_eq!(image_snapshot["cancelled"], json!(true));
+        assert_eq!(image_snapshot["reason"], json!("session_destroyed"));
+
+        let _ = exec_child.wait();
+        let _ = download_child.wait();
+        let _ = image_child.wait();
+        thread::sleep(Duration::from_millis(50));
+        assert!(!process_is_running(exec_metadata.pid));
+        assert!(!process_is_running(download_child.id()));
+        assert!(!process_is_running(image_child.id()));
     }
 }
 

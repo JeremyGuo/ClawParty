@@ -4,6 +4,7 @@ use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::net::IpAddr;
 use std::time::Duration;
 
 #[derive(Deserialize)]
@@ -82,14 +83,33 @@ fn build_chat_completions_url(config: &UpstreamConfig) -> String {
     format!("{}{}", base, path)
 }
 
+fn should_bypass_proxy(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 pub fn create_chat_completion(
     upstream: &UpstreamConfig,
     messages: &[ChatMessage],
     tools: &[Tool],
     extra_payload: Option<Map<String, Value>>,
 ) -> Result<ChatCompletionOutcome> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs_f64(upstream.timeout_seconds))
+    let chat_completions_url = build_chat_completions_url(upstream);
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs_f64(upstream.timeout_seconds));
+    if should_bypass_proxy(&chat_completions_url) {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder
         .build()
         .context("failed to construct upstream client")?;
 
@@ -132,7 +152,7 @@ pub fn create_chat_completion(
     }
 
     let mut request = client
-        .post(build_chat_completions_url(upstream))
+        .post(chat_completions_url)
         .json(&Value::Object(payload));
 
     if let Some(api_key) = upstream

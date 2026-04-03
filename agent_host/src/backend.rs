@@ -401,7 +401,8 @@ fn compose_zgent_system_prompt(
     let mut parts = vec![
         ZGENT_COMPAT_MARKER.to_string(),
         "You are running inside ZGent through AgentHost's compatibility layer. Use tools when they materially help.".to_string(),
-        "The model is responsible for choosing timeout_seconds for any built-in tool call.".to_string(),
+        "Only tools that explicitly expose timeout fields require the model to choose timeout_seconds.".to_string(),
+        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe.".to_string(),
     ];
     if !config.system_prompt.is_empty() {
         parts.push(config.system_prompt.clone());

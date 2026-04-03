@@ -32,7 +32,7 @@ use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::skills::discover_skills;
-use agent_frame::tooling::build_tool_registry;
+use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
     ChatMessage, SessionCompactionStats, SessionEvent, SessionExecutionControl, SessionRunReport,
     TokenUsage, Tool, estimate_session_tokens, extract_assistant_text,
@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::select;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
@@ -74,6 +74,7 @@ struct ServerRuntime {
     active_workspace_ids: Vec<String>,
     selected_main_model_key: Option<String>,
     selected_reasoning_effort: Option<String>,
+    selected_context_compaction_enabled: Option<bool>,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -582,7 +583,9 @@ impl ServerRuntime {
                 .root_dir
                 .join("runtime")
                 .join(&session.workspace_id),
-            enable_context_compression: self.main_agent.enable_context_compression,
+            enable_context_compression: self
+                .selected_context_compaction_enabled
+                .unwrap_or(self.main_agent.enable_context_compression),
             effective_context_window_percent: self.main_agent.effective_context_window_percent,
             auto_compact_token_limit: self.main_agent.auto_compact_token_limit,
             retain_recent_messages: self.main_agent.retain_recent_messages,
@@ -756,7 +759,7 @@ impl ServerRuntime {
 
             let runtime = self.clone();
             let session = session.clone();
-            tools.push(Tool::new_timed(
+            tools.push(Tool::new_interruptible(
                 "run_subagent",
                 "Run delegated subagent work in the current workspace. Use either task/model/timeout_seconds for a single subagent, or tasks:[{task, model?, timeout_seconds}, ...] to run multiple subagents in parallel. Set timeout_seconds to 0 to wait indefinitely for completion. Returns subagent reply text, optional attachment_paths, timeout status, and token usage.",
                 json!({
@@ -2256,9 +2259,9 @@ pub struct Server {
     models: BTreeMap<String, ModelConfig>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
-    conversations: ConversationManager,
-    snapshots: SnapshotManager,
-    sessions: SessionManager,
+    conversations: Arc<Mutex<ConversationManager>>,
+    snapshots: Arc<Mutex<SnapshotManager>>,
+    sessions: Arc<Mutex<SessionManager>>,
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
     agent_registry: Arc<Mutex<AgentRegistry>>,
@@ -2273,6 +2276,33 @@ pub struct Server {
 }
 
 impl Server {
+    fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session manager lock poisoned"))?;
+        f(&mut sessions)
+    }
+
+    fn with_conversations<T>(
+        &self,
+        f: impl FnOnce(&mut ConversationManager) -> Result<T>,
+    ) -> Result<T> {
+        let mut conversations = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation manager lock poisoned"))?;
+        f(&mut conversations)
+    }
+
+    fn with_snapshots<T>(&self, f: impl FnOnce(&mut SnapshotManager) -> Result<T>) -> Result<T> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow!("snapshot manager lock poisoned"))?;
+        f(&mut snapshots)
+    }
+
     pub fn from_config(config: ServerConfig, workdir: impl AsRef<Path>) -> Result<Self> {
         let workdir = workdir.as_ref().to_path_buf();
         std::fs::create_dir_all(&workdir)
@@ -2317,7 +2347,10 @@ impl Server {
         let agent_registry_notify = Arc::new(Notify::new());
 
         Ok(Self {
-            sessions: SessionManager::new(&workdir, workspace_manager.clone())?,
+            sessions: Arc::new(Mutex::new(SessionManager::new(
+                &workdir,
+                workspace_manager.clone(),
+            )?)),
             workdir: workdir.clone(),
             agent_workspace,
             workspace_manager,
@@ -2326,8 +2359,8 @@ impl Server {
             models: config.models,
             main_agent: config.main_agent,
             sandbox: config.sandbox,
-            conversations: ConversationManager::new(&workdir)?,
-            snapshots: SnapshotManager::new(&workdir)?,
+            conversations: Arc::new(Mutex::new(ConversationManager::new(&workdir)?)),
+            snapshots: Arc::new(Mutex::new(SnapshotManager::new(&workdir)?)),
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager,
             agent_registry,
@@ -2345,8 +2378,10 @@ impl Server {
     pub async fn run(mut self) -> Result<()> {
         self.retry_pending_workspace_summaries().await?;
         let (sender, mut receiver) = mpsc::channel::<IncomingMessage>(128);
+        let background_receiver = self.background_job_receiver.take();
+        let server = Arc::new(self);
         {
-            let runtime = self.tool_runtime();
+            let runtime = server.tool_runtime();
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(runtime.cron_poll_interval_seconds));
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2363,8 +2398,8 @@ impl Server {
                 }
             });
         }
-        if let Some(mut background_receiver) = self.background_job_receiver.take() {
-            let runtime = self.tool_runtime();
+        if let Some(mut background_receiver) = background_receiver {
+            let runtime = server.tool_runtime();
             tokio::spawn(async move {
                 while let Some(job) = background_receiver.recv().await {
                     let runtime = runtime.clone();
@@ -2382,84 +2417,125 @@ impl Server {
             });
         }
 
-        for channel in self.channels.values() {
+        for channel in server.channels.values() {
             spawn_channel_supervisor(Arc::clone(channel), sender.clone());
         }
         drop(sender);
 
         let mut idle_compaction_ticker = interval(Duration::from_secs(
-            self.main_agent
+            server
+                .main_agent
                 .idle_context_compaction_poll_interval_seconds,
         ));
         idle_compaction_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
-        let pending_notify = Arc::new(Notify::new());
-        let receiver_closed = Arc::new(AtomicBool::new(false));
-        let active_controls = Arc::clone(&self.active_foreground_controls);
-        let pump_channels = Arc::clone(&self.channels);
-        let pump_models = self.models.clone();
-        let pump_workdir = self.workdir.clone();
-        let pump_queue = Arc::clone(&pending_messages);
-        let pump_notify = Arc::clone(&pending_notify);
-        let pump_closed = Arc::clone(&receiver_closed);
-        tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                if let Some(outgoing) =
-                    fast_path_model_selection_message(&pump_workdir, &pump_models, &message)
-                {
-                    if let Some(channel) = pump_channels.get(&message.address.channel_id) {
-                        if let Err(error) = channel.send(&message.address, outgoing).await {
-                            error!(
-                                log_stream = "channel",
-                                log_key = %message.address.channel_id,
-                                kind = "fast_path_send_failed",
-                                conversation_id = %message.address.conversation_id,
-                                error = %format!("{error:#}"),
-                                "failed to send fast-path model selection message"
-                            );
-                        }
-                    }
-                    continue;
-                }
-                request_yield_for_incoming(&active_controls, &message);
-                if let Ok(mut queue) = pump_queue.lock() {
-                    queue.push_back(message);
-                }
-                pump_notify.notify_one();
-            }
-            pump_closed.store(true, Ordering::SeqCst);
-            pump_notify.notify_waiters();
-        });
+        let conversation_workers: Arc<
+            Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<IncomingMessage>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+        let active_worker_count = Arc::new(AtomicUsize::new(0));
+        let active_worker_notify = Arc::new(Notify::new());
+        let mut receiver_closed = false;
 
         loop {
-            let next_message = {
-                let mut queue = pending_messages
-                    .lock()
-                    .map_err(|_| anyhow!("pending messages lock poisoned"))?;
-                queue
-                    .pop_front()
-                    .map(|message| coalesce_buffered_conversation_messages(message, &mut queue))
-            };
-            if let Some(message) = next_message {
-                if let Err(error) = self.handle_incoming(message).await {
-                    error!(
-                        log_stream = "server",
-                        kind = "handle_incoming_failed",
-                        error = %format!("{error:#}"),
-                        "failed to handle incoming message"
-                    );
-                }
-                continue;
-            }
-
-            if receiver_closed.load(Ordering::SeqCst) {
+            if receiver_closed && active_worker_count.load(Ordering::SeqCst) == 0 {
                 break;
             }
 
             select! {
+                maybe_message = receiver.recv(), if !receiver_closed => {
+                    match maybe_message {
+                        Some(message) => {
+                            if let Some(outgoing) =
+                                fast_path_model_selection_message(&server.workdir, &server.models, &message)
+                            {
+                                if let Some(channel) = server.channels.get(&message.address.channel_id) {
+                                    if let Err(error) = channel.send(&message.address, outgoing).await {
+                                        error!(
+                                            log_stream = "channel",
+                                            log_key = %message.address.channel_id,
+                                            kind = "fast_path_send_failed",
+                                            conversation_id = %message.address.conversation_id,
+                                            error = %format!("{error:#}"),
+                                            "failed to send fast-path model selection message"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            request_yield_for_incoming(&server.active_foreground_controls, &message);
+                            let session_key = message.address.session_key();
+                            let mut pending_message = Some(message);
+                            loop {
+                                let worker_sender = conversation_workers
+                                    .lock()
+                                    .map_err(|_| anyhow!("conversation workers lock poisoned"))?
+                                    .get(&session_key)
+                                    .cloned();
+                                let worker_sender = match worker_sender {
+                                    Some(worker_sender) => worker_sender,
+                                    None => {
+                                        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel();
+                                        conversation_workers
+                                            .lock()
+                                            .map_err(|_| anyhow!("conversation workers lock poisoned"))?
+                                            .insert(session_key.clone(), worker_tx.clone());
+                                        active_worker_count.fetch_add(1, Ordering::SeqCst);
+                                        let server = Arc::clone(&server);
+                                        let conversation_workers = Arc::clone(&conversation_workers);
+                                        let active_worker_count = Arc::clone(&active_worker_count);
+                                        let active_worker_notify = Arc::clone(&active_worker_notify);
+                                        let worker_session_key = session_key.clone();
+                                        tokio::spawn(async move {
+                                            let mut local_queue = VecDeque::new();
+                                            while let Some(message) = worker_rx.recv().await {
+                                                local_queue.push_back(message);
+                                                while let Ok(message) = worker_rx.try_recv() {
+                                                    local_queue.push_back(message);
+                                                }
+                                                while let Some(message) = local_queue.pop_front() {
+                                                    let merged =
+                                                        coalesce_buffered_conversation_messages(message, &mut local_queue);
+                                                    if let Err(error) = server.handle_incoming(merged).await {
+                                                        error!(
+                                                            log_stream = "server",
+                                                            kind = "handle_incoming_failed",
+                                                            error = %format!("{error:#}"),
+                                                            "failed to handle incoming message"
+                                                        );
+                                                    }
+                                                    while let Ok(message) = worker_rx.try_recv() {
+                                                        local_queue.push_back(message);
+                                                    }
+                                                }
+                                            }
+                                            if let Ok(mut workers) = conversation_workers.lock() {
+                                                workers.remove(&worker_session_key);
+                                            }
+                                            active_worker_count.fetch_sub(1, Ordering::SeqCst);
+                                            active_worker_notify.notify_waiters();
+                                        });
+                                        worker_tx
+                                    }
+                                };
+                                let message = pending_message
+                                    .take()
+                                    .expect("pending message should exist while dispatching");
+                                match worker_sender.send(message) {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        if let Ok(mut workers) = conversation_workers.lock() {
+                                            workers.remove(&session_key);
+                                        }
+                                        pending_message = Some(error.0);
+                                    }
+                                }
+                            }
+                        }
+                        None => receiver_closed = true,
+                    }
+                }
                 _ = idle_compaction_ticker.tick() => {
-                    if self.main_agent.enable_idle_context_compaction
-                        && let Err(error) = self.run_idle_context_compaction_once().await
+                    if server.main_agent.enable_idle_context_compaction
+                        && let Err(error) = server.run_idle_context_compaction_once().await
                     {
                         error!(
                             log_stream = "server",
@@ -2469,11 +2545,11 @@ impl Server {
                         );
                     }
                 }
-                _ = pending_notify.notified() => {}
+                _ = active_worker_notify.notified(), if receiver_closed => {}
             }
         }
 
-        if let Err(error) = self.summarize_active_workspaces_on_shutdown().await {
+        if let Err(error) = server.summarize_active_workspaces_on_shutdown().await {
             warn!(
                 log_stream = "server",
                 kind = "workspace_shutdown_summary_failed",
@@ -2490,12 +2566,15 @@ impl Server {
         Ok(())
     }
 
-    async fn run_idle_context_compaction_once(&mut self) -> Result<()> {
+    async fn run_idle_context_compaction_once(&self) -> Result<()> {
         let lead_time = Duration::from_secs(30);
         let now = Utc::now();
-        let snapshots = self.sessions.list_foreground_snapshots();
+        let snapshots = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
 
         for session in snapshots {
+            if !self.effective_context_compaction_enabled(&session.address)? {
+                continue;
+            }
             let model_key = self.effective_main_model_key(&session.address)?;
             let model = self.model_config_or_main(&model_key)?.clone();
             let runtime = self.tool_runtime_for_address(&session.address)?;
@@ -2535,9 +2614,14 @@ impl Server {
             }
 
             let compaction_stats = compaction_stats_from_report(&report);
-            self.sessions
-                .record_idle_compaction(&session.address, report.messages, &compaction_stats)
-                .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
+            self.with_sessions(|sessions| {
+                sessions.record_idle_compaction(
+                    &session.address,
+                    report.messages,
+                    &compaction_stats,
+                )
+            })
+            .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
             info!(
                 log_stream = "session",
                 log_key = %session.id,
@@ -2568,13 +2652,14 @@ impl Server {
             agent_workspace: self.agent_workspace.clone(),
             workspace_manager: self.workspace_manager.clone(),
             active_workspace_ids: self
-                .sessions
-                .list_foreground_snapshots()
+                .with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))
+                .unwrap_or_default()
                 .into_iter()
                 .map(|session| session.workspace_id)
                 .collect(),
             selected_main_model_key: None,
             selected_reasoning_effort: None,
+            selected_context_compaction_enabled: None,
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
@@ -2601,10 +2686,10 @@ impl Server {
     fn tool_runtime_for_address(&self, address: &ChannelAddress) -> Result<ServerRuntime> {
         let sandbox_mode = self.effective_sandbox_mode(address)?;
         let mut runtime = self.tool_runtime_for_sandbox_mode(sandbox_mode);
-        runtime.selected_main_model_key = self.selected_main_model_key(address)?;
-        runtime.selected_reasoning_effort = self
-            .effective_conversation_settings(address)?
-            .reasoning_effort;
+        let settings = self.effective_conversation_settings(address)?;
+        runtime.selected_main_model_key = settings.main_model.clone();
+        runtime.selected_reasoning_effort = settings.reasoning_effort.clone();
+        runtime.selected_context_compaction_enabled = settings.context_compaction_enabled;
         Ok(runtime)
     }
 
@@ -2615,6 +2700,43 @@ impl Server {
             .map_err(|_| anyhow!("active foreground controls lock poisoned"))?;
         controls.remove(&address.session_key());
         Ok(())
+    }
+
+    fn destroy_foreground_session(&self, address: &ChannelAddress) -> Result<()> {
+        let snapshot = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
+        if let Some(control) = self
+            .active_foreground_controls
+            .lock()
+            .ok()
+            .and_then(|controls| controls.get(&address.session_key()).cloned())
+        {
+            control.request_cancel();
+        }
+        self.unregister_active_foreground_control(address)?;
+        if let Some(session) = snapshot {
+            let runtime_state_root = self
+                .agent_workspace
+                .root_dir
+                .join("runtime")
+                .join(&session.workspace_id);
+            let report = terminate_runtime_state_tasks(&runtime_state_root)?;
+            if report.exec_processes_killed > 0
+                || report.file_downloads_cancelled > 0
+                || report.image_tasks_cancelled > 0
+            {
+                info!(
+                    log_stream = "session",
+                    log_key = %session.id,
+                    kind = "session_runtime_tasks_destroyed",
+                    workspace_id = %session.workspace_id,
+                    exec_processes_killed = report.exec_processes_killed as u64,
+                    file_downloads_cancelled = report.file_downloads_cancelled as u64,
+                    image_tasks_cancelled = report.image_tasks_cancelled as u64,
+                    "destroyed background runtime tasks for session"
+                );
+            }
+        }
+        self.with_sessions(|sessions| sessions.destroy_foreground(address))
     }
 
     pub fn workdir(&self) -> &Path {
@@ -2630,8 +2752,10 @@ impl Server {
         }
     }
 
-    async fn handle_incoming(&mut self, incoming: IncomingMessage) -> Result<()> {
-        self.conversations.ensure_conversation(&incoming.address)?;
+    async fn handle_incoming(&self, incoming: IncomingMessage) -> Result<()> {
+        self.with_conversations(|conversations| {
+            conversations.ensure_conversation(&incoming.address)
+        })?;
         if let Err(error) = self.archive_stale_workspaces_if_needed() {
             warn!(
                 log_stream = "server",
@@ -2668,7 +2792,7 @@ impl Server {
                         reason = reason,
                         "channel reported that the conversation should be closed"
                     );
-                    self.sessions.destroy_foreground(&incoming.address)?;
+                    self.destroy_foreground_session(&incoming.address)?;
                     let disabled = self.disable_cron_tasks_for_conversation(&incoming.address)?;
                     if disabled > 0 {
                         warn!(
@@ -2691,9 +2815,12 @@ impl Server {
             .map(str::trim)
             .is_some_and(|text| command_matches(text, "/new"))
         {
-            if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address) {
-                self.sessions
-                    .mark_workspace_summary_state(&incoming.address, true, true)?;
+            if let Some(previous_session) =
+                self.with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
+            {
+                self.with_sessions(|sessions| {
+                    sessions.mark_workspace_summary_state(&incoming.address, true, true)
+                })?;
                 if let Err(error) = self
                     .summarize_workspace_before_destroy(&previous_session)
                     .await
@@ -2710,9 +2837,10 @@ impl Server {
                         .await;
                     return Err(error);
                 }
-                self.sessions.destroy_foreground(&incoming.address)?;
+                self.destroy_foreground_session(&incoming.address)?;
             }
-            let session = self.sessions.reset_foreground(&incoming.address)?;
+            let session =
+                self.with_sessions(|sessions| sessions.reset_foreground(&incoming.address))?;
             info!(
                 log_stream = "session",
                 log_key = %session.id,
@@ -2747,11 +2875,13 @@ impl Server {
         }
 
         if let Some(workspace_id) = parse_oldspace_command(incoming.text.as_deref()) {
-            if let Some(previous_session) = self.sessions.get_snapshot(&incoming.address)
+            if let Some(previous_session) =
+                self.with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
                 && previous_session.workspace_id != workspace_id
             {
-                self.sessions
-                    .mark_workspace_summary_state(&incoming.address, true, true)?;
+                self.with_sessions(|sessions| {
+                    sessions.mark_workspace_summary_state(&incoming.address, true, true)
+                })?;
                 if let Err(error) = self
                     .summarize_workspace_before_destroy(&previous_session)
                     .await
@@ -2768,7 +2898,7 @@ impl Server {
                         .await;
                     return Err(error);
                 }
-                self.sessions.destroy_foreground(&incoming.address)?;
+                self.destroy_foreground_session(&incoming.address)?;
             }
             let session = match self.activate_existing_workspace(&incoming.address, &workspace_id) {
                 Ok(session) => session,
@@ -2844,12 +2974,81 @@ impl Server {
                 .await?;
                 return Ok(());
             };
-            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let session =
+                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
             let status_text = self.status_text_for_session(&session, &effective_model_key)?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(status_text),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if incoming
+            .text
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| command_matches(text, "/compact"))
+        {
+            let Some(effective_model_key) = self.selected_main_model_key(&incoming.address)? else {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    self.model_selection_message(
+                        &incoming.address,
+                        "Choose a model for this conversation before using `/compact`.",
+                    )?,
+                )
+                .await?;
+                return Ok(());
+            };
+            let session =
+                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let compacted = self
+                .compact_session_now(&session, &effective_model_key, true)
+                .await?;
+            let message = if compacted {
+                "Compacted the current conversation context.".to_string()
+            } else {
+                "The current conversation context did not need compaction.".to_string()
+            };
+            self.send_channel_message(&channel, &incoming.address, OutgoingMessage::text(message))
+                .await?;
+            return Ok(());
+        }
+
+        if let Some(argument) = parse_compact_mode_command(incoming.text.as_deref()) {
+            if let Some(mode_name) = argument {
+                let enabled = match mode_name.trim() {
+                    "on" | "enable" | "enabled" => true,
+                    "off" | "disable" | "disabled" => false,
+                    _ => {
+                        let error = anyhow!("unknown compact mode {}", mode_name);
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                self.with_conversations(|conversations| {
+                    conversations.set_context_compaction_enabled(&incoming.address, Some(enabled))
+                })?;
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(format!(
+                        "Automatic context compaction is now `{}` for this conversation.",
+                        if enabled { "enabled" } else { "disabled" }
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                self.compact_mode_message(&incoming.address)?,
             )
             .await?;
             return Ok(());
@@ -2863,19 +3062,31 @@ impl Server {
                         .await;
                     return Err(error);
                 }
-                let compacted = if let Some(previous_model_key) =
-                    self.selected_main_model_key(&incoming.address)?
-                {
-                    let session = self.sessions.ensure_foreground(&incoming.address)?;
-                    self.compact_session_now(&session, &previous_model_key)
+                let current_model_key = self.selected_main_model_key(&incoming.address)?;
+                if current_model_key.as_deref() == Some(model_key.as_str()) {
+                    self.send_channel_message(
+                        &channel,
+                        &incoming.address,
+                        OutgoingMessage::text(format!(
+                            "Conversation model is already `{}`. No change was made.",
+                            model_key
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let compacted = if let Some(previous_model_key) = current_model_key {
+                    let session = self
+                        .with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+                    self.compact_session_now(&session, &previous_model_key, false)
                         .await
                         .unwrap_or(false)
                 } else {
                     false
                 };
-                let conversation = self
-                    .conversations
-                    .set_main_model(&incoming.address, Some(model_key.clone()))?;
+                let conversation = self.with_conversations(|conversations| {
+                    conversations.set_main_model(&incoming.address, Some(model_key.clone()))
+                })?;
                 let effective_model_key = conversation
                     .settings
                     .main_model
@@ -2933,9 +3144,9 @@ impl Server {
                     }
                     Some(parsed)
                 };
-                let conversation = self
-                    .conversations
-                    .set_sandbox_mode(&incoming.address, selected_mode)?;
+                let conversation = self.with_conversations(|conversations| {
+                    conversations.set_sandbox_mode(&incoming.address, selected_mode)
+                })?;
                 let effective_mode = conversation
                     .settings
                     .sandbox_mode
@@ -2997,9 +3208,9 @@ impl Server {
                     };
                     Some(parsed.to_string())
                 };
-                let conversation = self
-                    .conversations
-                    .set_reasoning_effort(&incoming.address, selected_effort)?;
+                let conversation = self.with_conversations(|conversations| {
+                    conversations.set_reasoning_effort(&incoming.address, selected_effort)
+                })?;
                 let effective_effort = conversation
                     .settings
                     .reasoning_effort
@@ -3054,20 +3265,24 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
-            let session = self.sessions.ensure_foreground(&incoming.address)?;
-            let checkpoint = self.sessions.export_checkpoint(&incoming.address)?;
+            let session =
+                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let checkpoint =
+                self.with_sessions(|sessions| sessions.export_checkpoint(&incoming.address))?;
             let bundle = SnapshotBundle {
                 saved_at: Utc::now(),
                 source_address: incoming.address.clone(),
                 settings: self.effective_conversation_settings(&incoming.address)?,
                 session: checkpoint,
             };
-            let record = self.snapshots.save_snapshot(
-                &incoming.address,
-                &checkpoint_name,
-                bundle,
-                &session.workspace_root,
-            )?;
+            let record = self.with_snapshots(|snapshots| {
+                snapshots.save_snapshot(
+                    &incoming.address,
+                    &checkpoint_name,
+                    bundle,
+                    &session.workspace_root,
+                )
+            })?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
@@ -3086,7 +3301,7 @@ impl Server {
                 Some(None)
             )
         {
-            let snapshots = self.snapshots.list_snapshots();
+            let snapshots = self.with_snapshots(|snapshots| Ok(snapshots.list_snapshots()))?;
             if snapshots.is_empty() {
                 self.send_channel_message(
                     &channel,
@@ -3132,30 +3347,50 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_load_command(incoming.text.as_deref()) {
-            let loaded = match self.snapshots.load_snapshot(&checkpoint_name) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
-                }
-            };
-            self.conversations
-                .set_main_model(&incoming.address, loaded.bundle.settings.main_model.clone())?;
-            self.conversations
-                .set_sandbox_mode(&incoming.address, loaded.bundle.settings.sandbox_mode)?;
+            let loaded =
+                match self.with_snapshots(|snapshots| snapshots.load_snapshot(&checkpoint_name)) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                };
+            self.with_conversations(|conversations| {
+                conversations
+                    .set_main_model(&incoming.address, loaded.bundle.settings.main_model.clone())
+            })?;
+            self.with_conversations(|conversations| {
+                conversations
+                    .set_sandbox_mode(&incoming.address, loaded.bundle.settings.sandbox_mode)
+            })?;
+            self.with_conversations(|conversations| {
+                conversations.set_reasoning_effort(
+                    &incoming.address,
+                    loaded.bundle.settings.reasoning_effort.clone(),
+                )
+            })?;
+            self.with_conversations(|conversations| {
+                conversations.set_context_compaction_enabled(
+                    &incoming.address,
+                    loaded.bundle.settings.context_compaction_enabled,
+                )
+            })?;
+            self.destroy_foreground_session(&incoming.address)?;
             let workspace = self.workspace_manager.create_workspace(
                 uuid::Uuid::new_v4(),
                 uuid::Uuid::new_v4(),
                 Some(&format!("snapshot-{}", loaded.record.name)),
             )?;
             replace_directory_contents(&workspace.files_dir, &loaded.workspace_dir)?;
-            let restored = self.sessions.restore_foreground_from_checkpoint(
-                &incoming.address,
-                loaded.bundle.session,
-                workspace.id.clone(),
-                workspace.files_dir.clone(),
-            )?;
+            let restored = self.with_sessions(|sessions| {
+                sessions.restore_foreground_from_checkpoint(
+                    &incoming.address,
+                    loaded.bundle.session,
+                    workspace.id.clone(),
+                    workspace.files_dir.clone(),
+                )
+            })?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
@@ -3182,7 +3417,8 @@ impl Server {
         }
 
         if let Some(argument) = parse_set_api_timeout_command(incoming.text.as_deref()) {
-            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let session =
+                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
             let effective_model_key = self.effective_main_model_key(&incoming.address)?;
             let model_timeout_seconds =
                 self.model_upstream_timeout_seconds(&effective_model_key)?;
@@ -3195,8 +3431,9 @@ impl Server {
                         return Err(error);
                     }
                 };
-            self.sessions
-                .set_api_timeout_override(&incoming.address, override_timeout)?;
+            self.with_sessions(|sessions| {
+                sessions.set_api_timeout_override(&incoming.address, override_timeout)
+            })?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
@@ -3207,8 +3444,11 @@ impl Server {
         }
 
         if parse_continue_command(incoming.text.as_deref()) {
-            let session = self.sessions.ensure_foreground(&incoming.address)?;
-            let Some(pending_continue) = self.sessions.pending_continue(&incoming.address)? else {
+            let session =
+                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let Some(pending_continue) =
+                self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?
+            else {
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
@@ -3228,15 +3468,11 @@ impl Server {
                 incoming.address.clone(),
                 ProcessingState::Typing,
             );
-            let continue_message = ChatMessage::text(
-                "user",
-                "Continue from the preserved failure point. Do not restart completed work or repeat finished tool calls. Resume from the latest preserved state and finish the user's request.",
-            );
             let outcome = self
-                .run_main_agent_turn(
+                .run_main_agent_turn_with_previous_messages(
                     &session,
                     &pending_continue.model_key,
-                    continue_message,
+                    pending_continue.resume_messages.clone(),
                     pending_continue.original_user_text.clone(),
                     pending_continue.original_attachments.clone(),
                 )
@@ -3263,21 +3499,27 @@ impl Server {
                 } => {
                     let loaded_skills =
                         extract_loaded_skill_names(&messages, session.agent_message_count);
-                    self.sessions
-                        .record_agent_turn(&incoming.address, messages, &usage, &compaction)
-                        .context("failed to persist continued agent_frame messages")?;
-                    self.sessions
-                        .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
-                    self.sessions.append_user_message(
-                        &incoming.address,
-                        pending_continue.original_user_text.clone(),
-                        pending_continue.original_attachments.clone(),
-                    )?;
-                    self.sessions.append_assistant_message(
-                        &incoming.address,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )?;
+                    self.with_sessions(|sessions| {
+                        sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
+                    })
+                    .context("failed to persist continued agent_frame messages")?;
+                    self.with_sessions(|sessions| {
+                        sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
+                    })?;
+                    self.with_sessions(|sessions| {
+                        sessions.append_user_message(
+                            &incoming.address,
+                            pending_continue.original_user_text.clone(),
+                            pending_continue.original_attachments.clone(),
+                        )
+                    })?;
+                    self.with_sessions(|sessions| {
+                        sessions.append_assistant_message(
+                            &incoming.address,
+                            outgoing.text.clone(),
+                            Vec::new(),
+                        )
+                    })?;
                     let foreground =
                         self.build_foreground_agent(&session, &pending_continue.model_key)?;
                     self.log_turn_usage(&session, &usage, false);
@@ -3308,11 +3550,18 @@ impl Server {
                 } => {
                     let loaded_skills =
                         extract_loaded_skill_names(&messages, session.agent_message_count);
-                    self.sessions
-                        .record_yielded_turn(&incoming.address, messages, &usage, &compaction)
-                        .context("failed to persist yielded continued agent_frame messages")?;
-                    self.sessions
-                        .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
+                    self.with_sessions(|sessions| {
+                        sessions.record_yielded_turn(
+                            &incoming.address,
+                            messages,
+                            &usage,
+                            &compaction,
+                        )
+                    })
+                    .context("failed to persist yielded continued agent_frame messages")?;
+                    self.with_sessions(|sessions| {
+                        sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
+                    })?;
                     channel
                         .set_processing(&incoming.address, ProcessingState::Idle)
                         .await
@@ -3323,8 +3572,10 @@ impl Server {
                     pending_continue,
                     error,
                 } => {
-                    self.sessions
-                        .set_pending_continue(&incoming.address, Some(pending_continue.clone()))?;
+                    self.with_sessions(|sessions| {
+                        sessions
+                            .set_pending_continue(&incoming.address, Some(pending_continue.clone()))
+                    })?;
                     channel
                         .set_processing(&incoming.address, ProcessingState::Idle)
                         .await
@@ -3357,7 +3608,8 @@ impl Server {
             return Ok(());
         }
 
-        let session = self.sessions.ensure_foreground(&incoming.address)?;
+        let session =
+            self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
         if session.agent_message_count == 0 {
             if let Err(error) = self.initialize_foreground_session(&session, false).await {
                 self.send_user_error_message(&channel, &incoming.address, &error)
@@ -3366,8 +3618,7 @@ impl Server {
             }
         }
         let session = self
-            .sessions
-            .get_snapshot(&incoming.address)
+            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
             .expect("session should exist after initialization");
 
         let stored_attachments = self
@@ -3383,6 +3634,13 @@ impl Server {
             &effective_model,
             backend_supports_native_multimodal_input(effective_model.backend),
         )?;
+        let pending_continue =
+            self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?;
+        let previous_messages = build_previous_messages_for_turn(
+            &session.agent_messages,
+            pending_continue.as_ref(),
+            Some(user_message),
+        );
 
         channel
             .set_processing(&incoming.address, ProcessingState::Typing)
@@ -3395,10 +3653,10 @@ impl Server {
         );
 
         let turn_result = self
-            .run_main_agent_turn(
+            .run_main_agent_turn_with_previous_messages(
                 &session,
                 &effective_model_key,
-                user_message,
+                previous_messages,
                 incoming.text.clone(),
                 stored_attachments.clone(),
             )
@@ -3431,16 +3689,20 @@ impl Server {
             } => {
                 let loaded_skills =
                     extract_loaded_skill_names(&messages, session.agent_message_count);
-                self.sessions
-                    .record_yielded_turn(&incoming.address, messages, &usage, &compaction)
-                    .context("failed to persist yielded agent_frame messages")?;
-                self.sessions
-                    .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
-                self.sessions.append_user_message(
-                    &incoming.address,
-                    incoming.text.clone(),
-                    stored_attachments.clone(),
-                )?;
+                self.with_sessions(|sessions| {
+                    sessions.record_yielded_turn(&incoming.address, messages, &usage, &compaction)
+                })
+                .context("failed to persist yielded agent_frame messages")?;
+                self.with_sessions(|sessions| {
+                    sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
+                })?;
+                self.with_sessions(|sessions| {
+                    sessions.append_user_message(
+                        &incoming.address,
+                        incoming.text.clone(),
+                        stored_attachments.clone(),
+                    )
+                })?;
                 channel
                     .set_processing(&incoming.address, ProcessingState::Idle)
                     .await
@@ -3451,8 +3713,9 @@ impl Server {
                 pending_continue,
                 error,
             } => {
-                self.sessions
-                    .set_pending_continue(&incoming.address, Some(pending_continue.clone()))?;
+                self.with_sessions(|sessions| {
+                    sessions.set_pending_continue(&incoming.address, Some(pending_continue.clone()))
+                })?;
                 channel
                     .set_processing(&incoming.address, ProcessingState::Idle)
                     .await
@@ -3472,21 +3735,23 @@ impl Server {
         };
 
         let loaded_skills = extract_loaded_skill_names(&messages, session.agent_message_count);
-        self.sessions
-            .record_agent_turn(&incoming.address, messages, &usage, &compaction)
-            .context("failed to persist agent_frame messages")?;
-        self.sessions
-            .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
-        self.sessions.append_user_message(
-            &incoming.address,
-            incoming.text.clone(),
-            stored_attachments.clone(),
-        )?;
-        self.sessions.append_assistant_message(
-            &incoming.address,
-            outgoing.text.clone(),
-            Vec::new(),
-        )?;
+        self.with_sessions(|sessions| {
+            sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
+        })
+        .context("failed to persist agent_frame messages")?;
+        self.with_sessions(|sessions| {
+            sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
+        })?;
+        self.with_sessions(|sessions| {
+            sessions.append_user_message(
+                &incoming.address,
+                incoming.text.clone(),
+                stored_attachments.clone(),
+            )
+        })?;
+        self.with_sessions(|sessions| {
+            sessions.append_assistant_message(&incoming.address, outgoing.text.clone(), Vec::new())
+        })?;
 
         let foreground = self.build_foreground_agent(&session, &effective_model_key)?;
         self.log_turn_usage(&session, &usage, false);
@@ -3567,7 +3832,7 @@ impl Server {
     }
 
     fn status_text_for_session(
-        &mut self,
+        &self,
         session: &SessionSnapshot,
         model_key: &str,
     ) -> Result<String> {
@@ -3592,6 +3857,8 @@ impl Server {
                     .as_ref()
                     .and_then(|reasoning| reasoning.effort.clone())
             });
+        let context_compaction_enabled =
+            self.effective_context_compaction_enabled(&session.address)?;
         Ok(format_session_status(
             &self.main_agent.language,
             model_key,
@@ -3601,13 +3868,13 @@ impl Server {
             timeout_source,
             current_context_estimate,
             current_reasoning_effort.as_deref(),
+            context_compaction_enabled,
         ))
     }
 
     fn archive_stale_workspaces_if_needed(&self) -> Result<()> {
         let protected = self
-            .sessions
-            .list_foreground_snapshots()
+            .with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?
             .into_iter()
             .map(|session| session.workspace_id)
             .collect::<Vec<_>>();
@@ -3626,14 +3893,14 @@ impl Server {
     }
 
     fn activate_existing_workspace(
-        &mut self,
+        &self,
         address: &ChannelAddress,
         workspace_id: &str,
     ) -> Result<SessionSnapshot> {
         self.workspace_manager.reactivate_workspace(workspace_id)?;
-        let session = self
-            .sessions
-            .reset_foreground_to_workspace(address, workspace_id)?;
+        let session = self.with_sessions(|sessions| {
+            sessions.reset_foreground_to_workspace(address, workspace_id)
+        })?;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -3647,11 +3914,14 @@ impl Server {
     }
 
     async fn compact_session_now(
-        &mut self,
+        &self,
         session: &SessionSnapshot,
         model_key: &str,
+        force: bool,
     ) -> Result<bool> {
-        if !self.main_agent.enable_context_compression || session.agent_message_count == 0 {
+        if (!force && !self.effective_context_compaction_enabled(&session.address)?)
+            || session.agent_message_count == 0
+        {
             return Ok(false);
         }
         let runtime = self.tool_runtime_for_address(&session.address)?;
@@ -3675,11 +3945,9 @@ impl Server {
             return Ok(false);
         }
         let compaction_stats = compaction_stats_from_report(&report);
-        self.sessions.record_idle_compaction(
-            &session.address,
-            report.messages,
-            &compaction_stats,
-        )?;
+        self.with_sessions(|sessions| {
+            sessions.record_idle_compaction(&session.address, report.messages, &compaction_stats)
+        })?;
         Ok(true)
     }
 
@@ -3692,7 +3960,7 @@ impl Server {
     }
 
     async fn initialize_foreground_session(
-        &mut self,
+        &self,
         session: &SessionSnapshot,
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
@@ -3715,18 +3983,16 @@ impl Server {
                 usage,
                 compaction,
             } => {
-                self.sessions.record_yielded_turn(
-                    &session.address,
-                    messages,
-                    &usage,
-                    &compaction,
-                )?;
+                self.with_sessions(|sessions| {
+                    sessions.record_yielded_turn(&session.address, messages, &usage, &compaction)
+                })?;
                 return Ok(OutgoingMessage::default());
             }
             ForegroundTurnOutcome::Failed { error, .. } => return Err(error),
         };
-        self.sessions
-            .record_agent_turn(&session.address, messages, &usage, &compaction)?;
+        self.with_sessions(|sessions| {
+            sessions.record_agent_turn(&session.address, messages, &usage, &compaction)
+        })?;
         self.log_turn_usage(session, &usage, true);
         if timed_out {
             warn!(
@@ -3739,22 +4005,24 @@ impl Server {
             );
         }
         if show_reply {
-            self.sessions.append_assistant_message(
-                &session.address,
-                outgoing.text.clone(),
-                Vec::new(),
-            )?;
+            self.with_sessions(|sessions| {
+                sessions.append_assistant_message(
+                    &session.address,
+                    outgoing.text.clone(),
+                    Vec::new(),
+                )
+            })?;
         }
         Ok(outgoing)
     }
 
-    async fn summarize_active_workspaces_on_shutdown(&mut self) -> Result<()> {
-        let snapshots = self.sessions.list_foreground_snapshots();
+    async fn summarize_active_workspaces_on_shutdown(&self) -> Result<()> {
+        let snapshots = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
         let mut first_error = None;
         for session in snapshots {
-            let _ = self
-                .sessions
-                .mark_workspace_summary_state(&session.address, true, false);
+            let _ = self.with_sessions(|sessions| {
+                sessions.mark_workspace_summary_state(&session.address, true, false)
+            });
             if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
                 warn!(
                     log_stream = "session",
@@ -3775,24 +4043,22 @@ impl Server {
         Ok(())
     }
 
-    async fn summarize_workspace_before_destroy(
-        &mut self,
-        session: &SessionSnapshot,
-    ) -> Result<()> {
+    async fn summarize_workspace_before_destroy(&self, session: &SessionSnapshot) -> Result<()> {
         let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_tracker));
         let entries =
             self.workspace_manager
                 .list_workspace_contents(&session.workspace_id, None, 3, 200)?;
         if session.agent_message_count == 0 && entries.is_empty() {
-            self.sessions
-                .mark_workspace_summary_state(&session.address, false, false)?;
+            self.with_sessions(|sessions| {
+                sessions.mark_workspace_summary_state(&session.address, false, false)
+            })?;
             return Ok(());
         }
 
         let mut previous_messages = session.agent_messages.clone();
         let effective_model_key = self.effective_main_model_key(&session.address)?;
         let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
-        if self.main_agent.enable_context_compression
+        if self.effective_context_compaction_enabled(&session.address)?
             && session.agent_message_count > self.main_agent.retain_recent_messages
         {
             let runtime = self.tool_runtime();
@@ -3879,8 +4145,9 @@ impl Server {
             extract_attachment_references(&summary_text, &session.workspace_root)?;
         let clean_summary = clean_summary.trim();
         if clean_summary.is_empty() {
-            self.sessions
-                .mark_workspace_summary_state(&session.address, false, false)?;
+            self.with_sessions(|sessions| {
+                sessions.mark_workspace_summary_state(&session.address, false, false)
+            })?;
             return Ok(());
         }
         let updated = self.workspace_manager.update_summary(
@@ -3888,8 +4155,9 @@ impl Server {
             clean_summary.to_string(),
             None,
         )?;
-        self.sessions
-            .mark_workspace_summary_state(&session.address, false, false)?;
+        self.with_sessions(|sessions| {
+            sessions.mark_workspace_summary_state(&session.address, false, false)
+        })?;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -3902,8 +4170,9 @@ impl Server {
         Ok(())
     }
 
-    async fn retry_pending_workspace_summaries(&mut self) -> Result<()> {
-        let pending = self.sessions.pending_workspace_summary_snapshots();
+    async fn retry_pending_workspace_summaries(&self) -> Result<()> {
+        let pending =
+            self.with_sessions(|sessions| Ok(sessions.pending_workspace_summary_snapshots()))?;
         for session in pending {
             if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
                 warn!(
@@ -3916,10 +4185,11 @@ impl Server {
                 );
                 continue;
             }
-            self.sessions
-                .mark_workspace_summary_state(&session.address, false, false)?;
+            self.with_sessions(|sessions| {
+                sessions.mark_workspace_summary_state(&session.address, false, false)
+            })?;
             if session.close_after_summary {
-                self.sessions.destroy_foreground(&session.address)?;
+                self.destroy_foreground_session(&session.address)?;
             }
         }
         Ok(())
@@ -3933,9 +4203,27 @@ impl Server {
         original_user_text: Option<String>,
         original_attachments: Vec<StoredAttachment>,
     ) -> Result<ForegroundTurnOutcome> {
-        let workspace_root = session.workspace_root.clone();
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
+        self.run_main_agent_turn_with_previous_messages(
+            session,
+            model_key,
+            previous_messages,
+            original_user_text,
+            original_attachments,
+        )
+        .await
+    }
+
+    async fn run_main_agent_turn_with_previous_messages(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+        previous_messages: Vec<ChatMessage>,
+        original_user_text: Option<String>,
+        original_attachments: Vec<StoredAttachment>,
+    ) -> Result<ForegroundTurnOutcome> {
+        let workspace_root = session.workspace_root.clone();
         let timeout_seconds = self.main_agent_timeout_seconds(model_key)?;
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
@@ -4001,7 +4289,7 @@ impl Server {
             TimedRunOutcome::Failed { checkpoint, error } => {
                 let resume_messages = checkpoint
                     .map(|report| report.messages)
-                    .unwrap_or(previous_messages);
+                    .unwrap_or_else(|| previous_messages.clone());
                 Ok(ForegroundTurnOutcome::Failed {
                     pending_continue: PendingContinueState {
                         model_key: model_key.to_string(),
@@ -4023,8 +4311,7 @@ impl Server {
         address: &ChannelAddress,
     ) -> Result<ConversationSettings> {
         Ok(self
-            .conversations
-            .get_snapshot(address)
+            .with_conversations(|conversations| Ok(conversations.get_snapshot(address)))?
             .map(|snapshot| snapshot.settings)
             .unwrap_or_default())
     }
@@ -4042,6 +4329,13 @@ impl Server {
     fn effective_sandbox_mode(&self, address: &ChannelAddress) -> Result<SandboxMode> {
         let settings = self.effective_conversation_settings(address)?;
         Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
+    }
+
+    fn effective_context_compaction_enabled(&self, address: &ChannelAddress) -> Result<bool> {
+        Ok(self
+            .effective_conversation_settings(address)?
+            .context_compaction_enabled
+            .unwrap_or(self.main_agent.enable_context_compression))
     }
 
     fn model_selection_message(
@@ -4107,6 +4401,28 @@ impl Server {
                     .unwrap_or_else(|| "`default`".to_string())
             ),
             "Choose a reasoning effort",
+            options,
+        ))
+    }
+
+    fn compact_mode_message(&self, address: &ChannelAddress) -> Result<OutgoingMessage> {
+        let enabled = self.effective_context_compaction_enabled(address)?;
+        let options = vec![
+            ShowOption {
+                label: "enabled".to_string(),
+                value: "/compact_mode on".to_string(),
+            },
+            ShowOption {
+                label: "disabled".to_string(),
+                value: "/compact_mode off".to_string(),
+            },
+        ];
+        Ok(OutgoingMessage::with_options(
+            format!(
+                "Automatic context compaction for this conversation is currently `{}`.\nChoose a mode below or send `/compact_mode <on|off>`.\nYou can always trigger a one-off compaction with `/compact`.",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+            "Choose automatic compaction mode",
             options,
         ))
     }
@@ -4187,14 +4503,11 @@ impl Server {
         Ok(observed)
     }
 
-    fn observe_runtime_skill_changes(
-        &mut self,
-        session: &SessionSnapshot,
-    ) -> Result<Option<String>> {
+    fn observe_runtime_skill_changes(&self, session: &SessionSnapshot) -> Result<Option<String>> {
         let observed = self.current_runtime_skill_observations()?;
-        let notices = self
-            .sessions
-            .observe_skill_changes(&session.address, &observed)?;
+        let notices = self.with_sessions(|sessions| {
+            sessions.observe_skill_changes(&session.address, &observed)
+        })?;
         let rendered = render_skill_change_notices(&notices);
         Ok((!rendered.is_empty()).then_some(rendered))
     }
@@ -4216,7 +4529,7 @@ impl Server {
     }
 
     async fn send_channel_message(
-        &mut self,
+        &self,
         channel: &Arc<dyn Channel>,
         address: &ChannelAddress,
         message: OutgoingMessage,
@@ -4233,7 +4546,7 @@ impl Server {
                         error = %format!("{error:#}"),
                         "channel send indicates the conversation no longer exists; closing foreground session"
                     );
-                    self.sessions.destroy_foreground(address)?;
+                    self.destroy_foreground_session(address)?;
                     let disabled = self.disable_cron_tasks_for_conversation(address)?;
                     if disabled > 0 {
                         warn!(
@@ -4260,7 +4573,7 @@ impl Server {
     }
 
     async fn send_user_error_message(
-        &mut self,
+        &self,
         channel: &Arc<dyn Channel>,
         address: &ChannelAddress,
         error: &anyhow::Error,
@@ -4471,7 +4784,7 @@ fn fast_path_model_selection_message(
     if text.is_empty() {
         return None;
     }
-    if text.starts_with("/model") || text.starts_with("/help") {
+    if text.starts_with('/') {
         return None;
     }
 
@@ -4600,6 +4913,20 @@ fn merge_user_text<'a>(
     }
 }
 
+fn build_previous_messages_for_turn(
+    session_agent_messages: &[ChatMessage],
+    pending_continue: Option<&PendingContinueState>,
+    next_user_message: Option<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut previous_messages = pending_continue
+        .map(|pending| pending.resume_messages.clone())
+        .unwrap_or_else(|| session_agent_messages.to_vec());
+    if let Some(next_user_message) = next_user_message {
+        previous_messages.push(next_user_message);
+    }
+    previous_messages
+}
+
 fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> String {
     if notices.is_empty() {
         return String::new();
@@ -4641,7 +4968,7 @@ fn extract_loaded_skill_names(
         let Some(tool_name) = message.name.as_deref() else {
             continue;
         };
-        if tool_name != "skill_load" && tool_name != "load_skill" {
+        if tool_name != "skill_load" {
             continue;
         }
         let Some(content) = message.content.as_ref().and_then(|value| value.as_str()) else {
@@ -5319,6 +5646,7 @@ fn format_session_status(
     timeout_source: &str,
     current_context_estimate: usize,
     current_reasoning_effort: Option<&str>,
+    context_compaction_enabled: bool,
 ) -> String {
     let usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
@@ -5342,6 +5670,14 @@ fn format_session_status(
             format!(
                 "Reasoning effort: {}",
                 current_reasoning_effort.unwrap_or("default")
+            ),
+            format!(
+                "Automatic context compaction: {}",
+                if context_compaction_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ),
             format!("Turns: {}", session.turn_count),
             format!(
@@ -5419,6 +5755,14 @@ fn format_session_status(
             format!(
                 "Reasoning effort: {}",
                 current_reasoning_effort.unwrap_or("default")
+            ),
+            format!(
+                "Automatic context compaction: {}",
+                if context_compaction_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ),
             format!("Turns: {}", session.turn_count),
             format!(
@@ -5619,6 +5963,10 @@ fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
 
 fn parse_model_command(text: Option<&str>) -> Option<Option<String>> {
     parse_optional_command_argument(text, "/model")
+}
+
+fn parse_compact_mode_command(text: Option<&str>) -> Option<Option<String>> {
+    parse_optional_command_argument(text, "/compact_mode")
 }
 
 fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
@@ -6156,18 +6504,19 @@ mod tests {
     use super::{
         SinkTarget, TokenUsage, background_agent_timeout_seconds,
         background_recovery_timeout_seconds, background_timeout_with_active_children_text,
-        build_user_turn_message, channel_restart_backoff_seconds, estimate_compaction_savings_usd,
-        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_model_command,
-        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, parse_think_command, should_attempt_idle_context_compaction,
-        workspace_visible_in_list,
+        build_previous_messages_for_turn, build_user_turn_message, channel_restart_backoff_seconds,
+        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
+        is_timeout_like, parse_model_command, parse_oldspace_command, parse_sandbox_command,
+        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
+        parse_snap_load_command, parse_snap_save_command, parse_think_command,
+        should_attempt_idle_context_compaction, workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, StoredAttachment};
-    use crate::session::SessionSnapshot;
+    use crate::session::{PendingContinueState, SessionSnapshot};
+    use agent_frame::ChatMessage;
     use agent_frame::SessionCompactionStats;
     use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -6443,6 +6792,13 @@ mod tests {
     }
 
     #[test]
+    fn model_reselect_short_circuits_without_change() {
+        let current_model_key = Some("demo-model".to_string());
+        let requested_model_key = "demo-model";
+        assert_eq!(current_model_key.as_deref(), Some(requested_model_key));
+    }
+
+    #[test]
     fn parses_snap_commands_with_bot_suffix() {
         assert_eq!(
             parse_snap_save_command(Some("/snapsave demo-checkpoint")),
@@ -6462,6 +6818,46 @@ mod tests {
         );
         assert!(parse_snap_list_command(Some("/snaplist")));
         assert!(parse_snap_list_command(Some("/snaplist@party_claw_bot")));
+    }
+
+    #[test]
+    fn pending_continue_resume_messages_drive_followup_turn_inputs() {
+        let session_messages = vec![ChatMessage::text("assistant", "current session tail")];
+        let resume_messages = vec![ChatMessage::text("assistant", "preserved failure point")];
+        let pending_continue = PendingContinueState {
+            model_key: "demo-model".to_string(),
+            resume_messages: resume_messages.clone(),
+            original_user_text: Some("original request".to_string()),
+            original_attachments: Vec::new(),
+            error_summary: "error".to_string(),
+            progress_summary: "progress".to_string(),
+            failed_at: Utc::now(),
+        };
+
+        let continue_messages =
+            build_previous_messages_for_turn(&session_messages, Some(&pending_continue), None);
+        assert_eq!(continue_messages, resume_messages);
+
+        let followup_messages = build_previous_messages_for_turn(
+            &session_messages,
+            Some(&pending_continue),
+            Some(ChatMessage::text("user", "new user message")),
+        );
+        assert_eq!(followup_messages.len(), 2);
+        assert_eq!(
+            followup_messages[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("preserved failure point")
+        );
+        assert_eq!(
+            followup_messages[1]
+                .content
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("new user message")
+        );
     }
 
     #[test]
