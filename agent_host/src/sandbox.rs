@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -441,6 +442,10 @@ fn build_bubblewrap_command(
     )?;
     bind_path(&mut command, workspace_root, false)?;
     bind_path(&mut command, runtime_state_root, false)?;
+    if let Some(home_dir) = discover_home_dir() {
+        let home_skeleton = prepare_sandbox_home_skeleton(runtime_state_root, &home_dir)?;
+        bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
+    }
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
@@ -461,10 +466,34 @@ fn build_bubblewrap_command(
     Ok(command)
 }
 
+fn discover_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from)
+}
+
 fn discover_home_ssh_dir() -> Option<PathBuf> {
-    let home_dir = env::var_os("HOME").map(PathBuf::from)?;
+    let home_dir = discover_home_dir()?;
     let ssh_dir = home_dir.join(".ssh");
     ssh_dir.exists().then_some(ssh_dir)
+}
+
+fn prepare_sandbox_home_skeleton(runtime_state_root: &Path, home_dir: &Path) -> Result<PathBuf> {
+    let home_name = home_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("HOME path has no final component: {}", home_dir.display()))?;
+    let parent_name = home_dir
+        .parent()
+        .and_then(Path::file_name)
+        .ok_or_else(|| anyhow!("HOME path has no parent directory: {}", home_dir.display()))?;
+    let skeleton_root = runtime_state_root.join(".sandbox-home");
+    let home_parent = skeleton_root.join(parent_name);
+    let home_target = home_parent.join(home_name);
+    fs::create_dir_all(&home_target).with_context(|| {
+        format!(
+            "failed to prepare sandbox home skeleton at {}",
+            home_target.display()
+        )
+    })?;
+    Ok(home_target)
 }
 
 fn bind_path(command: &mut Command, path: &Path, read_only: bool) -> Result<()> {
