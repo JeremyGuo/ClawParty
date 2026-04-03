@@ -493,6 +493,12 @@ fn prepare_sandbox_home_skeleton(runtime_state_root: &Path, home_dir: &Path) -> 
             home_target.display()
         )
     })?;
+    fs::create_dir_all(home_target.join(".ssh")).with_context(|| {
+        format!(
+            "failed to prepare sandbox home ssh placeholder at {}",
+            home_target.join(".ssh").display()
+        )
+    })?;
     Ok(home_target)
 }
 
