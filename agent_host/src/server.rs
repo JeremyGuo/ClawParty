@@ -4717,6 +4717,10 @@ impl Server {
         let runtime = self.tool_runtime_for_address(&session.address)?;
         let current_context_estimate =
             estimate_current_context_tokens_for_session(&runtime, session, model_key)?;
+        let current_context_limit = self.main_agent.auto_compact_token_limit.unwrap_or_else(|| {
+            (model.context_window_tokens as f64 * self.main_agent.effective_context_window_percent)
+                .floor() as usize
+        });
         let current_reasoning_effort = self
             .effective_conversation_settings(&session.address)?
             .reasoning_effort
@@ -4736,6 +4740,7 @@ impl Server {
             effective_api_timeout,
             timeout_source,
             current_context_estimate,
+            current_context_limit,
             current_reasoning_effort.as_deref(),
             context_compaction_enabled,
         ))
@@ -6541,6 +6546,7 @@ fn format_session_status(
     effective_api_timeout_seconds: f64,
     timeout_source: &str,
     current_context_estimate: usize,
+    current_context_limit: usize,
     current_reasoning_effort: Option<&str>,
     context_compaction_enabled: bool,
 ) -> String {
@@ -6553,6 +6559,11 @@ fn format_session_status(
     };
     let pricing = estimate_cost_usd(model, usage);
     let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
+    let context_percent = if current_context_limit == 0 {
+        0.0
+    } else {
+        (current_context_estimate as f64 / current_context_limit as f64) * 100.0
+    };
     let language = language.to_ascii_lowercase();
     if language.starts_with("zh") {
         let mut lines = vec![
@@ -6577,8 +6588,8 @@ fn format_session_status(
             ),
             format!("Turns: {}", session.turn_count),
             format!(
-                "Current context estimate: {} tokens (local estimate)",
-                current_context_estimate
+                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
+                current_context_estimate, current_context_limit, context_percent
             ),
             String::new(),
             "Token 用量：".to_string(),
@@ -6662,8 +6673,8 @@ fn format_session_status(
             ),
             format!("Turns: {}", session.turn_count),
             format!(
-                "Current context estimate: {} tokens (local estimate)",
-                current_context_estimate
+                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
+                current_context_estimate, current_context_limit, context_percent
             ),
             String::new(),
             "Token usage:".to_string(),

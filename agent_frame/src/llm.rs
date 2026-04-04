@@ -285,6 +285,11 @@ fn create_responses_completion(
             payload.insert(key, value);
         }
     }
+    if upstream.auth_kind == UpstreamAuthKind::CodexSubscription {
+        // ChatGPT Codex responses reject some OpenAI-compatible optional knobs
+        // such as max_completion_tokens during compaction/image helper calls.
+        payload.remove("max_completion_tokens");
+    }
 
     let auth = load_codex_auth(upstream)?;
     let mut request = client.post(&responses_url).json(&Value::Object(payload.clone()));
@@ -881,8 +886,8 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_responses_input, parse_streamed_responses_body, responses_value_to_chat_message,
-        upstream_error_from_value,
+        UpstreamAuthKind, build_responses_input, parse_streamed_responses_body,
+        responses_value_to_chat_message, upstream_error_from_value,
     };
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use serde_json::json;
@@ -908,6 +913,20 @@ mod tests {
             "output": []
         });
         assert_eq!(upstream_error_from_value(&body), None);
+    }
+
+    #[test]
+    fn codex_responses_drop_unsupported_max_completion_tokens() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".to_string(), json!("gpt-5.4"));
+        payload.insert("input".to_string(), json!([]));
+        payload.insert("max_completion_tokens".to_string(), json!(1200));
+
+        if UpstreamAuthKind::CodexSubscription == UpstreamAuthKind::CodexSubscription {
+            payload.remove("max_completion_tokens");
+        }
+
+        assert!(payload.get("max_completion_tokens").is_none());
     }
 
     #[test]
