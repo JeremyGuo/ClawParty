@@ -1144,7 +1144,10 @@ mod tests {
 
         assert_eq!(sanitized.len(), 3);
         assert_eq!(sanitized[0].role, "system");
-        assert_eq!(sanitized[0].content.as_ref().and_then(|v| v.as_str()), Some("system a"));
+        assert_eq!(
+            sanitized[0].content.as_ref().and_then(|v| v.as_str()),
+            Some("system a")
+        );
         assert_eq!(sanitized[1].role, "assistant");
         assert_eq!(sanitized[2].role, "system");
         assert_eq!(
@@ -1317,17 +1320,29 @@ mod tests {
         sessions.ensure_foreground(&address).unwrap();
 
         let first = sessions
-            .observe_shared_profile_changes(&address, "user-v1".to_string(), "identity-v1".to_string())
+            .observe_shared_profile_changes(
+                &address,
+                "user-v1".to_string(),
+                "identity-v1".to_string(),
+            )
             .unwrap();
         assert!(first.is_empty());
 
         let second = sessions
-            .observe_shared_profile_changes(&address, "user-v2".to_string(), "identity-v1".to_string())
+            .observe_shared_profile_changes(
+                &address,
+                "user-v2".to_string(),
+                "identity-v1".to_string(),
+            )
             .unwrap();
         assert_eq!(second, vec![SharedProfileChangeNotice::UserUpdated]);
 
         let third = sessions
-            .observe_shared_profile_changes(&address, "user-v2".to_string(), "identity-v2".to_string())
+            .observe_shared_profile_changes(
+                &address,
+                "user-v2".to_string(),
+                "identity-v2".to_string(),
+            )
             .unwrap();
         assert_eq!(third, vec![SharedProfileChangeNotice::IdentityUpdated]);
     }

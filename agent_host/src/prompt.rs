@@ -309,9 +309,7 @@ mod tests {
                 poll_interval_seconds: 15,
                 min_ratio: 0.5,
             },
-            timeout_observation_compaction: TimeoutObservationCompactionConfig {
-                enabled: true,
-            },
+            timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
         };
 
         let prompt = build_agent_system_prompt(
@@ -447,9 +445,7 @@ mod tests {
                 poll_interval_seconds: 15,
                 min_ratio: 0.5,
             },
-            timeout_observation_compaction: TimeoutObservationCompactionConfig {
-                enabled: true,
-            },
+            timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
         };
 
         let prompt = build_agent_system_prompt(

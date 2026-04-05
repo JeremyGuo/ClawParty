@@ -129,7 +129,7 @@ fn auto_compact_token_limit(config: &AgentConfig) -> usize {
         .token_limit_override
         .unwrap_or_else(|| {
             (config.upstream.context_window_tokens as f64 * config.context_compaction.trigger_ratio)
-            .floor() as usize
+                .floor() as usize
         })
 }
 
@@ -151,9 +151,9 @@ fn extract_previous_compaction_summary(message: &ChatMessage) -> Option<String> 
     if after_marker.is_empty() {
         return None;
     }
-    let summary_start = after_marker
-        .find("## Old Summary")
-        .or_else(|| after_marker.find("Older conversation history has been compacted into the summary below."));
+    let summary_start = after_marker.find("## Old Summary").or_else(|| {
+        after_marker.find("Older conversation history has been compacted into the summary below.")
+    });
     let summary = summary_start
         .map(|index| &after_marker[index..])
         .unwrap_or(after_marker)
@@ -188,7 +188,10 @@ fn split_compaction_inputs(
     (previous_old_summary, new_messages)
 }
 
-fn build_summary_request(messages: &[ChatMessage], preserved_recent_count: usize) -> Vec<ChatMessage> {
+fn build_summary_request(
+    messages: &[ChatMessage],
+    preserved_recent_count: usize,
+) -> Vec<ChatMessage> {
     let mut request_messages = messages.to_vec();
     request_messages.push(ChatMessage::text(
         "user",
@@ -246,7 +249,10 @@ fn generate_summary(
     if summary_text.trim().is_empty() {
         return Err(anyhow!("context compression summary came back empty"));
     }
-    Ok((parse_structured_summary(&summary_text)?, summary_message.usage))
+    Ok((
+        parse_structured_summary(&summary_text)?,
+        summary_message.usage,
+    ))
 }
 
 fn find_originating_tool_use_index(
@@ -349,13 +355,10 @@ fn compact_history_once(
     }
     let messages_to_summarize = &body[..split_index];
     let recent_messages = &body[split_index..];
-    let (structured_output, usage) =
-        generate_summary(config, messages, recent_messages.len())?;
+    let (structured_output, usage) = generate_summary(config, messages, recent_messages.len())?;
     let runtime_state = active_runtime_state_summary(&config.runtime_state_root)?;
-    let summary_message = ChatMessage::text(
-        "assistant",
-        render_structured_summary(&structured_output),
-    );
+    let summary_message =
+        ChatMessage::text("assistant", render_structured_summary(&structured_output));
     let mut compacted = system_prefix;
     compacted.push(summary_message);
     if let Some(runtime_state) = runtime_state.filter(|value| !value.trim().is_empty()) {
@@ -448,9 +451,8 @@ mod tests {
     use super::{
         COMPACTION_MARKER, adjust_split_index_to_preserve_tool_context, content_to_text,
         estimate_message_tokens, extract_previous_compaction_summary,
-        find_originating_tool_use_index,
-        parse_structured_summary, split_compaction_inputs,
-        recent_tail_start_by_token_budget,
+        find_originating_tool_use_index, parse_structured_summary,
+        recent_tail_start_by_token_budget, split_compaction_inputs,
     };
     use crate::message::{ChatMessage, ToolCall};
     use serde_json::json;
@@ -546,7 +548,11 @@ mod tests {
                     },
                 }]),
             },
-            ChatMessage::tool_output("call_1", "exec_wait", "{\"exec_id\":\"abc\",\"status\":\"running\"}"),
+            ChatMessage::tool_output(
+                "call_1",
+                "exec_wait",
+                "{\"exec_id\":\"abc\",\"status\":\"running\"}",
+            ),
         ];
 
         let budget = estimate_message_tokens(&messages[3]);
@@ -558,9 +564,7 @@ mod tests {
     fn extracts_previous_compaction_summary_from_marker_message() {
         let message = ChatMessage::text(
             "assistant",
-            format!(
-                "{COMPACTION_MARKER}\n\n## Old Summary\n- older\n\n## New Summary\n- newer"
-            ),
+            format!("{COMPACTION_MARKER}\n\n## Old Summary\n- older\n\n## New Summary\n- newer"),
         );
 
         let summary = extract_previous_compaction_summary(&message).unwrap();
@@ -580,7 +584,10 @@ mod tests {
         let (old_summary, new_messages) =
             split_compaction_inputs(&[prior_summary, next_user.clone(), next_assistant.clone()]);
 
-        assert_eq!(old_summary.as_deref(), Some("## Old Summary\n- old\n\n## New Summary\n- new"));
+        assert_eq!(
+            old_summary.as_deref(),
+            Some("## Old Summary\n- old\n\n## New Summary\n- new")
+        );
         assert_eq!(new_messages, vec![next_user, next_assistant]);
     }
 

@@ -250,9 +250,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
                 poll_interval_seconds: raw.idle_context_compaction_poll_interval_seconds,
                 min_ratio: raw.idle_compact_min_ratio,
             }),
-            timeout_observation_compaction: raw
-                .timeout_observation_compaction
-                .unwrap_or_default(),
+            timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
         })
     }
 }
