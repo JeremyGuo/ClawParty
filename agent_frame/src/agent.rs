@@ -496,24 +496,20 @@ pub fn run_session_with_report_controlled(
         });
     }
 
-    let initial_compaction = maybe_compact_messages_with_report(
-        &config,
-        &messages,
-        &tool_definitions,
-        &prompt,
-    )
-    .context("threshold context compaction failed during initial phase")?;
+    let initial_compaction =
+        maybe_compact_messages_with_report(&config, &messages, &tool_definitions, &prompt)
+            .context("threshold context compaction failed during initial phase")?;
     if let Some(control) = &control {
-            control.emit_event(SessionEvent::CompactionCompleted {
-                phase: "initial".to_string(),
-                compacted: initial_compaction.compacted,
-                estimated_tokens_before: initial_compaction.estimated_tokens_before,
-                estimated_tokens_after: initial_compaction.estimated_tokens_after,
-                token_limit: initial_compaction.token_limit,
-                structured_output: initial_compaction.structured_output.clone(),
-                compacted_messages: initial_compaction.compacted_messages.clone(),
-            });
-        }
+        control.emit_event(SessionEvent::CompactionCompleted {
+            phase: "initial".to_string(),
+            compacted: initial_compaction.compacted,
+            estimated_tokens_before: initial_compaction.estimated_tokens_before,
+            estimated_tokens_after: initial_compaction.estimated_tokens_after,
+            token_limit: initial_compaction.token_limit,
+            structured_output: initial_compaction.structured_output.clone(),
+            compacted_messages: initial_compaction.compacted_messages.clone(),
+        });
+    }
     usage.add_assign(&initial_compaction.usage);
     compaction_stats.record_report(&initial_compaction);
     messages = initial_compaction.messages;
@@ -910,6 +906,8 @@ mod tests {
                     cache_type: "ephemeral".to_string(),
                     ttl: Some("31s".to_string()),
                 }),
+                prompt_cache_retention: None,
+                prompt_cache_key: None,
                 reasoning: None,
                 headers: serde_json::Map::new(),
                 native_web_search: None,
@@ -927,8 +925,9 @@ mod tests {
                 token_limit_override: Some(40),
                 recent_fidelity_target_ratio: 0.18,
             },
-            timeout_observation_compaction:
-                crate::config::TimeoutObservationCompactionConfig { enabled: true },
+            timeout_observation_compaction: crate::config::TimeoutObservationCompactionConfig {
+                enabled: true,
+            },
         };
         let stable_prefix = vec![
             ChatMessage::text("system", "[AgentFrame Runtime]\n\nTest system prompt."),

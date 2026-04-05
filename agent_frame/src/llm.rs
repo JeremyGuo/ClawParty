@@ -619,6 +619,7 @@ pub(super) fn parse_usage(response: &Value) -> TokenUsage {
                 &[
                     &["cache_read_input_tokens"],
                     &["prompt_tokens_details", "cached_tokens"],
+                    &["input_tokens_details", "cached_tokens"],
                     &["input_tokens_details", "cache_read_input_tokens"],
                 ],
             )
@@ -632,6 +633,7 @@ pub(super) fn parse_usage(response: &Value) -> TokenUsage {
                     &["cache_creation_input_tokens"],
                     &["cache_write_input_tokens"],
                     &["prompt_tokens_details", "cache_write_tokens"],
+                    &["input_tokens_details", "cache_write_tokens"],
                     &["input_tokens_details", "cache_creation_input_tokens"],
                 ],
             )
@@ -669,7 +671,7 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamAuthKind, build_responses_input, parse_streamed_responses_body,
+        UpstreamAuthKind, build_responses_input, parse_streamed_responses_body, parse_usage,
         responses_value_to_chat_message, upstream_error_from_value,
     };
     use crate::config::{
@@ -731,6 +733,8 @@ mod tests {
             timeout_seconds: 30.0,
             context_window_tokens: 200_000,
             cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
             reasoning: None,
             headers: serde_json::Map::new(),
             native_web_search: None,
@@ -773,6 +777,27 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(payload, json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn parse_usage_reads_cached_tokens_from_input_token_details() {
+        let usage = parse_usage(&json!({
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 80,
+                "input_tokens_details": {
+                    "cached_tokens": 900,
+                    "cache_creation_input_tokens": 120
+                }
+            }
+        }));
+
+        assert_eq!(usage.prompt_tokens, 1200);
+        assert_eq!(usage.completion_tokens, 80);
+        assert_eq!(usage.cache_hit_tokens, 900);
+        assert_eq!(usage.cache_read_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 120);
+        assert_eq!(usage.cache_miss_tokens, 300);
     }
 
     #[test]

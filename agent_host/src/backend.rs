@@ -730,6 +730,8 @@ mod tests {
                     timeout_seconds: 10.0,
                     context_window_tokens: 128_000,
                     cache_control: None,
+                    prompt_cache_retention: None,
+                    prompt_cache_key: None,
                     reasoning: None,
                     headers: serde_json::Map::new(),
                     native_web_search: None,

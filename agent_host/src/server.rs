@@ -95,6 +95,7 @@ struct ServerRuntime {
     selected_main_model_key: Option<String>,
     selected_reasoning_effort: Option<String>,
     selected_context_compaction_enabled: Option<bool>,
+    selected_chat_version_id: Option<Uuid>,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
@@ -155,6 +156,7 @@ enum ForegroundTurnOutcome {
     },
     Failed {
         pending_continue: PendingContinueState,
+        compaction: SessionCompactionStats,
         error: anyhow::Error,
     },
 }
@@ -1132,7 +1134,12 @@ impl ServerRuntime {
         Ok(serde_json::to_value(summary).context("failed to serialize workspace move result")?)
     }
 
-    fn memory_search(&self, session: &SessionSnapshot, query: String, limit: usize) -> Result<Value> {
+    fn memory_search(
+        &self,
+        session: &SessionSnapshot,
+        query: String,
+        limit: usize,
+    ) -> Result<Value> {
         memory_search_files(session, &query, limit)
     }
 
@@ -1195,6 +1202,9 @@ impl ServerRuntime {
         upstream_timeout_seconds: Option<f64>,
     ) -> Result<FrameAgentConfig> {
         let model = self.model_config(model_key)?;
+        let prompt_cache_key = self.selected_chat_version_id.as_ref().map(Uuid::to_string);
+        let prompt_cache_retention =
+            default_prompt_cache_retention(model.cache_ttl.as_deref(), model);
         let image_tool_upstream = match model.image_tool_model.as_deref() {
             None | Some("self") => None,
             Some(other_model_key) => {
@@ -1220,6 +1230,11 @@ impl ServerRuntime {
                             cache_type: "ephemeral".to_string(),
                             ttl: Some(ttl.clone()),
                         }),
+                    prompt_cache_retention: default_prompt_cache_retention(
+                        image_model.cache_ttl.as_deref(),
+                        image_model,
+                    ),
+                    prompt_cache_key: None,
                     reasoning: image_model.reasoning.clone(),
                     headers: image_model.headers.clone(),
                     native_web_search: image_model.native_web_search.clone(),
@@ -1262,6 +1277,8 @@ impl ServerRuntime {
                     cache_type: "ephemeral".to_string(),
                     ttl: Some(ttl.clone()),
                 }),
+                prompt_cache_retention,
+                prompt_cache_key,
                 reasoning,
                 headers: model.headers.clone(),
                 native_web_search: model.native_web_search.clone(),
@@ -2133,11 +2150,7 @@ impl ServerRuntime {
             let _ = checkpoint_sender.send(report);
         })
         .with_event_callback(move |event| {
-            update_active_foreground_phase(
-                &active_foreground_phases,
-                &phase_session_key,
-                &event,
-            );
+            update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
         if let Some(observer) = control_observer {
@@ -2336,11 +2349,7 @@ impl ServerRuntime {
             let _ = checkpoint_sender.send(report);
         })
         .with_event_callback(move |event| {
-            update_active_foreground_phase(
-                &active_foreground_phases,
-                &phase_session_key,
-                &event,
-            );
+            update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
         if let Some(observer) = control_observer {
@@ -3977,10 +3986,8 @@ impl Server {
         for session in snapshots {
             if let Err(error) = self.attempt_idle_context_compaction(&session, false).await {
                 self.with_sessions(|sessions| {
-                    sessions.mark_idle_compaction_retry_needed(
-                        &session.address,
-                        format!("{error:#}"),
-                    )
+                    sessions
+                        .mark_idle_compaction_retry_needed(&session.address, format!("{error:#}"))
                 })?;
                 warn!(
                     log_stream = "session",
@@ -4030,9 +4037,9 @@ impl Server {
             None,
         );
         let estimated_tokens = estimate_session_tokens(&source_messages, &extra_tools, "");
-        let idle_min_tokens =
-            (model.context_window_tokens as f64 * self.main_agent.idle_compaction.min_ratio)
-                .floor() as usize;
+        let idle_min_tokens = (model.context_window_tokens as f64
+            * self.main_agent.idle_compaction.min_ratio)
+            .floor() as usize;
         if estimated_tokens < idle_min_tokens {
             return Ok(false);
         }
@@ -4067,14 +4074,14 @@ impl Server {
             self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
             return Ok(false);
         }
-        let normalized_messages =
-            normalize_messages_for_persistence(
-                report.messages.clone(),
-                &persistence_system_prompt,
-                &[],
-            );
-        let rollout_id = persist_compaction_artifacts(session, &report)
-            .with_context(|| format!("failed to persist compaction artifacts for {}", session.id))?;
+        let normalized_messages = normalize_messages_for_persistence(
+            report.messages.clone(),
+            &persistence_system_prompt,
+            &[],
+        );
+        let rollout_id = persist_compaction_artifacts(session, &report).with_context(|| {
+            format!("failed to persist compaction artifacts for {}", session.id)
+        })?;
 
         let compaction_stats = compaction_stats_from_report(&report);
         self.with_sessions(|sessions| {
@@ -4085,6 +4092,7 @@ impl Server {
             )
         })
         .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
+        self.rotate_chat_version_after_external_compaction(&session.address)?;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -4126,6 +4134,7 @@ impl Server {
             selected_main_model_key: None,
             selected_reasoning_effort: None,
             selected_context_compaction_enabled: None,
+            selected_chat_version_id: None,
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
@@ -4155,10 +4164,15 @@ impl Server {
     fn tool_runtime_for_address(&self, address: &ChannelAddress) -> Result<ServerRuntime> {
         let sandbox_mode = self.effective_sandbox_mode(address)?;
         let mut runtime = self.tool_runtime_for_sandbox_mode(sandbox_mode);
-        let settings = self.effective_conversation_settings(address)?;
+        let settings = self.with_conversations(|conversations| {
+            conversations
+                .ensure_conversation(address)
+                .map(|snapshot| snapshot.settings)
+        })?;
         runtime.selected_main_model_key = settings.main_model.clone();
         runtime.selected_reasoning_effort = settings.reasoning_effort.clone();
         runtime.selected_context_compaction_enabled = settings.context_compaction_enabled;
+        runtime.selected_chat_version_id = Some(settings.chat_version_id);
         Ok(runtime)
     }
 
@@ -4990,6 +5004,7 @@ impl Server {
                         sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
                     })
                     .context("failed to persist continued agent_frame messages")?;
+                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
                     self.with_sessions(|sessions| {
                         sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
                     })?;
@@ -5051,6 +5066,7 @@ impl Server {
                         )
                     })
                     .context("failed to persist yielded continued agent_frame messages")?;
+                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
                     self.with_sessions(|sessions| {
                         sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
                     })?;
@@ -5062,6 +5078,7 @@ impl Server {
                 }
                 ForegroundTurnOutcome::Failed {
                     mut pending_continue,
+                    compaction,
                     error,
                 } => {
                     pending_continue.resume_messages = normalize_messages_for_persistence(
@@ -5073,6 +5090,7 @@ impl Server {
                         sessions
                             .set_pending_continue(&incoming.address, Some(pending_continue.clone()))
                     })?;
+                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
                     channel
                         .set_processing(&incoming.address, ProcessingState::Idle)
                         .await
@@ -5236,6 +5254,7 @@ impl Server {
                     sessions.record_yielded_turn(&incoming.address, messages, &usage, &compaction)
                 })
                 .context("failed to persist yielded agent_frame messages")?;
+                self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
                 self.with_sessions(|sessions| {
                     sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
                 })?;
@@ -5254,6 +5273,7 @@ impl Server {
             }
             ForegroundTurnOutcome::Failed {
                 mut pending_continue,
+                compaction,
                 error,
             } => {
                 pending_continue.resume_messages = normalize_messages_for_persistence(
@@ -5264,6 +5284,7 @@ impl Server {
                 self.with_sessions(|sessions| {
                     sessions.set_pending_continue(&incoming.address, Some(pending_continue.clone()))
                 })?;
+                self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
                 channel
                     .set_processing(&incoming.address, ProcessingState::Idle)
                     .await
@@ -5292,6 +5313,7 @@ impl Server {
             sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
         })
         .context("failed to persist agent_frame messages")?;
+        self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
         self.with_sessions(|sessions| {
             sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
         })?;
@@ -5503,9 +5525,9 @@ impl Server {
         );
         let model = self.model_config_or_main(model_key)?;
         if force {
-            let manual_compact_min_tokens =
-                (model.context_window_tokens as f64 * self.main_agent.idle_compaction.min_ratio)
-                    .floor() as usize;
+            let manual_compact_min_tokens = (model.context_window_tokens as f64
+                * self.main_agent.idle_compaction.min_ratio)
+                .floor() as usize;
             let estimated_tokens =
                 estimate_session_tokens(&session.agent_messages, &extra_tools, "");
             if estimated_tokens < manual_compact_min_tokens {
@@ -5523,12 +5545,11 @@ impl Server {
         if !report.compacted {
             return Ok(false);
         }
-        let normalized_messages =
-            normalize_messages_for_persistence(
-                report.messages.clone(),
-                &persistence_system_prompt,
-                &[],
-            );
+        let normalized_messages = normalize_messages_for_persistence(
+            report.messages.clone(),
+            &persistence_system_prompt,
+            &[],
+        );
         persist_compaction_artifacts(session, &report)?;
         let compaction_stats = compaction_stats_from_report(&report);
         self.with_sessions(|sessions| {
@@ -5538,6 +5559,7 @@ impl Server {
                 &compaction_stats,
             )
         })?;
+        self.rotate_chat_version_after_external_compaction(&session.address)?;
         Ok(true)
     }
 
@@ -5581,14 +5603,17 @@ impl Server {
                 self.with_sessions(|sessions| {
                     sessions.record_yielded_turn(&session.address, messages, &usage, &compaction)
                 })?;
+                self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
                 return Ok(OutgoingMessage::default());
             }
             ForegroundTurnOutcome::Failed { error, .. } => return Err(error),
         };
-        let messages = normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
+        let messages =
+            normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
         self.with_sessions(|sessions| {
             sessions.record_agent_turn(&session.address, messages, &usage, &compaction)
         })?;
+        self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
         self.log_turn_usage(session, &usage, true);
         if timed_out {
             warn!(
@@ -5884,9 +5909,11 @@ impl Server {
                 })
             }
             TimedRunOutcome::Failed { checkpoint, error } => {
-                let resume_messages = checkpoint
-                    .map(|report| report.messages)
-                    .unwrap_or_else(|| previous_messages.clone());
+                let (resume_messages, compaction) = checkpoint
+                    .map(|report| (report.messages, report.compaction))
+                    .unwrap_or_else(|| {
+                        (previous_messages.clone(), SessionCompactionStats::default())
+                    });
                 Ok(ForegroundTurnOutcome::Failed {
                     pending_continue: PendingContinueState {
                         model_key: model_key.to_string(),
@@ -5897,6 +5924,7 @@ impl Server {
                         original_user_text,
                         original_attachments,
                     },
+                    compaction,
                     error,
                 })
             }
@@ -5933,6 +5961,28 @@ impl Server {
             .effective_conversation_settings(address)?
             .context_compaction_enabled
             .unwrap_or(self.main_agent.enable_context_compression))
+    }
+
+    fn rotate_chat_version_if_compacted(
+        &self,
+        address: &ChannelAddress,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        if compaction.compacted_run_count == 0 {
+            return Ok(());
+        }
+        self.with_conversations(|conversations| {
+            conversations.rotate_chat_version_id(address).map(|_| ())
+        })
+    }
+
+    fn rotate_chat_version_after_external_compaction(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<()> {
+        self.with_conversations(|conversations| {
+            conversations.rotate_chat_version_id(address).map(|_| ())
+        })
     }
 
     fn model_selection_message(
@@ -6115,14 +6165,15 @@ impl Server {
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<SharedProfileChangeNotice>> {
-        let user_markdown = fs::read_to_string(&self.agent_workspace.user_md_path).with_context(|| {
-            format!(
-                "failed to read {}",
-                self.agent_workspace.user_md_path.display()
-            )
-        })?;
-        let identity_markdown =
-            fs::read_to_string(&self.agent_workspace.identity_md_path).with_context(|| {
+        let user_markdown =
+            fs::read_to_string(&self.agent_workspace.user_md_path).with_context(|| {
+                format!(
+                    "failed to read {}",
+                    self.agent_workspace.user_md_path.display()
+                )
+            })?;
+        let identity_markdown = fs::read_to_string(&self.agent_workspace.identity_md_path)
+            .with_context(|| {
                 format!(
                     "failed to read {}",
                     self.agent_workspace.identity_md_path.display()
@@ -7648,7 +7699,10 @@ fn format_idle_compaction_retry_status(language: &str, session: &SessionSnapshot
 fn summarize_idle_compaction_retry_error(error_summary: &str) -> String {
     const MAX_CHARS: usize = 120;
 
-    let normalized = error_summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = error_summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if normalized.chars().count() <= MAX_CHARS {
         return normalized;
     }
@@ -7729,6 +7783,13 @@ fn compaction_stats_from_report(
     stats.estimated_tokens_after = report.estimated_tokens_after as u64;
     stats.usage = report.usage.clone();
     stats
+}
+
+fn default_prompt_cache_retention(cache_ttl: Option<&str>, model: &ModelConfig) -> Option<String> {
+    cache_ttl.map(str::to_string).or_else(|| {
+        (model.upstream_auth_kind() == agent_frame::config::UpstreamAuthKind::CodexSubscription)
+            .then(|| "24h".to_string())
+    })
 }
 
 fn format_api_timeout_update(
@@ -8017,7 +8078,12 @@ fn merge_unique_strings(existing: &mut Vec<String>, incoming: impl IntoIterator<
 fn classify_chat_message_kind(message: &ChatMessage) -> &'static str {
     if message.role == "tool" {
         "tool_result"
-    } else if message.role == "assistant" && message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+    } else if message.role == "assistant"
+        && message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    {
         "tool_call"
     } else if message.role == "user" {
         "user_message"
@@ -8119,7 +8185,10 @@ fn persist_compaction_artifacts(
     memory_summary.updated_at = created_at;
     merge_unique_strings(
         &mut memory_summary.recent_groups,
-        structured.memory_hints.iter().map(|hint| hint.group.clone()),
+        structured
+            .memory_hints
+            .iter()
+            .map(|hint| hint.group.clone()),
     );
     merge_unique_strings(
         &mut memory_summary.recent_rollouts,
@@ -8306,8 +8375,16 @@ fn rollout_read_file(
     let events = parse_transcript_events(&transcript_path)?;
     let anchor_index = events
         .iter()
-        .position(|event| event.get("event_id").and_then(Value::as_u64) == Some(anchor_event_id as u64))
-        .ok_or_else(|| anyhow!("anchor_event_id {} not found in rollout {}", anchor_event_id, rollout_id))?;
+        .position(|event| {
+            event.get("event_id").and_then(Value::as_u64) == Some(anchor_event_id as u64)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "anchor_event_id {} not found in rollout {}",
+                anchor_event_id,
+                rollout_id
+            )
+        })?;
 
     let mode = mode.unwrap_or("turn_segment").to_string();
     let (start, end) = if mode == "window" {
@@ -8354,14 +8431,19 @@ fn parse_transcript_events(transcript_path: &Path) -> Result<Vec<Value>> {
     raw.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            serde_json::from_str::<Value>(line)
-                .with_context(|| format!("failed to parse transcript line in {}", transcript_path.display()))
+            serde_json::from_str::<Value>(line).with_context(|| {
+                format!(
+                    "failed to parse transcript line in {}",
+                    transcript_path.display()
+                )
+            })
         })
         .collect()
 }
 
 fn transcript_event_kind(event: &Value) -> String {
-    event.get("kind")
+    event
+        .get("kind")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .or_else(|| {
@@ -8787,21 +8869,19 @@ fn log_agent_frame_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        SinkTarget, TokenUsage, background_agent_timeout_seconds,
+        ForegroundRuntimePhase, SinkTarget, TokenUsage, background_agent_timeout_seconds,
         background_recovery_timeout_seconds, background_timeout_with_active_children_text,
-        build_previous_messages_for_turn, build_user_turn_message, channel_restart_backoff_seconds,
-        conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
-        extract_attachment_references, format_session_status, is_timeout_like, parse_model_command,
-        memory_search_files, parse_oldspace_command, parse_sandbox_command,
-        normalize_messages_for_persistence,
-        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
-        parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, rollout_read_file, rollout_search_files,
-        request_yield_for_incoming, send_outgoing_message_now,
-        should_attempt_idle_context_compaction, tag_interrupted_followup_text,
-        update_active_foreground_phase, user_facing_continue_error_text,
-        workspace_visible_in_list,
-        build_synthetic_system_messages, ForegroundRuntimePhase,
+        build_previous_messages_for_turn, build_synthetic_system_messages, build_user_turn_message,
+        channel_restart_backoff_seconds, conversation_memory_root, estimate_compaction_savings_usd,
+        estimate_cost_usd, extract_attachment_references, format_session_status, is_timeout_like,
+        memory_search_files, normalize_messages_for_persistence, parse_model_command,
+        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
+        request_yield_for_incoming, rollout_read_file, rollout_search_files,
+        send_outgoing_message_now, should_attempt_idle_context_compaction,
+        tag_interrupted_followup_text, update_active_foreground_phase,
+        user_facing_continue_error_text, workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::channel::{Channel, IncomingMessage};
@@ -8809,20 +8889,20 @@ mod tests {
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::{PendingContinueState, SessionSnapshot};
+    use agent_frame::message::{FunctionCall, ToolCall};
     use agent_frame::{
         ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
         SessionExecutionControl, StructuredCompactionMemoryHint, StructuredCompactionOutput,
         StructuredCompactionRefs,
     };
-    use agent_frame::message::{FunctionCall, ToolCall};
     use anyhow::anyhow;
     use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -9104,17 +9184,12 @@ mod tests {
             control: None,
         };
 
-        let disposition =
-            request_yield_for_incoming(&active_controls, &active_phases, &incoming);
+        let disposition = request_yield_for_incoming(&active_controls, &active_phases, &incoming);
 
         assert!(disposition.interrupted);
         assert!(disposition.compaction_in_progress);
         assert!(control.take_yield_requested());
-        let phase = active_phases
-            .lock()
-            .unwrap()
-            .get(&session_key)
-            .copied();
+        let phase = active_phases.lock().unwrap().get(&session_key).copied();
         assert_eq!(phase, Some(ForegroundRuntimePhase::Compacting));
     }
 
@@ -9232,20 +9307,24 @@ mod tests {
             &fs::read_to_string(memory_root.join("memory_summary.json")).unwrap(),
         )
         .unwrap();
-        assert!(memory_summary["recent_groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some("Memory System")));
+        assert!(
+            memory_summary["recent_groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("Memory System"))
+        );
 
         let memory_index: Value =
             serde_json::from_str(&fs::read_to_string(memory_root.join("MEMORY.json")).unwrap())
                 .unwrap();
-        assert!(memory_index["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|group| group["group"].as_str() == Some("Memory System")));
+        assert!(
+            memory_index["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["group"].as_str() == Some("Memory System"))
+        );
     }
 
     #[test]
@@ -9258,15 +9337,21 @@ mod tests {
         let matches = result["matches"].as_array().unwrap();
 
         assert!(!matches.is_empty());
-        assert!(matches.iter().any(|entry| entry["layer"].as_str() == Some("memory_summary")));
+        assert!(
+            matches
+                .iter()
+                .any(|entry| entry["layer"].as_str() == Some("memory_summary"))
+        );
         assert!(matches.iter().any(|entry| {
             entry["layer"].as_str() == Some("memory")
-                && entry["rollouts"]
-                    .as_array()
-                    .is_some_and(|rollouts| rollouts.iter().any(|value| {
+                && entry["rollouts"].as_array().is_some_and(|rollouts| {
+                    rollouts.iter().any(|value| {
                         value.as_str()
-                            == Some(format!("rollouts/{}/rollout_summary.json", rollout_id).as_str())
-                    }))
+                            == Some(
+                                format!("rollouts/{}/rollout_summary.json", rollout_id).as_str(),
+                            )
+                    })
+                })
         }));
     }
 
@@ -9289,9 +9374,9 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["rollout_id"].as_str(), Some(rollout_id.as_str()));
         assert_eq!(matches[0]["kind"].as_str(), Some("tool_result"));
-        assert!(matches[0]["preview"]
-            .as_str()
-            .is_some_and(|preview| preview.contains("context compression summary came back empty")));
+        assert!(matches[0]["preview"].as_str().is_some_and(|preview| {
+            preview.contains("context compression summary came back empty")
+        }));
     }
 
     #[test]
@@ -9300,15 +9385,23 @@ mod tests {
         let session = build_test_session(&temp_dir);
         let rollout_id = seed_memory_artifacts(&session);
 
-        let result = rollout_read_file(&session, &rollout_id, 3, Some("turn_segment"), 1, 1)
-            .unwrap();
+        let result =
+            rollout_read_file(&session, &rollout_id, 3, Some("turn_segment"), 1, 1).unwrap();
         let events = result["events"].as_array().unwrap();
 
         assert_eq!(result["rollout_id"].as_str(), Some(rollout_id.as_str()));
         assert_eq!(result["anchor_event_id"].as_u64(), Some(3));
         assert!(events.len() >= 2);
-        assert!(events.iter().any(|event| event["kind"].as_str() == Some("tool_call")));
-        assert!(events.iter().any(|event| event["kind"].as_str() == Some("tool_result")));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"].as_str() == Some("tool_call"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"].as_str() == Some("tool_result"))
+        );
         assert_eq!(result["has_more_before"].as_bool(), Some(false));
     }
 
@@ -9470,7 +9563,8 @@ mod tests {
 
     #[test]
     fn continue_error_text_prefers_compaction_recovery_wording() {
-        let error = anyhow!("threshold context compaction failed during round phase: upstream timed out");
+        let error =
+            anyhow!("threshold context compaction failed during round phase: upstream timed out");
         let zh = user_facing_continue_error_text("zh-CN", &error, "已执行到工具阶段");
         let en = user_facing_continue_error_text("en", &error, "tool phase reached");
 

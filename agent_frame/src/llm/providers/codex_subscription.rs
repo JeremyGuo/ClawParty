@@ -46,6 +46,18 @@ impl UpstreamProvider for CodexSubscriptionProvider {
         if let Some(instructions) = instructions {
             payload.insert("instructions".to_string(), Value::String(instructions));
         }
+        if let Some(prompt_cache_retention) = upstream.prompt_cache_retention.as_ref() {
+            payload.insert(
+                "prompt_cache_retention".to_string(),
+                Value::String(prompt_cache_retention.clone()),
+            );
+        }
+        if let Some(prompt_cache_key) = upstream.prompt_cache_key.as_ref() {
+            payload.insert(
+                "prompt_cache_key".to_string(),
+                Value::String(prompt_cache_key.clone()),
+            );
+        }
         if let Some(reasoning) = codex_reasoning_payload(upstream.reasoning.as_ref())? {
             payload.insert("reasoning".to_string(), reasoning);
         }

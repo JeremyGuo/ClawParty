@@ -7,7 +7,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+fn default_chat_version_id() -> Uuid {
+    Uuid::new_v4()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationSettings {
     #[serde(default)]
     pub main_model: Option<String>,
@@ -17,6 +21,20 @@ pub struct ConversationSettings {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub context_compaction_enabled: Option<bool>,
+    #[serde(default = "default_chat_version_id")]
+    pub chat_version_id: Uuid,
+}
+
+impl Default for ConversationSettings {
+    fn default() -> Self {
+        Self {
+            main_model: None,
+            sandbox_mode: None,
+            reasoning_effort: None,
+            context_compaction_enabled: None,
+            chat_version_id: default_chat_version_id(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +211,23 @@ impl ConversationManager {
         state.persist()?;
         Ok(state.snapshot())
     }
+
+    pub fn rotate_chat_version_id(
+        &mut self,
+        address: &ChannelAddress,
+    ) -> Result<ConversationSnapshot> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        let state = self
+            .conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.chat_version_id = Uuid::new_v4();
+        state.persist()?;
+        Ok(state.snapshot())
+    }
 }
 
 fn load_persisted_conversations(root: &Path) -> Result<HashMap<String, ConversationState>> {
@@ -231,6 +266,7 @@ mod tests {
     use crate::config::SandboxMode;
     use crate::domain::ChannelAddress;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn test_address() -> ChannelAddress {
         ChannelAddress {
@@ -269,5 +305,21 @@ mod tests {
         );
         assert_eq!(snapshot.settings.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(snapshot.settings.context_compaction_enabled, Some(false));
+        assert_ne!(snapshot.settings.chat_version_id, Uuid::nil());
+    }
+
+    #[test]
+    fn rotates_chat_version_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let mut manager = ConversationManager::new(temp_dir.path()).unwrap();
+
+        let original = manager.ensure_conversation(&address).unwrap();
+        let rotated = manager.rotate_chat_version_id(&address).unwrap();
+
+        assert_ne!(
+            original.settings.chat_version_id,
+            rotated.settings.chat_version_id
+        );
     }
 }

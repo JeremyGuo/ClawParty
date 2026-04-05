@@ -59,6 +59,10 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub cache_control: Option<CacheControlConfig>,
     #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub headers: serde_json::Map<String, Value>,
@@ -224,6 +228,10 @@ struct UpstreamConfigRaw {
     #[serde(default)]
     cache_control: Option<CacheControlConfig>,
     #[serde(default)]
+    prompt_cache_retention: Option<String>,
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
+    #[serde(default)]
     reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     reasoning_effort: Option<String>,
@@ -333,6 +341,8 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         timeout_seconds: raw.timeout_seconds,
         context_window_tokens: raw.context_window_tokens,
         cache_control: raw.cache_control,
+        prompt_cache_retention: raw.prompt_cache_retention,
+        prompt_cache_key: raw.prompt_cache_key,
         reasoning,
         headers: raw.headers,
         native_web_search: raw.native_web_search,
@@ -419,9 +429,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             token_limit_override: raw.auto_compact_token_limit,
             recent_fidelity_target_ratio: raw.recent_fidelity_target_ratio,
         }),
-        timeout_observation_compaction: raw
-            .timeout_observation_compaction
-            .unwrap_or_default(),
+        timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
     })
 }
 
