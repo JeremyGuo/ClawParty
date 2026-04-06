@@ -1,6 +1,13 @@
 ---
-version: 0.4.0-beta2
+version: 0.4.0-beta3
 ---
+
+# 0.4.0-beta3
+
+- 修复 GitHub Release workflow 的远端 tag 检测逻辑：
+  由本地 `refs/tags/*` 判断改为查询 `origin` 远端 tags，避免 `workflow_run` 场景下误判 tag 不存在并导致发布流程异常。
+- 补齐自动发布链路验证：
+  通过版本号递增重新触发 Release 流程，确保当前 CI/CD 与 GitHub Release 产物生成逻辑一致。
 
 # 0.4.0-beta2
 
