@@ -1,6 +1,19 @@
 ---
-version: 0.4.0-beta3
+version: 0.5.0-beta1
 ---
+
+# 0.5.0-beta1
+
+- 重构 `agent_host` 服务端主流程：
+  将超长的 `server.rs` 拆分为运行时辅助、消息处理、命令处理和持久化子模块，并补充了 Mermaid 工作流图与伪代码文档。
+- 调整 Background Agent 架构：
+  Background Agent 现在与 Foreground Agent 共享 conversation 和 workspace，但不共享 session，记忆改为严格的 session 级隔离；cron 创建的后台任务也会挂到对应 conversation 下。
+- 引入 workdir 结构版本升级链：
+  workdir 根目录现在使用 `VERSION` 文件标识结构版本，缺失时按 `0.4` 处理，并可按顺序升级到 `0.5`；`0.5` 会把旧 session 中的 `workspace_id` 回填到 conversation 持久化状态。
+- 升级配置保存格式到 `0.5`：
+  保持老版本 config loader 兼容，同时最新保存格式不再写入 `main_agent.timeout_seconds`，并同步更新 `scripts/add_chat_model.sh` 对最新配置版本的支持。
+- 改进 Telegram 交互：
+  选项类消息改为 inline keyboard callback 按钮，减少聊天框输入干扰并改善模型选择、设置切换等交互体验。
 
 # 0.4.0-beta3
 
