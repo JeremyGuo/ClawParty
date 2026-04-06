@@ -373,8 +373,23 @@ impl TelegramChannel {
         }
     }
 
-    fn build_address(&self, message: &TelegramMessage) -> ChannelAddress {
-        let display_name = message.from.as_ref().map(|user| {
+    async fn answer_callback_query(&self, callback_query_id: &str) -> Result<()> {
+        self.call_api::<bool>(
+            "answerCallbackQuery",
+            json!({
+                "callback_query_id": callback_query_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn build_address_from_chat_and_user(
+        &self,
+        chat: &TelegramChat,
+        user: Option<&TelegramUser>,
+    ) -> ChannelAddress {
+        let display_name = user.map(|user| {
             let mut pieces = Vec::new();
             if !user.first_name.trim().is_empty() {
                 pieces.push(user.first_name.trim());
@@ -393,10 +408,14 @@ impl TelegramChannel {
 
         ChannelAddress {
             channel_id: self.id.clone(),
-            conversation_id: message.chat.id.to_string(),
-            user_id: message.from.as_ref().map(|user| user.id.to_string()),
+            conversation_id: chat.id.to_string(),
+            user_id: user.map(|user| user.id.to_string()),
             display_name,
         }
+    }
+
+    fn build_address(&self, message: &TelegramMessage) -> ChannelAddress {
+        self.build_address_from_chat_and_user(&message.chat, message.from.as_ref())
     }
 
     fn collect_attachments(&self, message: &TelegramMessage) -> Vec<PendingAttachment> {
@@ -925,7 +944,7 @@ impl Channel for TelegramChannel {
             let payload = json!({
                 "timeout": self.poll_timeout_seconds,
                 "offset": offset,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             });
             let updates: Vec<TelegramUpdate> = match self.call_api("getUpdates", payload).await {
                 Ok(updates) => {
@@ -952,6 +971,48 @@ impl Channel for TelegramChannel {
             };
             for update in updates {
                 offset = Some(update.update_id + 1);
+                if let Some(callback_query) = update.callback_query {
+                    if let Err(error) = self.answer_callback_query(&callback_query.id).await {
+                        warn!(
+                            log_stream = "channel",
+                            log_key = %self.id,
+                            kind = "telegram_callback_query_ack_failed",
+                            callback_query_id = callback_query.id,
+                            error = %format!("{error:#}"),
+                            "failed to acknowledge telegram callback query"
+                        );
+                    }
+                    let Some(message) = callback_query.message else {
+                        continue;
+                    };
+                    let Some(text) = callback_query
+                        .data
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let incoming = IncomingMessage {
+                        remote_message_id: format!("callback:{}", callback_query.id),
+                        address: self.build_address_from_chat_and_user(
+                            &message.chat,
+                            Some(&callback_query.from),
+                        ),
+                        text: Some(text),
+                        attachments: Vec::new(),
+                        control: None,
+                    };
+                    if sender.send(incoming).await.is_err() {
+                        warn!(
+                            log_stream = "channel",
+                            log_key = %self.id,
+                            kind = "telegram_receiver_closed",
+                            "telegram receiver closed; stopping polling loop"
+                        );
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let Some(message) = update.message else {
                     continue;
                 };
@@ -1180,17 +1241,22 @@ fn summarize_for_log(text: &str) -> String {
     }
 }
 
-fn build_reply_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
-    let keyboard = options
-        .options
-        .iter()
-        .map(|option| vec![json!({ "text": option.value })])
-        .collect::<Vec<_>>();
+fn build_inline_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for chunk in options.options.chunks(2) {
+        let row = chunk
+            .iter()
+            .map(|option| {
+                json!({
+                    "text": option.label,
+                    "callback_data": option.value,
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.push(row);
+    }
     json!({
-        "keyboard": keyboard,
-        "resize_keyboard": true,
-        "one_time_keyboard": options.one_time,
-        "input_field_placeholder": options.prompt,
+        "inline_keyboard": rows,
     })
 }
 
@@ -1217,7 +1283,7 @@ fn build_send_text_payload(
     {
         object.insert(
             "reply_markup".to_string(),
-            build_reply_keyboard_markup(options),
+            build_inline_keyboard_markup(options),
         );
     }
     Ok(payload)
@@ -1248,7 +1314,7 @@ fn build_edit_text_payload(
     {
         object.insert(
             "reply_markup".to_string(),
-            build_reply_keyboard_markup(options),
+            build_inline_keyboard_markup(options),
         );
     }
     Ok(payload)
@@ -3084,7 +3150,7 @@ mod tests {
     }
 
     #[test]
-    fn build_send_text_payload_includes_entities_and_reply_markup() {
+    fn build_send_text_payload_includes_entities_and_inline_keyboard() {
         let payload = build_send_text_payload(
             "123",
             TelegramRenderedText {
@@ -3111,7 +3177,14 @@ mod tests {
         assert_eq!(payload["chat_id"], "123");
         assert_eq!(payload["text"], "hello");
         assert_eq!(payload["entities"][0]["type"], "bold");
-        assert!(payload.get("reply_markup").is_some());
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "One"
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "One"
+        );
     }
 
     #[test]
@@ -3136,6 +3209,51 @@ mod tests {
         assert_eq!(payload["chat_id"], "123");
         assert_eq!(payload["message_id"], 42);
         assert_eq!(payload["entities"][0]["type"], "italic");
+    }
+
+    #[test]
+    fn build_send_text_payload_lays_out_inline_keyboard_two_per_row() {
+        let payload = build_send_text_payload(
+            "123",
+            TelegramRenderedText {
+                text: "choose".to_string(),
+                entities: Vec::new(),
+            },
+            Some(&ShowOptions {
+                prompt: "Choose a model".to_string(),
+                options: vec![
+                    crate::domain::ShowOption {
+                        label: "One".to_string(),
+                        value: "/one".to_string(),
+                    },
+                    crate::domain::ShowOption {
+                        label: "Two".to_string(),
+                        value: "/two".to_string(),
+                    },
+                    crate::domain::ShowOption {
+                        label: "Three".to_string(),
+                        value: "/three".to_string(),
+                    },
+                ],
+                one_time: true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][1]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3668,6 +3786,15 @@ struct TelegramEnvelope<T> {
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    from: TelegramUser,
+    message: Option<TelegramMessage>,
+    data: Option<String>,
 }
 
 #[derive(Deserialize)]
