@@ -72,6 +72,10 @@ pub struct SessionCheckpointData {
     pub seen_user_profile_version: Option<String>,
     #[serde(default)]
     pub seen_identity_profile_version: Option<String>,
+    #[serde(default)]
+    pub pending_user_profile_notice: bool,
+    #[serde(default)]
+    pub pending_identity_profile_notice: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +151,8 @@ struct Session {
     skill_states: HashMap<String, SessionSkillState>,
     seen_user_profile_version: Option<String>,
     seen_identity_profile_version: Option<String>,
+    pending_user_profile_notice: bool,
+    pending_identity_profile_notice: bool,
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     pending_continue: Option<PendingContinueState>,
     pending_workspace_summary: bool,
@@ -219,6 +225,8 @@ impl Session {
             skill_states: self.skill_states.clone(),
             seen_user_profile_version: self.seen_user_profile_version.clone(),
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
+            pending_user_profile_notice: self.pending_user_profile_notice,
+            pending_identity_profile_notice: self.pending_identity_profile_notice,
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
@@ -267,6 +275,8 @@ impl Session {
             skill_states: persisted.skill_states,
             seen_user_profile_version: persisted.seen_user_profile_version,
             seen_identity_profile_version: persisted.seen_identity_profile_version,
+            pending_user_profile_notice: persisted.pending_user_profile_notice,
+            pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             idle_compaction_retry: persisted.idle_compaction_retry,
             pending_continue,
             pending_workspace_summary: persisted.pending_workspace_summary,
@@ -329,6 +339,10 @@ struct PersistedSession {
     seen_user_profile_version: Option<String>,
     #[serde(default)]
     seen_identity_profile_version: Option<String>,
+    #[serde(default)]
+    pending_user_profile_notice: bool,
+    #[serde(default)]
+    pending_identity_profile_notice: bool,
     #[serde(default)]
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     #[serde(default)]
@@ -522,6 +536,8 @@ impl SessionManager {
             skill_states: session.skill_states.clone(),
             seen_user_profile_version: session.seen_user_profile_version.clone(),
             seen_identity_profile_version: session.seen_identity_profile_version.clone(),
+            pending_user_profile_notice: session.pending_user_profile_notice,
+            pending_identity_profile_notice: session.pending_identity_profile_notice,
         })
     }
 
@@ -561,6 +577,8 @@ impl SessionManager {
             skill_states: checkpoint.skill_states,
             seen_user_profile_version: checkpoint.seen_user_profile_version,
             seen_identity_profile_version: checkpoint.seen_identity_profile_version,
+            pending_user_profile_notice: checkpoint.pending_user_profile_notice,
+            pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
             idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
@@ -712,6 +730,7 @@ impl SessionManager {
             }
             Some(previous) if previous != user_profile_version => {
                 session.seen_user_profile_version = Some(user_profile_version);
+                session.pending_user_profile_notice = true;
                 notices.push(SharedProfileChangeNotice::UserUpdated);
             }
             Some(_) => {}
@@ -723,11 +742,61 @@ impl SessionManager {
             }
             Some(previous) if previous != identity_profile_version => {
                 session.seen_identity_profile_version = Some(identity_profile_version);
+                session.pending_identity_profile_notice = true;
                 notices.push(SharedProfileChangeNotice::IdentityUpdated);
             }
             Some(_) => {}
         }
 
+        session.persist()?;
+        Ok(notices)
+    }
+
+    pub fn stage_shared_profile_change_notices(
+        &mut self,
+        address: &ChannelAddress,
+        notices: &[SharedProfileChangeNotice],
+    ) -> Result<()> {
+        if notices.is_empty() {
+            return Ok(());
+        }
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        for notice in notices {
+            match notice {
+                SharedProfileChangeNotice::UserUpdated => {
+                    session.pending_user_profile_notice = true;
+                }
+                SharedProfileChangeNotice::IdentityUpdated => {
+                    session.pending_identity_profile_notice = true;
+                }
+            }
+        }
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn take_shared_profile_change_notices(
+        &mut self,
+        address: &ChannelAddress,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut notices = Vec::new();
+        if session.pending_user_profile_notice {
+            notices.push(SharedProfileChangeNotice::UserUpdated);
+            session.pending_user_profile_notice = false;
+        }
+        if session.pending_identity_profile_notice {
+            notices.push(SharedProfileChangeNotice::IdentityUpdated);
+            session.pending_identity_profile_notice = false;
+        }
         session.persist()?;
         Ok(notices)
     }
@@ -997,6 +1066,8 @@ impl SessionManager {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            pending_user_profile_notice: false,
+            pending_identity_profile_notice: false,
             idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
@@ -1047,6 +1118,8 @@ impl SessionManager {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            pending_user_profile_notice: false,
+            pending_identity_profile_notice: false,
             idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
@@ -1312,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_profile_changes_are_silent_on_first_observation_then_emit_updates() {
+    fn shared_profile_changes_queue_until_taken() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
@@ -1336,6 +1409,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second, vec![SharedProfileChangeNotice::UserUpdated]);
+        let queued = sessions
+            .take_shared_profile_change_notices(&address)
+            .unwrap();
+        assert_eq!(queued, vec![SharedProfileChangeNotice::UserUpdated]);
+        assert!(
+            sessions
+                .take_shared_profile_change_notices(&address)
+                .unwrap()
+                .is_empty()
+        );
 
         let third = sessions
             .observe_shared_profile_changes(
@@ -1345,6 +1428,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(third, vec![SharedProfileChangeNotice::IdentityUpdated]);
+        sessions
+            .stage_shared_profile_change_notices(
+                &address,
+                &[SharedProfileChangeNotice::UserUpdated],
+            )
+            .unwrap();
+        let delivered = sessions
+            .take_shared_profile_change_notices(&address)
+            .unwrap();
+        assert_eq!(
+            delivered,
+            vec![
+                SharedProfileChangeNotice::UserUpdated,
+                SharedProfileChangeNotice::IdentityUpdated
+            ]
+        );
     }
 
     #[test]

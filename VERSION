@@ -1,6 +1,16 @@
 ---
-version: 0.4.0-beta1
+version: 0.4.0-beta2
 ---
+
+# 0.4.0-beta2
+
+- 修复 `USER.md` / `IDENTITY.md` 共享资料流转：
+  workspace 会自动带上副本，缺失时会在对话前自动补齐，并只在正常对话里注入更新提醒。
+- 新增 `shared_profile_upload` 工具：
+  Agent 修改 workspace 内的 `USER.md` / `IDENTITY.md` 后可回传到共享区，只有内容真的变化时才会更新共享文件并轮换 conversation 的 `chat_version_id`。
+- 调整共享资料提示语义：
+  当前前台运行期间不重建 system prompt，收到系统提示后需要用 `read_file` 读取 workspace 内的 `IDENTITY.md`，`USER.md` 则按需读取，从而避免中途改写 prompt 造成 KV cache 失效。
+- 修复 `agent_frame` 集成测试与当前结构化 compaction / timeout observation 行为不一致的问题，恢复 CI 绿色并重新打通自动 Release 链路。
 
 # 0.4.0-beta1
 

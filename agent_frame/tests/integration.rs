@@ -43,6 +43,24 @@ fn acquire_process_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn structured_compaction_response_text() -> String {
+    json!({
+        "old_summary": "",
+        "new_summary": "- Keep working on the task\n- Stay concise",
+        "keywords": ["task"],
+        "important_refs": {
+            "paths": [],
+            "commands": [],
+            "errors": [],
+            "urls": [],
+            "ids": []
+        },
+        "memory_hints": [],
+        "next_step": "Continue the task."
+    })
+    .to_string()
+}
+
 impl TestServer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -854,7 +872,7 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
         "choices": [{
             "message": {
                 "role": "assistant",
-                "content": "Goals\n- Keep working on the task\n\nConstraints\n- Stay concise"
+                "content": structured_compaction_response_text()
             }
         }]
     }));
@@ -900,10 +918,12 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     assert!(
-        requests[0]["messages"][0]["content"]
-            .as_str()
+        requests[0]["messages"]
+            .as_array()
             .unwrap()
-            .contains("compress older conversation history")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Compress the older conversation history"))
     );
     assert!(
         requests[1]["messages"][1]["content"]
@@ -1028,7 +1048,7 @@ fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<(
         "choices": [{
             "message": {
                 "role": "assistant",
-                "content": "Goals\n- Keep working on the task\n\nConstraints\n- Stay concise"
+                "content": structured_compaction_response_text()
             }
         }],
         "usage": {
@@ -1635,6 +1655,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
             "enabled_tools": ["exec_wait"],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt.",
+            "timeout_observation_compaction": {"enabled": true},
             "workspace_root": temp_dir.path()
         }),
         temp_dir.path(),

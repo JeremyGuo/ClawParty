@@ -68,6 +68,8 @@ use uuid::Uuid;
 
 const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
 const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
+const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
+const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
 
 #[derive(Clone, Debug)]
@@ -113,6 +115,7 @@ struct ServerRuntime {
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
+    conversations: Arc<Mutex<ConversationManager>>,
 }
 
 struct SubAgentSlot {
@@ -304,6 +307,33 @@ impl ServerRuntime {
         }))
     }
 
+    fn upload_shared_profile_files(&self, session: &SessionSnapshot) -> Result<Value> {
+        let report =
+            upload_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)?;
+        if report.changed_any() {
+            self.with_conversations(|conversations| {
+                conversations
+                    .rotate_chat_version_id(&session.address)
+                    .map(|_| ())
+            })?;
+        }
+        Ok(json!({
+            "user_md": {
+                "changed": report.user_changed,
+                "workspace_path": session.workspace_root.join("USER.md").display().to_string(),
+                "shared_path": self.agent_workspace.user_md_path.display().to_string(),
+            },
+            "identity_md": {
+                "changed": report.identity_changed,
+                "workspace_path": session.workspace_root.join("IDENTITY.md").display().to_string(),
+                "shared_path": self.agent_workspace.identity_md_path.display().to_string(),
+            },
+            "chat_version_rotated": report.changed_any(),
+            "current_turn_prompt_refreshed": false,
+            "note": "The current turn's system prompt does not hot-reload. The next turn will pick up the new shared profile content.",
+        }))
+    }
+
     fn default_subagent_charge_seconds(&self, model_key: &str) -> Result<f64> {
         Ok(self.main_agent_timeout_seconds(model_key)?.unwrap_or(300.0))
     }
@@ -323,6 +353,17 @@ impl ServerRuntime {
             .lock()
             .map_err(|_| anyhow!("subagent manager lock poisoned"))?;
         f(&mut subagents)
+    }
+
+    fn with_conversations<T>(
+        &self,
+        f: impl FnOnce(&mut ConversationManager) -> Result<T>,
+    ) -> Result<T> {
+        let mut conversations = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation manager lock poisoned"))?;
+        f(&mut conversations)
     }
 
     fn get_subagent_handle(&self, subagent_id: uuid::Uuid) -> Result<Arc<HostedSubagent>> {
@@ -1574,6 +1615,24 @@ impl ServerRuntime {
                         object.get("before").and_then(Value::as_u64).unwrap_or(3) as usize,
                         object.get("after").and_then(Value::as_u64).unwrap_or(3) as usize,
                     )
+                },
+            ));
+
+            let runtime = self.clone();
+            let tell_session = session.clone();
+            tools.push(Tool::new(
+                "shared_profile_upload",
+                "Upload the workspace copies of USER.md and IDENTITY.md back to the shared profile files. Call this right after you edit either file. The current foreground run keeps its existing system prompt after upload, so use read_file on the workspace copy to inspect the refreshed content directly. If you changed IDENTITY.md, reread ./IDENTITY.md immediately after uploading so your current turn follows the updated persona.",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let _ = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.upload_shared_profile_files(&tell_session)
                 },
             ));
 
@@ -4152,6 +4211,7 @@ impl Server {
             summary_tracker: Arc::clone(&self.summary_tracker),
             active_foreground_phases: Arc::clone(&self.active_foreground_phases),
             subagents: Arc::clone(&self.subagents),
+            conversations: Arc::clone(&self.conversations),
         }
     }
 
@@ -5173,7 +5233,15 @@ impl Server {
             .materialize_attachments(&session.attachments_dir, incoming.attachments)
             .await?;
         let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
-        let profile_change_notices = self.observe_runtime_profile_changes(&session)?;
+        let workspace_profile_notices = self.sync_runtime_profile_files(&session)?;
+        self.observe_runtime_profile_changes(&session)?;
+        self.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
+        let profile_change_notices = if should_emit_profile_change_prompt(incoming.text.as_deref())
+        {
+            self.take_runtime_profile_change_notices(&session)?
+        } else {
+            Vec::new()
+        };
         let effective_model_key = self.effective_main_model_key(&incoming.address)?;
         let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
@@ -6161,10 +6229,14 @@ impl Server {
         Ok((!rendered.is_empty()).then_some(rendered))
     }
 
-    fn observe_runtime_profile_changes(
+    fn sync_runtime_profile_files(
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<SharedProfileChangeNotice>> {
+        sync_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)
+    }
+
+    fn observe_runtime_profile_changes(&self, session: &SessionSnapshot) -> Result<()> {
         let user_markdown =
             fs::read_to_string(&self.agent_workspace.user_md_path).with_context(|| {
                 format!(
@@ -6186,8 +6258,26 @@ impl Server {
                 &session.address,
                 user_profile_version,
                 identity_profile_version,
-            )
+            )?;
+            Ok(())
         })
+    }
+
+    fn stage_runtime_profile_change_notices(
+        &self,
+        session: &SessionSnapshot,
+        notices: &[SharedProfileChangeNotice],
+    ) -> Result<()> {
+        self.with_sessions(|sessions| {
+            sessions.stage_shared_profile_change_notices(&session.address, notices)
+        })
+    }
+
+    fn take_runtime_profile_change_notices(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        self.with_sessions(|sessions| sessions.take_shared_profile_change_notices(&session.address))
     }
 
     fn should_auto_close_conversation_after_send_error(
@@ -6417,7 +6507,7 @@ fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage
 
 fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> String {
     let mut sections = vec![
-        "[Queued User Updates]".to_string(),
+        QUEUED_USER_UPDATES_MARKER.to_string(),
         "While you were still working on the previous turn, the user sent multiple follow-up messages. Treat later items as newer steering updates when they conflict.".to_string(),
     ];
     for (index, (text, attachment_count)) in messages.iter().enumerate() {
@@ -6431,6 +6521,12 @@ fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> Stri
         sections.push(format!("Follow-up {}:\n{}", index + 1, body));
     }
     sections.join("\n\n")
+}
+
+fn should_emit_profile_change_prompt(text: Option<&str>) -> bool {
+    let trimmed = text.map(str::trim_start).unwrap_or("");
+    !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
+        && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
 }
 
 struct IncomingYieldDisposition {
@@ -6504,10 +6600,11 @@ fn update_active_foreground_phase(
 }
 
 fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
-    let marker = "[Interrupted Follow-up]";
     match text {
-        Some(text) if !text.trim().is_empty() => Some(format!("{marker}\n{text}")),
-        _ => Some(marker.to_string()),
+        Some(text) if !text.trim().is_empty() => {
+            Some(format!("{INTERRUPTED_FOLLOWUP_MARKER}\n{text}"))
+        }
+        _ => Some(INTERRUPTED_FOLLOWUP_MARKER.to_string()),
     }
 }
 
@@ -6644,10 +6741,10 @@ fn build_synthetic_system_messages(
     for notice in profile_change_notices {
         let text = match notice {
             SharedProfileChangeNotice::UserUpdated => {
-                "[System Message: USER Updated, read the file if you need to know the changes]"
+                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use read_file on ./USER.md.]"
             }
             SharedProfileChangeNotice::IdentityUpdated => {
-                "[System Message: IDENTITY Updated, read the file if you need to know the changes]"
+                "[System Message: IDENTITY.md changed. It defines your persona. Use read_file on ./IDENTITY.md now so your current behavior follows the updated persona.]"
             }
         };
         messages.push(ChatMessage::text("system", text));
@@ -8235,6 +8332,76 @@ fn stable_content_version(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SharedProfileUploadReport {
+    user_changed: bool,
+    identity_changed: bool,
+}
+
+impl SharedProfileUploadReport {
+    fn changed_any(self) -> bool {
+        self.user_changed || self.identity_changed
+    }
+}
+
+fn sync_workspace_shared_profile_files(
+    agent_workspace: &AgentWorkspace,
+    workspace_root: &Path,
+) -> Result<Vec<SharedProfileChangeNotice>> {
+    let mut notices = Vec::new();
+    if sync_shared_profile_file(
+        &agent_workspace.user_md_path,
+        &workspace_root.join("USER.md"),
+    )? {
+        notices.push(SharedProfileChangeNotice::UserUpdated);
+    }
+    if sync_shared_profile_file(
+        &agent_workspace.identity_md_path,
+        &workspace_root.join("IDENTITY.md"),
+    )? {
+        notices.push(SharedProfileChangeNotice::IdentityUpdated);
+    }
+    Ok(notices)
+}
+
+fn upload_workspace_shared_profile_files(
+    agent_workspace: &AgentWorkspace,
+    workspace_root: &Path,
+) -> Result<SharedProfileUploadReport> {
+    Ok(SharedProfileUploadReport {
+        user_changed: sync_shared_profile_file(
+            &workspace_root.join("USER.md"),
+            &agent_workspace.user_md_path,
+        )?,
+        identity_changed: sync_shared_profile_file(
+            &workspace_root.join("IDENTITY.md"),
+            &agent_workspace.identity_md_path,
+        )?,
+    })
+}
+
+fn sync_shared_profile_file(source_path: &Path, target_path: &Path) -> Result<bool> {
+    let source_bytes = fs::read(source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let changed = match fs::read(target_path) {
+        Ok(existing) => existing != source_bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", target_path.display()));
+        }
+    };
+    if !changed {
+        return Ok(false);
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(target_path, &source_bytes)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(true)
+}
+
 fn memory_search_files(session: &SessionSnapshot, query: &str, limit: usize) -> Result<Value> {
     let query = query.trim();
     if query.is_empty() {
@@ -8880,10 +9047,13 @@ mod tests {
         parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
         request_yield_for_incoming, rollout_read_file, rollout_search_files,
         send_outgoing_message_now, should_attempt_idle_context_compaction,
+        should_emit_profile_change_prompt, sync_workspace_shared_profile_files,
         tag_interrupted_followup_text, update_active_foreground_phase,
-        user_facing_continue_error_text, workspace_visible_in_list,
+        upload_workspace_shared_profile_files, user_facing_continue_error_text,
+        workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
+    use crate::bootstrap::AgentWorkspace;
     use crate::channel::{Channel, IncomingMessage};
     use crate::config::ModelConfig;
     use crate::domain::ChannelAddress;
@@ -9222,14 +9392,14 @@ mod tests {
         let canonical = "[AgentFrame Runtime]\ncanonical prompt";
         let ephemeral = vec![ChatMessage::text(
             "system",
-            "[System Message: USER Updated, read the file if you need to know the changes]",
+            "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use read_file on ./USER.md.]",
         )];
         let messages = vec![
             ChatMessage::text("system", "[AgentFrame Runtime]\nold prompt"),
             ChatMessage::text("system", "[AgentHost Main Foreground Agent]\nold duplicate"),
             ChatMessage::text(
                 "system",
-                "[System Message: USER Updated, read the file if you need to know the changes]",
+                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use read_file on ./USER.md.]",
             ),
             ChatMessage::text("assistant", "summary"),
             ChatMessage::text("system", "[Active Runtime Tasks]\nexec_id=123"),
@@ -9245,6 +9415,81 @@ mod tests {
         );
         assert_eq!(normalized[3], ChatMessage::text("user", "继续"));
         assert_eq!(normalized.len(), 4);
+    }
+
+    #[test]
+    fn profile_change_prompts_are_suppressed_for_interrupted_messages() {
+        assert!(!should_emit_profile_change_prompt(Some(
+            "[Interrupted Follow-up]\n进度如何？"
+        )));
+        assert!(!should_emit_profile_change_prompt(Some(
+            "[Queued User Updates]\nFollow-up 1:\n继续"
+        )));
+        assert!(should_emit_profile_change_prompt(Some("正常对话")));
+    }
+
+    #[test]
+    fn shared_profile_sync_copies_missing_workspace_files_and_upload_only_reports_real_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let workdir = temp_dir.path();
+        let agent_dir = workdir.join("agent");
+        let workspace_root = workdir.join("workspace");
+        let rundir = workdir.join("rundir");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&rundir).unwrap();
+        fs::create_dir_all(rundir.join(".skills")).unwrap();
+        fs::write(agent_dir.join("USER.md"), "shared user v1").unwrap();
+        fs::write(agent_dir.join("IDENTITY.md"), "shared identity v1").unwrap();
+        fs::write(rundir.join("AGENTS.md"), "").unwrap();
+
+        let agent_workspace = AgentWorkspace {
+            root_dir: workdir.to_path_buf(),
+            rundir: rundir.clone(),
+            agent_dir: agent_dir.clone(),
+            skills_dir: rundir.join(".skills"),
+            skill_creator_dir: rundir.join(".skills/skill-creator"),
+            tmp_dir: rundir.join("tmp"),
+            identity_md_path: agent_dir.join("IDENTITY.md"),
+            user_md_path: agent_dir.join("USER.md"),
+            agents_md_path: rundir.join("AGENTS.md"),
+            identity_prompt: "stale identity".to_string(),
+            user_profile_markdown: "stale user".to_string(),
+            raw_identity_markdown: "stale identity".to_string(),
+            agents_markdown: String::new(),
+        };
+
+        let notices =
+            sync_workspace_shared_profile_files(&agent_workspace, &workspace_root).unwrap();
+        assert_eq!(
+            notices,
+            vec![
+                crate::session::SharedProfileChangeNotice::UserUpdated,
+                crate::session::SharedProfileChangeNotice::IdentityUpdated
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("USER.md")).unwrap(),
+            "shared user v1"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("IDENTITY.md")).unwrap(),
+            "shared identity v1"
+        );
+
+        let no_op =
+            upload_workspace_shared_profile_files(&agent_workspace, &workspace_root).unwrap();
+        assert!(!no_op.changed_any());
+
+        fs::write(workspace_root.join("IDENTITY.md"), "shared identity v2").unwrap();
+        let changed =
+            upload_workspace_shared_profile_files(&agent_workspace, &workspace_root).unwrap();
+        assert!(!changed.user_changed);
+        assert!(changed.identity_changed);
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("IDENTITY.md")).unwrap(),
+            "shared identity v2"
+        );
     }
 
     #[test]

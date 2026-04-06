@@ -54,6 +54,7 @@ pub struct WorkspaceManager {
     workspaces_root: PathBuf,
     meta_root: PathBuf,
     template_root: PathBuf,
+    shared_agent_root: PathBuf,
     registry_path: PathBuf,
     registry: Arc<Mutex<WorkspaceRegistry>>,
 }
@@ -96,6 +97,7 @@ impl WorkspaceManager {
         let meta_root = sandbox_dir.join("workspace_meta");
         let workspaces_root = workdir.join("workspaces");
         let template_root = workdir.join("rundir");
+        let shared_agent_root = workdir.join("agent");
         let registry_path = sandbox_dir.join("workspaces.json");
         fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("failed to create {}", sandbox_dir.display()))?;
@@ -130,6 +132,7 @@ impl WorkspaceManager {
             workspaces_root,
             meta_root,
             template_root,
+            shared_agent_root,
             registry_path,
             registry: Arc::new(Mutex::new(registry)),
         })
@@ -685,6 +688,7 @@ impl WorkspaceManager {
 
     fn seed_workspace_from_template(&self, record: &WorkspaceRecord) -> Result<()> {
         if !self.template_root.exists() {
+            self.seed_shared_profiles(record)?;
             return Ok(());
         }
         for entry in fs::read_dir(&self.template_root)
@@ -696,6 +700,22 @@ impl WorkspaceManager {
                 continue;
             }
             let target_path = record.files_dir.join(entry.file_name());
+            if target_path.exists() {
+                continue;
+            }
+            copy_path_recursive(&source_path, &target_path)?;
+        }
+        self.seed_shared_profiles(record)?;
+        Ok(())
+    }
+
+    fn seed_shared_profiles(&self, record: &WorkspaceRecord) -> Result<()> {
+        for file_name in ["USER.md", "IDENTITY.md"] {
+            let source_path = self.shared_agent_root.join(file_name);
+            if !source_path.is_file() {
+                continue;
+            }
+            let target_path = record.files_dir.join(file_name);
             if target_path.exists() {
                 continue;
             }
@@ -1148,12 +1168,15 @@ mod tests {
     fn workspace_manager_seeds_new_workspace_from_rundir_template() {
         let temp_dir = TempDir::new().unwrap();
         fs::create_dir_all(temp_dir.path().join("rundir/.skills")).unwrap();
+        fs::create_dir_all(temp_dir.path().join("agent")).unwrap();
         fs::write(temp_dir.path().join("rundir/AGENTS.md"), "template agents").unwrap();
         fs::write(
             temp_dir.path().join("rundir/.skills/template.txt"),
             "skill template",
         )
         .unwrap();
+        fs::write(temp_dir.path().join("agent/USER.md"), "shared user").unwrap();
+        fs::write(temp_dir.path().join("agent/IDENTITY.md"), "shared identity").unwrap();
 
         let manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let created = manager
@@ -1167,6 +1190,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(created.files_dir.join(".skills/template.txt")).unwrap(),
             "skill template"
+        );
+        assert_eq!(
+            fs::read_to_string(created.files_dir.join("USER.md")).unwrap(),
+            "shared user"
+        );
+        assert_eq!(
+            fs::read_to_string(created.files_dir.join("IDENTITY.md")).unwrap(),
+            "shared identity"
         );
     }
 

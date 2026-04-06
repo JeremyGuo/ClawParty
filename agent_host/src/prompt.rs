@@ -66,6 +66,7 @@ pub fn build_agent_system_prompt(
         "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as an interruption signal. Give immediate visible feedback. If you can stop and answer directly, do that. If you will continue doing more work after acknowledging it, send the acknowledgement with user_tell before continuing.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat the newest items as the latest steering, and give immediate visible feedback. If you continue working after that acknowledgement, use user_tell for the acknowledgement instead of hiding it inside an assistant message with tool_calls.".to_string(),
+        "USER.md and IDENTITY.md are copied into the workspace root. The current foreground run keeps a fixed system prompt, so shared-profile updates do not rewrite that prompt mid-run. If a system message says one of those files changed, use read_file to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use read_file on ./IDENTITY.md after changing it.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root
@@ -336,6 +337,8 @@ mod tests {
         assert!(prompt.contains("you must use the user_tell tool"));
         assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
         assert!(prompt.contains("If a user message starts with [Queued User Updates]"));
+        assert!(prompt.contains("shared_profile_upload"));
+        assert!(prompt.contains("use read_file to inspect that workspace file"));
         assert!(!prompt.contains("Use subagent_create to start delegated work"));
         assert!(!prompt.contains("prefer leaving stdout/stderr unredirected"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
