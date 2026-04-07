@@ -32,6 +32,9 @@ pub enum ZgentNativeKernelReadiness {
     MissingRuntimeDir {
         root_dir: PathBuf,
     },
+    IncompleteRuntimeDir {
+        root_dir: PathBuf,
+    },
     SourceOnly {
         root_dir: PathBuf,
         manifest_path: PathBuf,
@@ -51,6 +54,10 @@ impl ZgentNativeKernelReadiness {
         match self {
             Self::MissingRuntimeDir { root_dir } => format!(
                 "local ./zgent runtime directory is unavailable at {}",
+                root_dir.display()
+            ),
+            Self::IncompleteRuntimeDir { root_dir } => format!(
+                "local ./zgent runtime directory exists at {} but no built zgent-server binary or Cargo.toml manifest was found",
                 root_dir.display()
             ),
             Self::SourceOnly {
@@ -96,7 +103,7 @@ pub fn zgent_native_kernel_readiness() -> ZgentNativeKernelReadiness {
         };
     }
 
-    ZgentNativeKernelReadiness::MissingRuntimeDir { root_dir }
+    ZgentNativeKernelReadiness::IncompleteRuntimeDir { root_dir }
 }
 
 #[cfg(test)]
@@ -125,6 +132,15 @@ mod tests {
         match readiness {
             ZgentNativeKernelReadiness::MissingRuntimeDir { root_dir } => {
                 assert!(!root_dir.is_dir());
+            }
+            ZgentNativeKernelReadiness::IncompleteRuntimeDir { root_dir } => {
+                assert!(root_dir.is_dir());
+                assert!(!root_dir.join("Cargo.toml").is_file());
+                assert!(
+                    zgent_server_binary_candidates(&root_dir)
+                        .into_iter()
+                        .all(|candidate| !candidate.is_file())
+                );
             }
             ZgentNativeKernelReadiness::SourceOnly {
                 root_dir,
