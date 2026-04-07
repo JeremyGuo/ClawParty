@@ -8,11 +8,10 @@
       "backend": "agent_frame",
       "capabilities": [
         "chat",
-        "image_in",
-        "web_search"
+        "image_in"
       ],
       "native_web_search": {
-        "enabled": true,
+        "enabled": false,
         "payload": {}
       },
       "api_key_env": "OPENAI_API_KEY",
