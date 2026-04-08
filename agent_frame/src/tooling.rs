@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
@@ -555,25 +555,23 @@ fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[derive(Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 struct ProcessMetadata {
     exec_id: String,
-    pid: u32,
+    worker_pid: u32,
     command: String,
     cwd: String,
     stdout_path: String,
     stderr_path: String,
-    exit_code_path: String,
+    status_path: String,
+    worker_exit_code_path: String,
+    requests_dir: String,
 }
 
-struct LiveManagedProcess {
-    stdin: Option<ChildStdin>,
-    metadata: ProcessMetadata,
-}
+static LIVE_PROCESSES: std::sync::OnceLock<Mutex<BTreeMap<String, ProcessMetadata>>> =
+    std::sync::OnceLock::new();
 
-static LIVE_PROCESSES: OnceLock<Mutex<BTreeMap<String, LiveManagedProcess>>> = OnceLock::new();
-
-fn live_processes() -> &'static Mutex<BTreeMap<String, LiveManagedProcess>> {
+fn live_processes() -> &'static Mutex<BTreeMap<String, ProcessMetadata>> {
     LIVE_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -634,56 +632,175 @@ fn record_exit_code(path: &Path, code: i32) -> Result<()> {
         .with_context(|| format!("failed to write exit code to {}", path.display()))
 }
 
-fn spawn_managed_process(state_dir: &Path, command: &str, cwd: &Path) -> Result<ProcessMetadata> {
+fn process_request_path(requests_dir: &Path, request_id: &str) -> PathBuf {
+    requests_dir.join(format!("request-{request_id}.json"))
+}
+
+fn process_request_result_path(requests_dir: &Path, request_id: &str) -> PathBuf {
+    requests_dir.join(format!("request-{request_id}.result.json"))
+}
+
+fn queue_exec_input_request(metadata: &ProcessMetadata, input: &str) -> Result<PathBuf> {
+    let requests_dir = Path::new(&metadata.requests_dir);
+    fs::create_dir_all(requests_dir)
+        .with_context(|| format!("failed to create {}", requests_dir.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let request_id = format!("{timestamp:020}-{}", Uuid::new_v4());
+    let request_path = process_request_path(requests_dir, &request_id);
+    let temp_path = requests_dir.join(format!("request-{request_id}.tmp"));
+    fs::write(
+        &temp_path,
+        serde_json::to_vec_pretty(&json!({ "input": input }))
+            .context("failed to serialize exec input request")?,
+    )
+    .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &request_path).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            temp_path.display(),
+            request_path.display()
+        )
+    })?;
+    Ok(process_request_result_path(requests_dir, &request_id))
+}
+
+fn read_exec_input_result(result_path: &Path) -> Result<Option<Value>> {
+    if !result_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(result_path)
+        .with_context(|| format!("failed to read {}", result_path.display()))?;
+    let value = serde_json::from_str(&raw).context("failed to parse exec input result")?;
+    Ok(Some(value))
+}
+
+fn exec_pid_from_snapshot(snapshot: &Value) -> Option<u32> {
+    snapshot
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+fn kill_exec_processes(metadata: &ProcessMetadata, snapshot: Option<&Value>) {
+    if let Some(exec_pid) = snapshot.and_then(exec_pid_from_snapshot)
+        && exec_pid != metadata.worker_pid
+    {
+        terminate_process_pid(exec_pid);
+    }
+    terminate_process_pid(metadata.worker_pid);
+}
+
+fn write_exec_snapshot(
+    metadata: &ProcessMetadata,
+    running: bool,
+    completed: bool,
+    returncode: Value,
+    extra: Option<Map<String, Value>>,
+) -> Result<()> {
+    let pid = read_status_json(Path::new(&metadata.status_path))
+        .ok()
+        .and_then(|value| value.get("pid").cloned())
+        .unwrap_or(Value::Null);
+    let stdin_closed = read_status_json(Path::new(&metadata.status_path))
+        .ok()
+        .and_then(|value| value.get("stdin_closed").cloned())
+        .unwrap_or(Value::Bool(true));
+    let failed = read_status_json(Path::new(&metadata.status_path))
+        .ok()
+        .and_then(|value| value.get("failed").cloned())
+        .unwrap_or(Value::Bool(false));
+
+    let mut object = Map::from_iter([
+        (
+            "exec_id".to_string(),
+            Value::String(metadata.exec_id.clone()),
+        ),
+        ("pid".to_string(), pid),
+        (
+            "command".to_string(),
+            Value::String(metadata.command.clone()),
+        ),
+        ("cwd".to_string(), Value::String(metadata.cwd.clone())),
+        ("running".to_string(), Value::Bool(running)),
+        ("completed".to_string(), Value::Bool(completed)),
+        ("returncode".to_string(), returncode),
+        ("stdin_closed".to_string(), stdin_closed),
+        ("failed".to_string(), failed),
+    ]);
+    if let Some(extra) = extra {
+        object.extend(extra);
+    }
+    fs::write(
+        &metadata.status_path,
+        serde_json::to_vec_pretty(&Value::Object(object))
+            .context("failed to serialize exec status snapshot")?,
+    )
+    .with_context(|| format!("failed to write {}", metadata.status_path))
+}
+
+fn spawn_managed_process(
+    runtime_state_root: &Path,
+    state_dir: &Path,
+    command: &str,
+    cwd: &Path,
+) -> Result<ProcessMetadata> {
     let exec_id = Uuid::new_v4().to_string();
     let stdout_path = state_dir.join(format!("{}.stdout", exec_id));
     let stderr_path = state_dir.join(format!("{}.stderr", exec_id));
-    let exit_code_path = state_dir.join(format!("{}.exit", exec_id));
-    let stdout_file = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(
-            "eval \"$AGENT_FRAME_EXEC_COMMAND\"; code=$?; printf '%s' \"$code\" > \"$AGENT_FRAME_EXIT_CODE_PATH\"; exit $code",
-        )
-        .current_dir(cwd)
-        .env("AGENT_FRAME_EXEC_COMMAND", command)
-        .env("AGENT_FRAME_EXIT_CODE_PATH", &exit_code_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
-    let stdin = child.stdin.take();
-    let pid = child.id();
+    let status_path = state_dir.join(format!("{}.status.json", exec_id));
+    let requests_dir = state_dir.join(format!("{}.requests", exec_id));
+    fs::create_dir_all(&requests_dir)
+        .with_context(|| format!("failed to create {}", requests_dir.display()))?;
+    fs::write(
+        &status_path,
+        serde_json::to_vec_pretty(&json!({
+            "exec_id": exec_id,
+            "pid": Value::Null,
+            "command": command,
+            "cwd": cwd.display().to_string(),
+            "running": true,
+            "completed": false,
+            "returncode": Value::Null,
+            "stdin_closed": false,
+            "failed": false,
+            "error": Value::Null,
+        }))
+        .context("failed to serialize initial exec status")?,
+    )
+    .with_context(|| format!("failed to write {}", status_path.display()))?;
+    let worker = spawn_background_worker_process(
+        runtime_state_root,
+        "exec",
+        &exec_id,
+        &ToolWorkerJob::Exec {
+            exec_id: exec_id.clone(),
+            command: command.to_string(),
+            cwd: cwd.display().to_string(),
+            status_path: status_path.display().to_string(),
+            stdout_path: stdout_path.display().to_string(),
+            stderr_path: stderr_path.display().to_string(),
+            requests_dir: requests_dir.display().to_string(),
+        },
+    )?;
     let metadata = ProcessMetadata {
         exec_id: exec_id.clone(),
-        pid,
+        worker_pid: worker.pid,
         command: command.to_string(),
         cwd: cwd.display().to_string(),
         stdout_path: stdout_path.display().to_string(),
         stderr_path: stderr_path.display().to_string(),
-        exit_code_path: exit_code_path.display().to_string(),
+        status_path: status_path.display().to_string(),
+        worker_exit_code_path: worker.exit_code_path,
+        requests_dir: requests_dir.display().to_string(),
     };
     write_process_metadata(state_dir, &metadata)?;
-    drop(child);
-    live_processes().lock().unwrap().insert(
-        exec_id,
-        LiveManagedProcess {
-            stdin,
-            metadata: ProcessMetadata {
-                exec_id: metadata.exec_id.clone(),
-                pid: metadata.pid,
-                command: metadata.command.clone(),
-                cwd: metadata.cwd.clone(),
-                stdout_path: metadata.stdout_path.clone(),
-                stderr_path: metadata.stderr_path.clone(),
-                exit_code_path: metadata.exit_code_path.clone(),
-            },
-        },
-    );
+    live_processes()
+        .lock()
+        .unwrap()
+        .insert(exec_id, metadata.clone());
     Ok(metadata)
 }
 
@@ -704,26 +821,50 @@ fn read_process_snapshot(
         Ok(metadata) => metadata,
         Err(_) => return Err(process_missing_error(exec_id)),
     };
-    let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
-    let running = if exit_code.is_some() {
-        false
-    } else {
-        process_is_running(metadata.pid)
-    };
-    if !running && exit_code.is_none() {
-        return Err(process_missing_error(exec_id));
+    let mut snapshot = read_status_json(Path::new(&metadata.status_path))
+        .map_err(|_| process_missing_error(exec_id))?;
+    let worker_alive = read_exit_code(Path::new(&metadata.worker_exit_code_path)).is_none()
+        && process_is_running(metadata.worker_pid);
+    let running = snapshot
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if running && !worker_alive {
+        let pid = snapshot.get("pid").cloned().unwrap_or(Value::Null);
+        snapshot = json!({
+            "exec_id": metadata.exec_id,
+            "pid": pid,
+            "command": metadata.command,
+            "cwd": metadata.cwd,
+            "running": false,
+            "completed": false,
+            "returncode": Value::Null,
+            "stdin_closed": true,
+            "failed": true,
+            "error": "exec worker exited unexpectedly",
+        });
     }
-    Ok(json!({
-        "exec_id": metadata.exec_id,
-        "pid": metadata.pid,
-        "command": metadata.command,
-        "cwd": metadata.cwd,
-        "running": running,
-        "completed": !running,
-        "returncode": exit_code,
-        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
-        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
-    }))
+    let mut object = snapshot
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
+    object.insert(
+        "stdout".to_string(),
+        Value::String(read_file_lines_window(
+            Path::new(&metadata.stdout_path),
+            start,
+            limit,
+        )?),
+    );
+    object.insert(
+        "stderr".to_string(),
+        Value::String(read_file_lines_window(
+            Path::new(&metadata.stderr_path),
+            start,
+            limit,
+        )?),
+    );
+    Ok(Value::Object(object))
 }
 
 fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
@@ -736,20 +877,31 @@ fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> 
     {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".json") || file_name.ends_with(".status.json") {
             continue;
         }
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let metadata: ProcessMetadata =
             serde_json::from_str(&raw).context("failed to parse process metadata")?;
-        let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
-        if exit_code.is_some() || !process_is_running(metadata.pid) {
+        let snapshot = read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0)?;
+        if !snapshot
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             continue;
         }
+        let pid = snapshot
+            .get("pid")
+            .and_then(Value::as_u64)
+            .unwrap_or(metadata.worker_pid as u64);
         entries.push(format!(
             "- exec_id=`{}` pid={} cwd=`{}` command=`{}`",
-            metadata.exec_id, metadata.pid, metadata.cwd, metadata.command
+            metadata.exec_id, pid, metadata.cwd, metadata.command
         ));
     }
     entries.sort();
@@ -763,17 +915,28 @@ pub fn terminate_all_managed_processes() -> Result<()> {
         .collect::<Vec<_>>();
     drop(registry);
     for process in processes {
-        let meta_path = process_meta_path(
-            Path::new(&process.metadata.stdout_path)
+        let snapshot = read_process_snapshot(
+            Path::new(&process.stdout_path)
                 .parent()
                 .unwrap_or_else(|| Path::new(".")),
-            &process.metadata.exec_id,
+            &process.exec_id,
+            0,
+            0,
+        )
+        .ok();
+        let meta_path = process_meta_path(
+            Path::new(&process.stdout_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            &process.exec_id,
         );
         let _ = fs::remove_file(meta_path);
-        let _ = fs::remove_file(&process.metadata.exit_code_path);
-        let _ = fs::remove_file(&process.metadata.stdout_path);
-        let _ = fs::remove_file(&process.metadata.stderr_path);
-        terminate_process_pid(process.metadata.pid);
+        let _ = fs::remove_file(&process.worker_exit_code_path);
+        let _ = fs::remove_file(&process.status_path);
+        let _ = fs::remove_file(&process.stdout_path);
+        let _ = fs::remove_file(&process.stderr_path);
+        let _ = fs::remove_dir_all(&process.requests_dir);
+        kill_exec_processes(&process, snapshot.as_ref());
     }
     Ok(())
 }
@@ -787,30 +950,56 @@ fn wait_for_managed_process(
     limit: usize,
     cancel_flag: Option<&Arc<InterruptSignal>>,
 ) -> Result<Value> {
-    if let Some(input) = input {
-        let mut registry = live_processes().lock().unwrap();
-        let Some(process) = registry.get_mut(exec_id) else {
-            return Err(anyhow!(
-                "stdin is unavailable for exec process {}; it may have been started by a previous agent child",
-                exec_id
-            ));
-        };
-        let stdin = process
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("stdin is closed for exec process {}", exec_id))?;
-        stdin
-            .write_all(input.as_bytes())
-            .with_context(|| format!("failed to write stdin for exec process {}", exec_id))?;
-        stdin
-            .flush()
-            .with_context(|| format!("failed to flush stdin for exec process {}", exec_id))?;
-    }
-
-    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    let pending_input_result = if let Some(input) = input {
+        let metadata = read_process_metadata(state_dir, exec_id)
+            .map_err(|_| process_missing_error(exec_id))?;
+        Some(queue_exec_input_request(&metadata, input)?)
+    } else {
+        None
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(wait_timeout_seconds);
+    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    let mut input_acknowledged = pending_input_result.is_none();
     loop {
         let snapshot = read_process_snapshot(state_dir, exec_id, start, limit)?;
+        if !input_acknowledged && let Some(result_path) = pending_input_result.as_ref() {
+            if let Some(result) = read_exec_input_result(result_path)? {
+                let _ = fs::remove_file(result_path);
+                let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                if !ok {
+                    let error = result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stdin is closed for exec process");
+                    return Err(anyhow!(error.to_string()));
+                }
+                input_acknowledged = true;
+            } else {
+                let running = snapshot
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let stdin_closed = snapshot
+                    .get("stdin_closed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let failed = snapshot
+                    .get("failed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if stdin_closed || failed || !running {
+                    let error = snapshot
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("stdin is closed for exec process {}", exec_id));
+                    return Err(anyhow!(error));
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        }
+
         let completed = snapshot
             .get("completed")
             .and_then(Value::as_bool)
@@ -896,7 +1085,7 @@ fn exec_start_tool(
                 .map(|value| resolve_path(value, &workspace_root))
                 .unwrap_or_else(|| workspace_root.clone());
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let metadata = spawn_managed_process(&state_dir, &command, &cwd)?;
+            let metadata = spawn_managed_process(&runtime_state_root, &state_dir, &command, &cwd)?;
             let mut result = read_process_snapshot(&state_dir, &metadata.exec_id, start, limit)?;
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
@@ -1014,14 +1203,25 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let exec_id = string_arg(arguments, "exec_id")?;
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let _ = live_processes().lock().unwrap().remove(&exec_id);
             let metadata = read_process_metadata(&state_dir, &exec_id)
                 .map_err(|_| process_missing_error(&exec_id))?;
-            terminate_process_pid(metadata.pid);
-            record_exit_code(Path::new(&metadata.exit_code_path), -9)?;
+            let previous = read_process_snapshot(&state_dir, &exec_id, 0, 0).ok();
+            kill_exec_processes(&metadata, previous.as_ref());
+            let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
+            let mut extra = Map::new();
+            extra.insert("killed".to_string(), Value::Bool(true));
+            extra.insert("failed".to_string(), Value::Bool(false));
+            extra.insert("stdin_closed".to_string(), Value::Bool(true));
+            extra.insert("error".to_string(), Value::Null);
+            write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
+            live_processes().lock().unwrap().remove(&exec_id);
             Ok(json!({
                 "exec_id": metadata.exec_id,
-                "pid": metadata.pid,
+                "pid": previous
+                    .as_ref()
+                    .and_then(exec_pid_from_snapshot)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
                 "command": metadata.command,
                 "cwd": metadata.cwd,
                 "running": false,
@@ -1537,12 +1737,29 @@ fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let metadata: ProcessMetadata =
             serde_json::from_str(&raw).context("failed to parse process metadata")?;
+        let snapshot = read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0).ok();
+        let running = snapshot
+            .as_ref()
+            .and_then(|value| value.get("running"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         live_processes().lock().unwrap().remove(&metadata.exec_id);
-        if read_exit_code(Path::new(&metadata.exit_code_path)).is_none()
-            && process_is_running(metadata.pid)
+        if running
+            || (read_exit_code(Path::new(&metadata.worker_exit_code_path)).is_none()
+                && process_is_running(metadata.worker_pid))
         {
-            terminate_process_pid(metadata.pid);
-            let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+            kill_exec_processes(&metadata, snapshot.as_ref());
+            let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
+            let mut extra = Map::new();
+            extra.insert("cancelled".to_string(), Value::Bool(true));
+            extra.insert(
+                "reason".to_string(),
+                Value::String("session_destroyed".to_string()),
+            );
+            extra.insert("stdin_closed".to_string(), Value::Bool(true));
+            extra.insert("failed".to_string(), Value::Bool(false));
+            extra.insert("error".to_string(), Value::Null);
+            let _ = write_exec_snapshot(&metadata, false, false, Value::from(-9), Some(extra));
             killed = killed.saturating_add(1);
         }
     }
@@ -2807,7 +3024,7 @@ pub mod macro_support {
 mod tests {
     use super::{
         BackgroundTaskMetadata, ProcessMetadata, Tool, active_runtime_state_summary,
-        build_tool_registry_with_cancel, process_is_running, process_meta_path, record_exit_code,
+        build_tool_registry_with_cancel, process_is_running, process_meta_path,
         terminate_runtime_state_tasks, write_background_task_metadata,
     };
     use crate::config::{
@@ -3182,15 +3399,37 @@ mod tests {
         fs::create_dir_all(&downloads_dir).unwrap();
         fs::create_dir_all(&subagents_dir).unwrap();
 
-        let exec_exit_path = processes_dir.join("exec-1.exit");
+        let exec_status_path = processes_dir.join("exec-1.status.json");
+        fs::write(
+            &exec_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "exec_id": "exec-1",
+                "pid": std::process::id(),
+                "command": "sleep 10",
+                "cwd": "/tmp/demo",
+                "running": true,
+                "completed": false,
+                "returncode": json!(null),
+                "stdin_closed": false,
+                "failed": false,
+                "error": json!(null),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let exec_metadata = ProcessMetadata {
             exec_id: "exec-1".to_string(),
-            pid: std::process::id(),
+            worker_pid: std::process::id(),
             command: "sleep 10".to_string(),
             cwd: "/tmp/demo".to_string(),
             stdout_path: processes_dir.join("exec-1.stdout").display().to_string(),
             stderr_path: processes_dir.join("exec-1.stderr").display().to_string(),
-            exit_code_path: exec_exit_path.display().to_string(),
+            status_path: exec_status_path.display().to_string(),
+            worker_exit_code_path: processes_dir
+                .join("exec-1.worker.exit")
+                .display()
+                .to_string(),
+            requests_dir: processes_dir.join("exec-1.requests").display().to_string(),
         };
         fs::write(
             process_meta_path(&processes_dir, "exec-1"),
@@ -3198,10 +3437,27 @@ mod tests {
         )
         .unwrap();
 
-        let finished_exit_path = processes_dir.join("exec-finished.exit");
+        let finished_status_path = processes_dir.join("exec-finished.status.json");
+        fs::write(
+            &finished_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "exec_id": "exec-finished",
+                "pid": std::process::id(),
+                "command": "echo done",
+                "cwd": "/tmp/finished",
+                "running": false,
+                "completed": true,
+                "returncode": 0,
+                "stdin_closed": true,
+                "failed": false,
+                "error": json!(null),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let finished_metadata = ProcessMetadata {
             exec_id: "exec-finished".to_string(),
-            pid: std::process::id(),
+            worker_pid: std::process::id(),
             command: "echo done".to_string(),
             cwd: "/tmp/finished".to_string(),
             stdout_path: processes_dir
@@ -3212,14 +3468,21 @@ mod tests {
                 .join("exec-finished.stderr")
                 .display()
                 .to_string(),
-            exit_code_path: finished_exit_path.display().to_string(),
+            status_path: finished_status_path.display().to_string(),
+            worker_exit_code_path: processes_dir
+                .join("exec-finished.worker.exit")
+                .display()
+                .to_string(),
+            requests_dir: processes_dir
+                .join("exec-finished.requests")
+                .display()
+                .to_string(),
         };
         fs::write(
             process_meta_path(&processes_dir, "exec-finished"),
             serde_json::to_vec_pretty(&finished_metadata).unwrap(),
         )
         .unwrap();
-        record_exit_code(&finished_exit_path, 0).unwrap();
 
         let download_status_path = downloads_dir.join("download-1.status.json");
         let download_exit_path = downloads_dir.join("download-1.exit");
@@ -3302,9 +3565,27 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let exec_status_path = processes_dir.join("exec-cleanup.status.json");
+        fs::write(
+            &exec_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "exec_id": "exec-cleanup",
+                "pid": exec_child.id(),
+                "command": "sleep 30",
+                "cwd": "/tmp",
+                "running": true,
+                "completed": false,
+                "returncode": json!(null),
+                "stdin_closed": false,
+                "failed": false,
+                "error": json!(null),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let exec_metadata = ProcessMetadata {
             exec_id: "exec-cleanup".to_string(),
-            pid: exec_child.id(),
+            worker_pid: exec_child.id(),
             command: "sleep 30".to_string(),
             cwd: "/tmp".to_string(),
             stdout_path: processes_dir
@@ -3315,8 +3596,13 @@ mod tests {
                 .join("exec-cleanup.stderr")
                 .display()
                 .to_string(),
-            exit_code_path: processes_dir
-                .join("exec-cleanup.exit")
+            status_path: exec_status_path.display().to_string(),
+            worker_exit_code_path: processes_dir
+                .join("exec-cleanup.worker.exit")
+                .display()
+                .to_string(),
+            requests_dir: processes_dir
+                .join("exec-cleanup.requests")
                 .display()
                 .to_string(),
         };
@@ -3434,7 +3720,7 @@ mod tests {
         let _ = download_child.wait();
         let _ = image_child.wait();
         thread::sleep(Duration::from_millis(50));
-        assert!(!process_is_running(exec_metadata.pid));
+        assert!(!process_is_running(exec_metadata.worker_pid));
         assert!(!process_is_running(download_child.id()));
         assert!(!process_is_running(image_child.id()));
     }

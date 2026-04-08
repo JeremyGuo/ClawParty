@@ -6,9 +6,13 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fs;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::Path;
+use std::process::{ChildStdin, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -56,6 +60,15 @@ pub enum ToolWorkerJob {
         temp_path: String,
         headers: Map<String, Value>,
         status_path: String,
+    },
+    Exec {
+        exec_id: String,
+        command: String,
+        cwd: String,
+        status_path: String,
+        stdout_path: String,
+        stderr_path: String,
+        requests_dir: String,
     },
 }
 
@@ -142,6 +155,23 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             headers,
             Path::new(&status_path),
         ),
+        ToolWorkerJob::Exec {
+            exec_id,
+            command,
+            cwd,
+            status_path,
+            stdout_path,
+            stderr_path,
+            requests_dir,
+        } => run_exec_job(
+            &exec_id,
+            &command,
+            Path::new(&cwd),
+            Path::new(&status_path),
+            Path::new(&stdout_path),
+            Path::new(&stderr_path),
+            Path::new(&requests_dir),
+        ),
     }
 }
 
@@ -166,6 +196,140 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
         serde_json::to_vec_pretty(value).context("failed to serialize worker status")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn exec_status_json(
+    exec_id: &str,
+    command: &str,
+    cwd: &Path,
+    pid: Option<u32>,
+    running: bool,
+    completed: bool,
+    returncode: Option<i32>,
+    stdin_closed: bool,
+    failed: bool,
+    error: Option<String>,
+) -> Value {
+    json!({
+        "exec_id": exec_id,
+        "pid": pid,
+        "command": command,
+        "cwd": cwd.display().to_string(),
+        "running": running,
+        "completed": completed,
+        "returncode": returncode,
+        "stdin_closed": stdin_closed,
+        "failed": failed,
+        "error": error,
+    })
+}
+
+fn write_exec_status(
+    status_path: &Path,
+    exec_id: &str,
+    command: &str,
+    cwd: &Path,
+    pid: Option<u32>,
+    running: bool,
+    completed: bool,
+    returncode: Option<i32>,
+    stdin_closed: bool,
+    failed: bool,
+    error: Option<String>,
+) -> Result<()> {
+    write_json_file(
+        status_path,
+        &exec_status_json(
+            exec_id,
+            command,
+            cwd,
+            pid,
+            running,
+            completed,
+            returncode,
+            stdin_closed,
+            failed,
+            error,
+        ),
+    )
+}
+
+#[derive(Deserialize)]
+struct ExecInputRequest {
+    input: String,
+}
+
+fn process_exec_requests(
+    requests_dir: &Path,
+    stdin: &mut Option<ChildStdin>,
+    exec_id: &str,
+) -> Result<bool> {
+    let mut request_paths = fs::read_dir(requests_dir)
+        .with_context(|| format!("failed to read {}", requests_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with("request-") && !name.ends_with(".result.json"))
+        })
+        .collect::<Vec<_>>();
+    request_paths.sort();
+
+    let mut stdin_closed = stdin.is_none();
+    for path in request_paths {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let request: ExecInputRequest =
+            serde_json::from_str(&raw).context("failed to parse exec input request")?;
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("invalid exec input request name"))?;
+        let result_path = requests_dir.join(format!("{stem}.result.json"));
+        let mut close_stdin_after_request = false;
+
+        let result = match stdin.as_mut() {
+            Some(stdin) => match stdin.write_all(request.input.as_bytes()) {
+                Ok(()) => match stdin.flush() {
+                    Ok(()) => json!({
+                        "ok": true,
+                    }),
+                    Err(error) => {
+                        close_stdin_after_request = true;
+                        stdin_closed = true;
+                        json!({
+                            "ok": false,
+                            "error": format!("failed to flush stdin for exec process {}: {}", exec_id, error),
+                        })
+                    }
+                },
+                Err(error) => {
+                    close_stdin_after_request = true;
+                    stdin_closed = true;
+                    json!({
+                        "ok": false,
+                        "error": format!("stdin is closed for exec process {}: {}", exec_id, error),
+                    })
+                }
+            },
+            None => {
+                stdin_closed = true;
+                json!({
+                    "ok": false,
+                    "error": format!("stdin is closed for exec process {}", exec_id),
+                })
+            }
+        };
+
+        write_json_file(&result_path, &result)?;
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+        if close_stdin_after_request {
+            *stdin = None;
+        }
+    }
+
+    Ok(stdin_closed)
 }
 
 fn should_bypass_proxy(url: &str) -> bool {
@@ -708,6 +872,121 @@ fn run_file_download_job(
             "content_type": content_type,
         }),
     )
+}
+
+fn run_exec_job(
+    exec_id: &str,
+    command: &str,
+    cwd: &Path,
+    status_path: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    requests_dir: &Path,
+) -> Result<()> {
+    let run_result = (|| -> Result<()> {
+        if let Some(parent) = stdout_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if let Some(parent) = stderr_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::create_dir_all(requests_dir)
+            .with_context(|| format!("failed to create {}", requests_dir.display()))?;
+
+        let stdout_file = File::create(stdout_path)
+            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+        let stderr_file = File::create(stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("eval \"$AGENT_FRAME_EXEC_COMMAND\"")
+            .current_dir(cwd)
+            .env("AGENT_FRAME_EXEC_COMMAND", command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file))
+            .spawn()
+            .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
+        let pid = child.id();
+        let mut stdin = child.stdin.take();
+        let mut stdin_closed = stdin.is_none();
+        let mut last_stdin_closed = stdin_closed;
+
+        write_exec_status(
+            status_path,
+            exec_id,
+            command,
+            cwd,
+            Some(pid),
+            true,
+            false,
+            None,
+            stdin_closed,
+            false,
+            None,
+        )?;
+
+        loop {
+            stdin_closed = process_exec_requests(requests_dir, &mut stdin, exec_id)?;
+            if stdin_closed != last_stdin_closed {
+                write_exec_status(
+                    status_path,
+                    exec_id,
+                    command,
+                    cwd,
+                    Some(pid),
+                    true,
+                    false,
+                    None,
+                    stdin_closed,
+                    false,
+                    None,
+                )?;
+                last_stdin_closed = stdin_closed;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to poll exec child process")?
+            {
+                write_exec_status(
+                    status_path,
+                    exec_id,
+                    command,
+                    cwd,
+                    Some(pid),
+                    false,
+                    true,
+                    status.code().or(Some(-1)),
+                    stdin_closed,
+                    false,
+                    None,
+                )?;
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    })();
+
+    if let Err(error) = run_result {
+        write_exec_status(
+            status_path,
+            exec_id,
+            command,
+            cwd,
+            None,
+            false,
+            false,
+            None,
+            true,
+            true,
+            Some(format!("{error:#}")),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn strip_html_tags(body: &str) -> String {

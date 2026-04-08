@@ -1,6 +1,19 @@
 ---
-version: 0.8.3
+version: 0.8.4
 ---
+
+# 0.8.4
+
+- 升级 `workdir` 结构版本到 `0.8`：
+  `agent/runtime/*/agent_frame/processes` 下的 `exec` 运行态元数据改为后台 worker 驱动的新格式，支持普通跨 turn 继续 `exec_wait(input=...)`，不再依赖启动该命令的同一个 child turn 进程仍然存活。
+- 调整 `exec_*` 运行时模型：
+  `exec_start` 现在会拉起独立的后台 exec worker，由它持有真实子进程的 stdin；后续 turn 会通过落盘请求文件把输入转发给同一个 worker，`exec_observe/exec_wait/exec_kill` 因而可以跨 turn 复用同一个 `exec_id`。
+- 保持 session destroy 时的清理语义不变：
+  前台 session 被销毁时，运行中的 `exec` 仍会被统一 kill，不会残留到 session 生命周期之外。
+- 补强前台 turn 失败时的恢复点选择：
+  `agent_frame` 现在会持续维护最近的 stable report；如果这一轮在 `tool-wait context compaction` 或后续模型调用阶段失败，但尚未 emit 正式 checkpoint，`pending_continue` 会回退到最近稳定前缀，而不是整轮 turn 开始前的 `previous_messages`。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.7 -> 0.8` workdir upgrade step；升级时会清理旧版 `exec` runtime state，避免旧格式元数据与新版后台 worker 模式混用。
 
 # 0.8.3
 

@@ -438,6 +438,7 @@ pub struct SessionExecutionControl {
     checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
     event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
+    stable_report: Arc<Mutex<Option<SessionRunReport>>>,
     pending_prefix_rewrite: Arc<Mutex<Option<PendingPrefixRewrite>>>,
 }
 
@@ -473,6 +474,7 @@ impl SessionExecutionControl {
             checkpoint_callback: None,
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
+            stable_report: Arc::new(Mutex::new(None)),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
     }
@@ -491,6 +493,7 @@ impl SessionExecutionControl {
             checkpoint_callback: Some(Arc::new(callback)),
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
+            stable_report: Arc::new(Mutex::new(None)),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
     }
@@ -569,6 +572,13 @@ impl SessionExecutionControl {
             .unwrap_or_default()
     }
 
+    pub fn stable_report_snapshot(&self) -> Option<SessionRunReport> {
+        self.stable_report
+            .lock()
+            .ok()
+            .and_then(|report| report.clone())
+    }
+
     pub fn request_prefix_rewrite(
         &self,
         expected_prefix: Vec<ChatMessage>,
@@ -617,6 +627,24 @@ impl SessionExecutionControl {
     fn set_stable_prefix_messages(&self, messages: &[ChatMessage]) {
         if let Ok(mut stable_prefix) = self.stable_prefix_messages.lock() {
             *stable_prefix = messages.to_vec();
+        }
+    }
+
+    fn set_stable_report(
+        &self,
+        messages: &[ChatMessage],
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
+    ) {
+        if let Ok(mut stable_report) = self.stable_report.lock() {
+            *stable_report = Some(SessionRunReport {
+                messages: messages.to_vec(),
+                usage: usage.clone(),
+                compaction: compaction.clone(),
+                yielded: false,
+                response_checkpoint,
+            });
         }
     }
 
@@ -723,6 +751,14 @@ pub fn run_session_with_report_controlled(
     messages = initial_compaction.messages;
     if let Some(control) = &control {
         control.set_stable_prefix_messages(&messages);
+        control.set_stable_report(
+            &messages,
+            &usage,
+            &compaction_stats,
+            last_response_checkpoint
+                .clone()
+                .filter(|checkpoint| checkpoint.matches_messages(&messages)),
+        );
     }
     if !prompt.is_empty() {
         messages.push(ChatMessage::text("user", prompt));
@@ -732,6 +768,14 @@ pub fn run_session_with_report_controlled(
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
+            control.set_stable_report(
+                &messages,
+                &usage,
+                &compaction_stats,
+                last_response_checkpoint
+                    .clone()
+                    .filter(|checkpoint| checkpoint.matches_messages(&messages)),
+            );
             if control.take_yield_requested() {
                 let response_checkpoint = last_response_checkpoint
                     .clone()
@@ -783,6 +827,16 @@ pub fn run_session_with_report_controlled(
             usage.add_assign(&round_compaction.usage);
             compaction_stats.record_report(&round_compaction);
             messages = round_compaction.messages;
+            if let Some(control) = &control {
+                control.set_stable_report(
+                    &messages,
+                    &usage,
+                    &compaction_stats,
+                    last_response_checkpoint
+                        .clone()
+                        .filter(|checkpoint| checkpoint.matches_messages(&messages)),
+                );
+            }
         }
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
@@ -836,16 +890,25 @@ pub fn run_session_with_report_controlled(
         last_response_checkpoint = outcome
             .response_id
             .map(|response_id| ResponseCheckpoint::for_messages(response_id, &messages));
+        let stable_response_checkpoint = last_response_checkpoint
+            .clone()
+            .filter(|checkpoint| checkpoint.matches_messages(&messages));
+        if let Some(control) = &control {
+            control.set_stable_report(
+                &messages,
+                &usage,
+                &compaction_stats,
+                stable_response_checkpoint.clone(),
+            );
+        }
         if let Some(control) = &control
             && tool_calls.is_empty()
             && !extract_assistant_text(&messages).trim().is_empty()
         {
-            control.emit_checkpoint(&messages, &usage, last_response_checkpoint.clone());
+            control.emit_checkpoint(&messages, &usage, stable_response_checkpoint.clone());
         }
         if tool_calls.is_empty() {
-            let response_checkpoint = last_response_checkpoint
-                .clone()
-                .filter(|checkpoint| checkpoint.matches_messages(&messages));
+            let response_checkpoint = stable_response_checkpoint;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::SessionCompleted {
                     message_count: messages.len(),
@@ -865,6 +928,14 @@ pub fn run_session_with_report_controlled(
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
+            control.set_stable_report(
+                &messages,
+                &usage,
+                &compaction_stats,
+                last_response_checkpoint
+                    .clone()
+                    .filter(|checkpoint| checkpoint.matches_messages(&messages)),
+            );
             for tool_call in &tool_calls {
                 control.emit_event(SessionEvent::ToolCallStarted {
                     round_index,
@@ -987,6 +1058,14 @@ pub fn run_session_with_report_controlled(
             messages = post_tool_compaction.messages;
             if let Some(control) = &control {
                 control.set_stable_prefix_messages(&messages);
+                control.set_stable_report(
+                    &messages,
+                    &usage,
+                    &compaction_stats,
+                    last_response_checkpoint
+                        .clone()
+                        .filter(|checkpoint| checkpoint.matches_messages(&messages)),
+                );
             }
         }
         if let Some(control) = &control
@@ -1151,8 +1230,10 @@ fn synthesize_tool_timeout_observation(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionSignal, SessionExecutionControl, finish_pending_tool_wait_compaction,
-        start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
+        ExecutionSignal, PendingPrefixRewrite, ResponseCheckpoint, SessionCompactionStats,
+        SessionExecutionControl, TokenUsage, apply_pending_prefix_rewrite,
+        finish_pending_tool_wait_compaction, start_pending_tool_wait_compaction,
+        synthetic_user_message_from_tool_result,
     };
     use crate::config::{AgentConfig, CacheControlConfig, UpstreamConfig};
     use crate::message::ChatMessage;
@@ -1344,6 +1425,43 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stable_report_snapshot_keeps_tail_after_prefix_rewrite() {
+        let control = SessionExecutionControl::new();
+        let expected_prefix = vec![
+            ChatMessage::text("system", "[AgentFrame Runtime]\n\nPrompt"),
+            ChatMessage::text("assistant", "old summary"),
+        ];
+        let replacement_prefix = vec![
+            ChatMessage::text("system", "[AgentFrame Runtime]\n\nPrompt"),
+            ChatMessage::text("assistant", "new summary"),
+        ];
+        if let Ok(mut pending) = control.pending_prefix_rewrite.lock() {
+            *pending = Some(PendingPrefixRewrite {
+                expected_prefix: expected_prefix.clone(),
+                replacement_prefix: replacement_prefix.clone(),
+                usage: TokenUsage::default(),
+                compaction: SessionCompactionStats::default(),
+            });
+        }
+
+        let mut messages = expected_prefix;
+        messages.push(ChatMessage::text("user", "tail message"));
+        let mut usage = TokenUsage::default();
+        let mut compaction = SessionCompactionStats::default();
+
+        apply_pending_prefix_rewrite(&control, &mut messages, &mut usage, &mut compaction);
+        let response_checkpoint = Some(ResponseCheckpoint::for_messages("resp-1", &messages));
+        control.set_stable_report(&messages, &usage, &compaction, response_checkpoint.clone());
+
+        assert_eq!(control.stable_prefix_snapshot(), replacement_prefix);
+        let stable_report = control
+            .stable_report_snapshot()
+            .expect("stable report should be recorded");
+        assert_eq!(stable_report.messages, messages);
+        assert_eq!(stable_report.response_checkpoint, response_checkpoint);
     }
 }
 

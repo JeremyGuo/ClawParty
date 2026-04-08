@@ -10,6 +10,8 @@ use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
 use std::net::TcpStream;
+use std::thread::sleep;
+use std::time::Duration;
 use tungstenite::WebSocket;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::{HeaderName, HeaderValue};
@@ -19,6 +21,8 @@ use url::Url;
 use uuid::Uuid;
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
+const DEFAULT_STREAM_RECONNECT_ATTEMPTS: u32 = 5;
+const INITIAL_STREAM_RETRY_DELAY_MS: u64 = 200;
 
 pub(super) struct CodexSubscriptionProvider;
 
@@ -62,17 +66,24 @@ impl UpstreamProvider for CodexSubscriptionProvider {
 
         let response = match session {
             Some(ChatCompletionSession::CodexSubscription(session)) => {
-                send_response_create(&mut session.socket, payload)?
-            }
-            None => {
-                let auth = load_codex_auth(upstream)?;
-                match send_responses_websocket_request(upstream, payload.clone(), auth.as_ref()) {
+                match send_response_create(&mut session.socket, payload.clone()) {
                     Ok(response) => response,
-                    Err(error) => {
-                        retry_after_auth_failure(upstream, payload, auth.as_ref(), error)?
+                    Err(error) if should_recover_codex_websocket_error(&error) => {
+                        let (response, socket) = send_responses_websocket_request_with_retries(
+                            upstream, payload,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "existing codex websocket session could not be recovered: {error:#}"
+                            )
+                        })?;
+                        session.socket = socket;
+                        response
                     }
+                    Err(error) => return Err(error),
                 }
             }
+            None => send_responses_websocket_request_with_retries(upstream, payload)?.0,
         };
 
         let usage = crate::llm::parse_usage(&response);
@@ -125,7 +136,7 @@ fn retry_after_auth_failure(
     payload: Map<String, Value>,
     auth: Option<&crate::config::CodexAuthConfig>,
     original_error: anyhow::Error,
-) -> Result<Value> {
+) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
     if !is_probable_auth_error(&original_error) {
         return Err(original_error);
     }
@@ -167,13 +178,74 @@ fn is_probable_auth_error(error: &anyhow::Error) -> bool {
         || text.contains("authentication")
 }
 
+fn should_recover_codex_websocket_error(error: &anyhow::Error) -> bool {
+    is_probable_auth_error(error) || is_probable_retryable_websocket_error(error)
+}
+
+fn is_probable_retryable_websocket_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("websocket_connection_limit_reached")
+        || text.contains("responses websocket connection limit reached")
+        || text.contains("failed to establish codex websocket")
+        || text.contains("failed to send codex websocket request")
+        || text.contains("failed to read codex websocket event")
+        || text.contains("failed to send codex websocket pong")
+        || text.contains("codex websocket closed before response.completed")
+        || text.contains("broken pipe")
+        || text.contains("connection reset")
+        || text.contains("unexpected eof")
+        || text.contains("tls handshake eof")
+        || text.contains("already closed")
+        || text.contains("connection closed")
+}
+
+fn stream_retry_backoff(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(20);
+    Duration::from_millis(INITIAL_STREAM_RETRY_DELAY_MS.saturating_mul(1_u64 << exponent))
+}
+
 fn send_responses_websocket_request(
     upstream: &UpstreamConfig,
     payload: Map<String, Value>,
     auth: Option<&crate::config::CodexAuthConfig>,
-) -> Result<Value> {
+) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
     let mut socket = connect_codex_websocket(upstream, auth)?;
-    send_response_create(&mut socket, payload)
+    let response = send_response_create(&mut socket, payload)?;
+    Ok((response, socket))
+}
+
+fn send_responses_websocket_request_once(
+    upstream: &UpstreamConfig,
+    payload: Map<String, Value>,
+) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+    let auth = load_codex_auth(upstream)?;
+    match send_responses_websocket_request(upstream, payload.clone(), auth.as_ref()) {
+        Ok(response) => Ok(response),
+        Err(error) => retry_after_auth_failure(upstream, payload, auth.as_ref(), error),
+    }
+}
+
+fn send_responses_websocket_request_with_retries(
+    upstream: &UpstreamConfig,
+    payload: Map<String, Value>,
+) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+    let mut last_error = None;
+
+    for attempt in 0..=DEFAULT_STREAM_RECONNECT_ATTEMPTS {
+        if attempt > 0 {
+            sleep(stream_retry_backoff(attempt));
+        }
+
+        match send_responses_websocket_request_once(upstream, payload.clone()) {
+            Ok(response) => return Ok(response),
+            Err(error) if is_probable_retryable_websocket_error(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("codex websocket retries exhausted")))
 }
 
 fn establish_codex_websocket(
@@ -457,13 +529,16 @@ pub(crate) fn codex_reasoning_payload(
 mod tests {
     use super::{
         WebsocketResponseAccumulator, build_responses_request_payload,
-        merge_streamed_response_output,
+        is_probable_retryable_websocket_error, merge_streamed_response_output,
+        stream_retry_backoff,
     };
     use crate::config::{
         AuthCredentialsStoreMode, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
     };
     use crate::tooling::Tool;
+    use anyhow::anyhow;
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     fn test_upstream() -> UpstreamConfig {
         UpstreamConfig {
@@ -602,5 +677,29 @@ mod tests {
         assert!(payload.get("tools").is_some());
         assert_eq!(payload["parallel_tool_calls"], Value::Bool(true));
         assert_eq!(payload["tool_choice"], Value::String("auto".to_string()));
+    }
+
+    #[test]
+    fn retryable_websocket_error_detection_matches_disconnect_signals() {
+        assert!(is_probable_retryable_websocket_error(&anyhow!(
+            "failed to send codex websocket pong: Broken pipe (os error 32)"
+        )));
+        assert!(is_probable_retryable_websocket_error(&anyhow!(
+            "codex websocket closed before response.completed: connection closed"
+        )));
+        assert!(is_probable_retryable_websocket_error(&anyhow!(
+            "codex websocket request failed: websocket_connection_limit_reached"
+        )));
+        assert!(!is_probable_retryable_websocket_error(&anyhow!(
+            "codex websocket request failed: invalid schema"
+        )));
+    }
+
+    #[test]
+    fn stream_retry_backoff_doubles_from_two_hundred_milliseconds() {
+        assert_eq!(stream_retry_backoff(1), Duration::from_millis(200));
+        assert_eq!(stream_retry_backoff(2), Duration::from_millis(400));
+        assert_eq!(stream_retry_backoff(3), Duration::from_millis(800));
+        assert_eq!(stream_retry_backoff(4), Duration::from_millis(1600));
     }
 }

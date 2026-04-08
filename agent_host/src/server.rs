@@ -231,6 +231,13 @@ enum ForegroundTurnOutcome {
     },
 }
 
+fn latest_checkpoint_or_stable_report(
+    latest_checkpoint: Option<SessionRunReport>,
+    control: &SessionExecutionControl,
+) -> Option<SessionRunReport> {
+    latest_checkpoint.or_else(|| control.stable_report_snapshot())
+}
+
 impl Drop for SubAgentSlot {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
@@ -2599,6 +2606,7 @@ impl ServerRuntime {
             update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
+        let stable_report_control = execution_control.clone();
         if let Some(observer) = control_observer {
             if let Ok(mut phases) = self.active_foreground_phases.lock() {
                 phases.insert(
@@ -2695,7 +2703,10 @@ impl ServerRuntime {
                         Ok(report) => report,
                         Err(error) => {
                             return Ok(TimedRunOutcome::Failed {
-                                checkpoint: latest_checkpoint,
+                                checkpoint: latest_checkpoint_or_stable_report(
+                                    latest_checkpoint,
+                                    &stable_report_control,
+                                ),
                                 error,
                             });
                         }
@@ -2744,6 +2755,7 @@ impl ServerRuntime {
             update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
+        let stable_report_control = execution_control.clone();
         if let Some(observer) = control_observer {
             if let Ok(mut phases) = self.active_foreground_phases.lock() {
                 phases.insert(
@@ -2870,7 +2882,10 @@ impl ServerRuntime {
                         Ok(report) => report,
                         Err(error) => {
                             return Ok(TimedRunOutcome::Failed {
-                                checkpoint: latest_checkpoint,
+                                checkpoint: latest_checkpoint_or_stable_report(
+                                    latest_checkpoint,
+                                    &stable_report_control,
+                                ),
                                 error,
                             });
                         }
@@ -2901,7 +2916,10 @@ impl ServerRuntime {
                     let timeout_seconds = timeout_seconds.expect("hard deadline exists");
                     cancellation_handle.request_cancel();
                     return Ok(TimedRunOutcome::TimedOut {
-                        checkpoint: latest_checkpoint,
+                        checkpoint: latest_checkpoint_or_stable_report(
+                            latest_checkpoint,
+                            &stable_report_control,
+                        ),
                         error: anyhow!(
                             "{} hard timed out after {:.1} seconds",
                             timeout_label,

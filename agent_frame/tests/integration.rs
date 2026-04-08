@@ -562,6 +562,65 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
 }
 
 #[test]
+fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let starter = build_tool_registry(
+        &["exec_start".to_string()],
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let started = execute_tool_call(
+        &starter,
+        "exec_start",
+        Some(r#"{"command":"read line; printf 'got:%s\n' \"$line\"","include_stdout":false}"#),
+    );
+    let started_json: Value = serde_json::from_str(&started)?;
+    let exec_id = started_json["exec_id"].as_str().unwrap();
+
+    let waiter = build_tool_registry(
+        &["exec_wait".to_string()],
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+    )?;
+    let waited = execute_tool_call(
+        &waiter,
+        "exec_wait",
+        Some(&format!(
+            r#"{{"exec_id":"{}","input":"hello\n","wait_timeout_seconds":5.0}}"#,
+            exec_id
+        )),
+    );
+    let waited_json: Value = serde_json::from_str(&waited)?;
+    assert_eq!(waited_json["completed"], json!(true));
+    assert_eq!(waited_json["returncode"], json!(0));
+    assert!(
+        waited_json["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("got:hello")
+    );
+    Ok(())
+}
+
+#[test]
 fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let skill_root = temp_dir.path().join("skills");
