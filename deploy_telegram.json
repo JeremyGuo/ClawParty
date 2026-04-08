@@ -2,7 +2,8 @@
   "agent": {
     "agent_frame": {
       "available_models": [
-        "gpt54"
+        "gpt54",
+        "opus-4.6"
       ]
     },
     "zgent": {
@@ -28,7 +29,7 @@
     "enable_context_compression": true,
     "global_install_root": "/opt",
     "idle_compaction": {
-      "enabled": false,
+      "enabled": true,
       "min_ratio": 0.5,
       "poll_interval_seconds": 15
     },
@@ -77,8 +78,10 @@
       "type": "codex-subscription"
     },
     "opus-4.6": {
+      "agent_model_enabled": true,
       "api_endpoint": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
+      "auth_credentials_store_mode": "auto",
       "capabilities": [
         "chat",
         "image_in"
@@ -86,6 +89,7 @@
       "context_window_tokens": 262144,
       "description": "Claude Opus 4.6 via OpenRouter using the native ZGent backend.",
       "model": "anthropic/claude-opus-4.6",
+      "supports_vision_input": false,
       "timeout_seconds": 300.0,
       "type": "openrouter"
     },

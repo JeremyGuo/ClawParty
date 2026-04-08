@@ -1,6 +1,16 @@
+version: 0.9.3
 ---
-version: 0.9.2
----
+
+# 0.9.3
+
+- 收紧中途追问进度时的默认前台 agent 行为：
+  system prompt 现在明确把“进度如何”“还在跑吗”这类消息视为状态查询而不是默认停止信号，要求优先用 `user_tell` 发短进度并继续当前任务，只有在用户明确要求停止、改向或立即给最终答复时才中断执行。
+- 扩大 bubblewrap 沙盒里的默认可写安装根：
+  `main_agent.global_install_root` 现在会在进入 bubblewrap 前自动确保目录存在，并以可写 bind mount 暴露给沙盒内进程，方便把全局安装型依赖统一落在配置指定的位置。
+- 更新默认 Telegram 部署模板：
+  `deploy_telegram.json` 现在默认把 `opus-4.6` 纳入 `agent_frame.available_models`，开启 idle compaction，并补齐该模型在模板中的若干显式字段，减少部署后手工微调。
+- 明确本次不影响 `config` 与 `workdir` schema：
+  没有新增 config loader，也没有新增 workdir upgrade step；按版本策略将仓库版本从 `0.9.2` 提升到 `0.9.3`。
 
 # 0.9.2
 

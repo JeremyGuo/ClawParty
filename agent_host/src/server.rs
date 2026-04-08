@@ -2362,6 +2362,7 @@ impl ServerRuntime {
                 prompt,
                 config,
                 backend_execution_options,
+                PathBuf::from(&self.main_agent.global_install_root),
                 self.agent_workspace.rundir.join("skill_memory"),
                 self.agent_workspace.skills_dir.clone(),
                 extra_tools,

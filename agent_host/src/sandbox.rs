@@ -217,6 +217,7 @@ pub fn run_turn_in_child_process(
     prompt: String,
     config: agent_frame::config::AgentConfig,
     execution_options: BackendExecutionOptions,
+    global_install_root: PathBuf,
     skill_memory_source: PathBuf,
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
@@ -237,6 +238,7 @@ pub fn run_turn_in_child_process(
             &current_exe,
             &config.workspace_root,
             &config.runtime_state_root,
+            &global_install_root,
             &config.workspace_root.join(".skill_memory"),
             &skill_memory_source,
             &skills_source_root,
@@ -444,6 +446,7 @@ fn build_bubblewrap_command(
     current_exe: &Path,
     workspace_root: &Path,
     runtime_state_root: &Path,
+    global_install_root: &Path,
     skill_memory_target: &Path,
     skill_memory_source: &Path,
     skills_source_root: &Path,
@@ -497,6 +500,15 @@ fn build_bubblewrap_command(
     }
     bind_path(&mut command, workspace_root, false)?;
     bind_path(&mut command, runtime_state_root, false)?;
+    if !global_install_root.as_os_str().is_empty() {
+        fs::create_dir_all(global_install_root).with_context(|| {
+            format!(
+                "failed to prepare global install root {}",
+                global_install_root.display()
+            )
+        })?;
+        bind_path(&mut command, global_install_root, false)?;
+    }
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
@@ -612,4 +624,108 @@ fn bind_path_to(
         command.args(["--bind", source_str, target_str]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_bubblewrap_command;
+    use crate::config::{SandboxConfig, SandboxMode};
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[test]
+    fn bubblewrap_mounts_global_install_root_as_writable_bind() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let global_install_root = temp_dir.path().join("global");
+        let skill_memory_source = temp_dir.path().join("skill_memory");
+        let skills_source_root = temp_dir.path().join("skills-source");
+        let workspace_skills_dir = workspace_root.join(".skills");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&skill_memory_source).unwrap();
+        fs::create_dir_all(&skills_source_root).unwrap();
+        fs::create_dir_all(&workspace_skills_dir).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &global_install_root,
+            &workspace_root.join(".skill_memory"),
+            &skill_memory_source,
+            &skills_source_root,
+            &[workspace_skills_dir],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let expected = vec![
+            "--bind".to_string(),
+            global_install_root.to_string_lossy().into_owned(),
+            global_install_root.to_string_lossy().into_owned(),
+        ];
+        assert!(
+            args.windows(expected.len())
+                .any(|window| window == expected),
+            "bubblewrap args did not include writable global_install_root bind: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn bubblewrap_creates_and_mounts_missing_global_install_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let missing_global_install_root = temp_dir.path().join("missing-global");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &missing_global_install_root,
+            &workspace_root.join(".skill_memory"),
+            &temp_dir.path().join("skill_memory"),
+            &temp_dir.path().join("skills-source"),
+            &[PathBuf::from("/tmp/unused-skills-dir")],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(missing_global_install_root.is_dir());
+        assert!(
+            args.iter()
+                .any(|arg| arg == &missing_global_install_root.to_string_lossy()),
+            "bubblewrap args did not reference created global_install_root: {:?}",
+            args
+        );
+    }
 }
