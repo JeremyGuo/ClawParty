@@ -186,6 +186,13 @@ fn select_image_generation_routing(
     }
 }
 
+fn infer_single_agent_backend(agent: &AgentConfig, model_key: &str) -> Option<AgentBackendKind> {
+    match agent.backends_for_model(model_key).as_slice() {
+        [backend] => Some(*backend),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 struct ServerRuntime {
     agent_workspace: AgentWorkspace,
@@ -324,12 +331,7 @@ impl ServerRuntime {
     }
 
     fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
-        let backends = self.agent.backends_for_model(model_key);
-        if backends.len() == 1 {
-            Some(backends[0])
-        } else {
-            None
-        }
+        infer_single_agent_backend(&self.agent, model_key)
     }
 
     fn selected_agent_backend(&self) -> Option<AgentBackendKind> {
@@ -6887,8 +6889,7 @@ impl Server {
     }
 
     fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
-        let backends = self.agent.backends_for_model(model_key);
-        (backends.len() == 1).then_some(backends[0])
+        infer_single_agent_backend(&self.agent, model_key)
     }
 
     fn selected_agent_backend(&self, address: &ChannelAddress) -> Result<Option<AgentBackendKind>> {
@@ -7426,9 +7427,9 @@ mod tests {
         build_previous_messages_for_turn_with_prompt, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
-        fast_path_agent_selection_message, format_session_status, is_timeout_like,
-        memory_search_files, normalize_messages_for_persistence, parse_agent_command,
-        parse_model_command, parse_oldspace_command, parse_sandbox_command,
+        fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
+        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
+        parse_agent_command, parse_model_command, parse_oldspace_command, parse_sandbox_command,
         parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
         parse_snap_load_command, parse_snap_save_command, parse_think_command,
         persist_compaction_artifacts, rebuild_canonical_system_prompt,
@@ -8930,6 +8931,42 @@ mod tests {
             snapshot.settings.agent_backend,
             Some(AgentBackendKind::AgentFrame)
         );
+    }
+
+    #[test]
+    fn infer_single_agent_backend_returns_none_when_model_has_no_backend() {
+        let agent = AgentConfig::default();
+
+        assert_eq!(infer_single_agent_backend(&agent, "missing-model"), None);
+    }
+
+    #[test]
+    fn infer_single_agent_backend_returns_backend_when_model_is_unique() {
+        let agent = AgentConfig {
+            agent_frame: AgentBackendConfig {
+                available_models: vec!["gpt54".to_string()],
+            },
+            zgent: AgentBackendConfig::default(),
+        };
+
+        assert_eq!(
+            infer_single_agent_backend(&agent, "gpt54"),
+            Some(AgentBackendKind::AgentFrame)
+        );
+    }
+
+    #[test]
+    fn infer_single_agent_backend_returns_none_when_model_has_multiple_backends() {
+        let agent = AgentConfig {
+            agent_frame: AgentBackendConfig {
+                available_models: vec!["gpt54".to_string()],
+            },
+            zgent: AgentBackendConfig {
+                available_models: vec!["gpt54".to_string()],
+            },
+        };
+
+        assert_eq!(infer_single_agent_backend(&agent, "gpt54"), None);
     }
 
     #[test]

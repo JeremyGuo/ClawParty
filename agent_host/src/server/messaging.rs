@@ -244,10 +244,10 @@ pub(super) fn fast_path_agent_selection_message(
         .get_snapshot(&message.address)
         .map(|snapshot| snapshot.settings)
         .unwrap_or_default();
-    let inferred_backend = settings.main_model.as_deref().and_then(|model_key| {
-        let backends = agent.backends_for_model(model_key);
-        (backends.len() == 1).then_some(backends[0])
-    });
+    let inferred_backend = settings
+        .main_model
+        .as_deref()
+        .and_then(|model_key| infer_single_agent_backend(agent, model_key));
     let effective_backend = settings.agent_backend.or(inferred_backend);
     if settings.agent_backend.is_none()
         && settings.main_model.is_some()
