@@ -43,7 +43,7 @@
       ],
       "api_key_env": "OPENAI_API_KEY",
       "chat_completions_path": "/responses",
-      "codex_home": "/home/jeremyguo/.codex",
+      "codex_home": "~/.codex",
       "auth_credentials_store_mode": "auto",
       "timeout_seconds": 300.0,
       "context_window_tokens": 262144,
