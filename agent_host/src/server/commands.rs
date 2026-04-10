@@ -42,16 +42,6 @@ pub(super) fn format_api_timeout_update(
     ))
 }
 
-pub(super) fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix("/oldspace")?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
-}
-
 pub(super) fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
     let text = normalized_command_text(text?)?;
     let suffix = text.strip_prefix("/set_api_timeout")?.trim();
@@ -204,7 +194,6 @@ pub(super) fn command_starts_with(text: &str, command: &str) -> bool {
 
 pub(super) fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
     match mode {
-        SandboxMode::Disabled => "disabled",
         SandboxMode::Subprocess => "subprocess",
         SandboxMode::Bubblewrap => "bubblewrap",
     }
@@ -216,7 +205,7 @@ pub(super) fn sandbox_mode_value(mode: SandboxMode) -> &'static str {
 
 pub(super) fn parse_sandbox_mode_value(value: &str) -> Option<SandboxMode> {
     match value.trim() {
-        "disabled" => Some(SandboxMode::Disabled),
+        "disabled" => Some(SandboxMode::Subprocess),
         "subprocess" => Some(SandboxMode::Subprocess),
         "bubblewrap" => Some(SandboxMode::Bubblewrap),
         _ => None,

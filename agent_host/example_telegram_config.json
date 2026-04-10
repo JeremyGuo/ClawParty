@@ -1,5 +1,5 @@
 {
-  "version": "0.12",
+  "version": "0.13",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -62,10 +62,6 @@
       "poll_timeout_seconds": 30,
       "poll_interval_ms": 250,
       "commands": [
-        {
-          "command": "new",
-          "description": "Start a new session"
-        },
         {
           "command": "help",
           "description": "Show available commands"

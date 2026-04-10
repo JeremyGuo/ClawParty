@@ -6,9 +6,10 @@ use agent_frame::tooling::{
     build_tool_registry, execute_tool_call, terminate_all_managed_processes,
 };
 use agent_frame::{
-    ExternalWebSearchConfig, NativeWebSearchConfig, SessionEvent, SessionExecutionControl,
-    UpstreamConfig, compact_session_messages_with_report, extract_assistant_text,
-    load_config_value, run_session, run_session_with_report, run_session_with_report_controlled,
+    AgentConfig, ExternalWebSearchConfig, NativeWebSearchConfig, SessionEvent,
+    SessionExecutionControl, SessionState, Tool, UpstreamConfig,
+    compact_session_messages_with_report, extract_assistant_text, load_config_value, run_session,
+    run_session_state, run_session_state_controlled,
 };
 use anyhow::Result;
 use assert_cmd::Command;
@@ -117,6 +118,53 @@ impl Drop for TestServer {
             let _ = handle.join();
         }
     }
+}
+
+fn run_session_state_until_end(
+    previous_messages: Vec<ChatMessage>,
+    prompt: impl Into<String>,
+    config: AgentConfig,
+    extra_tools: Vec<Tool>,
+    control: Option<SessionExecutionControl>,
+) -> Result<SessionState> {
+    let mut state = run_session_state_controlled(
+        previous_messages,
+        prompt,
+        config.clone(),
+        extra_tools.clone(),
+        control.clone(),
+    )?;
+    let mut usage = state.usage.clone();
+    let mut compaction = state.compaction.clone();
+    for _ in 0..16 {
+        if state.phase != agent_frame::SessionPhase::Yielded || state.errno.is_some() {
+            state.usage = usage;
+            state.compaction = compaction;
+            return Ok(state);
+        }
+        state = run_session_state_controlled(
+            state.messages.clone(),
+            "",
+            config.clone(),
+            extra_tools.clone(),
+            control.clone(),
+        )?;
+        usage.add_assign(&state.usage);
+        compaction.run_count = compaction
+            .run_count
+            .saturating_add(state.compaction.run_count);
+        compaction.compacted_run_count = compaction
+            .compacted_run_count
+            .saturating_add(state.compaction.compacted_run_count);
+        compaction.estimated_tokens_before = compaction
+            .estimated_tokens_before
+            .saturating_add(state.compaction.estimated_tokens_before);
+        compaction.estimated_tokens_after = compaction
+            .estimated_tokens_after
+            .saturating_add(state.compaction.estimated_tokens_after);
+        compaction.usage.add_assign(&state.compaction.usage);
+    }
+    anyhow::bail!("session did not reach End after auto-resume attempts")
 }
 
 fn handle_stream(
@@ -911,7 +959,14 @@ fn run_session_with_extra_tool() -> Result<()> {
         ".",
     )?;
 
-    let messages = run_session(Vec::new(), "What is 6 times 7?", config, vec![multiply])?;
+    let messages = run_session_state_until_end(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        None,
+    )?
+    .messages;
     assert_eq!(extract_assistant_text(&messages), "42");
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
@@ -1115,7 +1170,7 @@ fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
         ".",
     )?;
 
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_until_end(
         vec![
             ChatMessage::text("user", "old question"),
             ChatMessage::text("assistant", "old answer"),
@@ -1300,7 +1355,7 @@ fn upstream_cache_control_and_reasoning_are_forwarded() -> Result<()> {
 }
 
 #[test]
-fn run_session_report_aggregates_usage_across_tool_roundtrips() -> Result<()> {
+fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let server = TestServer::start();
     server.push_response(json!({
@@ -1361,7 +1416,13 @@ fn run_session_report_aggregates_usage_across_tool_roundtrips() -> Result<()> {
         temp_dir.path(),
     )?;
 
-    let report = run_session_with_report(Vec::new(), "What is 6 times 7?", config, vec![multiply])?;
+    let report = run_session_state_until_end(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        None,
+    )?;
     assert_eq!(extract_assistant_text(&report.messages), "42");
     assert_eq!(report.usage.llm_calls, 2);
     assert_eq!(report.usage.prompt_tokens, 24);
@@ -1371,6 +1432,52 @@ fn run_session_report_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     assert_eq!(report.usage.cache_hit_tokens, 12);
     assert_eq!(report.usage.cache_write_tokens, 2);
     assert_eq!(report.usage.cache_miss_tokens, 12);
+    Ok(())
+}
+
+#[test]
+fn empty_final_assistant_response_yields_api_failure_state() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12
+        }
+    }));
+    let temp_dir = TempDir::new()?;
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {
+                "base_url": server.address,
+                "model": "demo-model"
+            },
+            "workspace_root": temp_dir.path()
+        }),
+        temp_dir.path(),
+    )?;
+
+    let state = run_session_state(Vec::new(), "Look again", config, Vec::new())?;
+
+    assert_eq!(state.phase, agent_frame::SessionPhase::Yielded);
+    assert_eq!(state.errno, Some(agent_frame::SessionErrno::ApiFailure));
+    assert!(
+        state
+            .errinfo
+            .as_deref()
+            .is_some_and(|text| text.contains("empty final assistant"))
+    );
+    assert_eq!(
+        state.messages.last().map(|message| message.role.as_str()),
+        Some("user")
+    );
+    assert_eq!(state.usage.completion_tokens, 2);
     Ok(())
 }
 
@@ -1415,15 +1522,10 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
         ".",
     )?;
 
-    let checkpoints = Arc::new(Mutex::new(Vec::new()));
     let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
     let control = {
-        let checkpoints = Arc::clone(&checkpoints);
         let control_holder = Arc::clone(&control_holder);
-        SessionExecutionControl::with_checkpoint_callback(move |report| {
-            checkpoints.lock().unwrap().push(report);
-        })
-        .with_event_callback(move |event| {
+        SessionExecutionControl::new().with_event_callback(move |event| {
             if matches!(event, SessionEvent::ToolCallStarted { .. })
                 && let Some(control) = control_holder.lock().unwrap().as_ref()
             {
@@ -1433,17 +1535,22 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
     };
     *control_holder.lock().unwrap() = Some(control.clone());
 
-    let error = run_session_with_report_controlled(
+    let report = run_session_state_controlled(
         Vec::new(),
         "What is 6 times 7?",
         config,
         vec![multiply],
         Some(control),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("cancelled"));
-    let checkpoints = checkpoints.lock().unwrap();
-    assert_eq!(checkpoints.len(), 0);
+    )?;
+    assert_eq!(report.phase, agent_frame::SessionPhase::Yielded);
+    assert_eq!(
+        report
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -1509,7 +1616,7 @@ fn controlled_run_emits_process_events() -> Result<()> {
         })
     };
 
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "What is 6 times 7?",
         config,
@@ -1591,15 +1698,9 @@ fn controlled_run_does_not_emit_checkpoint_for_assistant_messages_with_tool_call
         ".",
     )?;
 
-    let checkpoints = Arc::new(Mutex::new(Vec::new()));
-    let control = {
-        let checkpoints = Arc::clone(&checkpoints);
-        SessionExecutionControl::with_checkpoint_callback(move |report| {
-            checkpoints.lock().unwrap().push(report);
-        })
-    };
+    let control = SessionExecutionControl::new();
 
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "What is 6 times 7?",
         config,
@@ -1607,12 +1708,6 @@ fn controlled_run_does_not_emit_checkpoint_for_assistant_messages_with_tool_call
         Some(control),
     )?;
     assert_eq!(extract_assistant_text(&report.messages), "final answer");
-    let checkpoints = checkpoints.lock().unwrap();
-    assert_eq!(checkpoints.len(), 1);
-    assert_eq!(
-        extract_assistant_text(&checkpoints[0].messages),
-        "final answer"
-    );
     Ok(())
 }
 
@@ -1689,7 +1784,7 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
     )?;
 
     let started = std::time::Instant::now();
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "Run both tools.",
         config,
@@ -1801,7 +1896,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
     };
     *control_holder.lock().unwrap() = Some(control.clone());
 
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "Check the environment",
         config,
@@ -1902,14 +1997,14 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
     };
     *control_holder.lock().unwrap() = Some(control.clone());
 
-    let report = run_session_with_report_controlled(
+    let report = run_session_state_controlled(
         Vec::new(),
         "Check the environment",
         config,
         Vec::new(),
         Some(control),
     )?;
-    assert!(report.yielded);
+    assert!(report.phase == agent_frame::SessionPhase::Yielded);
     let tool_messages = report
         .messages
         .iter()

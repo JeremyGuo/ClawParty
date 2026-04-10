@@ -15,6 +15,7 @@ mod v0_1;
 mod v0_10;
 mod v0_11;
 mod v0_12;
+mod v0_13;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -25,7 +26,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.12";
+pub const LATEST_CONFIG_VERSION: &str = "0.13";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -36,6 +37,7 @@ pub const VERSION_0_8: &str = "0.8";
 pub const VERSION_0_9: &str = "0.9";
 pub const VERSION_0_10: &str = "0.10";
 pub const VERSION_0_11: &str = "0.11";
+pub const VERSION_0_12: &str = "0.12";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -492,7 +494,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     #[default]
-    Disabled,
+    #[serde(alias = "disabled")]
     Subprocess,
     Bubblewrap,
 }
@@ -714,10 +716,6 @@ fn default_poll_interval_ms() -> u64 {
 pub fn default_bot_commands() -> Vec<BotCommandConfig> {
     vec![
         BotCommandConfig {
-            command: "oldspace".to_string(),
-            description: "Reactivate an older workspace by id".to_string(),
-        },
-        BotCommandConfig {
             command: "help".to_string(),
             description: "Show available commands".to_string(),
         },
@@ -824,7 +822,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 12] = [
+    let loaders: [&dyn ConfigLoader; 13] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -837,6 +835,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_10::LatestConfigLoader,
         &v0_11::LatestConfigLoader,
         &v0_12::LatestConfigLoader,
+        &v0_13::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -938,7 +937,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 12] = [
+        let loaders: [&dyn ConfigLoader; 13] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -951,6 +950,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_10::LatestConfigLoader,
             &v0_11::LatestConfigLoader,
             &v0_12::LatestConfigLoader,
+            &v0_13::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -1414,7 +1414,7 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType,
+        ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType, SandboxMode,
         default_dingtalk_commands, default_telegram_commands, expand_home_path,
         load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
@@ -1505,6 +1505,16 @@ mod tests {
     #[test]
     fn dingtalk_commands_default_to_builtin_list() {
         assert_eq!(default_dingtalk_commands(), super::default_bot_commands());
+    }
+
+    #[test]
+    fn default_bot_commands_omit_retired_session_commands() {
+        let commands = super::default_bot_commands()
+            .into_iter()
+            .map(|command| command.command)
+            .collect::<Vec<_>>();
+        assert!(!commands.iter().any(|command| command == "new"));
+        assert!(!commands.iter().any(|command| command == "oldspace"));
     }
 
     #[test]
@@ -1827,6 +1837,55 @@ mod tests {
         assert_eq!(config.version, LATEST_CONFIG_VERSION);
         assert_eq!(config.chat_model_keys, vec!["main".to_string()]);
         assert_eq!(config.models["main"].model_type, ModelType::Openrouter);
+    }
+
+    #[test]
+    fn legacy_disabled_sandbox_mode_loads_as_subprocess() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.12",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://openrouter.ai/api/v1",
+                  "model": "anthropic/claude-sonnet-4.6",
+                  "capabilities": ["chat"],
+                  "description": "demo"
+                }
+              },
+              "agent": {
+                "agent_frame": {
+                  "available_models": ["main"]
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "sandbox": {
+                "mode": "disabled"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert_eq!(config.sandbox.mode, SandboxMode::Subprocess);
+        let rewritten = fs::read_to_string(&config_path).unwrap();
+        assert!(rewritten.contains(r#""mode": "subprocess""#));
+        assert!(!rewritten.contains(r#""mode": "disabled""#));
     }
 
     #[test]
@@ -2322,7 +2381,7 @@ mod tests {
         assert!(config.main_agent.time_awareness.emit_idle_time_gap_hint);
 
         let written = fs::read_to_string(&config_path).unwrap();
-        assert!(written.contains("\"version\": \"0.12\""));
+        assert!(written.contains(&format!("\"version\": \"{LATEST_CONFIG_VERSION}\"")));
         assert!(written.contains("\"time_awareness\""));
     }
 

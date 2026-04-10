@@ -293,8 +293,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             workspace_root: PathBuf::from("/tmp/work/workspaces/workspace-1/files"),
             message_count: 0,
-            agent_message_count: 0,
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -309,10 +307,9 @@ mod tests {
             seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+            session_state: crate::session::DurableSessionState::default(),
         };
         let model = ModelConfig {
             model_type: crate::config::ModelType::Openrouter,
@@ -406,9 +403,13 @@ mod tests {
         assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
         assert!(prompt.contains("If a user message starts with [Queued User Updates]"));
         assert!(prompt.contains("you MUST call user_tell first"));
-        assert!(prompt.contains("Silent continuation after an interrupted follow-up is a failure."));
+        assert!(
+            prompt.contains("Silent continuation after an interrupted follow-up is a failure.")
+        );
         assert!(prompt.contains("Choose between subagent and background agent based on who owns the final user-facing result."));
-        assert!(prompt.contains("Do not use a background agent as an internal helper for your current turn."));
+        assert!(prompt.contains(
+            "Do not use a background agent as an internal helper for your current turn."
+        ));
         assert!(prompt.contains("Positive examples: use a subagent to polish a draft that you will review before replying"));
         assert!(prompt.contains("Negative examples: do not start a background agent just to draft text that you will personally integrate"));
         assert!(prompt.contains("shared_profile_upload"));
@@ -468,8 +469,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             workspace_root: temp_dir.path().join("workspace"),
             message_count: 0,
-            agent_message_count: 0,
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -484,10 +483,9 @@ mod tests {
             seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+            session_state: crate::session::DurableSessionState::default(),
         };
         let model = ModelConfig {
             model_type: crate::config::ModelType::Openrouter,
@@ -608,8 +606,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             workspace_root: workspace_root.clone(),
             message_count: 0,
-            agent_message_count: 0,
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -624,10 +620,9 @@ mod tests {
             seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+            session_state: crate::session::DurableSessionState::default(),
         };
         let model = ModelConfig {
             model_type: crate::config::ModelType::Openrouter,

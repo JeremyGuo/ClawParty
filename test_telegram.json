@@ -151,14 +151,6 @@
           "description": "Reject a chat id for this channel"
         },
         {
-          "command": "new",
-          "description": "Start a new session"
-        },
-        {
-          "command": "oldspace",
-          "description": "Reactivate an older workspace by id"
-        },
-        {
           "command": "help",
           "description": "Show available commands"
         },

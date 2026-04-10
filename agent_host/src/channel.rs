@@ -103,6 +103,7 @@ pub struct IncomingMessage {
     pub address: ChannelAddress,
     pub text: Option<String>,
     pub attachments: Vec<PendingAttachment>,
+    pub stored_attachments: Vec<StoredAttachment>,
     pub control: Option<IncomingControl>,
 }
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.12",
+  "version": "0.13",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",
@@ -160,10 +160,6 @@
         {
           "command": "admin_chat_reject",
           "description": "Reject a chat id for this channel"
-        },
-        {
-          "command": "oldspace",
-          "description": "Reactivate an older workspace by id"
         },
         {
           "command": "help",

@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod config;
 pub mod llm;
 pub mod message;
+mod modality;
 pub mod skills;
 pub mod tool_worker;
 pub mod tooling;
@@ -11,10 +12,10 @@ pub mod tooling;
 pub use serde_json;
 
 pub use agent::{
-    ExecutionSignal, ResponseCheckpoint, SessionCompactionStats, SessionEvent,
-    SessionExecutionControl, SessionRunReport, compact_session_messages,
-    compact_session_messages_with_report, extract_assistant_text, run_session,
-    run_session_with_report, run_session_with_report_controlled,
+    ExecutionSignal, PersistentSessionRuntime, SessionCompactionStats, SessionErrno, SessionEvent,
+    SessionExecutionControl, SessionPhase, SessionState, compact_session_messages,
+    compact_session_messages_with_report, extract_assistant_text, run_session, run_session_state,
+    run_session_state_controlled, run_session_state_controlled_persistent,
 };
 pub use compaction::{
     ContextCompactionReport, StructuredCompactionMemoryHint, StructuredCompactionOutput,

@@ -1,6 +1,6 @@
 use crate::backend::{AgentBackendKind, BackendExecutionOptions};
 use agent_frame::config::AgentConfig as FrameAgentConfig;
-use agent_frame::{ChatMessage, SessionEvent, SessionRunReport};
+use agent_frame::{ChatMessage, SessionEvent, SessionState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,7 +12,7 @@ pub struct RemoteToolDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChildInitPayload {
+pub struct ChildTurnPayload {
     pub backend: AgentBackendKind,
     pub previous_messages: Vec<ChatMessage>,
     pub prompt: String,
@@ -25,7 +25,7 @@ pub struct ChildInitPayload {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ParentToChildMessage {
-    Init(ChildInitPayload),
+    RunTurn(ChildTurnPayload),
     ToolResponse {
         request_id: String,
         ok: bool,
@@ -35,6 +35,7 @@ pub enum ParentToChildMessage {
     SoftTimeout,
     Yield,
     Cancel,
+    Shutdown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,14 +43,12 @@ pub enum ParentToChildMessage {
 pub enum ChildToParentMessage {
     Started,
     SessionEvent(SessionEvent),
-    Checkpoint(SessionRunReport),
-    StableReport(SessionRunReport),
     ToolRequest {
         request_id: String,
         tool_name: String,
         arguments: Value,
     },
-    Completed(SessionRunReport),
+    Completed(SessionState),
     Failed {
         error: String,
     },

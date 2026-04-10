@@ -7,7 +7,8 @@ use agent_host::bootstrap::AgentWorkspace;
 use agent_host::channel::{LocalFileAttachmentSource, PendingAttachment};
 use agent_host::domain::{AttachmentKind, ChannelAddress};
 use agent_host::prompt::greeting_for_language;
-use agent_host::session::SessionManager;
+use agent_host::session::{SessionErrno, SessionManager, SessionPhase};
+use agent_host::upgrade::upgrade_workdir;
 use agent_host::workspace::WorkspaceManager;
 use chrono::Utc;
 use serde_json::json;
@@ -131,6 +132,7 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
             .record_agent_turn(
                 &address,
                 vec![ChatMessage::text("assistant", "persist me")],
+                &[],
                 &usage,
                 &SessionCompactionStats {
                     run_count: 1,
@@ -148,7 +150,6 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
                         cache_write_tokens: 0,
                     },
                 },
-                None,
             )
             .unwrap();
         manager.get_snapshot(&address).unwrap()
@@ -162,7 +163,7 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     assert_eq!(restored.workspace_id, original.workspace_id);
     assert_eq!(restored.workspace_root, original.workspace_root);
     assert_eq!(restored.message_count, 1);
-    assert_eq!(restored.agent_message_count, 1);
+    assert_eq!(restored.stable_message_count(), 1);
     assert_eq!(restored.turn_count, 1);
     assert_eq!(restored.api_timeout_override_seconds, Some(321.0));
     assert_eq!(restored.cumulative_usage.prompt_tokens, 123);
@@ -174,9 +175,13 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     assert_eq!(restored.cumulative_compaction.estimated_tokens_after, 600);
     assert!(restored.last_agent_returned_at.is_some());
     assert_eq!(
-        restored.agent_messages,
+        restored.stable_messages(),
         vec![ChatMessage::text("assistant", "persist me")]
     );
+    assert_eq!(restored.session_state.messages, restored.stable_messages());
+    assert!(restored.session_state.pending_messages.is_empty());
+    assert_eq!(restored.session_state.phase, SessionPhase::End);
+    assert_eq!(restored.session_state.errno, None);
 }
 
 #[test]
@@ -197,9 +202,9 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
             .record_agent_turn(
                 &address,
                 vec![ChatMessage::text("assistant", "before compact")],
+                &[],
                 &agent_frame::TokenUsage::default(),
                 &SessionCompactionStats::default(),
-                None,
             )
             .unwrap();
         manager
@@ -229,7 +234,7 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
     assert!(restored.last_agent_returned_at.is_some());
     assert!(restored.last_compacted_at.is_some());
     assert_eq!(
-        restored.agent_messages,
+        restored.stable_messages(),
         vec![ChatMessage::text(
             "assistant",
             "[AgentFrame Context Compression]\n\ncompressed",
@@ -332,6 +337,72 @@ fn session_manager_migrates_legacy_session_without_workspace_id() {
     let restored = restored.expect("legacy session should be restored");
     assert!(!restored.workspace_id.is_empty());
     assert!(restored.workspace_root.exists());
+    assert_eq!(
+        restored.session_state.messages,
+        vec![ChatMessage::text("assistant", "legacy")]
+    );
+    assert_eq!(restored.session_state.phase, SessionPhase::End);
     let persisted = std::fs::read_to_string(session_dir.join("session.json")).unwrap();
     assert!(persisted.contains("\"workspace_id\""));
+}
+
+#[test]
+fn legacy_pending_continue_is_migrated_into_runtime_failure_yielded_session_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let session_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let address = ChannelAddress {
+        channel_id: "telegram-main".to_string(),
+        conversation_id: "1717801091".to_string(),
+        user_id: Some("user-1".to_string()),
+        display_name: Some("Telegram User".to_string()),
+    };
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(session_id.to_string());
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("session.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": session_id,
+            "agent_id": agent_id,
+            "address": address,
+            "history": [],
+            "agent_messages": [{"role": "assistant", "content": "stale"}],
+            "pending_continue": {
+                "agent_backend": "agent_frame",
+                "model_key": "demo-model",
+                "resume_messages": [{"role": "assistant", "content": "resume-here"}],
+                "original_user_text": "hello",
+                "original_attachments": [],
+                "error_summary": "legacy failure",
+                "progress_summary": "progress",
+                "failed_at": Utc::now(),
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    std::fs::write(temp_dir.path().join("VERSION"), "0.14\n").unwrap();
+    upgrade_workdir(temp_dir.path()).unwrap();
+    let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+    let manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+    let restored = manager.get_snapshot(&address).expect("session should load");
+
+    assert_eq!(
+        restored.session_state.messages,
+        vec![ChatMessage::text("assistant", "resume-here")]
+    );
+    assert!(restored.session_state.pending_messages.is_empty());
+    assert_eq!(restored.session_state.phase, SessionPhase::Yielded);
+    assert_eq!(
+        restored.session_state.errno,
+        Some(SessionErrno::RuntimeFailure)
+    );
+    assert_eq!(
+        restored.session_state.errinfo.as_deref(),
+        Some("legacy failure")
+    );
 }

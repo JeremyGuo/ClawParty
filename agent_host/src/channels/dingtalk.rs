@@ -283,6 +283,7 @@ impl DingtalkChannel {
                     address: self.build_address(&payload),
                     text: extract_callback_text(&payload),
                     attachments: Vec::new(),
+                    stored_attachments: Vec::new(),
                     control: None,
                 };
                 sender

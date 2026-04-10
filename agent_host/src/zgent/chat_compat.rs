@@ -4,7 +4,7 @@ use agent_frame::message::ChatMessage;
 use agent_frame::message::{FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall};
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tooling::build_tool_registry_with_cancel;
-use agent_frame::{SessionExecutionControl, SessionRunReport, TokenUsage, Tool};
+use agent_frame::{SessionExecutionControl, SessionPhase, SessionState, TokenUsage, Tool};
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ pub(crate) fn run_zgent_session_with_report_controlled(
     config: FrameAgentConfig,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
-) -> Result<SessionRunReport> {
+) -> Result<SessionState> {
     let discovered_skills = discover_skills(&config.skills_dirs)?;
     let system_prompt = compose_zgent_system_prompt(&config, &discovered_skills);
     let mut messages = ensure_system_message(&previous_messages, &system_prompt);
@@ -191,12 +191,14 @@ pub(crate) fn run_zgent_session_with_report_controlled(
             _ => Vec::new(),
         };
         if tool_calls.is_empty() {
-            return Ok(SessionRunReport {
+            return Ok(SessionState {
                 messages,
+                pending_messages: Vec::new(),
+                phase: SessionPhase::End,
+                errno: None,
+                errinfo: None,
                 usage,
                 compaction: SessionCompactionStats::default(),
-                yielded: false,
-                response_checkpoint: None,
             });
         }
 

@@ -3,8 +3,11 @@ use crate::compaction::{
     maybe_compact_messages_with_report, maybe_compact_messages_with_report_with_session,
 };
 use crate::config::AgentConfig;
-use crate::llm::{TokenUsage, create_chat_completion, start_chat_completion_session};
+use crate::llm::{
+    ChatCompletionSession, TokenUsage, create_chat_completion, start_chat_completion_session,
+};
 use crate::message::ChatMessage;
+use crate::modality::materialize_messages_for_upstream;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
 use crate::tooling::{
     InterruptSignal, Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool,
@@ -107,45 +110,135 @@ pub fn extract_assistant_text(messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+fn assistant_message_has_content_or_tool_calls(message: &ChatMessage) -> bool {
+    if message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|tool_calls| !tool_calls.is_empty())
+    {
+        return true;
+    }
+    match &message.content {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => items.iter().any(|item| match item {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                Some("text" | "input_text" | "output_text") => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                _ => true,
+            },
+            Value::Null => false,
+            _ => true,
+        }),
+        Some(_) => true,
+    }
+}
+
 pub fn run_session(
     previous_messages: Vec<ChatMessage>,
     prompt: impl Into<String>,
     config: AgentConfig,
     extra_tools: Vec<Tool>,
 ) -> Result<Vec<ChatMessage>> {
-    Ok(run_session_with_report(previous_messages, prompt, config, extra_tools)?.messages)
+    Ok(run_session_state(previous_messages, prompt, config, extra_tools)?.messages)
 }
 
-fn prepare_responses_continuation_messages(
-    messages: &[ChatMessage],
-    checkpoint: &ResponseCheckpoint,
-) -> Option<Vec<ChatMessage>> {
-    if !checkpoint.matches_messages(messages) || messages.len() <= checkpoint.message_count {
-        return None;
+#[derive(Clone, Debug, PartialEq)]
+struct ResponseContinuation {
+    response_id: String,
+    anchor_messages: Vec<ChatMessage>,
+}
+
+impl ResponseContinuation {
+    fn for_messages(response_id: impl Into<String>, messages: &[ChatMessage]) -> Self {
+        Self {
+            response_id: response_id.into(),
+            anchor_messages: messages.to_vec(),
+        }
     }
 
-    let mut request_messages = messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .cloned()
-        .collect::<Vec<_>>();
-    request_messages.extend(
-        messages[checkpoint.message_count..]
-            .iter()
-            .filter(|message| message.role != "system")
-            .cloned(),
-    );
+    fn delta_request_messages(&self, messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
+        if !messages.starts_with(&self.anchor_messages)
+            || messages.len() <= self.anchor_messages.len()
+        {
+            return None;
+        }
 
-    (!request_messages.is_empty()).then_some(request_messages)
+        let mut request_messages = messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .cloned()
+            .collect::<Vec<_>>();
+        request_messages.extend(
+            messages[self.anchor_messages.len()..]
+                .iter()
+                .filter(|message| message.role != "system")
+                .cloned(),
+        );
+        (!request_messages.is_empty()).then_some(request_messages)
+    }
+
+    fn previous_response_payload(&self) -> serde_json::Map<String, Value> {
+        serde_json::Map::from_iter([(
+            "previous_response_id".to_string(),
+            Value::String(self.response_id.clone()),
+        )])
+    }
 }
 
-fn codex_previous_response_payload(
-    checkpoint: &ResponseCheckpoint,
-) -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        "previous_response_id".to_string(),
-        Value::String(checkpoint.response_id.clone()),
-    )])
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UpstreamRuntimeFingerprint {
+    base_url: String,
+    model: String,
+    api_kind: crate::config::UpstreamApiKind,
+    auth_kind: crate::config::UpstreamAuthKind,
+    chat_completions_path: String,
+}
+
+impl UpstreamRuntimeFingerprint {
+    fn from_config(config: &AgentConfig) -> Self {
+        Self {
+            base_url: config.upstream.base_url.clone(),
+            model: config.upstream.model.clone(),
+            api_kind: config.upstream.api_kind,
+            auth_kind: config.upstream.auth_kind,
+            chat_completions_path: config.upstream.chat_completions_path.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct PersistentSessionRuntime {
+    fingerprint: Option<UpstreamRuntimeFingerprint>,
+    continuation: Option<ResponseContinuation>,
+    llm_session: Option<ChatCompletionSession>,
+}
+
+impl PersistentSessionRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.fingerprint = None;
+        self.continuation = None;
+        self.llm_session = None;
+    }
+
+    fn prepare_for_config(&mut self, config: &AgentConfig) -> Result<()> {
+        let fingerprint = UpstreamRuntimeFingerprint::from_config(config);
+        if self.fingerprint.as_ref() != Some(&fingerprint) {
+            self.fingerprint = Some(fingerprint);
+            self.continuation = None;
+            self.llm_session = start_chat_completion_session(&config.upstream)?;
+        } else if self.llm_session.is_none() {
+            self.llm_session = start_chat_completion_session(&config.upstream)?;
+        }
+        Ok(())
+    }
 }
 
 fn is_previous_response_id_error(error: &anyhow::Error) -> bool {
@@ -267,47 +360,37 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
     })
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionRunReport {
-    pub messages: Vec<ChatMessage>,
-    pub usage: TokenUsage,
-    pub compaction: SessionCompactionStats,
-    #[serde(default)]
-    pub yielded: bool,
-    #[serde(default)]
-    pub response_checkpoint: Option<ResponseCheckpoint>,
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    #[default]
+    End,
+    Yielded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponseCheckpoint {
-    pub response_id: String,
-    pub message_count: usize,
-    pub message_hash: u64,
+#[serde(rename_all = "snake_case")]
+pub enum SessionErrno {
+    ApiFailure,
+    ThresholdCompactionFailure,
+    ToolWaitTimeout,
+    IdleCompactionFailure,
+    RuntimeFailure,
 }
 
-impl ResponseCheckpoint {
-    pub fn for_messages(response_id: impl Into<String>, messages: &[ChatMessage]) -> Self {
-        Self {
-            response_id: response_id.into(),
-            message_count: messages.len(),
-            message_hash: message_hash(messages),
-        }
-    }
-
-    pub fn matches_messages(&self, messages: &[ChatMessage]) -> bool {
-        messages.len() >= self.message_count
-            && self.message_hash == message_hash(&messages[..self.message_count])
-    }
-}
-
-fn message_hash(messages: &[ChatMessage]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let raw = serde_json::to_vec(messages).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    raw.hash(&mut hasher);
-    hasher.finish()
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionState {
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub pending_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub phase: SessionPhase,
+    #[serde(default)]
+    pub errno: Option<SessionErrno>,
+    #[serde(default)]
+    pub errinfo: Option<String>,
+    pub usage: TokenUsage,
+    pub compaction: SessionCompactionStats,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -371,10 +454,6 @@ pub enum SessionEvent {
         completion_tokens: u64,
         total_tokens: u64,
     },
-    CheckpointEmitted {
-        message_count: usize,
-        total_tokens: u64,
-    },
     ToolWaitCompactionScheduled {
         tool_name: String,
         stable_prefix_message_count: usize,
@@ -435,11 +514,8 @@ pub struct SessionExecutionControl {
     yield_requested: Arc<AtomicBool>,
     signal_sender: Sender<ExecutionSignal>,
     signal_receiver: Receiver<ExecutionSignal>,
-    checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
-    stable_report_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
     event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
-    stable_report: Arc<Mutex<Option<SessionRunReport>>>,
     pending_prefix_rewrite: Arc<Mutex<Option<PendingPrefixRewrite>>>,
 }
 
@@ -472,41 +548,10 @@ impl SessionExecutionControl {
             yield_requested: Arc::new(AtomicBool::new(false)),
             signal_sender,
             signal_receiver,
-            checkpoint_callback: None,
-            stable_report_callback: None,
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
-            stable_report: Arc::new(Mutex::new(None)),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn with_checkpoint_callback(
-        callback: impl Fn(SessionRunReport) + Send + Sync + 'static,
-    ) -> Self {
-        let (signal_sender, signal_receiver) = unbounded();
-        Self {
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            tool_interrupt_flag: Arc::new(InterruptSignal::new()),
-            timeout_observation_requested: Arc::new(AtomicBool::new(false)),
-            yield_requested: Arc::new(AtomicBool::new(false)),
-            signal_sender,
-            signal_receiver,
-            checkpoint_callback: Some(Arc::new(callback)),
-            stable_report_callback: None,
-            event_callback: None,
-            stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
-            stable_report: Arc::new(Mutex::new(None)),
-            pending_prefix_rewrite: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn with_stable_report_callback(
-        mut self,
-        callback: impl Fn(SessionRunReport) + Send + Sync + 'static,
-    ) -> Self {
-        self.stable_report_callback = Some(Arc::new(callback));
-        self
     }
 
     pub fn with_event_callback(
@@ -548,16 +593,6 @@ impl SessionExecutionControl {
         Arc::clone(&self.tool_interrupt_flag)
     }
 
-    pub fn emit_checkpoint_report(&self, report: SessionRunReport) {
-        if let Some(callback) = &self.checkpoint_callback {
-            callback(report);
-        }
-    }
-
-    pub fn emit_stable_report_external(&self, report: SessionRunReport) {
-        self.store_stable_report(report);
-    }
-
     pub fn emit_event_external(&self, event: SessionEvent) {
         self.emit_event(event);
     }
@@ -587,13 +622,6 @@ impl SessionExecutionControl {
             .unwrap_or_default()
     }
 
-    pub fn stable_report_snapshot(&self) -> Option<SessionRunReport> {
-        self.stable_report
-            .lock()
-            .ok()
-            .and_then(|report| report.clone())
-    }
-
     pub fn request_prefix_rewrite(
         &self,
         expected_prefix: Vec<ChatMessage>,
@@ -618,56 +646,10 @@ impl SessionExecutionControl {
         Ok(())
     }
 
-    fn emit_checkpoint(
-        &self,
-        messages: &[ChatMessage],
-        usage: &TokenUsage,
-        response_checkpoint: Option<ResponseCheckpoint>,
-    ) {
-        if let Some(callback) = &self.checkpoint_callback {
-            callback(SessionRunReport {
-                messages: messages.to_vec(),
-                usage: usage.clone(),
-                compaction: SessionCompactionStats::default(),
-                yielded: false,
-                response_checkpoint,
-            });
-        }
-        self.emit_event(SessionEvent::CheckpointEmitted {
-            message_count: messages.len(),
-            total_tokens: usage.total_tokens,
-        });
-    }
-
-    fn store_stable_report(&self, report: SessionRunReport) {
-        if let Ok(mut stable_report) = self.stable_report.lock() {
-            *stable_report = Some(report.clone());
-        }
-        if let Some(callback) = &self.stable_report_callback {
-            callback(report);
-        }
-    }
-
     fn set_stable_prefix_messages(&self, messages: &[ChatMessage]) {
         if let Ok(mut stable_prefix) = self.stable_prefix_messages.lock() {
             *stable_prefix = messages.to_vec();
         }
-    }
-
-    fn set_stable_report(
-        &self,
-        messages: &[ChatMessage],
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
-    ) {
-        self.store_stable_report(SessionRunReport {
-            messages: messages.to_vec(),
-            usage: usage.clone(),
-            compaction: compaction.clone(),
-            yielded: false,
-            response_checkpoint,
-        });
     }
 
     fn take_pending_prefix_rewrite(&self) -> Option<PendingPrefixRewrite> {
@@ -690,30 +672,67 @@ impl Default for SessionExecutionControl {
     }
 }
 
-pub fn run_session_with_report(
+pub fn run_session_state(
     previous_messages: Vec<ChatMessage>,
     prompt: impl Into<String>,
     config: AgentConfig,
     extra_tools: Vec<Tool>,
-) -> Result<SessionRunReport> {
-    run_session_with_report_controlled(previous_messages, prompt, config, extra_tools, None)
+) -> Result<SessionState> {
+    run_session_state_controlled(previous_messages, prompt, config, extra_tools, None)
 }
 
-pub fn run_session_with_report_controlled(
+pub fn run_session_state_controlled_persistent(
     previous_messages: Vec<ChatMessage>,
     prompt: impl Into<String>,
     config: AgentConfig,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
-) -> Result<SessionRunReport> {
-    let prompt = prompt.into();
+    runtime: &mut PersistentSessionRuntime,
+) -> Result<SessionState> {
+    runtime.prepare_for_config(&config)?;
+    run_session_state_controlled_internal(
+        previous_messages,
+        prompt.into(),
+        config,
+        extra_tools,
+        control,
+        runtime,
+    )
+}
+
+pub fn run_session_state_controlled(
+    previous_messages: Vec<ChatMessage>,
+    prompt: impl Into<String>,
+    config: AgentConfig,
+    extra_tools: Vec<Tool>,
+    control: Option<SessionExecutionControl>,
+) -> Result<SessionState> {
+    let mut runtime = PersistentSessionRuntime::new();
+    runtime.prepare_for_config(&config)?;
+    run_session_state_controlled_internal(
+        previous_messages,
+        prompt.into(),
+        config,
+        extra_tools,
+        control,
+        &mut runtime,
+    )
+}
+
+fn run_session_state_controlled_internal(
+    previous_messages: Vec<ChatMessage>,
+    prompt: String,
+    config: AgentConfig,
+    extra_tools: Vec<Tool>,
+    control: Option<SessionExecutionControl>,
+    runtime: &mut PersistentSessionRuntime,
+) -> Result<SessionState> {
     let discovered_skills = discover_skills(&config.skills_dirs)?;
     let system_prompt = compose_system_prompt(&config, &discovered_skills);
     let mut messages = ensure_system_message(&previous_messages, &system_prompt);
     let mut usage = TokenUsage::default();
     let mut compaction_stats = SessionCompactionStats::default();
-    let mut last_response_checkpoint = config.response_checkpoint.clone();
-    let mut llm_session = start_chat_completion_session(&config.upstream)?;
+    let llm_session = &mut runtime.llm_session;
 
     if let Some(control) = &control {
         control.ensure_not_cancelled()?;
@@ -749,9 +768,10 @@ pub fn run_session_with_report_controlled(
         });
     }
 
+    let initial_compaction_source = materialize_messages_for_upstream(&messages, &config)?;
     let initial_compaction = maybe_compact_messages_with_report_with_session(
         &config,
-        &messages,
+        &initial_compaction_source,
         &tool_definitions,
         &prompt,
         llm_session.as_mut(),
@@ -770,50 +790,35 @@ pub fn run_session_with_report_controlled(
     }
     usage.add_assign(&initial_compaction.usage);
     compaction_stats.record_report(&initial_compaction);
-    messages = initial_compaction.messages;
+    if initial_compaction.compacted {
+        messages = initial_compaction.messages;
+    }
     if let Some(control) = &control {
         control.set_stable_prefix_messages(&messages);
-        control.set_stable_report(
-            &messages,
-            &usage,
-            &compaction_stats,
-            last_response_checkpoint
-                .clone()
-                .filter(|checkpoint| checkpoint.matches_messages(&messages)),
-        );
     }
     if !prompt.is_empty() {
         messages.push(ChatMessage::text("user", prompt));
     }
 
-    let mut round_index = 0usize;
+    let round_index = 0usize;
     loop {
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
-            control.set_stable_report(
-                &messages,
-                &usage,
-                &compaction_stats,
-                last_response_checkpoint
-                    .clone()
-                    .filter(|checkpoint| checkpoint.matches_messages(&messages)),
-            );
             if control.take_yield_requested() {
-                let response_checkpoint = last_response_checkpoint
-                    .clone()
-                    .filter(|checkpoint| checkpoint.matches_messages(&messages));
                 control.emit_event(SessionEvent::SessionYielded {
                     phase: "round_start".to_string(),
                     message_count: messages.len(),
                     total_tokens: usage.total_tokens,
                 });
-                return Ok(SessionRunReport {
+                return Ok(SessionState {
                     messages,
+                    pending_messages: Vec::new(),
+                    phase: SessionPhase::Yielded,
+                    errno: None,
+                    errinfo: None,
                     usage,
                     compaction: compaction_stats,
-                    yielded: true,
-                    response_checkpoint,
                 });
             }
             control.emit_event(SessionEvent::RoundStarted {
@@ -828,9 +833,10 @@ pub fn run_session_with_report_controlled(
                     message_count: messages.len(),
                 });
             }
+            let round_compaction_source = materialize_messages_for_upstream(&messages, &config)?;
             let round_compaction = maybe_compact_messages_with_report_with_session(
                 &config,
-                &messages,
+                &round_compaction_source,
                 &tool_definitions,
                 "",
                 llm_session.as_mut(),
@@ -849,16 +855,8 @@ pub fn run_session_with_report_controlled(
             }
             usage.add_assign(&round_compaction.usage);
             compaction_stats.record_report(&round_compaction);
-            messages = round_compaction.messages;
-            if let Some(control) = &control {
-                control.set_stable_report(
-                    &messages,
-                    &usage,
-                    &compaction_stats,
-                    last_response_checkpoint
-                        .clone()
-                        .filter(|checkpoint| checkpoint.matches_messages(&messages)),
-                );
+            if round_compaction.compacted {
+                messages = round_compaction.messages;
             }
         }
         if let Some(control) = &control {
@@ -868,17 +866,21 @@ pub fn run_session_with_report_controlled(
                 message_count: messages.len(),
             });
         }
-        let continuation_messages = last_response_checkpoint
+        let request_messages = materialize_messages_for_upstream(&messages, &config)?;
+        let continuation_messages = runtime
+            .continuation
             .as_ref()
-            .and_then(|checkpoint| prepare_responses_continuation_messages(&messages, checkpoint));
-        let continuation_payload = last_response_checkpoint.as_ref().and_then(|checkpoint| {
+            .and_then(|continuation| continuation.delta_request_messages(&request_messages));
+        let continuation_payload = runtime.continuation.as_ref().and_then(|continuation| {
             continuation_messages
                 .as_ref()
-                .map(|_| codex_previous_response_payload(checkpoint))
+                .map(|_| continuation.previous_response_payload())
         });
         let outcome = match create_chat_completion(
             &config.upstream,
-            continuation_messages.as_deref().unwrap_or(&messages),
+            continuation_messages
+                .as_deref()
+                .unwrap_or(&request_messages),
             &tool_definitions,
             continuation_payload.clone(),
             llm_session.as_mut(),
@@ -887,9 +889,10 @@ pub fn run_session_with_report_controlled(
             Err(error)
                 if continuation_payload.is_some() && is_previous_response_id_error(&error) =>
             {
+                runtime.continuation = None;
                 create_chat_completion(
                     &config.upstream,
-                    &messages,
+                    &request_messages,
                     &tool_definitions,
                     None,
                     llm_session.as_mut(),
@@ -909,41 +912,50 @@ pub fn run_session_with_report_controlled(
                 total_tokens: outcome.usage.total_tokens,
             });
         }
-        messages.push(outcome.message);
-        last_response_checkpoint = outcome
-            .response_id
-            .map(|response_id| ResponseCheckpoint::for_messages(response_id, &messages));
-        let stable_response_checkpoint = last_response_checkpoint
-            .clone()
-            .filter(|checkpoint| checkpoint.matches_messages(&messages));
-        if let Some(control) = &control {
-            control.set_stable_report(
-                &messages,
-                &usage,
-                &compaction_stats,
-                stable_response_checkpoint.clone(),
-            );
+        if tool_calls.is_empty() && !assistant_message_has_content_or_tool_calls(&outcome.message) {
+            runtime.continuation = None;
+            return Ok(SessionState {
+                messages,
+                pending_messages: Vec::new(),
+                phase: SessionPhase::Yielded,
+                errno: Some(SessionErrno::ApiFailure),
+                errinfo: Some("upstream returned an empty final assistant message".to_string()),
+                usage,
+                compaction: compaction_stats,
+            });
         }
-        if let Some(control) = &control
-            && tool_calls.is_empty()
-            && !extract_assistant_text(&messages).trim().is_empty()
-        {
-            control.emit_checkpoint(&messages, &usage, stable_response_checkpoint.clone());
+
+        messages.push(outcome.message);
+        if let Some(response_id) = outcome.response_id {
+            let mut anchor_messages = request_messages;
+            anchor_messages.push(
+                messages
+                    .last()
+                    .cloned()
+                    .expect("assistant response just appended"),
+            );
+            runtime.continuation = Some(ResponseContinuation::for_messages(
+                response_id,
+                &anchor_messages,
+            ));
+        } else {
+            runtime.continuation = None;
         }
         if tool_calls.is_empty() {
-            let response_checkpoint = stable_response_checkpoint;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::SessionCompleted {
                     message_count: messages.len(),
                     total_tokens: usage.total_tokens,
                 });
             }
-            return Ok(SessionRunReport {
+            return Ok(SessionState {
                 messages,
+                pending_messages: Vec::new(),
+                phase: SessionPhase::End,
+                errno: None,
+                errinfo: None,
                 usage,
                 compaction: compaction_stats,
-                yielded: false,
-                response_checkpoint,
             });
         }
 
@@ -951,14 +963,6 @@ pub fn run_session_with_report_controlled(
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
-            control.set_stable_report(
-                &messages,
-                &usage,
-                &compaction_stats,
-                last_response_checkpoint
-                    .clone()
-                    .filter(|checkpoint| checkpoint.matches_messages(&messages)),
-            );
             for tool_call in &tool_calls {
                 control.emit_event(SessionEvent::ToolCallStarted {
                     round_index,
@@ -1057,9 +1061,11 @@ pub fn run_session_with_report_controlled(
                     stable_prefix_message_count: messages.len(),
                 });
             }
+            let post_tool_compaction_source =
+                materialize_messages_for_upstream(&messages, &config)?;
             let post_tool_compaction = maybe_compact_messages_with_report_with_session(
                 &config,
-                &messages,
+                &post_tool_compaction_source,
                 &tool_definitions,
                 "",
                 llm_session.as_mut(),
@@ -1078,41 +1084,29 @@ pub fn run_session_with_report_controlled(
             }
             usage.add_assign(&post_tool_compaction.usage);
             compaction_stats.record_report(&post_tool_compaction);
-            messages = post_tool_compaction.messages;
+            if post_tool_compaction.compacted {
+                messages = post_tool_compaction.messages;
+            }
             if let Some(control) = &control {
                 control.set_stable_prefix_messages(&messages);
-                control.set_stable_report(
-                    &messages,
-                    &usage,
-                    &compaction_stats,
-                    last_response_checkpoint
-                        .clone()
-                        .filter(|checkpoint| checkpoint.matches_messages(&messages)),
-                );
             }
         }
-        if let Some(control) = &control
-            && control.take_yield_requested()
-        {
-            let response_checkpoint = last_response_checkpoint
-                .clone()
-                .filter(|checkpoint| checkpoint.matches_messages(&messages));
+        if let Some(control) = &control {
             control.emit_event(SessionEvent::SessionYielded {
                 phase: "after_tool_batch".to_string(),
                 message_count: messages.len(),
                 total_tokens: usage.total_tokens,
             });
-            return Ok(SessionRunReport {
-                messages,
-                usage,
-                compaction: compaction_stats,
-                yielded: true,
-                response_checkpoint,
-            });
         }
-        round_index = round_index
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("agent round index overflowed"))?;
+        return Ok(SessionState {
+            messages,
+            pending_messages: Vec::new(),
+            phase: SessionPhase::Yielded,
+            errno: None,
+            errinfo: None,
+            usage,
+            compaction: compaction_stats,
+        });
     }
 }
 
@@ -1251,8 +1245,7 @@ fn synthesize_tool_timeout_observation(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionSignal, PendingPrefixRewrite, ResponseCheckpoint, SessionCompactionStats,
-        SessionExecutionControl, TokenUsage, apply_pending_prefix_rewrite,
+        ExecutionSignal, ResponseContinuation, SessionExecutionControl,
         finish_pending_tool_wait_compaction, start_pending_tool_wait_compaction,
         synthetic_user_message_from_tool_result,
     };
@@ -1260,7 +1253,6 @@ mod tests {
     use crate::message::ChatMessage;
     use serde_json::Value;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -1300,7 +1292,6 @@ mod tests {
                 native_audio_input: false,
                 native_image_generation: false,
             },
-            response_checkpoint: None,
             image_tool_upstream: None,
             pdf_tool_upstream: None,
             audio_tool_upstream: None,
@@ -1451,68 +1442,28 @@ mod tests {
     }
 
     #[test]
-    fn stable_report_snapshot_keeps_tail_after_prefix_rewrite() {
-        let control = SessionExecutionControl::new();
-        let expected_prefix = vec![
-            ChatMessage::text("system", "[AgentFrame Runtime]\n\nPrompt"),
-            ChatMessage::text("assistant", "old summary"),
+    fn response_continuation_sends_only_delta_messages() {
+        let anchor = vec![
+            ChatMessage::text("system", "system prompt"),
+            ChatMessage::text("user", "first request"),
+            ChatMessage::text("assistant", "first answer"),
         ];
-        let replacement_prefix = vec![
-            ChatMessage::text("system", "[AgentFrame Runtime]\n\nPrompt"),
-            ChatMessage::text("assistant", "new summary"),
-        ];
-        if let Ok(mut pending) = control.pending_prefix_rewrite.lock() {
-            *pending = Some(PendingPrefixRewrite {
-                expected_prefix: expected_prefix.clone(),
-                replacement_prefix: replacement_prefix.clone(),
-                usage: TokenUsage::default(),
-                compaction: SessionCompactionStats::default(),
-            });
-        }
+        let continuation = ResponseContinuation::for_messages("resp_123", &anchor);
+        let mut next_request = anchor.clone();
+        next_request.push(ChatMessage::text("user", "follow-up"));
 
-        let mut messages = expected_prefix;
-        messages.push(ChatMessage::text("user", "tail message"));
-        let mut usage = TokenUsage::default();
-        let mut compaction = SessionCompactionStats::default();
-
-        apply_pending_prefix_rewrite(&control, &mut messages, &mut usage, &mut compaction);
-        let response_checkpoint = Some(ResponseCheckpoint::for_messages("resp-1", &messages));
-        control.set_stable_report(&messages, &usage, &compaction, response_checkpoint.clone());
-
-        assert_eq!(control.stable_prefix_snapshot(), replacement_prefix);
-        let stable_report = control
-            .stable_report_snapshot()
-            .expect("stable report should be recorded");
-        assert_eq!(stable_report.messages, messages);
-        assert_eq!(stable_report.response_checkpoint, response_checkpoint);
-    }
-
-    #[test]
-    fn stable_report_callback_receives_and_persists_latest_report() {
-        let reports = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&reports);
-        let control = SessionExecutionControl::new().with_stable_report_callback(move |report| {
-            captured.lock().unwrap().push(report);
-        });
-        let messages = vec![ChatMessage::text("assistant", "tool plan")];
-        let response_checkpoint = Some(ResponseCheckpoint::for_messages("resp-2", &messages));
-
-        control.set_stable_report(
-            &messages,
-            &TokenUsage::default(),
-            &SessionCompactionStats::default(),
-            response_checkpoint.clone(),
+        let delta = continuation.delta_request_messages(&next_request).unwrap();
+        assert_eq!(
+            delta,
+            vec![
+                ChatMessage::text("system", "system prompt"),
+                ChatMessage::text("user", "follow-up")
+            ]
         );
-
-        let snapshot = control
-            .stable_report_snapshot()
-            .expect("stable report should be recorded");
-        assert_eq!(snapshot.messages, messages);
-        assert_eq!(snapshot.response_checkpoint, response_checkpoint);
-
-        let captured = reports.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].messages, messages);
+        assert_eq!(
+            continuation.previous_response_payload()["previous_response_id"],
+            serde_json::json!("resp_123")
+        );
     }
 }
 
@@ -1546,5 +1497,11 @@ pub fn compact_session_messages_with_report(
         &extra_tools,
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
-    maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")
+    let compaction_source = materialize_messages_for_upstream(&messages, &config)?;
+    let mut report =
+        maybe_compact_messages_with_report(&config, &compaction_source, &tool_definitions, "")?;
+    if !report.compacted {
+        report.messages = messages;
+    }
+    Ok(report)
 }

@@ -267,7 +267,7 @@ impl ConfigEditorApp {
             Line::from("  Tooling: route helper tools to specific model aliases"),
             Line::from("  Main Agent: adjust defaults for the foreground agent"),
             Line::from("  Runtime: service-level counters and polling settings"),
-            Line::from("  Sandbox: choose disabled / subprocess / bubblewrap"),
+            Line::from("  Sandbox: choose subprocess / bubblewrap"),
             Line::from("  Channels: configure Telegram, DingTalk, or command-line channels"),
             Line::from(""),
             Line::from("Global keys"),
@@ -523,7 +523,7 @@ impl ConfigEditorApp {
             (
                 "mode",
                 nested_string(&self.value, &["sandbox", "mode"])
-                    .unwrap_or("disabled")
+                    .unwrap_or("subprocess")
                     .to_string(),
             ),
             (
@@ -1296,11 +1296,7 @@ impl ConfigEditorApp {
                     SandboxField::Mode => {
                         self.modal = Some(ModalState::Select(SelectState {
                             title: "Sandbox Mode".to_string(),
-                            options: vec![
-                                "disabled".to_string(),
-                                "subprocess".to_string(),
-                                "bubblewrap".to_string(),
-                            ],
+                            options: vec!["subprocess".to_string(), "bubblewrap".to_string()],
                             selected: current_sandbox_mode_index(&self.value),
                             target: SelectTarget::SandboxMode,
                         }));
@@ -1726,7 +1722,7 @@ impl ConfigEditorApp {
     fn apply_select(&mut self, target: SelectTarget, selected: usize) -> Result<()> {
         match target {
             SelectTarget::SandboxMode => {
-                let modes = ["disabled", "subprocess", "bubblewrap"];
+                let modes = ["subprocess", "bubblewrap"];
                 let value = modes
                     .get(selected)
                     .ok_or_else(|| anyhow!("invalid sandbox mode selection"))?;
@@ -2757,14 +2753,14 @@ impl SandboxField {
 
     fn help(self) -> &'static str {
         match self {
-            Self::Mode => "Choose disabled, subprocess, or bubblewrap",
+            Self::Mode => "Choose subprocess or bubblewrap",
             Self::BubblewrapBinary => "Executable name for bubblewrap, typically bwrap",
         }
     }
 
     fn default(self) -> &'static str {
         match self {
-            Self::Mode => "disabled",
+            Self::Mode => "subprocess",
             Self::BubblewrapBinary => "bwrap",
         }
     }
@@ -3879,10 +3875,9 @@ fn model_type_index(model_type: &str) -> usize {
 }
 
 fn current_sandbox_mode_index(value: &Value) -> usize {
-    match nested_string(value, &["sandbox", "mode"]).unwrap_or("disabled") {
-        "disabled" => 0,
-        "subprocess" => 1,
-        "bubblewrap" => 2,
+    match nested_string(value, &["sandbox", "mode"]).unwrap_or("subprocess") {
+        "subprocess" | "disabled" => 0,
+        "bubblewrap" => 1,
         _ => 0,
     }
 }
@@ -4058,7 +4053,7 @@ fn latest_server_config_skeleton() -> Value {
             }
         },
         "sandbox": {
-            "mode": "disabled",
+            "mode": "subprocess",
             "bubblewrap_binary": "bwrap"
         },
         "max_global_sub_agents": 4,
@@ -4285,6 +4280,7 @@ mod tests {
         let skeleton = latest_server_config_skeleton();
         assert_eq!(skeleton["version"], json!(LATEST_CONFIG_VERSION));
         assert_eq!(skeleton["main_agent"]["memory_system"], json!("layered"));
+        assert_eq!(skeleton["sandbox"]["mode"], json!("subprocess"));
         assert_eq!(
             skeleton["main_agent"]["time_awareness"]["emit_system_date_on_user_message"],
             json!(false)
@@ -4335,7 +4331,7 @@ mod tests {
                 }
             },
             "sandbox": {
-                "mode": "disabled",
+                "mode": "subprocess",
                 "bubblewrap_binary": "bwrap"
             },
             "max_global_sub_agents": 4,

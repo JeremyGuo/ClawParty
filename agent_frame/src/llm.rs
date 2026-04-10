@@ -338,6 +338,47 @@ pub(super) fn build_responses_input(
     Ok((instructions, input))
 }
 
+pub(super) fn chat_completions_messages_payload(messages: &[ChatMessage]) -> Result<Value> {
+    let mut payload_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut payload =
+            serde_json::to_value(message).context("failed to serialize chat completion message")?;
+        if message.role == "user"
+            && let Some(content) = payload.get_mut("content")
+        {
+            normalize_chat_completions_user_content(content);
+        }
+        payload_messages.push(payload);
+    }
+    Ok(Value::Array(payload_messages))
+}
+
+fn normalize_chat_completions_user_content(content: &mut Value) {
+    let Value::Array(items) = content else {
+        return;
+    };
+    for item in items {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        let item_type = object.get("type").and_then(Value::as_str);
+        match item_type {
+            Some("input_text") | Some("output_text") => {
+                object.insert("type".to_string(), Value::String("text".to_string()));
+            }
+            Some("input_image") | Some("image_url") => {
+                object.insert("type".to_string(), Value::String("image_url".to_string()));
+                if let Some(image_url) = object.get_mut("image_url")
+                    && let Some(url) = image_url.as_str().map(ToOwned::to_owned)
+                {
+                    *image_url = json!({ "url": url });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>> {
     match content {
         None | Some(Value::Null) => Ok(vec![json!({
@@ -760,8 +801,8 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 mod tests {
     use super::{
         UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
-        parse_streamed_responses_body, parse_usage, responses_value_to_chat_message,
-        upstream_error_from_value,
+        chat_completions_messages_payload, parse_streamed_responses_body, parse_usage,
+        responses_value_to_chat_message, upstream_error_from_value,
     };
     use crate::config::{
         AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind,
@@ -946,6 +987,28 @@ mod tests {
         assert_eq!(input[2]["name"], "file_read");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn chat_completions_payload_converts_internal_input_image_items() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                { "type": "input_text", "text": "Look again" },
+                { "type": "input_image", "image_url": "data:image/png;base64,AAAA" }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let payload = chat_completions_messages_payload(&messages).unwrap();
+        assert_eq!(payload[0]["content"][0]["type"], "text");
+        assert_eq!(payload[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            payload[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
     }
 
     #[test]

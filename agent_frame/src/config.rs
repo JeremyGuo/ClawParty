@@ -1,4 +1,3 @@
-use crate::agent::ResponseCheckpoint;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,8 +171,6 @@ pub struct AgentConfig {
     pub enabled_tools: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]
-    pub response_checkpoint: Option<ResponseCheckpoint>,
-    #[serde(default)]
     pub image_tool_upstream: Option<UpstreamConfig>,
     #[serde(default)]
     pub pdf_tool_upstream: Option<UpstreamConfig>,
@@ -204,8 +201,6 @@ struct AgentConfigRaw {
     #[serde(default)]
     enabled_tools: Vec<String>,
     upstream: UpstreamConfigRaw,
-    #[serde(default)]
-    response_checkpoint: Option<ResponseCheckpoint>,
     #[serde(default)]
     image_tool_upstream: Option<UpstreamConfigRaw>,
     #[serde(default)]
@@ -508,7 +503,6 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     Ok(AgentConfig {
         enabled_tools: normalize_enabled_tools(raw.enabled_tools),
         upstream: resolve_upstream(raw.upstream),
-        response_checkpoint: raw.response_checkpoint,
         image_tool_upstream: raw.image_tool_upstream.map(resolve_upstream),
         pdf_tool_upstream: raw.pdf_tool_upstream.map(resolve_upstream),
         audio_tool_upstream: raw.audio_tool_upstream.map(resolve_upstream),

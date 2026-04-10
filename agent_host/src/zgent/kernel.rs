@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_frame::config::AgentConfig as FrameAgentConfig;
 use agent_frame::message::ChatMessage;
-use agent_frame::{SessionExecutionControl, SessionRunReport, Tool};
+use agent_frame::{SessionExecutionControl, SessionPhase, SessionState, Tool};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value, json};
 use tracing::warn;
@@ -368,14 +368,14 @@ fn summary_into_remote_session(summary: ZgentSessionSummary) -> ZgentSessionCrea
     }
 }
 
-pub fn run_session_with_report_controlled(
+pub fn run_session_state_controlled(
     previous_messages: Vec<ChatMessage>,
     prompt: String,
     config: FrameAgentConfig,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
     options: BackendExecutionOptions,
-) -> Result<SessionRunReport> {
+) -> Result<SessionState> {
     if control.is_some() {
         return Err(anyhow!(
             "the zgent backend now only supports the native kernel path, which does not integrate with AgentHost execution control; use the persistent native foreground path instead"
@@ -423,17 +423,19 @@ fn run_session_with_native_kernel(
     config: &FrameAgentConfig,
     extra_tools: &[Tool],
     options: &BackendExecutionOptions,
-) -> Result<SessionRunReport> {
+) -> Result<SessionState> {
     let runtime = ZgentKernelRuntimeSpec::from_frame_config(config);
     let mut session = ZgentKernelSession::spawn(&runtime, extra_tools, options)?;
     require_workspace_binding(session.remote_workspace_path(), &config.workspace_root)?;
     let messages = session.run_immediate_turn(&previous_messages, &prompt)?;
-    Ok(SessionRunReport {
+    Ok(SessionState {
         messages,
+        pending_messages: Vec::new(),
+        phase: SessionPhase::End,
+        errno: None,
+        errinfo: None,
         usage: agent_frame::TokenUsage::default(),
         compaction: agent_frame::SessionCompactionStats::default(),
-        yielded: false,
-        response_checkpoint: None,
     })
 }
 

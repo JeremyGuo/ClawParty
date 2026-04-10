@@ -56,6 +56,7 @@ impl CommandLineChannel {
                     None,
                     Arc::new(LocalFileAttachmentSource::new(file_path)),
                 )],
+                stored_attachments: Vec::new(),
                 control: None,
             });
         }
@@ -76,6 +77,7 @@ impl CommandLineChannel {
                     None,
                     Arc::new(LocalFileAttachmentSource::new(file_path)),
                 )],
+                stored_attachments: Vec::new(),
                 control: None,
             });
         }
@@ -85,6 +87,7 @@ impl CommandLineChannel {
             address,
             text: Some(line.to_string()),
             attachments: Vec::new(),
+            stored_attachments: Vec::new(),
             control: None,
         })
     }

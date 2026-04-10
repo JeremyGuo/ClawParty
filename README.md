@@ -120,13 +120,12 @@ Channel (e.g. Telegram)
             └─ Agent Topology (main agent, subagents, background agents)
 ```
 
-- `/new` starts a fresh conversation. If no agent is selected, prompts the user first.
 - `/agent` first selects an agent backend, then selects the model for that backend with automatic context compression when switching.
-- `/sandbox` toggles sandbox mode (`disabled` / `subprocess` / `bubblewrap`).
+- `/sandbox` toggles sandbox mode (`subprocess` / `bubblewrap`).
 - `/compact` performs a one-off compaction; `/compact_mode` shows or toggles automatic compaction for the current conversation.
 - `/continue` retries the latest interrupted turn from its stored resume context. If the user keeps talking instead, the follow-up message is appended to that stored resume context.
 - Cron tasks and background agents inherit the creating conversation's agent backend and model.
-- Session destroy paths such as `/new` tear down session-bound `exec`, `file_download`, `image`, and subagent runtime tasks.
+- Session destroy paths tear down session-bound `exec`, `file_download`, `image`, and subagent runtime tasks.
 
 ---
 
@@ -276,7 +275,7 @@ Each named entry under `models` describes one model alias and its upstream setti
 | **Long message splitting** | Auto-splits replies that exceed Telegram's length limit |
 | **Group chat** | Recognizes `@botname`-suffixed commands; two-person groups treated as direct chat |
 | **Retry & queuing** | Send-side retry with FIFO fallback on failure |
-| **Interactive commands** | `/new`, `/oldspace`, `/help`, `/status`, `/compact`, `/compact_mode`, `/agent`, `/sandbox`, `/think`, `/set_api_timeout`, `/snapsave`, `/snapload`, `/snaplist`, `/continue` |
+| **Interactive commands** | `/help`, `/status`, `/compact`, `/compact_mode`, `/agent`, `/sandbox`, `/think`, `/set_api_timeout`, `/snapsave`, `/snapload`, `/snaplist`, `/continue` |
 
 ---
 

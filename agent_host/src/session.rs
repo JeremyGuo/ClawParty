@@ -1,7 +1,7 @@
-use crate::backend::AgentBackendKind;
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
-use agent_frame::{ChatMessage, ResponseCheckpoint, SessionCompactionStats, TokenUsage};
+use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
+pub use agent_frame::{SessionErrno, SessionPhase};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -56,8 +56,8 @@ pub enum ModelCatalogChangeNotice {
 pub struct SessionCheckpointData {
     #[serde(default)]
     pub history: Vec<SessionMessage>,
-    #[serde(default)]
-    pub agent_messages: Vec<ChatMessage>,
+    #[serde(default, alias = "agent_messages")]
+    pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub last_user_message_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -90,26 +90,6 @@ pub struct SessionCheckpointData {
     pub pending_model_catalog_notice: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PendingContinueState {
-    #[serde(default)]
-    pub agent_backend: Option<AgentBackendKind>,
-    pub model_key: String,
-    #[serde(default)]
-    pub resume_messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub original_user_text: Option<String>,
-    #[serde(default)]
-    pub original_attachments: Vec<StoredAttachment>,
-    #[serde(default)]
-    pub error_summary: String,
-    #[serde(default)]
-    pub progress_summary: String,
-    #[serde(skip, default)]
-    pub response_checkpoint: Option<ResponseCheckpoint>,
-    pub failed_at: DateTime<Utc>,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IdleCompactionRetryState {
     #[serde(default)]
@@ -130,6 +110,20 @@ pub struct ZgentNativeSessionState {
     pub context_window_size: Option<u32>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DurableSessionState {
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub pending_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub phase: SessionPhase,
+    #[serde(default)]
+    pub errno: Option<SessionErrno>,
+    #[serde(default)]
+    pub errinfo: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub id: Uuid,
@@ -140,8 +134,6 @@ pub struct SessionSnapshot {
     pub workspace_id: String,
     pub workspace_root: PathBuf,
     pub message_count: usize,
-    pub agent_message_count: usize,
-    pub agent_messages: Vec<ChatMessage>,
     pub last_user_message_at: Option<DateTime<Utc>>,
     pub last_agent_returned_at: Option<DateTime<Utc>>,
     pub last_compacted_at: Option<DateTime<Utc>>,
@@ -156,10 +148,25 @@ pub struct SessionSnapshot {
     pub seen_model_catalog_version: Option<String>,
     pub idle_compaction_retry: Option<IdleCompactionRetryState>,
     pub zgent_native: Option<ZgentNativeSessionState>,
-    pub pending_continue: Option<PendingContinueState>,
-    pub response_checkpoint: Option<ResponseCheckpoint>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
+    pub session_state: DurableSessionState,
+}
+
+impl SessionSnapshot {
+    pub fn stable_messages(&self) -> &[ChatMessage] {
+        &self.session_state.messages
+    }
+
+    pub fn stable_message_count(&self) -> usize {
+        self.stable_messages().len()
+    }
+
+    pub fn request_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self.session_state.messages.clone();
+        messages.extend(self.session_state.pending_messages.clone());
+        messages
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,7 +188,6 @@ struct Session {
     workspace_id: String,
     workspace_root: PathBuf,
     history: Vec<SessionMessage>,
-    agent_messages: Vec<ChatMessage>,
     last_user_message_at: Option<DateTime<Utc>>,
     last_agent_returned_at: Option<DateTime<Utc>>,
     last_compacted_at: Option<DateTime<Utc>>,
@@ -199,8 +205,7 @@ struct Session {
     pending_model_catalog_notice: bool,
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     zgent_native: Option<ZgentNativeSessionState>,
-    pending_continue: Option<PendingContinueState>,
-    response_checkpoint: Option<ResponseCheckpoint>,
+    session_state: DurableSessionState,
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
@@ -221,8 +226,6 @@ impl Session {
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
             message_count: self.history.len(),
-            agent_message_count: self.agent_messages.len(),
-            agent_messages: self.agent_messages.clone(),
             last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
@@ -237,10 +240,9 @@ impl Session {
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
-            pending_continue: self.pending_continue.clone(),
-            response_checkpoint: self.response_checkpoint.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
+            session_state: self.session_state.clone(),
         }
     }
 
@@ -268,7 +270,7 @@ impl Session {
             address: self.address.clone(),
             workspace_id: Some(self.workspace_id.clone()),
             history: self.history.clone(),
-            agent_messages: self.agent_messages.clone(),
+            legacy_agent_messages: self.session_state.messages.clone(),
             last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
@@ -286,7 +288,7 @@ impl Session {
             pending_model_catalog_notice: self.pending_model_catalog_notice,
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
-            pending_continue: self.pending_continue.clone(),
+            session_state: Some(self.session_state.clone()),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             closed_at: self.closed_at,
@@ -308,11 +310,23 @@ impl Session {
         let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
-        let agent_messages = sanitize_persisted_agent_messages(persisted.agent_messages);
-        let pending_continue = persisted.pending_continue.map(|mut pending| {
-            pending.resume_messages = sanitize_persisted_agent_messages(pending.resume_messages);
-            pending
-        });
+        let legacy_agent_messages =
+            sanitize_legacy_persisted_agent_messages(persisted.legacy_agent_messages);
+        let session_state = persisted
+            .session_state
+            .map(|mut state| {
+                state.messages = sanitize_legacy_persisted_agent_messages(state.messages);
+                state.pending_messages =
+                    sanitize_legacy_persisted_agent_messages(state.pending_messages);
+                state
+            })
+            .unwrap_or_else(|| DurableSessionState {
+                messages: legacy_agent_messages.clone(),
+                pending_messages: Vec::new(),
+                phase: SessionPhase::End,
+                errno: None,
+                errinfo: None,
+            });
         Ok(Self {
             kind: persisted.kind,
             id: persisted.id,
@@ -323,7 +337,6 @@ impl Session {
             workspace_id,
             workspace_root,
             history: persisted.history,
-            agent_messages,
             last_user_message_at: persisted.last_user_message_at,
             last_agent_returned_at: persisted.last_agent_returned_at,
             last_compacted_at: persisted.last_compacted_at,
@@ -341,8 +354,7 @@ impl Session {
             pending_model_catalog_notice: persisted.pending_model_catalog_notice,
             idle_compaction_retry: persisted.idle_compaction_retry,
             zgent_native: persisted.zgent_native,
-            pending_continue,
-            response_checkpoint: None,
+            session_state,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
@@ -350,7 +362,7 @@ impl Session {
     }
 }
 
-fn sanitize_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn sanitize_legacy_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut sanitized = Vec::new();
     let mut seen_leading_system = false;
     let mut leading = true;
@@ -375,16 +387,55 @@ fn sanitize_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMess
 fn record_turn(
     session: &mut Session,
     messages: Vec<ChatMessage>,
+    consumed_pending_messages: &[ChatMessage],
     usage: &TokenUsage,
     compaction: &SessionCompactionStats,
-    response_checkpoint: Option<ResponseCheckpoint>,
-    clear_pending_continue: bool,
+    phase: SessionPhase,
     log_kind: &str,
 ) -> Result<()> {
-    session.agent_messages = messages;
+    let remaining_pending_messages = if consumed_pending_messages.is_empty() {
+        session.session_state.pending_messages.clone()
+    } else if session
+        .session_state
+        .pending_messages
+        .starts_with(consumed_pending_messages)
+    {
+        session.session_state.pending_messages[consumed_pending_messages.len()..].to_vec()
+    } else {
+        session.session_state.pending_messages.clone()
+    };
+    commit_stable_messages(session, messages, remaining_pending_messages, phase);
     session.last_agent_returned_at = Some(Utc::now());
     session.turn_count = session.turn_count.saturating_add(1);
     session.cumulative_usage.add_assign(usage);
+    accumulate_compaction_stats(session, compaction);
+    session.idle_compaction_retry = None;
+    info!(
+        log_stream = "session",
+        log_key = %session.id,
+        kind = log_kind,
+        agent_message_count = session.session_state.messages.len() as u64,
+        turn_count = session.turn_count,
+        "recorded agent turn"
+    );
+    session.persist()?;
+    Ok(())
+}
+
+fn commit_stable_messages(
+    session: &mut Session,
+    messages: Vec<ChatMessage>,
+    pending_messages: Vec<ChatMessage>,
+    phase: SessionPhase,
+) {
+    session.session_state.messages = messages;
+    session.session_state.pending_messages = pending_messages;
+    session.session_state.phase = phase;
+    session.session_state.errno = None;
+    session.session_state.errinfo = None;
+}
+
+fn accumulate_compaction_stats(session: &mut Session, compaction: &SessionCompactionStats) {
     session.cumulative_compaction.run_count = session
         .cumulative_compaction
         .run_count
@@ -405,21 +456,6 @@ fn record_turn(
         .cumulative_compaction
         .usage
         .add_assign(&compaction.usage);
-    if clear_pending_continue {
-        session.pending_continue = None;
-    }
-    session.response_checkpoint = response_checkpoint;
-    session.idle_compaction_retry = None;
-    info!(
-        log_stream = "session",
-        log_key = %session.id,
-        kind = log_kind,
-        agent_message_count = session.agent_messages.len() as u64,
-        turn_count = session.turn_count,
-        "recorded agent turn"
-    );
-    session.persist()?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -434,7 +470,9 @@ struct PersistedSession {
     #[serde(default)]
     history: Vec<SessionMessage>,
     #[serde(default)]
-    agent_messages: Vec<ChatMessage>,
+    #[serde(skip_serializing)]
+    #[serde(rename = "agent_messages")]
+    legacy_agent_messages: Vec<ChatMessage>,
     #[serde(default)]
     last_user_message_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -470,7 +508,7 @@ struct PersistedSession {
     #[serde(default)]
     zgent_native: Option<ZgentNativeSessionState>,
     #[serde(default)]
-    pending_continue: Option<PendingContinueState>,
+    session_state: Option<DurableSessionState>,
     #[serde(default)]
     pending_workspace_summary: bool,
     #[serde(default)]
@@ -696,7 +734,7 @@ impl SessionManager {
             .with_context(|| format!("no active session for {}", key))?;
         Ok(SessionCheckpointData {
             history: session.history.clone(),
-            agent_messages: session.agent_messages.clone(),
+            messages: session.session_state.messages.clone(),
             last_user_message_at: session.last_user_message_at,
             last_agent_returned_at: session.last_agent_returned_at,
             last_compacted_at: session.last_compacted_at,
@@ -723,6 +761,7 @@ impl SessionManager {
         workspace_root: PathBuf,
     ) -> Result<SessionSnapshot> {
         self.destroy_foreground(address)?;
+        let checkpoint_messages = checkpoint.messages.clone();
         let session_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
         let root_dir = self.sessions_root.join(session_id.to_string());
@@ -741,7 +780,6 @@ impl SessionManager {
             workspace_id,
             workspace_root,
             history: checkpoint.history,
-            agent_messages: checkpoint.agent_messages,
             last_user_message_at: checkpoint.last_user_message_at,
             last_agent_returned_at: checkpoint.last_agent_returned_at,
             last_compacted_at: checkpoint.last_compacted_at,
@@ -759,8 +797,13 @@ impl SessionManager {
             pending_model_catalog_notice: checkpoint.pending_model_catalog_notice,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
+            session_state: DurableSessionState {
+                messages: checkpoint_messages,
+                pending_messages: Vec::new(),
+                phase: SessionPhase::End,
+                errno: None,
+                errinfo: None,
+            },
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -773,58 +816,6 @@ impl SessionManager {
             .get(&key)
             .expect("foreground session inserted")
             .snapshot())
-    }
-
-    pub fn update_agent_messages(
-        &mut self,
-        address: &ChannelAddress,
-        messages: Vec<ChatMessage>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.agent_messages = messages;
-        session.response_checkpoint = None;
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "agent_messages_updated",
-            agent_message_count = session.agent_messages.len() as u64,
-            "updated agent_frame message history"
-        );
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn rewrite_history_after_model_switch(
-        &mut self,
-        address: &ChannelAddress,
-        messages: Vec<ChatMessage>,
-        pending_continue: Option<PendingContinueState>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.agent_messages = messages;
-        session.response_checkpoint = None;
-        session.pending_continue = pending_continue.map(|mut pending| {
-            pending.response_checkpoint = None;
-            pending
-        });
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "history_rewritten_after_model_switch",
-            agent_message_count = session.agent_messages.len() as u64,
-            has_pending_continue = session.pending_continue.is_some(),
-            "rewrote persisted conversation history after model switch"
-        );
-        session.persist()?;
-        Ok(())
     }
 
     pub fn set_api_timeout_override(
@@ -840,18 +831,6 @@ impl SessionManager {
         session.api_timeout_override_seconds = timeout_seconds;
         session.persist()?;
         Ok(())
-    }
-
-    pub fn pending_continue(
-        &self,
-        address: &ChannelAddress,
-    ) -> Result<Option<PendingContinueState>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        Ok(session.pending_continue.clone())
     }
 
     pub fn zgent_native_state(
@@ -881,17 +860,76 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn set_pending_continue(
+    pub fn append_pending_request_message(
         &mut self,
         address: &ChannelAddress,
-        pending_continue: Option<PendingContinueState>,
+        message: ChatMessage,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.pending_continue = pending_continue;
+        session.session_state.pending_messages.push(message);
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn stage_foreground_user_turn(
+        &mut self,
+        address: &ChannelAddress,
+        pending_message: ChatMessage,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let attachment_count = attachments.len();
+        session.session_state.pending_messages.push(pending_message);
+        session.push_message(MessageRole::User, text, attachments);
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "foreground_user_turn_staged",
+            message_count = session.history.len() as u64,
+            pending_message_count = session.session_state.pending_messages.len() as u64,
+            attachment_count = attachment_count as u64,
+            "staged foreground user turn into pending request queue and visible history"
+        );
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn set_failed_foreground_turn(
+        &mut self,
+        address: &ChannelAddress,
+        resume_messages: Vec<ChatMessage>,
+        errno: SessionErrno,
+        errinfo: Option<String>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let existing_pending_messages = session.session_state.pending_messages.clone();
+        session.session_state.messages = resume_messages;
+        session.session_state.pending_messages = if !existing_pending_messages.is_empty()
+            && !session
+                .session_state
+                .messages
+                .ends_with(&existing_pending_messages)
+        {
+            existing_pending_messages
+        } else {
+            Vec::new()
+        };
+        session.session_state.phase = SessionPhase::Yielded;
+        session.session_state.errno = Some(errno);
+        session.session_state.errinfo = errinfo;
         session.persist()?;
         Ok(())
     }
@@ -1110,9 +1148,9 @@ impl SessionManager {
         &mut self,
         address: &ChannelAddress,
         messages: Vec<ChatMessage>,
+        consumed_pending_messages: &[ChatMessage],
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -1122,10 +1160,10 @@ impl SessionManager {
         record_turn(
             session,
             messages,
+            consumed_pending_messages,
             usage,
             compaction,
-            response_checkpoint,
-            true,
+            SessionPhase::End,
             "agent_turn_recorded",
         )
     }
@@ -1134,9 +1172,9 @@ impl SessionManager {
         &mut self,
         address: &ChannelAddress,
         messages: Vec<ChatMessage>,
+        consumed_pending_messages: &[ChatMessage],
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -1146,10 +1184,10 @@ impl SessionManager {
         record_turn(
             session,
             messages,
+            consumed_pending_messages,
             usage,
             compaction,
-            response_checkpoint,
-            false,
+            SessionPhase::Yielded,
             "agent_turn_yielded",
         )
     }
@@ -1160,16 +1198,15 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
         record_turn(
             session,
             messages,
+            &[],
             usage,
             compaction,
-            response_checkpoint,
-            true,
+            SessionPhase::End,
             "agent_turn_recorded",
         )?;
         Ok(())
@@ -1181,16 +1218,15 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
         record_turn(
             session,
             messages,
+            &[],
             usage,
             compaction,
-            response_checkpoint,
-            false,
+            SessionPhase::Yielded,
             "agent_turn_yielded",
         )?;
         Ok(())
@@ -1202,33 +1238,12 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
-        session.agent_messages = messages;
+        commit_stable_messages(session, messages, Vec::new(), SessionPhase::End);
         session.last_agent_returned_at = Some(Utc::now());
-        session.response_checkpoint = response_checkpoint;
         session.cumulative_usage.add_assign(usage);
-        session.cumulative_compaction.run_count = session
-            .cumulative_compaction
-            .run_count
-            .saturating_add(compaction.run_count);
-        session.cumulative_compaction.compacted_run_count = session
-            .cumulative_compaction
-            .compacted_run_count
-            .saturating_add(compaction.compacted_run_count);
-        session.cumulative_compaction.estimated_tokens_before = session
-            .cumulative_compaction
-            .estimated_tokens_before
-            .saturating_add(compaction.estimated_tokens_before);
-        session.cumulative_compaction.estimated_tokens_after = session
-            .cumulative_compaction
-            .estimated_tokens_after
-            .saturating_add(compaction.estimated_tokens_after);
-        session
-            .cumulative_compaction
-            .usage
-            .add_assign(&compaction.usage);
+        accumulate_compaction_stats(session, compaction);
         session.persist()?;
         Ok(())
     }
@@ -1244,40 +1259,25 @@ impl SessionManager {
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.agent_messages = messages.clone();
-        session.response_checkpoint = None;
-        if let Some(pending_continue) = &mut session.pending_continue {
-            pending_continue.resume_messages = messages;
-            pending_continue.response_checkpoint = None;
-        }
+        commit_stable_messages(
+            session,
+            messages,
+            session.session_state.pending_messages.clone(),
+            session.session_state.phase,
+        );
         session.last_compacted_at = Some(Utc::now());
         session.last_compacted_turn_count = session.turn_count;
-        session.cumulative_compaction.run_count = session
-            .cumulative_compaction
-            .run_count
-            .saturating_add(compaction.run_count);
-        session.cumulative_compaction.compacted_run_count = session
-            .cumulative_compaction
-            .compacted_run_count
-            .saturating_add(compaction.compacted_run_count);
-        session.cumulative_compaction.estimated_tokens_before = session
-            .cumulative_compaction
-            .estimated_tokens_before
-            .saturating_add(compaction.estimated_tokens_before);
-        session.cumulative_compaction.estimated_tokens_after = session
-            .cumulative_compaction
-            .estimated_tokens_after
-            .saturating_add(compaction.estimated_tokens_after);
-        session
-            .cumulative_compaction
-            .usage
-            .add_assign(&compaction.usage);
+        accumulate_compaction_stats(session, compaction);
         session.idle_compaction_retry = None;
+        if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
+            session.session_state.errno = None;
+            session.session_state.errinfo = None;
+        }
         info!(
             log_stream = "session",
             log_key = %session.id,
             kind = "idle_context_compacted",
-            agent_message_count = session.agent_messages.len() as u64,
+            agent_message_count = session.session_state.messages.len() as u64,
             turn_count = session.turn_count,
             "persisted idle context compaction"
         );
@@ -1299,6 +1299,11 @@ impl SessionManager {
             error_summary,
             failed_at: Some(Utc::now()),
         });
+        session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
+        session.session_state.errinfo = session
+            .idle_compaction_retry
+            .as_ref()
+            .map(|state| state.error_summary.clone());
         session.persist()?;
         Ok(())
     }
@@ -1310,6 +1315,27 @@ impl SessionManager {
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
         session.idle_compaction_retry = None;
+        if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
+            session.session_state.errno = None;
+            session.session_state.errinfo = None;
+        }
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn exhaust_idle_compaction_retry(
+        &mut self,
+        address: &ChannelAddress,
+        error_summary: String,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.idle_compaction_retry = None;
+        session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
+        session.session_state.errinfo = Some(error_summary);
         session.persist()?;
         Ok(())
     }
@@ -1435,7 +1461,6 @@ impl SessionManager {
             workspace_id: workspace.id,
             workspace_root: workspace.files_dir,
             history: Vec::new(),
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -1453,8 +1478,7 @@ impl SessionManager {
             pending_model_catalog_notice: false,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
+            session_state: DurableSessionState::default(),
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -1535,10 +1559,11 @@ fn load_persisted_sessions(
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCatalogChangeNotice, SessionManager, SessionSkillObservation,
-        SharedProfileChangeNotice, SkillChangeNotice, sanitize_persisted_agent_messages,
+        ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase,
+        SessionSkillObservation, SharedProfileChangeNotice, SkillChangeNotice,
+        sanitize_legacy_persisted_agent_messages,
     };
-    use crate::domain::{ChannelAddress, StoredAttachment};
+    use crate::domain::{ChannelAddress, MessageRole, StoredAttachment};
     use crate::workspace::WorkspaceManager;
     use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
     use tempfile::TempDir;
@@ -1554,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_persisted_agent_messages_keeps_only_first_leading_system() {
+    fn sanitize_legacy_persisted_agent_messages_keeps_only_first_leading_system() {
         let messages = vec![
             ChatMessage::text("system", "system a"),
             ChatMessage::text("system", "system b"),
@@ -1562,7 +1587,7 @@ mod tests {
             ChatMessage::text("system", "runtime state"),
         ];
 
-        let sanitized = sanitize_persisted_agent_messages(messages);
+        let sanitized = sanitize_legacy_persisted_agent_messages(messages);
 
         assert_eq!(sanitized.len(), 3);
         assert_eq!(sanitized[0].role, "system");
@@ -1600,10 +1625,10 @@ mod tests {
         sessions
             .record_agent_turn(
                 &address,
-                session.agent_messages.clone(),
+                session.stable_messages().to_vec(),
+                &[],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
-                None,
             )
             .unwrap();
         sessions
@@ -1697,10 +1722,10 @@ mod tests {
         sessions
             .record_agent_turn(
                 &address,
-                session.agent_messages.clone(),
+                session.stable_messages().to_vec(),
+                &[],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
-                None,
             )
             .unwrap();
         sessions
@@ -1853,6 +1878,238 @@ mod tests {
     }
 
     #[test]
+    fn idle_compaction_retry_can_be_exhausted_without_clearing_error_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .mark_idle_compaction_retry_needed(&address, "initial failure".to_string())
+            .unwrap();
+        sessions
+            .exhaust_idle_compaction_retry(&address, "retry failed too".to_string())
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert!(snapshot.idle_compaction_retry.is_none());
+        assert_eq!(
+            snapshot.session_state.errno,
+            Some(SessionErrno::IdleCompactionFailure)
+        );
+        assert_eq!(
+            snapshot.session_state.errinfo.as_deref(),
+            Some("retry failed too")
+        );
+    }
+
+    #[test]
+    fn staged_foreground_user_turn_updates_pending_queue_and_visible_history() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .stage_foreground_user_turn(
+                &address,
+                ChatMessage::text("user", "queued"),
+                Some("queued".to_string()),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(
+            snapshot.session_state.pending_messages,
+            vec![ChatMessage::text("user", "queued")]
+        );
+        let checkpoint = sessions.export_checkpoint(&address).unwrap();
+        assert_eq!(checkpoint.history.len(), 1);
+        assert_eq!(checkpoint.history[0].role, MessageRole::User);
+        assert_eq!(checkpoint.history[0].text.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn failed_foreground_turn_projects_errno_into_session_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .set_failed_foreground_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "preserved")],
+                SessionErrno::ApiFailure,
+                Some("upstream timed out".to_string()),
+            )
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(snapshot.session_state.phase, SessionPhase::Yielded);
+        assert_eq!(snapshot.session_state.errno, Some(SessionErrno::ApiFailure));
+        assert_eq!(
+            snapshot.session_state.errinfo.as_deref(),
+            Some("upstream timed out")
+        );
+        assert_eq!(
+            snapshot.session_state.messages,
+            vec![ChatMessage::text("assistant", "preserved")]
+        );
+    }
+
+    #[test]
+    fn pending_request_messages_are_included_in_request_view_and_cleared_after_turn() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+        sessions
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "tail")],
+                &[],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+        sessions
+            .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(
+            snapshot.request_messages(),
+            vec![
+                ChatMessage::text("assistant", "tail"),
+                ChatMessage::text("user", "queued")
+            ]
+        );
+
+        sessions
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "done")],
+                &[ChatMessage::text("user", "queued")],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert!(snapshot.session_state.pending_messages.is_empty());
+        assert_eq!(
+            snapshot.session_state.messages,
+            vec![ChatMessage::text("assistant", "done")]
+        );
+    }
+
+    #[test]
+    fn staged_pending_messages_survive_older_failure_checkpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+        sessions
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "stable-tail")],
+                &[],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+        sessions
+            .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
+            .unwrap();
+
+        sessions
+            .set_failed_foreground_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "stable-tail")],
+                SessionErrno::ApiFailure,
+                Some("upstream timed out".to_string()),
+            )
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(
+            snapshot.session_state.messages,
+            vec![ChatMessage::text("assistant", "stable-tail")]
+        );
+        assert_eq!(
+            snapshot.session_state.pending_messages,
+            vec![ChatMessage::text("user", "queued")]
+        );
+        assert_eq!(
+            snapshot.request_messages(),
+            vec![
+                ChatMessage::text("assistant", "stable-tail"),
+                ChatMessage::text("user", "queued")
+            ]
+        );
+    }
+
+    #[test]
+    fn record_turn_preserves_new_pending_tail_after_consumed_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+        sessions
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "stable")],
+                &[],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+        sessions
+            .append_pending_request_message(&address, ChatMessage::text("user", "consumed"))
+            .unwrap();
+        sessions
+            .append_pending_request_message(&address, ChatMessage::text("user", "new-tail"))
+            .unwrap();
+
+        sessions
+            .record_yielded_turn(
+                &address,
+                vec![
+                    ChatMessage::text("assistant", "stable"),
+                    ChatMessage::text("user", "consumed"),
+                    ChatMessage::text("assistant", "tool batch settled"),
+                ],
+                &[ChatMessage::text("user", "consumed")],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(
+            snapshot.session_state.pending_messages,
+            vec![ChatMessage::text("user", "new-tail")]
+        );
+        assert_eq!(
+            snapshot.request_messages(),
+            vec![
+                ChatMessage::text("assistant", "stable"),
+                ChatMessage::text("user", "consumed"),
+                ChatMessage::text("assistant", "tool batch settled"),
+                ChatMessage::text("user", "new-tail"),
+            ]
+        );
+    }
+
+    #[test]
     fn exports_and_restores_session_checkpoint() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
@@ -1871,9 +2128,9 @@ mod tests {
             .record_agent_turn(
                 &address,
                 vec![ChatMessage::text("assistant", "hi")],
+                &[],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
-                None,
             )
             .unwrap();
 
@@ -1892,7 +2149,7 @@ mod tests {
 
         assert_eq!(restored.workspace_id, workspace.id);
         assert_eq!(restored.message_count, 1);
-        assert_eq!(restored.agent_message_count, 1);
+        assert_eq!(restored.stable_message_count(), 1);
     }
 
     #[test]
@@ -1915,18 +2172,17 @@ mod tests {
                 vec![ChatMessage::text("assistant", "background memory")],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
-                None,
             )
             .unwrap();
 
         let foreground_after = sessions.get_snapshot(&address).unwrap();
         let background_after = sessions.background_snapshot(background.id).unwrap();
-        assert!(foreground_after.agent_messages.is_empty());
+        assert!(foreground_after.stable_messages().is_empty());
         assert_eq!(
-            background_after.agent_messages[0]
+            background_after.stable_messages()[0]
                 .content
                 .as_ref()
-                .and_then(|value| value.as_str()),
+                .and_then(serde_json::Value::as_str),
             Some("background memory")
         );
     }

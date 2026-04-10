@@ -68,14 +68,17 @@ pub(super) fn coalesce_buffered_conversation_messages(
     initial: IncomingMessage,
     pending_messages: &mut VecDeque<IncomingMessage>,
 ) -> IncomingMessage {
-    if initial.control.is_some() {
+    if initial.control.is_some() || !initial.stored_attachments.is_empty() {
         return initial;
     }
 
     let mut grouped = vec![initial];
     let mut remaining = VecDeque::new();
     while let Some(candidate) = pending_messages.pop_front() {
-        if candidate.control.is_none() && candidate.address == grouped[0].address {
+        if candidate.control.is_none()
+            && candidate.stored_attachments.is_empty()
+            && candidate.address == grouped[0].address
+        {
             grouped.push(candidate);
         } else {
             remaining.push_back(candidate);
@@ -115,6 +118,7 @@ fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage
                 .collect::<Vec<_>>(),
         )),
         attachments,
+        stored_attachments: Vec::new(),
         control: None,
     }
 }
@@ -198,7 +202,6 @@ pub(super) fn update_active_foreground_phase(
         | SessionEvent::RoundStarted { .. }
         | SessionEvent::ModelCallStarted { .. }
         | SessionEvent::ModelCallCompleted { .. }
-        | SessionEvent::CheckpointEmitted { .. }
         | SessionEvent::ToolWaitCompactionScheduled { .. }
         | SessionEvent::ToolCallStarted { .. }
         | SessionEvent::ToolCallCompleted { .. }
@@ -479,26 +482,7 @@ pub(super) fn render_model_catalog_change_notice(
     ))
 }
 
-pub(super) fn build_previous_messages_for_turn_with_prompt(
-    session_agent_messages: &[ChatMessage],
-    pending_continue: Option<&PendingContinueState>,
-    injected_messages: &[ChatMessage],
-    next_user_message: Option<ChatMessage>,
-    canonical_system_prompt: Option<&str>,
-) -> (Vec<ChatMessage>, bool) {
-    let base_messages = pending_continue
-        .map(|pending| pending.resume_messages.clone())
-        .unwrap_or_else(|| session_agent_messages.to_vec());
-    let (mut previous_messages, rebuilt_system_prompt) = canonical_system_prompt
-        .map(|prompt| rebuild_canonical_system_prompt(&base_messages, prompt))
-        .unwrap_or_else(|| (base_messages, false));
-    previous_messages.extend(injected_messages.iter().cloned());
-    if let Some(next_user_message) = next_user_message {
-        previous_messages.push(next_user_message);
-    }
-    (previous_messages, rebuilt_system_prompt)
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 fn placeholder_text_item(text: String) -> Value {
     json!({
         "type": "text",

@@ -233,6 +233,23 @@ pub(super) fn is_timeout_like(error: &anyhow::Error) -> bool {
     error.to_string().contains("timed out")
 }
 
+pub(super) fn session_errno_for_turn_error(error: &anyhow::Error) -> SessionErrno {
+    let error_text = format!("{error:#}").to_ascii_lowercase();
+    if error_text.contains("threshold context compaction failed") {
+        SessionErrno::ThresholdCompactionFailure
+    } else if error_text.contains("tool-wait context compaction failed") {
+        SessionErrno::ToolWaitTimeout
+    } else if error_text.contains("upstream")
+        || error_text.contains("provider")
+        || error_text.contains("chat completion")
+        || error_text.contains("response body")
+    {
+        SessionErrno::ApiFailure
+    } else {
+        SessionErrno::RuntimeFailure
+    }
+}
+
 pub(super) fn should_attempt_idle_context_compaction(
     session: &SessionSnapshot,
     now: chrono::DateTime<Utc>,
@@ -889,7 +906,7 @@ pub(super) fn estimate_current_context_tokens_for_session(
         .or_else(|| runtime.inferred_agent_backend_for_model(model_key))
         .unwrap_or(AgentBackendKind::AgentFrame);
     let sanitized_messages = sanitize_messages_for_model_capabilities(
-        &session.agent_messages,
+        &session.request_messages(),
         model,
         backend_supports_native_multimodal_input(effective_backend),
     );
@@ -1133,21 +1150,6 @@ pub(super) fn log_agent_frame_event(
             completion_tokens = *completion_tokens,
             total_tokens = *total_tokens,
             "agent_frame model call completed"
-        ),
-        SessionEvent::CheckpointEmitted {
-            message_count,
-            total_tokens,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_checkpoint_emitted",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            message_count = *message_count as u64,
-            total_tokens = *total_tokens,
-            "agent_frame checkpoint emitted"
         ),
         SessionEvent::ToolWaitCompactionScheduled {
             tool_name,

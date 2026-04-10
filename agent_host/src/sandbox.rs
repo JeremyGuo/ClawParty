@@ -1,12 +1,12 @@
-use crate::backend::{
-    AgentBackendKind, BackendExecutionOptions,
-    run_session_with_report_controlled_with_options as run_backend_session,
-};
+use crate::backend::{AgentBackendKind, BackendExecutionOptions};
 use crate::child_rpc::{
-    ChildInitPayload, ChildToParentMessage, ParentToChildMessage, RemoteToolDefinition,
+    ChildToParentMessage, ChildTurnPayload, ParentToChildMessage, RemoteToolDefinition,
 };
 use crate::config::{SandboxConfig, SandboxMode};
-use agent_frame::{ExecutionSignal, SessionExecutionControl, SessionRunReport, Tool};
+use agent_frame::{
+    ExecutionSignal, PersistentSessionRuntime, SessionExecutionControl, SessionState, Tool,
+    run_session_state_controlled_persistent,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,7 +16,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -124,68 +124,60 @@ fn build_proxy_tool(
     )
 }
 
+enum ChildCommand {
+    RunTurn(ChildTurnPayload),
+    Shutdown,
+}
+
+pub struct PersistentChildRuntime {
+    child: Child,
+    writer: Arc<Mutex<BufWriter<ChildStdin>>>,
+    reader: BufReader<ChildStdout>,
+    child_stderr: Option<ChildStderr>,
+}
+
+pub fn is_child_run_turn_request_send_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("failed to send child run turn request")
+    })
+}
+
+pub fn is_child_transport_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("failed to send child run turn request")
+            || message.contains("failed to send child tool response")
+            || message.contains("child RPC stream closed unexpectedly")
+            || message.contains("failed to decode child RPC stream")
+    })
+}
+
 pub fn run_child_stdio() -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin);
     let writer = Arc::new(Mutex::new(BufWriter::new(stdout)));
-    let init = match read_json_line::<ParentToChildMessage>(&mut reader)? {
-        Some(ParentToChildMessage::Init(payload)) => payload,
-        Some(other) => {
-            return Err(anyhow!(
-                "expected initial init RPC message, received {:?}",
-                other
-            ));
-        }
-        None => return Err(anyhow!("stdin closed before init message")),
-    };
-
     {
         let mut writer = writer.lock().map_err(|_| anyhow!("RPC writer poisoned"))?;
         write_json_line(&mut *writer, &ChildToParentMessage::Started)?;
     }
 
-    let control = SessionExecutionControl::with_checkpoint_callback({
-        let writer = Arc::clone(&writer);
-        move |report| {
-            if let Ok(mut writer) = writer.lock() {
-                let _ = write_json_line(&mut *writer, &ChildToParentMessage::Checkpoint(report));
-            }
-        }
-    })
-    .with_stable_report_callback({
-        let writer = Arc::clone(&writer);
-        move |report| {
-            if let Ok(mut writer) = writer.lock() {
-                let _ = write_json_line(&mut *writer, &ChildToParentMessage::StableReport(report));
-            }
-        }
-    })
-    .with_event_callback({
-        let writer = Arc::clone(&writer);
-        move |event| {
-            if let Ok(mut writer) = writer.lock() {
-                let _ = write_json_line(&mut *writer, &ChildToParentMessage::SessionEvent(event));
-            }
-        }
-    });
-
     let pending: Arc<Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let mut extra_tools = Vec::with_capacity(init.extra_tools.len());
-    for definition in &init.extra_tools {
-        extra_tools.push(build_proxy_tool(
-            definition,
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-        ));
-    }
-
-    let signal_control = control.clone();
+    let current_control: Arc<Mutex<Option<SessionExecutionControl>>> = Arc::new(Mutex::new(None));
     let pending_map = Arc::clone(&pending);
+    let signal_control = Arc::clone(&current_control);
+    let (command_sender, command_receiver) = mpsc::channel::<ChildCommand>();
     let _inbound_thread = std::thread::spawn(move || -> Result<()> {
         while let Some(message) = read_json_line::<ParentToChildMessage>(&mut reader)? {
             match message {
+                ParentToChildMessage::RunTurn(payload) => {
+                    command_sender
+                        .send(ChildCommand::RunTurn(payload))
+                        .map_err(|_| anyhow!("child command channel closed"))?;
+                }
                 ParentToChildMessage::ToolResponse {
                     request_id,
                     ok,
@@ -205,50 +197,349 @@ pub fn run_child_stdio() -> Result<()> {
                     }
                 }
                 ParentToChildMessage::SoftTimeout => {
-                    signal_control.request_timeout_observation();
+                    if let Ok(guard) = signal_control.lock()
+                        && let Some(control) = guard.as_ref()
+                    {
+                        control.request_timeout_observation();
+                    }
                 }
                 ParentToChildMessage::Yield => {
-                    signal_control.request_yield();
+                    if let Ok(guard) = signal_control.lock()
+                        && let Some(control) = guard.as_ref()
+                    {
+                        control.request_yield();
+                    }
                 }
                 ParentToChildMessage::Cancel => {
-                    signal_control.request_cancel();
-                    break;
+                    if let Ok(guard) = signal_control.lock()
+                        && let Some(control) = guard.as_ref()
+                    {
+                        control.request_cancel();
+                    }
                 }
-                ParentToChildMessage::Init(_) => {
-                    return Err(anyhow!("received duplicate init message"));
+                ParentToChildMessage::Shutdown => {
+                    let _ = command_sender.send(ChildCommand::Shutdown);
+                    break;
                 }
             }
         }
         Ok(())
     });
 
-    let result = run_backend_session(
-        init.backend,
-        init.previous_messages,
-        init.prompt,
-        init.config,
-        extra_tools,
-        Some(control),
-        init.execution_options,
-    );
+    let mut agent_frame_runtime = PersistentSessionRuntime::new();
+    while let Ok(command) = command_receiver.recv() {
+        match command {
+            ChildCommand::RunTurn(payload) => {
+                let control = SessionExecutionControl::new().with_event_callback({
+                    let writer = Arc::clone(&writer);
+                    move |event| {
+                        if let Ok(mut writer) = writer.lock() {
+                            let _ = write_json_line(
+                                &mut *writer,
+                                &ChildToParentMessage::SessionEvent(event),
+                            );
+                        }
+                    }
+                });
+                {
+                    let mut active = current_control
+                        .lock()
+                        .map_err(|_| anyhow!("current child control lock poisoned"))?;
+                    *active = Some(control.clone());
+                }
 
-    {
-        let mut writer = writer.lock().map_err(|_| anyhow!("RPC writer poisoned"))?;
-        match result {
-            Ok(report) => write_json_line(&mut *writer, &ChildToParentMessage::Completed(report))?,
-            Err(error) => write_json_line(
-                &mut *writer,
-                &ChildToParentMessage::Failed {
-                    error: format!("{error:#}"),
-                },
-            )?,
+                let mut extra_tools = Vec::with_capacity(payload.extra_tools.len());
+                for definition in &payload.extra_tools {
+                    extra_tools.push(build_proxy_tool(
+                        definition,
+                        Arc::clone(&writer),
+                        Arc::clone(&pending),
+                    ));
+                }
+
+                let result = match payload.backend {
+                    AgentBackendKind::AgentFrame => run_session_state_controlled_persistent(
+                        payload.previous_messages,
+                        payload.prompt,
+                        payload.config,
+                        extra_tools,
+                        Some(control),
+                        &mut agent_frame_runtime,
+                    ),
+                    AgentBackendKind::Zgent => {
+                        if !crate::zgent::zgent_runtime_available() {
+                            Err(anyhow!(
+                                "the zgent backend is unavailable because the local ./zgent runtime directory is unavailable"
+                            ))
+                        } else {
+                            crate::zgent::kernel::run_session_state_controlled(
+                                payload.previous_messages,
+                                payload.prompt,
+                                payload.config,
+                                extra_tools,
+                                Some(control),
+                                payload.execution_options,
+                            )
+                        }
+                    }
+                };
+
+                {
+                    let mut active = current_control
+                        .lock()
+                        .map_err(|_| anyhow!("current child control lock poisoned"))?;
+                    *active = None;
+                }
+
+                let mut writer = writer.lock().map_err(|_| anyhow!("RPC writer poisoned"))?;
+                match result {
+                    Ok(report) => {
+                        write_json_line(&mut *writer, &ChildToParentMessage::Completed(report))?
+                    }
+                    Err(error) => write_json_line(
+                        &mut *writer,
+                        &ChildToParentMessage::Failed {
+                            error: format!("{error:#}"),
+                        },
+                    )?,
+                }
+            }
+            ChildCommand::Shutdown => {
+                break;
+            }
         }
     }
 
     Ok(())
 }
 
-pub fn run_turn_in_child_process(
+impl PersistentChildRuntime {
+    pub fn spawn(
+        sandbox: &SandboxConfig,
+        workspace_root: &Path,
+        runtime_state_root: &Path,
+        global_install_root: PathBuf,
+        skill_memory_source: PathBuf,
+        skills_source_root: PathBuf,
+        skills_dirs: &[std::path::PathBuf],
+    ) -> Result<Self> {
+        fs::create_dir_all(runtime_state_root).with_context(|| {
+            format!(
+                "failed to prepare runtime state root {}",
+                runtime_state_root.display()
+            )
+        })?;
+        let current_exe = resolve_spawnable_current_exe()?;
+        let mut command = match sandbox.mode {
+            SandboxMode::Subprocess => Command::new(&current_exe),
+            SandboxMode::Bubblewrap => build_bubblewrap_command(
+                sandbox,
+                &current_exe,
+                workspace_root,
+                runtime_state_root,
+                &global_install_root,
+                &workspace_root.join(".skill_memory"),
+                &skill_memory_source,
+                &skills_source_root,
+                skills_dirs,
+            )?,
+        };
+        command.arg("run-child");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("failed to spawn child agent runner")?;
+        let child_stdin = child.stdin.take().context("child stdin unavailable")?;
+        let child_stdout = child.stdout.take().context("child stdout unavailable")?;
+        let child_stderr = child.stderr.take().context("child stderr unavailable")?;
+        let mut runtime = Self {
+            child,
+            writer: Arc::new(Mutex::new(BufWriter::new(child_stdin))),
+            reader: BufReader::new(child_stdout),
+            child_stderr: Some(child_stderr),
+        };
+        match read_json_line::<ChildToParentMessage>(&mut runtime.reader)? {
+            Some(ChildToParentMessage::Started) => Ok(runtime),
+            Some(other) => Err(anyhow!(
+                "expected child startup acknowledgement, received {:?}",
+                other
+            )),
+            None => Err(anyhow!(
+                "child RPC stream closed before startup acknowledgement"
+            )),
+        }
+    }
+
+    pub fn run_turn(
+        &mut self,
+        backend: AgentBackendKind,
+        previous_messages: Vec<agent_frame::ChatMessage>,
+        prompt: String,
+        config: agent_frame::config::AgentConfig,
+        execution_options: BackendExecutionOptions,
+        extra_tools: Vec<Tool>,
+        control: Option<SessionExecutionControl>,
+    ) -> Result<SessionState> {
+        {
+            let payload = ParentToChildMessage::RunTurn(ChildTurnPayload {
+                backend,
+                previous_messages,
+                prompt,
+                config,
+                extra_tools: extra_tools
+                    .iter()
+                    .map(|tool| RemoteToolDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
+                    })
+                    .collect(),
+                execution_options,
+            });
+            let mut writer_guard = self
+                .writer
+                .lock()
+                .map_err(|_| anyhow!("child stdin poisoned"))?;
+            write_json_line(&mut *writer_guard, &payload)
+                .context("failed to send child run turn request")?;
+        }
+
+        if let Some(control) = &control {
+            let signal_receiver = control.signal_receiver();
+            let writer = Arc::clone(&self.writer);
+            std::thread::spawn(move || {
+                while let Ok(signal) = signal_receiver.recv() {
+                    let message = match signal {
+                        ExecutionSignal::Cancel => ParentToChildMessage::Cancel,
+                        ExecutionSignal::TimeoutObservation => ParentToChildMessage::SoftTimeout,
+                        ExecutionSignal::Yield => ParentToChildMessage::Yield,
+                    };
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = write_json_line(&mut *writer, &message);
+                    }
+                    if matches!(signal, ExecutionSignal::Cancel) {
+                        break;
+                    }
+                }
+            });
+        }
+
+        loop {
+            let message = self.read_child_message()?;
+            match message {
+                ChildToParentMessage::Started => {}
+                ChildToParentMessage::SessionEvent(event) => {
+                    if let Some(control) = &control {
+                        control.emit_event_external(event);
+                    }
+                }
+                ChildToParentMessage::ToolRequest {
+                    request_id,
+                    tool_name,
+                    arguments,
+                } => {
+                    let response = match extra_tools.iter().find(|tool| tool.name == tool_name) {
+                        Some(tool) => match tool.invoke(arguments) {
+                            Ok(result) => ParentToChildMessage::ToolResponse {
+                                request_id,
+                                ok: true,
+                                result: Some(result),
+                                error: None,
+                            },
+                            Err(error) => ParentToChildMessage::ToolResponse {
+                                request_id,
+                                ok: false,
+                                result: None,
+                                error: Some(format!("{error:#}")),
+                            },
+                        },
+                        None => ParentToChildMessage::ToolResponse {
+                            request_id,
+                            ok: false,
+                            result: None,
+                            error: Some(format!("unknown host tool: {tool_name}")),
+                        },
+                    };
+                    let mut writer_guard = self
+                        .writer
+                        .lock()
+                        .map_err(|_| anyhow!("child stdin poisoned"))?;
+                    write_json_line(&mut *writer_guard, &response)
+                        .context("failed to send child tool response")?;
+                }
+                ChildToParentMessage::Completed(report) => return Ok(report),
+                ChildToParentMessage::Failed { error } => return Err(anyhow!(error)),
+            }
+        }
+    }
+
+    fn read_child_message(&mut self) -> Result<ChildToParentMessage> {
+        match read_json_line::<ChildToParentMessage>(&mut self.reader) {
+            Ok(Some(message)) => Ok(message),
+            Ok(None) => {
+                let status = self.child.wait().ok();
+                let stderr_output = self.read_stderr_lossy();
+                Err(anyhow!(
+                    "child RPC stream closed unexpectedly; exit_status={}; stderr={}",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    if stderr_output.is_empty() {
+                        "<empty>"
+                    } else {
+                        stderr_output.as_str()
+                    }
+                ))
+            }
+            Err(error) => {
+                let status = self.child.wait().ok();
+                let stderr_output = self.read_stderr_lossy();
+                Err(anyhow!(
+                    "failed to decode child RPC stream: {error:#}; exit_status={}; stderr={}",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    if stderr_output.is_empty() {
+                        "<empty>"
+                    } else {
+                        stderr_output.as_str()
+                    }
+                ))
+            }
+        }
+    }
+
+    fn read_stderr_lossy(&mut self) -> String {
+        let Some(stderr) = self.child_stderr.take() else {
+            return String::new();
+        };
+        let mut stderr_reader = BufReader::new(stderr);
+        let mut stderr_output = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
+        stderr_output.trim().to_string()
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = write_json_line(&mut *writer, &ParentToChildMessage::Shutdown);
+        }
+        let status = self
+            .child
+            .wait()
+            .context("failed to wait for child agent runner")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "child agent runner exited unsuccessfully: {status}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn run_one_shot_child_turn(
     sandbox: &SandboxConfig,
     backend: AgentBackendKind,
     previous_messages: Vec<agent_frame::ChatMessage>,
@@ -260,222 +551,30 @@ pub fn run_turn_in_child_process(
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
-) -> Result<SessionRunReport> {
-    fs::create_dir_all(&config.runtime_state_root).with_context(|| {
-        format!(
-            "failed to prepare runtime state root {}",
-            config.runtime_state_root.display()
-        )
-    })?;
-    let current_exe = resolve_spawnable_current_exe()?;
-    let mut command = match sandbox.mode {
-        SandboxMode::Disabled => Command::new(&current_exe),
-        SandboxMode::Subprocess => Command::new(&current_exe),
-        SandboxMode::Bubblewrap => build_bubblewrap_command(
-            sandbox,
-            &current_exe,
-            &config.workspace_root,
-            &config.runtime_state_root,
-            &global_install_root,
-            &config.workspace_root.join(".skill_memory"),
-            &skill_memory_source,
-            &skills_source_root,
-            &config.skills_dirs,
-        )?,
-    };
-    command.arg("run-child");
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("failed to spawn child agent runner")?;
-
-    let child_stdin = child.stdin.take().context("child stdin unavailable")?;
-    let child_stdout = child.stdout.take().context("child stdout unavailable")?;
-    let mut child_stderr = Some(child.stderr.take().context("child stderr unavailable")?);
-    let writer = Arc::new(Mutex::new(BufWriter::new(child_stdin)));
-    {
-        let init = ParentToChildMessage::Init(ChildInitPayload {
-            backend,
-            previous_messages,
-            prompt,
-            config,
-            extra_tools: extra_tools
-                .iter()
-                .map(|tool| RemoteToolDefinition {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.parameters.clone(),
-                })
-                .collect(),
-            execution_options,
-        });
-        let mut writer_guard = writer.lock().map_err(|_| anyhow!("child stdin poisoned"))?;
-        if let Err(error) = write_json_line(&mut *writer_guard, &init) {
-            let mut stderr_reader = BufReader::new(
-                child_stderr
-                    .take()
-                    .ok_or_else(|| anyhow!("child stderr already consumed"))?,
-            );
-            let mut stderr_output = String::new();
-            let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
-            let status = child.wait().ok();
-            let stderr_output = stderr_output.trim();
-            return Err(anyhow!(
-                "failed to send init RPC message to child: {error:#}; exit_status={}; stderr={}",
-                status
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
-                if stderr_output.is_empty() {
-                    "<empty>"
-                } else {
-                    stderr_output
-                }
-            ));
-        }
-    }
-
-    if let Some(control) = &control {
-        let signal_receiver = control.signal_receiver();
-        let writer = Arc::clone(&writer);
-        std::thread::spawn(move || {
-            while let Ok(signal) = signal_receiver.recv() {
-                let message = match signal {
-                    ExecutionSignal::Cancel => ParentToChildMessage::Cancel,
-                    ExecutionSignal::TimeoutObservation => ParentToChildMessage::SoftTimeout,
-                    ExecutionSignal::Yield => ParentToChildMessage::Yield,
-                };
-                if let Ok(mut writer) = writer.lock() {
-                    let _ = write_json_line(&mut *writer, &message);
-                }
-                if matches!(signal, ExecutionSignal::Cancel) {
-                    break;
-                }
-            }
-        });
-    }
-
-    let mut reader = BufReader::new(child_stdout);
-    loop {
-        let message = match read_json_line::<ChildToParentMessage>(&mut reader) {
-            Ok(Some(message)) => message,
-            Ok(None) => {
-                let mut stderr_reader = BufReader::new(
-                    child_stderr
-                        .take()
-                        .ok_or_else(|| anyhow!("child stderr already consumed"))?,
-                );
-                let mut stderr_output = String::new();
-                let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
-                let status = child.wait().ok();
-                let stderr_output = stderr_output.trim();
-                return Err(anyhow!(
-                    "child RPC stream closed unexpectedly; exit_status={}; stderr={}",
-                    status
-                        .map(|status| status.to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    if stderr_output.is_empty() {
-                        "<empty>"
-                    } else {
-                        stderr_output
-                    }
-                ));
-            }
-            Err(error) => {
-                let mut stderr_reader = BufReader::new(
-                    child_stderr
-                        .take()
-                        .ok_or_else(|| anyhow!("child stderr already consumed"))?,
-                );
-                let mut stderr_output = String::new();
-                let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
-                let status = child.wait().ok();
-                let stderr_output = stderr_output.trim();
-                return Err(anyhow!(
-                    "failed to decode child RPC stream: {error:#}; exit_status={}; stderr={}",
-                    status
-                        .map(|status| status.to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    if stderr_output.is_empty() {
-                        "<empty>"
-                    } else {
-                        stderr_output
-                    }
-                ));
-            }
-        };
-        match message {
-            ChildToParentMessage::Started => {}
-            ChildToParentMessage::SessionEvent(event) => {
-                if let Some(control) = &control {
-                    control.emit_event_external(event);
-                }
-            }
-            ChildToParentMessage::Checkpoint(report) => {
-                if let Some(control) = &control {
-                    control.emit_checkpoint_report(report);
-                }
-            }
-            ChildToParentMessage::StableReport(report) => {
-                if let Some(control) = &control {
-                    control.emit_stable_report_external(report);
-                }
-            }
-            ChildToParentMessage::ToolRequest {
-                request_id,
-                tool_name,
-                arguments,
-            } => {
-                let response = match extra_tools.iter().find(|tool| tool.name == tool_name) {
-                    Some(tool) => match tool.invoke(arguments) {
-                        Ok(result) => ParentToChildMessage::ToolResponse {
-                            request_id,
-                            ok: true,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Err(error) => ParentToChildMessage::ToolResponse {
-                            request_id,
-                            ok: false,
-                            result: None,
-                            error: Some(format!("{error:#}")),
-                        },
-                    },
-                    None => ParentToChildMessage::ToolResponse {
-                        request_id,
-                        ok: false,
-                        result: None,
-                        error: Some(format!("unknown host tool: {tool_name}")),
-                    },
-                };
-                let mut writer_guard =
-                    writer.lock().map_err(|_| anyhow!("child stdin poisoned"))?;
-                write_json_line(&mut *writer_guard, &response)?;
-            }
-            ChildToParentMessage::Completed(report) => {
-                let status = child
-                    .wait()
-                    .context("failed to wait for child agent runner")?;
-                if !status.success() {
-                    return Err(anyhow!(
-                        "child agent runner exited unsuccessfully: {status}"
-                    ));
-                }
-                return Ok(report);
-            }
-            ChildToParentMessage::Failed { error } => {
-                let status = child.wait().ok();
-                return Err(anyhow!(
-                    "{}{}",
-                    error,
-                    status
-                        .map(|status| format!("; exit_status={status}"))
-                        .unwrap_or_default()
-                ));
-            }
-        }
+) -> Result<SessionState> {
+    let mut runtime = PersistentChildRuntime::spawn(
+        sandbox,
+        &config.workspace_root,
+        &config.runtime_state_root,
+        global_install_root,
+        skill_memory_source,
+        skills_source_root,
+        &config.skills_dirs,
+    )?;
+    let result = runtime.run_turn(
+        backend,
+        previous_messages,
+        prompt,
+        config,
+        execution_options,
+        extra_tools,
+        control,
+    );
+    let shutdown_result = runtime.shutdown();
+    match (result, shutdown_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 

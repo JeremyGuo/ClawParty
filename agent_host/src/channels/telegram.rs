@@ -1000,6 +1000,7 @@ impl Channel for TelegramChannel {
                         ),
                         text: Some(text),
                         attachments: Vec::new(),
+                        stored_attachments: Vec::new(),
                         control: None,
                     };
                     if sender.send(incoming).await.is_err() {
@@ -1022,6 +1023,7 @@ impl Channel for TelegramChannel {
                         address: self.build_address(&message),
                         text: None,
                         attachments: Vec::new(),
+                        stored_attachments: Vec::new(),
                         control: Some(IncomingControl::ConversationClosed {
                             reason: "telegram bot was removed from the chat".to_string(),
                         }),
@@ -1048,6 +1050,7 @@ impl Channel for TelegramChannel {
                             address: self.build_address(&message),
                             text: None,
                             attachments: Vec::new(),
+                            stored_attachments: Vec::new(),
                             control: Some(IncomingControl::ConversationClosed {
                                 reason: "telegram chat is no longer available".to_string(),
                             }),
@@ -1093,6 +1096,7 @@ impl Channel for TelegramChannel {
                     address: self.build_address(&message),
                     text,
                     attachments,
+                    stored_attachments: Vec::new(),
                     control: None,
                 };
                 if sender.send(incoming).await.is_err() {

@@ -1,5 +1,44 @@
-version: 0.12.1
+version: 0.13.0
 ---
+
+# 0.13.0
+
+- 升级 `config` 保存格式到 `0.13`，本次不影响 `workdir`：
+  删除 `sandbox.mode = "disabled"` 这一用户可选模式，最新配置与 TUI 只保留 `subprocess` / `bubblewrap`；旧配置里残留的 `"disabled"` 会在加载时自动视为 `"subprocess"` 并在升级后写回最新版本。
+- 前台 `agent_frame` 开始支持会话级常驻 child runtime：
+  `MainForeground` 路径会按 session 复用同一个 child 进程；模型切换或 sandbox 切换时，该 runtime 会被显式销毁并重建，避免把 provider continuation 状态泄漏到不兼容的新环境里。
+- `agent_frame` 内部重新收回 provider continuation 优化：
+  `previous_response_id` / provider session 现在只由常驻 runtime 私有维护，不再穿过 `agent_host` 的 config 或持久化状态；host 继续只围绕 canonical `SessionState` 工作。
+- 明确本次只影响 `config`，不影响 `workdir`：
+  新增 `0.12 -> 0.13` config loader，并按版本策略将仓库版本从 `0.12.5` 提升到 `0.13.0`。
+- 升级 `workdir` 结构版本到 `0.18`：
+  最新 `sessions/*/session.json` 不再持久化旧的 `agent_messages` 字段；新增 `0.17 -> 0.18` upgrade step 会把历史 workdir 里残留的这个旧稳定 transcript 副本移除，让 durable 会话状态只围绕 `session_state.messages/pending_messages` 展开。
+- 继续清理前台会话的双轨状态：
+  `SessionSnapshot` 和内存态 `Session` 都不再单独维护 `agent_messages` 镜像，稳定 transcript 统一收敛到 `session_state.messages`，兼容旧磁盘格式的责任则留在 upgrade 和反序列化 fallback。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.17 -> 0.18` workdir upgrade step；按版本策略将仓库版本从 `0.12.4` 提升到 `0.12.5`。
+- 升级 `workdir` 结构版本到 `0.17`：
+  新增 `0.16 -> 0.17` upgrade step，把历史 `session_state.errno = "legacy_pending_continue"` 统一重写为中性的 `runtime_failure`；这让旧恢复壳子的痕迹只停留在升级链里，不再暴露到最新运行时和最新持久化语义中。
+- 继续清理前台恢复模型中的过渡概念：
+  integration 与 upgrade 断言现在都只围绕 `session_state.phase`、`pending_messages` 和中性的 `runtime_failure` 工作，不再要求运行时代码理解 `LegacyPendingContinue` 这类兼容专用错误名。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.16 -> 0.17` workdir upgrade step；按版本策略将仓库版本从 `0.12.3` 提升到 `0.12.4`。
+- 升级 `workdir` 结构版本到 `0.16`：
+  `sessions/*/session.json` 不再持久化旧的 `pending_continue` 字段；升级会保留已存在的 `session_state`，并把残留的 `pending_continue` 从持久化文件里移除，让运行时代码只围绕新的 durable `session_state` 恢复模型工作。
+- 删除前台运行时对旧恢复壳子的依赖：
+  foreground 普通消息、打断消息和 `/continue` 现在都直接使用 `session_state`、`pending_messages` 和 `errno/errinfo` 驱动恢复，不再把新的失败状态回写成 legacy `pending_continue`。
+- 收紧前台用户消息的 durable staging 语义：
+  用户消息在进入 `pending_messages` 时会同步写入可见历史，成功或 yielded 后不再重复补写 user history；这进一步减少了继续执行和失败恢复对旧 `original_user_text/original_attachments` 元数据的依赖。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.15 -> 0.16` workdir upgrade step；按版本策略将仓库版本从 `0.12.2` 提升到 `0.12.3`。
+- 升级 `workdir` 结构版本到 `0.15`：
+  `sessions/*/session.json` 新增 durable `session_state`，集中持久化 `messages`、`pending_messages`、`phase` 与 `errno/errinfo`，为后续收敛 `/continue`、yield 与中断恢复语义打基础；升级会把旧的 `agent_messages` / `pending_continue.resume_messages` 自动投影成新的 `session_state`。
+- 前台 session 持久化开始同步写入新的恢复视图：
+  当前台 turn 正常结束、yield、idle compaction 失败或旧版 `pending_continue` 被恢复时，AgentHost 现在会同步维护 `session_state`，让 durable 状态不再只靠分散字段推断。
+- 前台失败态开始写入结构化 errno：
+  当前台 turn 因 threshold compaction、tool-wait compaction、上游 API 或其他 runtime 错误停在稳定点时，持久化的 `session_state.errno/errinfo` 会记录对应失败类型与摘要，而不再统一退化成“只有旧 `pending_continue`”。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.14 -> 0.15` workdir upgrade step；按版本策略将仓库版本从 `0.12.1` 提升到 `0.12.2`。
 
 # 0.12.1
 

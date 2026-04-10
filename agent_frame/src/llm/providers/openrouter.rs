@@ -2,7 +2,8 @@ use super::UpstreamProvider;
 use crate::config::UpstreamConfig;
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionResponse, ChatCompletionSession,
-    build_chat_completions_url, parse_usage, should_bypass_proxy, upstream_error_from_value,
+    build_chat_completions_url, chat_completions_messages_payload, parse_usage,
+    should_bypass_proxy, upstream_error_from_value,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -35,7 +36,8 @@ impl UpstreamProvider for OpenRouterProvider {
         payload.insert("model".to_string(), Value::String(upstream.model.clone()));
         payload.insert(
             "messages".to_string(),
-            serde_json::to_value(messages).context("failed to serialize messages")?,
+            chat_completions_messages_payload(messages)
+                .context("failed to serialize chat completion messages")?,
         );
         if let Some(cache_control) = &upstream.cache_control {
             payload.insert(

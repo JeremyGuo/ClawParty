@@ -3,7 +3,6 @@ use crate::agents::{ForegroundAgent, SubAgentSpec};
 use crate::backend::{
     AgentBackendKind, BackendExecutionOptions, backend_supports_native_multimodal_input,
     compact_session_messages_with_report as run_backend_compaction,
-    run_session_with_report_controlled_with_options as run_backend_session,
 };
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::{Channel, IncomingMessage};
@@ -31,9 +30,12 @@ use crate::prompt::{
     AgentPromptKind, build_agent_system_prompt, greeting_for_language,
     render_available_models_catalog,
 };
-use crate::sandbox::{bubblewrap_is_available, run_turn_in_child_process};
+use crate::sandbox::{
+    PersistentChildRuntime, bubblewrap_is_available, is_child_run_turn_request_send_error,
+    is_child_transport_error, run_one_shot_child_turn,
+};
 use crate::session::{
-    ModelCatalogChangeNotice, PendingContinueState, SessionManager, SessionSkillObservation,
+    ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase, SessionSkillObservation,
     SessionSnapshot, SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
 };
 use crate::sink::{SinkRouter, SinkTarget};
@@ -53,8 +55,8 @@ use agent_frame::config::{
 use agent_frame::skills::discover_skills;
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
-    ChatMessage, ContextCompactionReport, ResponseCheckpoint, SessionCompactionStats, SessionEvent,
-    SessionExecutionControl, SessionRunReport, StructuredCompactionOutput, TokenUsage, Tool,
+    ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
+    SessionExecutionControl, SessionState, StructuredCompactionOutput, TokenUsage, Tool,
     estimate_session_tokens, extract_assistant_text,
 };
 use anyhow::{Context, Result, anyhow};
@@ -77,10 +79,15 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod background;
+mod command_routing;
 mod commands;
+mod foreground;
 mod messaging;
 mod persistence;
 mod runtime_helpers;
+mod security;
+mod subagents;
 
 use self::commands::*;
 use self::messaging::*;
@@ -116,6 +123,18 @@ struct ActiveNativeZgentSession {
     kernel: Arc<PersistentZgentKernelSession>,
     model_key: String,
     busy: Arc<AtomicBool>,
+}
+
+struct ActiveForegroundAgentFrameRuntime {
+    model_key: String,
+    workspace_id: String,
+    sandbox_mode: SandboxMode,
+    runtime: PersistentChildRuntime,
+}
+
+struct PersistedYieldedForegroundTurn {
+    session: SessionSnapshot,
+    should_auto_resume: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -221,6 +240,8 @@ struct ServerRuntime {
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
+    active_foreground_agent_frame_runtimes:
+        Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
     conversations: Arc<Mutex<ConversationManager>>,
 }
@@ -239,44 +260,27 @@ struct SummaryTracker {
 }
 
 enum TimedRunOutcome {
-    Completed(SessionRunReport),
-    Yielded(SessionRunReport),
+    Completed(SessionState),
+    Yielded(SessionState),
     TimedOut {
-        checkpoint: Option<SessionRunReport>,
+        state: Option<SessionState>,
         error: anyhow::Error,
     },
-    Failed {
-        checkpoint: Option<SessionRunReport>,
-        error: anyhow::Error,
-    },
+    Failed(anyhow::Error),
 }
 
 enum ForegroundTurnOutcome {
     Replied {
-        messages: Vec<ChatMessage>,
+        state: SessionState,
         outgoing: OutgoingMessage,
-        usage: TokenUsage,
-        compaction: SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
     },
-    Yielded {
-        messages: Vec<ChatMessage>,
-        usage: TokenUsage,
-        compaction: SessionCompactionStats,
-        response_checkpoint: Option<ResponseCheckpoint>,
-    },
+    Yielded(SessionState),
     Failed {
-        pending_continue: PendingContinueState,
+        resume_messages: Vec<ChatMessage>,
+        progress_summary: String,
         compaction: SessionCompactionStats,
         error: anyhow::Error,
     },
-}
-
-fn latest_checkpoint_or_stable_report(
-    latest_checkpoint: Option<SessionRunReport>,
-    control: &SessionExecutionControl,
-) -> Option<SessionRunReport> {
-    latest_checkpoint.or_else(|| control.stable_report_snapshot())
 }
 
 impl Drop for SubAgentSlot {
@@ -384,6 +388,99 @@ impl ServerRuntime {
         self.ensure_model_available_for_backend(backend, &model_key)?;
         Ok(model_key)
     }
+
+    fn effective_sandbox_mode(&self, address: &ChannelAddress) -> Result<SandboxMode> {
+        let settings = self.with_conversations(|conversations| {
+            conversations
+                .ensure_conversation(address)
+                .map(|snapshot| snapshot.settings)
+        })?;
+        Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
+    }
+
+    fn ensure_foreground_agent_frame_runtime(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+        config: &FrameAgentConfig,
+    ) -> Result<Arc<Mutex<ActiveForegroundAgentFrameRuntime>>> {
+        let session_key = session.address.session_key();
+        let effective_sandbox_mode = self.effective_sandbox_mode(&session.address)?;
+        if let Some(existing) = self
+            .active_foreground_agent_frame_runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(&session_key).cloned())
+        {
+            let matches_current = existing.lock().ok().is_some_and(|runtime| {
+                runtime.model_key == model_key
+                    && runtime.workspace_id == session.workspace_id
+                    && runtime.sandbox_mode == effective_sandbox_mode
+            });
+            if matches_current {
+                return Ok(existing);
+            }
+            if let Some(runtime) = self
+                .active_foreground_agent_frame_runtimes
+                .lock()
+                .ok()
+                .and_then(|mut runtimes| runtimes.remove(&session_key))
+                && let Ok(mut runtime) = runtime.lock()
+            {
+                let _ = runtime.runtime.shutdown();
+                if runtime.sandbox_mode == SandboxMode::Bubblewrap {
+                    let _ = self
+                        .workspace_manager
+                        .cleanup_transient_mounts(&runtime.workspace_id);
+                }
+            }
+        }
+
+        let runtime = PersistentChildRuntime::spawn(
+            &SandboxConfig {
+                mode: effective_sandbox_mode,
+                bubblewrap_binary: self.sandbox.bubblewrap_binary.clone(),
+            },
+            &config.workspace_root,
+            &config.runtime_state_root,
+            PathBuf::from(&self.main_agent.global_install_root),
+            self.agent_workspace.rundir.join("skill_memory"),
+            self.agent_workspace.skills_dir.clone(),
+            &config.skills_dirs,
+        )?;
+        let entry = Arc::new(Mutex::new(ActiveForegroundAgentFrameRuntime {
+            model_key: model_key.to_string(),
+            workspace_id: session.workspace_id.clone(),
+            sandbox_mode: effective_sandbox_mode,
+            runtime,
+        }));
+        self.active_foreground_agent_frame_runtimes
+            .lock()
+            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
+            .insert(session_key, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    fn invalidate_foreground_agent_frame_runtime(&self, address: &ChannelAddress) -> Result<()> {
+        let session_key = address.session_key();
+        let runtime = self
+            .active_foreground_agent_frame_runtimes
+            .lock()
+            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
+            .remove(&session_key);
+        if let Some(runtime) = runtime
+            && let Ok(mut runtime) = runtime.lock()
+        {
+            let _ = runtime.runtime.shutdown();
+            if runtime.sandbox_mode == SandboxMode::Bubblewrap {
+                let _ = self
+                    .workspace_manager
+                    .cleanup_transient_mounts(&runtime.workspace_id);
+            }
+        }
+        Ok(())
+    }
+
     fn model_config(&self, model_key: &str) -> Result<&ModelConfig> {
         self.models
             .get(model_key)
@@ -800,12 +897,6 @@ impl ServerRuntime {
         ))
     }
 
-    fn subagent_prompt(description: &str) -> String {
-        format!(
-            "{description}\n\nThis is a delegated subtask for the caller. Keep the work narrowly scoped, prefer the fastest path to a correct result, and avoid exploring unrelated directions. Return a concise summary when you finish, including any files you changed and anything the caller must know before continuing."
-        )
-    }
-
     fn with_subagents<T>(
         &self,
         f: impl FnOnce(&mut HashMap<uuid::Uuid, Arc<HostedSubagent>>) -> Result<T>,
@@ -836,15 +927,6 @@ impl ServerRuntime {
         f(&mut sessions)
     }
 
-    fn get_subagent_handle(&self, subagent_id: uuid::Uuid) -> Result<Arc<HostedSubagent>> {
-        self.with_subagents(|subagents| {
-            subagents
-                .get(&subagent_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown subagent {}", subagent_id))
-        })
-    }
-
     fn create_background_session_for_conversation(
         &self,
         address: &ChannelAddress,
@@ -867,395 +949,6 @@ impl ServerRuntime {
             Ok(())
         })?;
         Ok(session)
-    }
-
-    fn persist_subagent_locked(
-        subagent: &HostedSubagent,
-        inner: &HostedSubagentInner,
-    ) -> Result<()> {
-        subagent.persist_locked(inner)
-    }
-
-    fn cleanup_subagent(&self, subagent: &HostedSubagent) -> Result<()> {
-        self.with_subagents(|subagents| {
-            subagents.remove(&subagent.id);
-            Ok(())
-        })?;
-        subagent.remove_state_file()
-    }
-
-    fn start_subagent(
-        &self,
-        parent_agent_id: uuid::Uuid,
-        session: SessionSnapshot,
-        description: String,
-        model_key: Option<String>,
-    ) -> Result<Value> {
-        let agent_backend = self.effective_agent_backend()?;
-        let model_key = model_key.unwrap_or(self.effective_main_model_key()?);
-        self.model_config(&model_key)?;
-        self.ensure_model_available_for_backend(agent_backend, &model_key)?;
-        let timeout_seconds = self.default_subagent_timeout_seconds(&model_key)?;
-        let subagent_id = uuid::Uuid::new_v4();
-        let runtime_state_root = self
-            .agent_workspace
-            .root_dir
-            .join("runtime")
-            .join(&session.workspace_id);
-        let initial_prompt = Self::subagent_prompt(&description);
-        let subagent = HostedSubagent::create(
-            subagent_id,
-            parent_agent_id,
-            session.id,
-            session.address.clone(),
-            session.workspace_id.clone(),
-            session.workspace_root.clone(),
-            runtime_state_root,
-            agent_backend,
-            model_key.clone(),
-            description.clone(),
-            timeout_seconds,
-            timeout_seconds,
-            initial_prompt,
-        )?;
-        self.register_managed_agent(
-            subagent_id,
-            ManagedAgentKind::Subagent,
-            model_key.clone(),
-            Some(parent_agent_id),
-            &session,
-            ManagedAgentState::Running,
-        );
-        self.with_subagents(|subagents| {
-            subagents.insert(subagent_id, Arc::clone(&subagent));
-            Ok(())
-        })?;
-        let runtime = self.clone();
-        thread::spawn(move || {
-            if let Err(error) = runtime.run_subagent_worker(subagent) {
-                error!(
-                    log_stream = "agent",
-                    kind = "subagent_worker_failed",
-                    agent_id = %subagent_id,
-                    error = %format!("{error:#}"),
-                    "subagent worker failed"
-                );
-            }
-        });
-        Ok(json!({
-            "agent_id": subagent_id,
-            "model": model_key,
-            "description": description,
-            "timeout_seconds": timeout_seconds,
-        }))
-    }
-
-    fn kill_subagent(&self, session: &SessionSnapshot, subagent_id: uuid::Uuid) -> Result<Value> {
-        let subagent = self.get_subagent_handle(subagent_id)?;
-        if subagent.session_id != session.id {
-            return Err(anyhow!(
-                "subagent {} does not belong to this session",
-                subagent_id
-            ));
-        }
-        {
-            let mut inner = subagent
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-            inner.persisted.state = SubagentState::Destroyed;
-            inner.persisted.updated_at = Utc::now();
-            inner.persisted.last_error = Some("destroyed".to_string());
-            if let Some(control) = inner.active_control.take() {
-                control.request_cancel();
-            }
-            Self::persist_subagent_locked(&subagent, &inner)?;
-        }
-        subagent.condvar.notify_all();
-        self.cleanup_subagent(&subagent)?;
-        Ok(json!({
-            "agent_id": subagent_id,
-            "killed": true
-        }))
-    }
-
-    fn join_subagent(
-        &self,
-        session: &SessionSnapshot,
-        subagent_id: uuid::Uuid,
-        timeout_seconds: f64,
-        control: Option<SessionExecutionControl>,
-    ) -> Result<Value> {
-        if timeout_seconds < 0.0 {
-            return Err(anyhow!("timeout_seconds must be non-negative"));
-        }
-        let subagent = self.get_subagent_handle(subagent_id)?;
-        if subagent.session_id != session.id {
-            return Err(anyhow!(
-                "subagent {} does not belong to this session",
-                subagent_id
-            ));
-        }
-        let deadline = (timeout_seconds > 0.0)
-            .then(|| std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds));
-        let signal_receiver = control
-            .as_ref()
-            .map(SessionExecutionControl::signal_receiver);
-        loop {
-            let inner = subagent
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-            match inner.persisted.state {
-                SubagentState::Ready => {
-                    let payload = json!({
-                        "agent_id": subagent_id,
-                        "running": false,
-                        "completed": true,
-                        "reason": "completed",
-                        "text": inner.persisted.last_result_text,
-                        "attachment_paths": inner.persisted.last_attachment_paths,
-                    });
-                    drop(inner);
-                    self.cleanup_subagent(&subagent)?;
-                    return Ok(payload);
-                }
-                SubagentState::Failed => {
-                    let payload = json!({
-                        "agent_id": subagent_id,
-                        "running": false,
-                        "completed": false,
-                        "reason": "failed",
-                        "error": inner.persisted.last_error,
-                    });
-                    drop(inner);
-                    self.cleanup_subagent(&subagent)?;
-                    return Ok(payload);
-                }
-                SubagentState::Destroyed => {
-                    return Ok(json!({
-                        "agent_id": subagent_id,
-                        "running": false,
-                        "completed": false,
-                        "reason": "destroyed",
-                    }));
-                }
-                SubagentState::Running | SubagentState::WaitingForCharge => {}
-            }
-            let wait_duration = deadline.map(|deadline| {
-                deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .min(Duration::from_millis(200))
-            });
-            drop(inner);
-            if let Some(receiver) = &signal_receiver
-                && receiver.try_recv().is_ok()
-            {
-                return Ok(json!({
-                    "agent_id": subagent_id,
-                    "running": true,
-                    "completed": false,
-                    "interrupted": true,
-                    "reason": "agent_turn_interrupted",
-                }));
-            }
-            if let Some(deadline) = deadline
-                && std::time::Instant::now() >= deadline
-            {
-                return Ok(json!({
-                    "agent_id": subagent_id,
-                    "running": true,
-                    "completed": false,
-                    "timed_out": true,
-                    "reason": "wait_timed_out",
-                }));
-            }
-            let inner = subagent
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-            let wait_duration = wait_duration.unwrap_or(Duration::from_millis(200));
-            let _ = subagent
-                .condvar
-                .wait_timeout(inner, wait_duration)
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-        }
-    }
-
-    fn destroy_subagents_for_session(&self, session_id: uuid::Uuid) -> Result<usize> {
-        let targets = self.with_subagents(|subagents| {
-            Ok(subagents
-                .values()
-                .filter(|subagent| subagent.session_id == session_id)
-                .cloned()
-                .collect::<Vec<_>>())
-        })?;
-        let mut destroyed = 0usize;
-        for subagent in targets {
-            {
-                let mut inner = subagent
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-                if inner.persisted.state == SubagentState::Destroyed {
-                    continue;
-                }
-                inner.persisted.state = SubagentState::Destroyed;
-                inner.persisted.updated_at = Utc::now();
-                inner.persisted.last_error = Some("session_destroyed".to_string());
-                if let Some(control) = inner.active_control.take() {
-                    control.request_cancel();
-                }
-                Self::persist_subagent_locked(&subagent, &inner)?;
-            }
-            subagent.condvar.notify_all();
-            self.cleanup_subagent(&subagent)?;
-            destroyed = destroyed.saturating_add(1);
-        }
-        Ok(destroyed)
-    }
-
-    fn subagent_session_snapshot(
-        &self,
-        subagent: &HostedSubagent,
-        message_count: usize,
-        _model_key: &str,
-    ) -> SessionSnapshot {
-        SessionSnapshot {
-            id: subagent.session_id,
-            agent_id: subagent.id,
-            address: subagent.address.clone(),
-            root_dir: self.agent_workspace.root_dir.join("subagent-sessions"),
-            attachments_dir: subagent.workspace_root.join("upload"),
-            workspace_id: subagent.workspace_id.clone(),
-            workspace_root: subagent.workspace_root.clone(),
-            message_count,
-            agent_message_count: message_count,
-            agent_messages: Vec::new(),
-            last_user_message_at: None,
-            last_agent_returned_at: None,
-            last_compacted_at: None,
-            turn_count: 0,
-            last_compacted_turn_count: 0,
-            cumulative_usage: TokenUsage::default(),
-            cumulative_compaction: SessionCompactionStats::default(),
-            api_timeout_override_seconds: None,
-            skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
-            idle_compaction_retry: None,
-            zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
-            pending_workspace_summary: false,
-            close_after_summary: false,
-        }
-    }
-
-    fn idle_compact_subagents_for_session(
-        &self,
-        session: &SessionSnapshot,
-        idle_threshold: Duration,
-    ) -> Result<()> {
-        let now = Utc::now();
-        let subagents = self.with_subagents(|subagents| {
-            Ok(subagents
-                .values()
-                .filter(|subagent| subagent.session_id == session.id)
-                .cloned()
-                .collect::<Vec<_>>())
-        })?;
-        for subagent in subagents {
-            let (agent_backend, model_key, messages, turn_count) = {
-                let inner = subagent
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-                if inner.persisted.state != SubagentState::Ready {
-                    continue;
-                }
-                let Some(last_returned_at) = inner.persisted.last_returned_at else {
-                    continue;
-                };
-                if now
-                    .signed_duration_since(last_returned_at)
-                    .to_std()
-                    .unwrap_or_default()
-                    < idle_threshold
-                {
-                    continue;
-                }
-                if inner.persisted.turn_count <= inner.persisted.last_compacted_turn_count
-                    || inner.persisted.messages.is_empty()
-                {
-                    continue;
-                }
-                (
-                    inner.persisted.agent_backend,
-                    inner.persisted.model_key.clone(),
-                    inner.persisted.messages.clone(),
-                    inner.persisted.turn_count,
-                )
-            };
-            let subagent_session =
-                self.subagent_session_snapshot(&subagent, messages.len(), &model_key);
-            let config = self.build_agent_frame_config(
-                &subagent_session,
-                &subagent.workspace_root,
-                AgentPromptKind::SubAgent,
-                &model_key,
-                None,
-            )?;
-            let extra_tools = self.build_extra_tools(
-                &subagent_session,
-                AgentPromptKind::SubAgent,
-                subagent.id,
-                None,
-            );
-            let report = run_backend_compaction(agent_backend, messages, config, extra_tools)?;
-            if !report.compacted {
-                continue;
-            }
-            let stats = compaction_stats_from_report(&report);
-            let mut inner = subagent
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-            inner.persisted.messages = report.messages;
-            inner.persisted.last_compacted_turn_count = turn_count;
-            inner.persisted.updated_at = Utc::now();
-            inner.persisted.cumulative_compaction.run_count = inner
-                .persisted
-                .cumulative_compaction
-                .run_count
-                .saturating_add(stats.run_count);
-            inner.persisted.cumulative_compaction.compacted_run_count = inner
-                .persisted
-                .cumulative_compaction
-                .compacted_run_count
-                .saturating_add(stats.compacted_run_count);
-            inner
-                .persisted
-                .cumulative_compaction
-                .estimated_tokens_before = inner
-                .persisted
-                .cumulative_compaction
-                .estimated_tokens_before
-                .saturating_add(stats.estimated_tokens_before);
-            inner.persisted.cumulative_compaction.estimated_tokens_after = inner
-                .persisted
-                .cumulative_compaction
-                .estimated_tokens_after
-                .saturating_add(stats.estimated_tokens_after);
-            inner
-                .persisted
-                .cumulative_compaction
-                .usage
-                .add_assign(&stats.usage);
-            Self::persist_subagent_locked(&subagent, &inner)?;
-        }
-        Ok(())
     }
 
     fn register_managed_agent(
@@ -1615,7 +1308,6 @@ impl ServerRuntime {
                 native_audio_input,
                 native_image_generation,
             )?,
-            response_checkpoint: None,
             image_tool_upstream,
             pdf_tool_upstream,
             audio_tool_upstream,
@@ -2322,27 +2014,6 @@ impl ServerRuntime {
         }
     }
 
-    fn try_acquire_subagent_slot(&self) -> Result<SubAgentSlot> {
-        loop {
-            let current = self.subagent_count.load(Ordering::SeqCst);
-            if current >= self.max_global_sub_agents {
-                return Err(anyhow!(
-                    "global subagent limit reached ({})",
-                    self.max_global_sub_agents
-                ));
-            }
-            if self
-                .subagent_count
-                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(SubAgentSlot {
-                    counter: Arc::clone(&self.subagent_count),
-                });
-            }
-        }
-    }
-
     fn run_agent_turn_sync(
         &self,
         session: SessionSnapshot,
@@ -2354,10 +2025,14 @@ impl ServerRuntime {
         prompt: String,
         upstream_timeout_seconds: Option<f64>,
         execution_control: Option<SessionExecutionControl>,
-    ) -> Result<agent_frame::SessionRunReport> {
+    ) -> Result<SessionState> {
         let workspace_root = session.workspace_root.clone();
         let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
-        if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
+        let effective_sandbox_mode = self.effective_sandbox_mode(&session.address)?;
+        if matches!(
+            effective_sandbox_mode,
+            crate::config::SandboxMode::Bubblewrap
+        ) {
             self.workspace_manager
                 .cleanup_transient_mounts(&session.workspace_id)?;
             let _ = self
@@ -2371,18 +2046,6 @@ impl ServerRuntime {
             &model_key,
             upstream_timeout_seconds,
         )?;
-        let mut config = config;
-        config.response_checkpoint = session
-            .pending_continue
-            .as_ref()
-            .and_then(|pending| pending.response_checkpoint.clone())
-            .filter(|checkpoint| checkpoint.matches_messages(&previous_messages))
-            .or_else(|| {
-                session
-                    .response_checkpoint
-                    .clone()
-                    .filter(|checkpoint| checkpoint.matches_messages(&previous_messages))
-            });
         std::fs::create_dir_all(&config.runtime_state_root).with_context(|| {
             format!(
                 "failed to create runtime state root {}",
@@ -2393,19 +2056,64 @@ impl ServerRuntime {
         let extra_tools =
             self.build_extra_tools(&session, kind, agent_id, execution_control.clone());
         let backend_execution_options = self.build_backend_execution_options(agent_backend);
-        if matches!(self.sandbox.mode, crate::config::SandboxMode::Disabled) {
-            run_backend_session(
-                agent_backend,
-                previous_messages,
-                prompt,
-                config,
-                extra_tools,
-                execution_control,
-                backend_execution_options,
-            )
+        if kind == AgentPromptKind::MainForeground && agent_backend == AgentBackendKind::AgentFrame
+        {
+            let runtime =
+                self.ensure_foreground_agent_frame_runtime(&session, &model_key, &config)?;
+            let result = {
+                let mut runtime = runtime
+                    .lock()
+                    .map_err(|_| anyhow!("foreground runtime lock poisoned"))?;
+                runtime.runtime.run_turn(
+                    agent_backend,
+                    previous_messages.clone(),
+                    prompt.clone(),
+                    config.clone(),
+                    backend_execution_options.clone(),
+                    extra_tools.clone(),
+                    execution_control.clone(),
+                )
+            };
+            match result {
+                Ok(report) => Ok(report),
+                Err(error) if is_child_transport_error(&error) => {
+                    let retryable_stale_pipe = is_child_run_turn_request_send_error(&error);
+                    let original_error = format!("{error:#}");
+                    self.invalidate_foreground_agent_frame_runtime(&session.address)?;
+                    if !retryable_stale_pipe {
+                        return Err(error);
+                    }
+                    let runtime =
+                        self.ensure_foreground_agent_frame_runtime(&session, &model_key, &config)?;
+                    let mut runtime = runtime
+                        .lock()
+                        .map_err(|_| anyhow!("foreground runtime lock poisoned"))?;
+                    runtime
+                        .runtime
+                        .run_turn(
+                            agent_backend,
+                            previous_messages,
+                            prompt,
+                            config,
+                            backend_execution_options,
+                            extra_tools,
+                            execution_control,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "retry after replacing stale child runtime failed; original error: {original_error}"
+                            )
+                        })
+                }
+                Err(error) => Err(error),
+            }
         } else {
-            let result = run_turn_in_child_process(
-                &self.sandbox,
+            let sandbox = SandboxConfig {
+                mode: effective_sandbox_mode,
+                bubblewrap_binary: self.sandbox.bubblewrap_binary.clone(),
+            };
+            let result = run_one_shot_child_turn(
+                &sandbox,
                 agent_backend,
                 previous_messages,
                 prompt,
@@ -2417,7 +2125,10 @@ impl ServerRuntime {
                 extra_tools,
                 execution_control,
             );
-            if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
+            if matches!(
+                effective_sandbox_mode,
+                crate::config::SandboxMode::Bubblewrap
+            ) {
                 let _ = self
                     .workspace_manager
                     .cleanup_transient_mounts(&session.workspace_id);
@@ -2440,9 +2151,8 @@ impl ServerRuntime {
         join_label: &str,
     ) -> Result<TimedRunOutcome> {
         enum DriverEvent {
-            Checkpoint(SessionRunReport),
             Runtime(SessionEvent),
-            Completed(Result<SessionRunReport>),
+            Completed(Result<SessionState>),
         }
 
         let runtime = self.clone();
@@ -2451,16 +2161,11 @@ impl ServerRuntime {
         let event_model_key = model_key.clone();
         let phase_session_key = event_session.address.session_key();
         let active_foreground_phases = Arc::clone(&self.active_foreground_phases);
-        let (checkpoint_sender, mut checkpoint_receiver) = mpsc::unbounded_channel();
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-        let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
-            let _ = checkpoint_sender.send(report);
-        })
-        .with_event_callback(move |event| {
+        let execution_control = SessionExecutionControl::new().with_event_callback(move |event| {
             update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
-        let stable_report_control = execution_control.clone();
         if let Some(observer) = control_observer {
             if let Ok(mut phases) = self.active_foreground_phases.lock() {
                 phases.insert(
@@ -2491,14 +2196,6 @@ impl ServerRuntime {
         {
             let driver_sender = driver_sender.clone();
             relay_tasks.push(tokio::spawn(async move {
-                while let Some(checkpoint) = checkpoint_receiver.recv().await {
-                    let _ = driver_sender.send(DriverEvent::Checkpoint(checkpoint));
-                }
-            }));
-        }
-        {
-            let driver_sender = driver_sender.clone();
-            relay_tasks.push(tokio::spawn(async move {
                 while let Some(event) = event_receiver.recv().await {
                     let _ = driver_sender.send(DriverEvent::Runtime(event));
                 }
@@ -2515,10 +2212,8 @@ impl ServerRuntime {
             }));
         }
         drop(driver_sender);
-        let mut latest_checkpoint = None;
         while let Some(driver_event) = driver_receiver.recv().await {
             match driver_event {
-                DriverEvent::Checkpoint(checkpoint) => latest_checkpoint = Some(checkpoint),
                 DriverEvent::Runtime(event) => {
                     if matches!(kind, AgentPromptKind::MainForeground)
                         && let SessionEvent::CompactionCompleted {
@@ -2555,22 +2250,16 @@ impl ServerRuntime {
                     for task in relay_tasks {
                         task.abort();
                     }
-                    let report = match result {
-                        Ok(report) => report,
+                    let state = match result {
+                        Ok(state) => state,
                         Err(error) => {
-                            return Ok(TimedRunOutcome::Failed {
-                                checkpoint: latest_checkpoint_or_stable_report(
-                                    latest_checkpoint,
-                                    &stable_report_control,
-                                ),
-                                error,
-                            });
+                            return Ok(TimedRunOutcome::Failed(error));
                         }
                     };
-                    if report.yielded {
-                        return Ok(TimedRunOutcome::Yielded(report));
+                    if state.phase == SessionPhase::Yielded {
+                        return Ok(TimedRunOutcome::Yielded(state));
                     }
-                    return Ok(TimedRunOutcome::Completed(report));
+                    return Ok(TimedRunOutcome::Completed(state));
                 }
             }
         }
@@ -2592,9 +2281,8 @@ impl ServerRuntime {
         timeout_label: &str,
     ) -> Result<TimedRunOutcome> {
         enum DriverEvent {
-            Checkpoint(SessionRunReport),
             Runtime(SessionEvent),
-            Completed(Result<SessionRunReport>),
+            Completed(Result<SessionState>),
             SoftDeadline,
             HardDeadline,
         }
@@ -2603,16 +2291,11 @@ impl ServerRuntime {
         let event_model_key = model_key.clone();
         let phase_session_key = event_session.address.session_key();
         let active_foreground_phases = Arc::clone(&self.active_foreground_phases);
-        let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
-        let execution_control = SessionExecutionControl::with_checkpoint_callback(move |report| {
-            let _ = checkpoint_sender.send(report);
-        })
-        .with_event_callback(move |event| {
+        let execution_control = SessionExecutionControl::new().with_event_callback(move |event| {
             update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
             let _ = event_sender.send(event);
         });
-        let stable_report_control = execution_control.clone();
         if let Some(observer) = control_observer {
             if let Ok(mut phases) = self.active_foreground_phases.lock() {
                 phases.insert(
@@ -2642,16 +2325,6 @@ impl ServerRuntime {
             )
         });
         let (driver_sender, driver_receiver) = std::sync::mpsc::channel();
-        {
-            let driver_sender = driver_sender.clone();
-            std::thread::spawn(move || {
-                while let Ok(report) = checkpoint_receiver.recv() {
-                    if driver_sender.send(DriverEvent::Checkpoint(report)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
         {
             let driver_sender = driver_sender.clone();
             std::thread::spawn(move || {
@@ -2699,11 +2372,9 @@ impl ServerRuntime {
             });
         }
         drop(driver_sender);
-        let mut latest_checkpoint = None;
         let mut soft_timeout_error = None;
         while let Ok(driver_event) = driver_receiver.recv() {
             match driver_event {
-                DriverEvent::Checkpoint(report) => latest_checkpoint = Some(report),
                 DriverEvent::Runtime(event) => {
                     if matches!(kind, AgentPromptKind::MainForeground)
                         && let SessionEvent::CompactionCompleted {
@@ -2737,28 +2408,22 @@ impl ServerRuntime {
                     log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
                 }
                 DriverEvent::Completed(result) => {
-                    let report = match result {
-                        Ok(report) => report,
+                    let state = match result {
+                        Ok(state) => state,
                         Err(error) => {
-                            return Ok(TimedRunOutcome::Failed {
-                                checkpoint: latest_checkpoint_or_stable_report(
-                                    latest_checkpoint,
-                                    &stable_report_control,
-                                ),
-                                error,
-                            });
+                            return Ok(TimedRunOutcome::Failed(error));
                         }
                     };
-                    if report.yielded {
-                        return Ok(TimedRunOutcome::Yielded(report));
+                    if state.phase == SessionPhase::Yielded {
+                        return Ok(TimedRunOutcome::Yielded(state));
                     }
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
-                            checkpoint: Some(report),
+                            state: Some(state),
                             error,
                         });
                     }
-                    return Ok(TimedRunOutcome::Completed(report));
+                    return Ok(TimedRunOutcome::Completed(state));
                 }
                 DriverEvent::SoftDeadline => {
                     if soft_timeout_error.is_none() {
@@ -2775,10 +2440,7 @@ impl ServerRuntime {
                     let timeout_seconds = timeout_seconds.expect("hard deadline exists");
                     cancellation_handle.request_cancel();
                     return Ok(TimedRunOutcome::TimedOut {
-                        checkpoint: latest_checkpoint_or_stable_report(
-                            latest_checkpoint,
-                            &stable_report_control,
-                        ),
+                        state: None,
                         error: anyhow!(
                             "{} hard timed out after {:.1} seconds",
                             timeout_label,
@@ -2789,741 +2451,6 @@ impl ServerRuntime {
             }
         }
         Err(anyhow!("agent turn driver channel closed unexpectedly"))
-    }
-
-    fn run_subagent_worker(&self, subagent: Arc<HostedSubagent>) -> Result<()> {
-        let _slot = self.try_acquire_subagent_slot()?;
-        let (agent_backend, model_key, previous_messages, prompt, timeout_seconds) = {
-            let mut inner = subagent
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-            loop {
-                match inner.persisted.state {
-                    SubagentState::Destroyed | SubagentState::Failed => {
-                        Self::persist_subagent_locked(&subagent, &inner)?;
-                        return Ok(());
-                    }
-                    SubagentState::Ready if !inner.queued_prompts.is_empty() => {
-                        inner.persisted.state = SubagentState::Running;
-                        break;
-                    }
-                    SubagentState::Running => break,
-                    SubagentState::Ready | SubagentState::WaitingForCharge => {
-                        inner = subagent
-                            .condvar
-                            .wait(inner)
-                            .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-                    }
-                }
-            }
-
-            let prompt = inner.queued_prompts.pop_front().unwrap_or_default();
-            inner.persisted.pending_prompts = inner.queued_prompts.iter().cloned().collect();
-            let timeout_seconds = inner.persisted.default_charge_seconds;
-            inner.persisted.updated_at = Utc::now();
-            Self::persist_subagent_locked(&subagent, &inner)?;
-            (
-                inner.persisted.agent_backend,
-                inner.persisted.model_key.clone(),
-                inner.persisted.messages.clone(),
-                prompt,
-                timeout_seconds,
-            )
-        };
-
-        self.mark_managed_agent_running(subagent.id);
-        let runtime = self.clone();
-        let subagent_for_observer = Arc::clone(&subagent);
-        let control_observer: Arc<dyn Fn(SessionExecutionControl) + Send + Sync> =
-            Arc::new(move |control| {
-                if let Ok(mut inner) = subagent_for_observer.inner.lock() {
-                    inner.active_control = Some(control);
-                }
-            });
-        let session = SessionSnapshot {
-            id: subagent.session_id,
-            agent_id: subagent.id,
-            address: subagent.address.clone(),
-            root_dir: self.agent_workspace.root_dir.join("subagent-sessions"),
-            attachments_dir: subagent.workspace_root.join("upload"),
-            workspace_id: subagent.workspace_id.clone(),
-            workspace_root: subagent.workspace_root.clone(),
-            message_count: 0,
-            agent_message_count: previous_messages.len(),
-            agent_messages: previous_messages.clone(),
-            last_user_message_at: None,
-            last_agent_returned_at: None,
-            last_compacted_at: None,
-            turn_count: 0,
-            last_compacted_turn_count: 0,
-            cumulative_usage: TokenUsage::default(),
-            cumulative_compaction: SessionCompactionStats::default(),
-            api_timeout_override_seconds: None,
-            skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
-            idle_compaction_retry: None,
-            zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
-            pending_workspace_summary: false,
-            close_after_summary: false,
-        };
-        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&model_key)?;
-        let outcome = runtime.run_agent_turn_with_timeout_blocking(
-            session.clone(),
-            AgentPromptKind::SubAgent,
-            subagent.id,
-            agent_backend,
-            model_key.clone(),
-            previous_messages,
-            prompt,
-            Some(timeout_seconds),
-            Some(upstream_timeout_seconds),
-            Some(control_observer),
-            "subagent",
-        )?;
-        let mut inner = subagent
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("subagent state lock poisoned"))?;
-        inner.active_control = None;
-        match outcome {
-            TimedRunOutcome::Completed(report) | TimedRunOutcome::Yielded(report) => {
-                inner.persisted.messages = report.messages;
-                inner.persisted.resume_pending = false;
-                inner.persisted.state = SubagentState::Ready;
-                inner.persisted.updated_at = Utc::now();
-                inner.persisted.last_returned_at = Some(Utc::now());
-                inner.persisted.turn_count = inner.persisted.turn_count.saturating_add(1);
-                inner.persisted.cumulative_usage.add_assign(&report.usage);
-                inner.persisted.cumulative_compaction.run_count = inner
-                    .persisted
-                    .cumulative_compaction
-                    .run_count
-                    .saturating_add(report.compaction.run_count);
-                inner.persisted.cumulative_compaction.compacted_run_count = inner
-                    .persisted
-                    .cumulative_compaction
-                    .compacted_run_count
-                    .saturating_add(report.compaction.compacted_run_count);
-                inner
-                    .persisted
-                    .cumulative_compaction
-                    .estimated_tokens_before = inner
-                    .persisted
-                    .cumulative_compaction
-                    .estimated_tokens_before
-                    .saturating_add(report.compaction.estimated_tokens_before);
-                inner.persisted.cumulative_compaction.estimated_tokens_after = inner
-                    .persisted
-                    .cumulative_compaction
-                    .estimated_tokens_after
-                    .saturating_add(report.compaction.estimated_tokens_after);
-                inner
-                    .persisted
-                    .cumulative_compaction
-                    .usage
-                    .add_assign(&report.compaction.usage);
-                let assistant_text = extract_assistant_text(&inner.persisted.messages);
-                let (clean_text, attachments) =
-                    extract_attachment_references(&assistant_text, &subagent.workspace_root)?;
-                inner.persisted.last_result_text = Some(clean_text);
-                inner.persisted.last_attachment_paths = attachments
-                    .iter()
-                    .map(|item| relative_attachment_path(&subagent.workspace_root, &item.path))
-                    .collect::<Result<Vec<_>>>()?;
-                inner.persisted.last_error = None;
-                self.mark_managed_agent_completed(subagent.id, &report.usage);
-                log_turn_usage(
-                    subagent.id,
-                    &session,
-                    &report.usage,
-                    false,
-                    "subagent",
-                    Some(inner.persisted.parent_agent_id),
-                );
-            }
-            TimedRunOutcome::TimedOut { checkpoint, error } => {
-                if let Some(report) = checkpoint {
-                    inner.persisted.messages = report.messages;
-                    inner.persisted.cumulative_usage.add_assign(&report.usage);
-                    inner.persisted.cumulative_compaction.run_count = inner
-                        .persisted
-                        .cumulative_compaction
-                        .run_count
-                        .saturating_add(report.compaction.run_count);
-                    inner.persisted.cumulative_compaction.compacted_run_count = inner
-                        .persisted
-                        .cumulative_compaction
-                        .compacted_run_count
-                        .saturating_add(report.compaction.compacted_run_count);
-                    inner
-                        .persisted
-                        .cumulative_compaction
-                        .estimated_tokens_before = inner
-                        .persisted
-                        .cumulative_compaction
-                        .estimated_tokens_before
-                        .saturating_add(report.compaction.estimated_tokens_before);
-                    inner.persisted.cumulative_compaction.estimated_tokens_after = inner
-                        .persisted
-                        .cumulative_compaction
-                        .estimated_tokens_after
-                        .saturating_add(report.compaction.estimated_tokens_after);
-                    inner
-                        .persisted
-                        .cumulative_compaction
-                        .usage
-                        .add_assign(&report.compaction.usage);
-                }
-                inner.persisted.resume_pending = false;
-                inner.persisted.state = SubagentState::Failed;
-                inner.persisted.updated_at = Utc::now();
-                inner.persisted.last_returned_at = Some(Utc::now());
-                inner.persisted.last_error = Some(format!("{error:#}"));
-                self.mark_managed_agent_timed_out(
-                    subagent.id,
-                    &inner.persisted.cumulative_usage,
-                    &error,
-                );
-            }
-            TimedRunOutcome::Failed { checkpoint, error } => {
-                if let Some(report) = checkpoint {
-                    inner.persisted.messages = report.messages;
-                    inner.persisted.cumulative_usage.add_assign(&report.usage);
-                }
-                inner.persisted.resume_pending = false;
-                inner.persisted.state = SubagentState::Failed;
-                inner.persisted.updated_at = Utc::now();
-                inner.persisted.last_error = Some(format!("{error:#}"));
-                self.mark_managed_agent_failed(
-                    subagent.id,
-                    &inner.persisted.cumulative_usage,
-                    &error,
-                );
-            }
-        }
-        Self::persist_subagent_locked(&subagent, &inner)?;
-        drop(inner);
-        subagent.condvar.notify_all();
-        Ok(())
-    }
-
-    fn start_background_agent(
-        &self,
-        parent_agent_id: uuid::Uuid,
-        session: SessionSnapshot,
-        model_key: Option<String>,
-        prompt: String,
-        sink: SinkTarget,
-    ) -> Result<Value> {
-        let background_agent_id = uuid::Uuid::new_v4();
-        let agent_backend = self.effective_agent_backend()?;
-        let model_key = match model_key {
-            Some(model_key) => model_key,
-            None => self.effective_main_model_key()?,
-        };
-        self.model_config(&model_key)?;
-        self.ensure_model_available_for_backend(agent_backend, &model_key)?;
-        let background_session =
-            self.create_background_session_for_conversation(&session.address, background_agent_id)?;
-        self.register_managed_agent(
-            background_agent_id,
-            ManagedAgentKind::Background,
-            model_key.clone(),
-            Some(parent_agent_id),
-            &background_session,
-            ManagedAgentState::Enqueued,
-        );
-        self.background_job_sender
-            .blocking_send(BackgroundJobRequest {
-                agent_id: background_agent_id,
-                parent_agent_id: Some(parent_agent_id),
-                cron_task_id: None,
-                session: background_session.clone(),
-                agent_backend,
-                model_key: model_key.clone(),
-                prompt,
-                sink: sink.clone(),
-            })
-            .context("failed to enqueue background agent")?;
-        info!(
-            log_stream = "agent",
-            log_key = %background_agent_id,
-            kind = "background_agent_enqueued",
-            parent_agent_id = %parent_agent_id,
-            session_id = %background_session.id,
-            channel_id = %background_session.address.channel_id,
-            model = %model_key,
-            "background agent enqueued"
-        );
-        Ok(json!({
-            "agent_id": background_agent_id,
-            "parent_agent_id": parent_agent_id,
-            "model": model_key,
-            "sink": sink_target_to_value(&sink)
-        }))
-    }
-
-    fn background_session_snapshot(&self, session_id: uuid::Uuid) -> Result<SessionSnapshot> {
-        self.with_sessions(|sessions| sessions.background_snapshot(session_id))
-    }
-
-    async fn run_background_agent_turn(
-        &self,
-        session: &SessionSnapshot,
-        agent_id: uuid::Uuid,
-        agent_backend: AgentBackendKind,
-        model_key: &str,
-        prompt: String,
-        join_label: &str,
-    ) -> Result<TimedRunOutcome> {
-        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(model_key)?;
-        self.run_agent_turn_with_timeout(
-            session.clone(),
-            AgentPromptKind::MainBackground,
-            agent_id,
-            agent_backend,
-            model_key.to_string(),
-            session.agent_messages.clone(),
-            prompt,
-            Some(upstream_timeout_seconds),
-            None,
-            join_label,
-        )
-        .await
-    }
-
-    fn persist_background_checkpoint(
-        &self,
-        session_id: uuid::Uuid,
-        checkpoint: &SessionRunReport,
-    ) -> Result<()> {
-        self.with_sessions(|sessions| {
-            sessions.update_background_checkpoint(
-                session_id,
-                checkpoint.messages.clone(),
-                &checkpoint.usage,
-                &checkpoint.compaction,
-                checkpoint.response_checkpoint.clone(),
-            )
-        })
-    }
-
-    async fn run_background_job(&self, job: BackgroundJobRequest) -> Result<()> {
-        let session = self.background_session_snapshot(job.session.id)?;
-        self.mark_managed_agent_running(job.agent_id);
-        info!(
-            log_stream = "agent",
-            log_key = %job.agent_id,
-            kind = "background_agent_started",
-            parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
-            cron_task_id = job.cron_task_id.map(|value| value.to_string()),
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            model = %job.model_key,
-            "background agent started"
-        );
-        let run_result = self
-            .run_background_agent_turn(
-                &session,
-                job.agent_id,
-                job.agent_backend,
-                &job.model_key,
-                job.prompt.clone(),
-                "background agent task join failed",
-            )
-            .await;
-
-        let outcome = match run_result {
-            Ok(TimedRunOutcome::Completed(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_turn(
-                        session.id,
-                        report.messages.clone(),
-                        &report.usage,
-                        &report.compaction,
-                        report.response_checkpoint.clone(),
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(job.prompt.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
-                    &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                log_turn_usage(
-                    job.agent_id,
-                    &session,
-                    &report.usage,
-                    false,
-                    "main_background",
-                    job.parent_agent_id,
-                );
-                info!(
-                    log_stream = "agent",
-                    log_key = %job.agent_id,
-                    kind = "background_agent_replied",
-                    parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
-                    cron_task_id = job.cron_task_id.map(|value| value.to_string()),
-                    session_id = %session.id,
-                    channel_id = %session.address.channel_id,
-                    has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
-                    attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
-                    "background agent produced reply"
-                );
-                let sink_router = self.sink_router.read().await;
-                if let Err(error) = sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
-                    .await
-                    .context("failed to dispatch background agent reply")
-                {
-                    self.mark_managed_agent_failed(job.agent_id, &report.usage, &error);
-                    let recovery = self
-                        .handle_background_job_failure(&job, &session, &error)
-                        .await
-                        .with_context(|| format!("{error:#}"));
-                    let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
-                    return recovery;
-                }
-                self.mark_managed_agent_completed(job.agent_id, &report.usage);
-                Ok(())
-            }
-            Ok(TimedRunOutcome::Yielded(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_yielded_turn(
-                        session.id,
-                        report.messages.clone(),
-                        &report.usage,
-                        &report.compaction,
-                        report.response_checkpoint.clone(),
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(job.prompt.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
-                    &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                log_turn_usage(
-                    job.agent_id,
-                    &session,
-                    &report.usage,
-                    false,
-                    "main_background",
-                    job.parent_agent_id,
-                );
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
-                    .await
-                    .context("failed to dispatch yielded background agent reply")?;
-                self.mark_managed_agent_completed(job.agent_id, &report.usage);
-                Ok(())
-            }
-            Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
-                if let Some(checkpoint) = &checkpoint {
-                    self.persist_background_checkpoint(session.id, checkpoint)?;
-                }
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
-            }
-            Ok(TimedRunOutcome::Failed { checkpoint, error }) => {
-                if let Some(checkpoint) = &checkpoint {
-                    self.persist_background_checkpoint(session.id, checkpoint)?;
-                }
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_failed(job.agent_id, &usage, &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
-            }
-            Err(error) => {
-                self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
-            }
-        };
-        let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
-        outcome
-    }
-
-    async fn handle_background_job_failure(
-        &self,
-        job: &BackgroundJobRequest,
-        session: &SessionSnapshot,
-        error: &anyhow::Error,
-    ) -> Result<()> {
-        let session = self.background_session_snapshot(session.id)?;
-        if error
-            .to_string()
-            .contains("failed to dispatch background agent reply")
-            || error
-                .to_string()
-                .contains("background agent error dispatch failed")
-        {
-            return Err(anyhow!(
-                "background job failed and frontend dispatch is unavailable"
-            ));
-        }
-
-        if is_timeout_like(error) && self.has_active_child_agents(job.agent_id) {
-            warn!(
-                log_stream = "agent",
-                log_key = %job.agent_id,
-                kind = "background_agent_recovery_skipped_active_children",
-                session_id = %session.id,
-                channel_id = %session.address.channel_id,
-                "background agent timed out while child agents were still active; skipping automatic recovery"
-            );
-            self.wait_for_child_agents_to_finish(job.agent_id).await;
-            let text = background_timeout_with_active_children_text(&self.main_agent.language);
-            let sink_router = self.sink_router.read().await;
-            sink_router
-                .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                .await
-                .context("failed to dispatch background timeout notification")?;
-            return Ok(());
-        }
-
-        let recovery_agent_id = uuid::Uuid::new_v4();
-        self.register_managed_agent(
-            recovery_agent_id,
-            ManagedAgentKind::Background,
-            job.model_key.clone(),
-            Some(job.agent_id),
-            &session,
-            ManagedAgentState::Running,
-        );
-        info!(
-            log_stream = "agent",
-            log_key = %recovery_agent_id,
-            kind = "background_agent_recovery_started",
-            failed_agent_id = %job.agent_id,
-            parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            model = %job.model_key,
-            "background failure recovery agent started"
-        );
-
-        let recovery_prompt = format!(
-            "A previous main background agent failed before completing its work.\n\nOriginal task:\n{}\n\nFailure:\n{}\n\nYour job now:\n1. Diagnose the failure.\n2. If it is recoverable without user intervention, continue or retry the original task yourself now and produce the final user-facing result. Do not mention the failure unless it is relevant.\n3. If it is not recoverable, produce a concise user-facing explanation of the problem and what the user should do next.\n4. Do not say that you will continue later. Either complete the work now or explain the blocker clearly.",
-            job.prompt, error
-        );
-        let recovery_prompt_for_history = recovery_prompt.clone();
-        let run_result = self
-            .run_background_agent_turn(
-                &session,
-                recovery_agent_id,
-                job.agent_backend,
-                &job.model_key,
-                recovery_prompt,
-                "background failure recovery task join failed",
-            )
-            .await;
-
-        match run_result {
-            Ok(TimedRunOutcome::Completed(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_turn(
-                        session.id,
-                        report.messages.clone(),
-                        &report.usage,
-                        &report.compaction,
-                        report.response_checkpoint.clone(),
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(recovery_prompt_for_history.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
-                    &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
-                    .await
-                    .context("failed to dispatch recovered background agent reply")?;
-                self.mark_managed_agent_completed(recovery_agent_id, &report.usage);
-                info!(
-                    log_stream = "agent",
-                    log_key = %recovery_agent_id,
-                    kind = "background_agent_recovery_completed",
-                    failed_agent_id = %job.agent_id,
-                    "background failure recovery agent completed"
-                );
-                Ok(())
-            }
-            Ok(TimedRunOutcome::Yielded(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_yielded_turn(
-                        session.id,
-                        report.messages.clone(),
-                        &report.usage,
-                        &report.compaction,
-                        report.response_checkpoint.clone(),
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(recovery_prompt_for_history.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
-                    &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
-                    .await
-                    .context("failed to dispatch yielded recovered background agent reply")?;
-                self.mark_managed_agent_completed(recovery_agent_id, &report.usage);
-                Ok(())
-            }
-            Ok(TimedRunOutcome::TimedOut {
-                checkpoint,
-                error: recovery_error,
-            }) => {
-                if let Some(checkpoint) = &checkpoint {
-                    self.persist_background_checkpoint(session.id, checkpoint)?;
-                }
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_timed_out(recovery_agent_id, &usage, &recovery_error);
-                let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
-                warn!(
-                    log_stream = "agent",
-                    log_key = %recovery_agent_id,
-                    kind = "background_agent_recovery_failed",
-                    failed_agent_id = %job.agent_id,
-                    error = %format!("{recovery_error:#}"),
-                    "background failure recovery agent timed out; user was notified"
-                );
-                Ok(())
-            }
-            Ok(TimedRunOutcome::Failed {
-                checkpoint,
-                error: recovery_error,
-            }) => {
-                if let Some(checkpoint) = &checkpoint {
-                    self.persist_background_checkpoint(session.id, checkpoint)?;
-                }
-                let usage = checkpoint
-                    .as_ref()
-                    .map(|report| report.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_failed(recovery_agent_id, &usage, &recovery_error);
-                let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
-                warn!(
-                    log_stream = "agent",
-                    log_key = %recovery_agent_id,
-                    kind = "background_agent_recovery_failed",
-                    failed_agent_id = %job.agent_id,
-                    error = %format!("{recovery_error:#}"),
-                    "background failure recovery agent failed; user was notified"
-                );
-                Ok(())
-            }
-            Err(recovery_error) => {
-                self.mark_managed_agent_failed(
-                    recovery_agent_id,
-                    &TokenUsage::default(),
-                    &recovery_error,
-                );
-                let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
-                warn!(
-                    log_stream = "agent",
-                    log_key = %recovery_agent_id,
-                    kind = "background_agent_recovery_failed",
-                    failed_agent_id = %job.agent_id,
-                    error = %format!("{recovery_error:#}"),
-                    "background failure recovery agent failed; user was notified"
-                );
-                Ok(())
-            }
-        }
     }
 
     fn list_cron_tasks(&self) -> Result<Value> {
@@ -3724,374 +2651,14 @@ pub struct Server {
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
+    active_foreground_agent_frame_runtimes:
+        Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
     active_native_zgent_sessions: Arc<Mutex<HashMap<String, Arc<ActiveNativeZgentSession>>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
     channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
 }
 
 impl Server {
-    fn requires_channel_authorization(&self, address: &ChannelAddress) -> bool {
-        self.telegram_channel_ids.contains(&address.channel_id)
-    }
-
-    fn allows_fast_path_agent_selection(&self, address: &ChannelAddress) -> Result<bool> {
-        if !self.requires_channel_authorization(address) {
-            return Ok(true);
-        }
-        Ok(self.with_channel_auth(|auth| {
-            Ok(matches!(
-                auth.current_conversation_state(address),
-                Some(ConversationApprovalState::Approved)
-            ))
-        })?)
-    }
-
-    fn is_private_conversation(address: &ChannelAddress) -> bool {
-        if let Ok(conversation_id) = address.conversation_id.parse::<i64>() {
-            conversation_id > 0
-        } else {
-            address
-                .user_id
-                .as_deref()
-                .is_some_and(|user_id| user_id == address.conversation_id)
-        }
-    }
-
-    fn render_chat_approval_label(state: ConversationApprovalState) -> &'static str {
-        match state {
-            ConversationApprovalState::Pending => "Pending Review",
-            ConversationApprovalState::Approved => "Approved",
-            ConversationApprovalState::Rejected => "Rejected",
-        }
-    }
-
-    fn format_chat_approval_subject(
-        item: &ConversationApprovalSnapshot,
-        admin_private_conversation_id: Option<&str>,
-    ) -> String {
-        let mut parts = vec![format!("`{}`", item.conversation_id)];
-        if item.display_name.is_some() || item.user_id.is_some() {
-            let mut details = Vec::new();
-            if let Some(name) = item.display_name.as_deref()
-                && !name.trim().is_empty()
-            {
-                details.push(name.trim().to_string());
-            }
-            if let Some(user_id) = item.user_id.as_deref()
-                && !user_id.trim().is_empty()
-            {
-                details.push(format!("user `{}`", user_id.trim()));
-            }
-            if !details.is_empty() {
-                parts.push(format!("({})", details.join(", ")));
-            }
-        }
-        if admin_private_conversation_id == Some(item.conversation_id.as_str()) {
-            parts.push("[admin private chat]".to_string());
-        }
-        parts.join(" ")
-    }
-
-    fn format_admin_chat_list_text(
-        address: &ChannelAddress,
-        admin: Option<ChannelAdminSnapshot>,
-        items: &[ConversationApprovalSnapshot],
-    ) -> String {
-        let pending = items
-            .iter()
-            .filter(|item| item.state == ConversationApprovalState::Pending)
-            .collect::<Vec<_>>();
-        let approved = items
-            .iter()
-            .filter(|item| item.state == ConversationApprovalState::Approved)
-            .collect::<Vec<_>>();
-        let rejected = items
-            .iter()
-            .filter(|item| item.state == ConversationApprovalState::Rejected)
-            .collect::<Vec<_>>();
-
-        let mut lines = vec![
-            format!("Approval dashboard for channel `{}`", address.channel_id),
-            format!(
-                "Summary: {} pending, {} approved, {} rejected",
-                pending.len(),
-                approved.len(),
-                rejected.len()
-            ),
-        ];
-
-        if let Some(ref admin) = admin {
-            let admin_name = admin
-                .display_name
-                .as_deref()
-                .filter(|value: &&str| !value.trim().is_empty())
-                .unwrap_or("unknown");
-            lines.push(format!(
-                "Administrator: {} (user `{}`)",
-                admin_name, admin.user_id
-            ));
-            if let Some(private_chat) = admin.private_conversation_id.as_deref() {
-                lines.push(format!("Admin private chat: `{}`", private_chat));
-            }
-        }
-
-        let admin_private_conversation_id = admin
-            .as_ref()
-            .and_then(|value| value.private_conversation_id.as_deref());
-
-        if !pending.is_empty() {
-            lines.push(String::new());
-            lines.push(format!(
-                "{}",
-                Self::render_chat_approval_label(ConversationApprovalState::Pending)
-            ));
-            for item in pending {
-                lines.push(format!(
-                    "- {}",
-                    Self::format_chat_approval_subject(item, admin_private_conversation_id)
-                ));
-                lines.push(format!(
-                    "  updated: `{}`",
-                    item.updated_at.format("%Y-%m-%d %H:%M UTC")
-                ));
-                lines.push(format!(
-                    "  approve: `/admin_chat_approve {}`",
-                    item.conversation_id
-                ));
-                lines.push(format!(
-                    "  reject: `/admin_chat_reject {}`",
-                    item.conversation_id
-                ));
-            }
-        }
-
-        for (state, bucket) in [
-            (ConversationApprovalState::Approved, approved),
-            (ConversationApprovalState::Rejected, rejected),
-        ] {
-            if bucket.is_empty() {
-                continue;
-            }
-            lines.push(String::new());
-            lines.push(Self::render_chat_approval_label(state).to_string());
-            for item in bucket {
-                lines.push(format!(
-                    "- {}",
-                    Self::format_chat_approval_subject(item, admin_private_conversation_id)
-                ));
-            }
-        }
-
-        lines.join("\n")
-    }
-
-    async fn handle_admin_authorize_command(
-        &self,
-        channel: &Arc<dyn Channel>,
-        address: &ChannelAddress,
-    ) -> Result<()> {
-        if !Self::is_private_conversation(address) {
-            self.send_channel_message(
-                channel,
-                address,
-                OutgoingMessage::text(
-                    "Please open a private chat with the bot and send `/admin_authorize` there."
-                        .to_string(),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        let outcome = self.with_channel_auth(|auth| auth.authorize_admin(address))?;
-        let text = match outcome {
-            AdminAuthorizeOutcome::Authorized(snapshot) => format!(
-                "You are now the administrator for channel `{}` as user `{}`. This private chat is approved automatically. Use `/admin_chat_list` here to review chat requests.",
-                address.channel_id, snapshot.user_id
-            ),
-            AdminAuthorizeOutcome::AlreadyAuthorized(snapshot) => format!(
-                "You are already the administrator for channel `{}` as user `{}`. This private chat remains approved.",
-                address.channel_id, snapshot.user_id
-            ),
-            AdminAuthorizeOutcome::OwnedByAnotherAdmin(snapshot) => format!(
-                "This channel already has an administrator registered as user `{}`{}.",
-                snapshot.user_id,
-                snapshot
-                    .display_name
-                    .as_deref()
-                    .map(|name| format!(" ({name})"))
-                    .unwrap_or_default()
-            ),
-        };
-        self.send_channel_message(channel, address, OutgoingMessage::text(text))
-            .await
-    }
-
-    async fn handle_admin_chat_list_command(
-        &self,
-        channel: &Arc<dyn Channel>,
-        address: &ChannelAddress,
-    ) -> Result<()> {
-        if !Self::is_private_conversation(address)
-            || !self.with_channel_auth(|auth| Ok(auth.is_channel_admin(address)))?
-        {
-            self.send_channel_message(
-                channel,
-                address,
-                OutgoingMessage::text(
-                    "Only this channel's administrator can use `/admin_chat_list` from a private chat."
-                        .to_string(),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        let items =
-            self.with_channel_auth(|auth| Ok(auth.list_conversations(&address.channel_id)))?;
-        if items.is_empty() {
-            self.send_channel_message(
-                channel,
-                address,
-                OutgoingMessage::text("No chats have requested access yet.".to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
-        let admin =
-            self.with_channel_auth(|auth| Ok(auth.admin_for_channel(&address.channel_id)))?;
-        let text = Self::format_admin_chat_list_text(address, admin, &items);
-        self.send_channel_message(channel, address, OutgoingMessage::text(text))
-            .await
-    }
-
-    async fn handle_admin_chat_state_command(
-        &self,
-        channel: &Arc<dyn Channel>,
-        address: &ChannelAddress,
-        conversation_id: &str,
-        approve: bool,
-    ) -> Result<()> {
-        if !Self::is_private_conversation(address)
-            || !self.with_channel_auth(|auth| Ok(auth.is_channel_admin(address)))?
-        {
-            let command_name = if approve {
-                "/admin_chat_approve"
-            } else {
-                "/admin_chat_reject"
-            };
-            self.send_channel_message(
-                channel,
-                address,
-                OutgoingMessage::text(format!(
-                    "Only this channel's administrator can use `{command_name}` from a private chat."
-                )),
-            )
-            .await?;
-            return Ok(());
-        }
-        let snapshot: ConversationApprovalSnapshot = self.with_channel_auth(|auth| {
-            if approve {
-                auth.approve_conversation(&address.channel_id, conversation_id)
-            } else {
-                auth.reject_conversation(&address.channel_id, conversation_id)
-            }
-        })?;
-        let action = if approve { "approved" } else { "rejected" };
-        self.send_channel_message(
-            channel,
-            address,
-            OutgoingMessage::text(format!(
-                "Conversation `{}` is now `{}`.",
-                snapshot.conversation_id, action
-            )),
-        )
-        .await
-    }
-
-    async fn enforce_channel_authorization(
-        &self,
-        channel: &Arc<dyn Channel>,
-        incoming: &IncomingMessage,
-    ) -> Result<bool> {
-        if !self.requires_channel_authorization(&incoming.address) {
-            return Ok(false);
-        }
-
-        let text = incoming.text.as_deref();
-        if parse_admin_authorize_command(text) {
-            self.handle_admin_authorize_command(channel, &incoming.address)
-                .await?;
-            return Ok(true);
-        }
-
-        let admin = self
-            .with_channel_auth(|auth| Ok(auth.admin_for_channel(&incoming.address.channel_id)))?;
-        let Some(_admin) = admin else {
-            self.send_channel_message(
-                channel,
-                &incoming.address,
-                OutgoingMessage::text(
-                    "This channel has no administrator yet. Please open a private chat with the bot and send `/admin_authorize` (or `/authorize`) there."
-                        .to_string(),
-                ),
-            )
-            .await?;
-            return Ok(true);
-        };
-
-        let is_admin_private = Self::is_private_conversation(&incoming.address)
-            && self.with_channel_auth(|auth| Ok(auth.is_channel_admin(&incoming.address)))?;
-
-        if is_admin_private && parse_admin_chat_list_command(text) {
-            self.handle_admin_chat_list_command(channel, &incoming.address)
-                .await?;
-            return Ok(true);
-        }
-        if is_admin_private && let Some(conversation_id) = parse_admin_chat_approve_command(text) {
-            self.handle_admin_chat_state_command(
-                channel,
-                &incoming.address,
-                &conversation_id,
-                true,
-            )
-            .await?;
-            return Ok(true);
-        }
-        if is_admin_private && let Some(conversation_id) = parse_admin_chat_reject_command(text) {
-            self.handle_admin_chat_state_command(
-                channel,
-                &incoming.address,
-                &conversation_id,
-                false,
-            )
-            .await?;
-            return Ok(true);
-        }
-
-        let state = self.with_channel_auth(|auth| {
-            let current = auth.current_conversation_state(&incoming.address);
-            if current.is_none() {
-                return auth.ensure_pending_conversation(&incoming.address);
-            }
-            Ok(current.expect("checked is_some above"))
-        })?;
-        match state {
-            ConversationApprovalState::Approved => Ok(false),
-            ConversationApprovalState::Pending => {
-                self.send_channel_message(
-                    channel,
-                    &incoming.address,
-                    OutgoingMessage::text(
-                        "This conversation is waiting for administrator approval. Please ask the channel admin to review it with `/admin_chat_list` in their private chat."
-                            .to_string(),
-                    ),
-                )
-                .await?;
-                Ok(true)
-            }
-            ConversationApprovalState::Rejected => Ok(true),
-        }
-    }
-
     fn clear_missing_selected_main_model(
         &self,
         address: &ChannelAddress,
@@ -4112,64 +2679,6 @@ impl Server {
                 .map(|_| ())
         })?;
         Ok(Some(model_key))
-    }
-
-    fn normalize_session_history_after_agent_switch(
-        &self,
-        address: &ChannelAddress,
-        selected_backend: AgentBackendKind,
-        model_key: &str,
-    ) -> Result<bool> {
-        let Some(session) = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?
-        else {
-            return Ok(false);
-        };
-        let model = self.model_config_or_main(model_key)?.clone();
-        let backend_supports_native = backend_supports_native_multimodal_input(selected_backend);
-        let rewritten_messages = downgrade_messages_for_model_switch(
-            &session.agent_messages,
-            &session.workspace_root,
-            &model,
-            backend_supports_native,
-        )?;
-        let session_changed =
-            rewritten_messages != session.agent_messages || session.response_checkpoint.is_some();
-
-        let mut pending_changed = false;
-        let rewritten_pending = session
-            .pending_continue
-            .clone()
-            .map(|mut pending| -> Result<PendingContinueState> {
-                let rewritten_resume = downgrade_messages_for_model_switch(
-                    &pending.resume_messages,
-                    &session.workspace_root,
-                    &model,
-                    backend_supports_native,
-                )?;
-                pending_changed = rewritten_resume != pending.resume_messages
-                    || pending.model_key != model_key
-                    || pending.agent_backend != Some(selected_backend)
-                    || pending.response_checkpoint.is_some();
-                pending.resume_messages = rewritten_resume;
-                pending.model_key = model_key.to_string();
-                pending.agent_backend = Some(selected_backend);
-                pending.response_checkpoint = None;
-                Ok(pending)
-            })
-            .transpose()?;
-
-        if !session_changed && !pending_changed {
-            return Ok(false);
-        }
-
-        self.with_sessions(|sessions| {
-            sessions.rewrite_history_after_model_switch(
-                address,
-                rewritten_messages,
-                rewritten_pending,
-            )
-        })?;
-        Ok(true)
     }
 
     fn foreground_uses_native_zgent(
@@ -4602,6 +3111,7 @@ impl Server {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(&workdir)?)),
@@ -4880,11 +3390,7 @@ impl Server {
         let model_key = self.effective_main_model_key(&session.address)?;
         let model = self.model_config_or_main(&model_key)?.clone();
         let runtime = self.tool_runtime_for_address(&session.address)?;
-        let source_messages = session
-            .pending_continue
-            .as_ref()
-            .map(|pending| pending.resume_messages.clone())
-            .unwrap_or_else(|| session.agent_messages.clone());
+        let source_messages = session.request_messages();
         if source_messages.is_empty() {
             return Ok(false);
         }
@@ -4935,18 +3441,18 @@ impl Server {
 
         let persistence_system_prompt = config.system_prompt.clone();
         let effective_backend = self.effective_agent_backend(&session.address)?;
-        let sanitized_source_messages = sanitize_messages_for_model_capabilities(
-            &source_messages,
-            &model,
-            backend_supports_native_multimodal_input(effective_backend),
-        );
-        let report = run_backend_compaction(
-            effective_backend,
-            sanitized_source_messages,
-            config,
-            extra_tools,
-        )
-        .with_context(|| format!("failed to compact idle session {}", session.id))?;
+        let source_messages = if effective_backend == AgentBackendKind::AgentFrame {
+            source_messages
+        } else {
+            sanitize_messages_for_model_capabilities(
+                &source_messages,
+                &model,
+                backend_supports_native_multimodal_input(effective_backend),
+            )
+        };
+        let report =
+            run_backend_compaction(effective_backend, source_messages, config, extra_tools)
+                .with_context(|| format!("failed to compact idle session {}", session.id))?;
         if !report.compacted {
             self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
             return Ok(false);
@@ -5031,6 +3537,9 @@ impl Server {
             background_job_sender: self.background_job_sender.clone(),
             summary_tracker: Arc::clone(&self.summary_tracker),
             active_foreground_phases: Arc::clone(&self.active_foreground_phases),
+            active_foreground_agent_frame_runtimes: Arc::clone(
+                &self.active_foreground_agent_frame_runtimes,
+            ),
             subagents: Arc::clone(&self.subagents),
             conversations: Arc::clone(&self.conversations),
         }
@@ -5090,11 +3599,32 @@ impl Server {
         Ok(())
     }
 
+    fn invalidate_foreground_agent_frame_runtime(&self, address: &ChannelAddress) -> Result<()> {
+        let session_key = address.session_key();
+        let runtime = self
+            .active_foreground_agent_frame_runtimes
+            .lock()
+            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
+            .remove(&session_key);
+        if let Some(runtime) = runtime
+            && let Ok(mut runtime) = runtime.lock()
+        {
+            let _ = runtime.runtime.shutdown();
+            if runtime.sandbox_mode == SandboxMode::Bubblewrap {
+                let _ = self
+                    .workspace_manager
+                    .cleanup_transient_mounts(&runtime.workspace_id);
+            }
+        }
+        Ok(())
+    }
+
     fn destroy_foreground_session(&self, address: &ChannelAddress) -> Result<()> {
         let snapshot = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
         if let Ok(mut sessions) = self.active_native_zgent_sessions.lock() {
             sessions.remove(&address.session_key());
         }
+        self.invalidate_foreground_agent_frame_runtime(address)?;
         if let Some(control) = self
             .active_foreground_controls
             .lock()
@@ -5155,32 +3685,8 @@ impl Server {
             .with_context(|| format!("unknown channel {}", incoming.address.channel_id))?
             .clone();
 
-        if let Some(control) = incoming.control.as_ref() {
-            match control {
-                crate::channel::IncomingControl::ConversationClosed { reason } => {
-                    info!(
-                        log_stream = "session",
-                        kind = "channel_conversation_closed",
-                        channel_id = %incoming.address.channel_id,
-                        conversation_id = %incoming.address.conversation_id,
-                        reason = reason,
-                        "channel reported that the conversation should be closed"
-                    );
-                    self.destroy_foreground_session(&incoming.address)?;
-                    let disabled = self.disable_cron_tasks_for_conversation(&incoming.address)?;
-                    if disabled > 0 {
-                        warn!(
-                            log_stream = "cron",
-                            kind = "cron_tasks_auto_disabled_for_closed_conversation",
-                            channel_id = %incoming.address.channel_id,
-                            conversation_id = %incoming.address.conversation_id,
-                            disabled_count = disabled as u64,
-                            "disabled cron tasks because the conversation was closed"
-                        );
-                    }
-                    return Ok(());
-                }
-            }
+        if self.handle_incoming_control(&incoming).await? {
+            return Ok(());
         }
 
         info!(
@@ -5213,1198 +3719,15 @@ impl Server {
             );
         }
 
-        if incoming
-            .text
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| command_matches(text, "/new"))
+        if self
+            .try_handle_incoming_command(&channel, &incoming)
+            .await?
         {
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(
-                    "当前已经按 conversation 持续维护上下文，不再需要 /new。请直接继续当前对话；如果系统提示存在恢复点，请使用 /continue。"
-                        .to_string(),
-                ),
-            )
-            .await?;
             return Ok(());
         }
 
-        if let Some(workspace_id) = parse_oldspace_command(incoming.text.as_deref()) {
-            if let Some(previous_session) =
-                self.with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-                && previous_session.workspace_id != workspace_id
-            {
-                self.with_sessions(|sessions| {
-                    sessions.mark_workspace_summary_state(&incoming.address, true, true)
-                })?;
-                if let Err(error) = self
-                    .summarize_workspace_before_destroy(&previous_session)
-                    .await
-                {
-                    warn!(
-                        log_stream = "session",
-                        log_key = %previous_session.id,
-                        kind = "workspace_summary_before_oldspace_failed",
-                        workspace_id = %previous_session.workspace_id,
-                        error = %format!("{error:#}"),
-                        "failed to summarize workspace before switching workspaces"
-                    );
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
-                }
-                self.destroy_foreground_session(&incoming.address)?;
-            }
-            let session = match self.activate_existing_workspace(&incoming.address, &workspace_id) {
-                Ok(session) => session,
-                Err(error) => {
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
-                }
-            };
-            if let Some(missing_model_key) =
-                self.clear_missing_selected_main_model(&incoming.address)?
-            {
-                self.prompt_missing_conversation_model(
-                    &channel,
-                    &incoming.address,
-                    &missing_model_key,
-                )
-                .await?;
-                return Ok(());
-            }
-            if self.has_complete_agent_selection(&incoming.address)? {
-                let welcome = match self.initialize_foreground_session(&session, true).await {
-                    Ok(welcome) => welcome,
-                    Err(error) => {
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                };
-                self.send_channel_message(&channel, &incoming.address, welcome)
-                    .await?;
-            } else {
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    self.agent_selection_message(
-                        &incoming.address,
-                        "Choose an agent backend and model for this conversation before activating a workspace.",
-                    )?,
-                )
-                .await?;
-            }
-            return Ok(());
-        }
-
-        if incoming
-            .text
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| command_matches(text, "/help"))
-        {
-            let help_text = self.help_text_for_channel(&incoming.address.channel_id);
-            info!(
-                log_stream = "server",
-                kind = "help_requested",
-                channel_id = %incoming.address.channel_id,
-                conversation_id = %incoming.address.conversation_id,
-                "rendering help text"
-            );
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(help_text),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if parse_agent_command(incoming.text.as_deref()).is_none()
-            && let Some(missing_model_key) =
-                self.clear_missing_selected_main_model(&incoming.address)?
-        {
-            self.prompt_missing_conversation_model(&channel, &incoming.address, &missing_model_key)
-                .await?;
-            return Ok(());
-        }
-
-        if incoming
-            .text
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| command_matches(text, "/status"))
-        {
-            let Ok(effective_model_key) = self.effective_main_model_key(&incoming.address) else {
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    self.agent_selection_message(
-                        &incoming.address,
-                        "Choose an agent backend and model for this conversation before using `/status`.",
-                    )?,
-                )
-                .await?;
-                return Ok(());
-            };
-            let session = self.ensure_foreground_session(&incoming.address)?;
-            let status_text = self.status_text_for_session(&session, &effective_model_key)?;
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(status_text),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if incoming
-            .text
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| command_matches(text, "/compact"))
-        {
-            let Ok(effective_model_key) = self.effective_main_model_key(&incoming.address) else {
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    self.agent_selection_message(
-                        &incoming.address,
-                        "Choose an agent backend and model for this conversation before using `/compact`.",
-                    )?,
-                )
-                .await?;
-                return Ok(());
-            };
-            let session = self.ensure_foreground_session(&incoming.address)?;
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text("正在压缩当前上下文，请稍候。".to_string()),
-            )
-            .await?;
-            let compacted = self
-                .compact_session_now(&session, &effective_model_key, true)
-                .await?;
-            let message = if compacted {
-                "Compacted the current conversation context.".to_string()
-            } else {
-                "The current conversation context did not need compaction.".to_string()
-            };
-            self.send_channel_message(&channel, &incoming.address, OutgoingMessage::text(message))
-                .await?;
-            return Ok(());
-        }
-
-        if let Some(argument) = parse_compact_mode_command(incoming.text.as_deref()) {
-            if let Some(mode_name) = argument {
-                let enabled = match mode_name.trim() {
-                    "on" | "enable" | "enabled" => true,
-                    "off" | "disable" | "disabled" => false,
-                    _ => {
-                        let error = anyhow!("unknown compact mode {}", mode_name);
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                };
-                self.with_conversations(|conversations| {
-                    conversations.set_context_compaction_enabled(&incoming.address, Some(enabled))
-                })?;
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(format!(
-                        "Automatic context compaction is now `{}` for this conversation.",
-                        if enabled { "enabled" } else { "disabled" }
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                self.compact_mode_message(&incoming.address)?,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if let Some(command) = parse_agent_command(incoming.text.as_deref()) {
-            match command {
-                AgentCommand::ShowSelection => {
-                    self.send_channel_message(
-                        &channel,
-                        &incoming.address,
-                        self.agent_backend_selection_message(
-                            &incoming.address,
-                            "Choose an agent backend for this conversation.",
-                        )?,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                AgentCommand::SelectBackend(backend) => {
-                    self.send_channel_message(
-                        &channel,
-                        &incoming.address,
-                        self.agent_model_selection_message(
-                            &incoming.address,
-                            backend,
-                            "Choose a model for this agent backend.",
-                        )?,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                AgentCommand::SelectModel { backend, model_key } => {
-                    if !self.models.contains_key(&model_key) {
-                        let error = anyhow!("unknown model {}", model_key);
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                    let selected_backend = backend
-                        .or(self.selected_agent_backend(&incoming.address)?)
-                        .or_else(|| self.inferred_agent_backend_for_model(&model_key))
-                        .ok_or_else(|| {
-                            anyhow!("please choose an agent backend first with `/agent`")
-                        })?;
-                    self.ensure_model_available_for_backend(selected_backend, &model_key)?;
-                    let stored_settings =
-                        self.effective_conversation_settings(&incoming.address)?;
-                    let current_backend = self.selected_agent_backend(&incoming.address)?;
-                    let current_model_key = self.selected_main_model_key(&incoming.address)?;
-                    if current_backend == Some(selected_backend)
-                        && current_model_key.as_deref() == Some(model_key.as_str())
-                    {
-                        if stored_settings.agent_backend != Some(selected_backend) {
-                            self.with_conversations(|conversations| {
-                                conversations.set_agent_selection(
-                                    &incoming.address,
-                                    Some(selected_backend),
-                                    Some(model_key.clone()),
-                                )
-                            })?;
-                            self.send_channel_message(
-                                &channel,
-                                &incoming.address,
-                                OutgoingMessage::text(format!(
-                                    "Conversation agent updated to `{}` with model `{}`.",
-                                    Self::render_agent_backend_value(selected_backend),
-                                    model_key
-                                )),
-                            )
-                            .await?;
-                            return Ok(());
-                        }
-                        self.send_channel_message(
-                            &channel,
-                            &incoming.address,
-                            OutgoingMessage::text(format!(
-                                "Conversation agent is already `{}` with model `{}`. No change was made.",
-                                Self::render_agent_backend_value(selected_backend),
-                                model_key
-                            )),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    let compacted = if let Some(previous_model_key) = current_model_key {
-                        let session = self.ensure_foreground_session(&incoming.address)?;
-                        self.compact_session_now(&session, &previous_model_key, false)
-                            .await
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    let conversation = self.with_conversations(|conversations| {
-                        conversations.set_agent_selection(
-                            &incoming.address,
-                            Some(selected_backend),
-                            Some(model_key.clone()),
-                        )
-                    })?;
-                    let history_normalized = self.normalize_session_history_after_agent_switch(
-                        &incoming.address,
-                        selected_backend,
-                        &model_key,
-                    )?;
-                    let effective_model_key = conversation
-                        .settings
-                        .main_model
-                        .clone()
-                        .expect("model just set");
-                    self.send_channel_message(
-                        &channel,
-                        &incoming.address,
-                        OutgoingMessage::text(format!(
-                            "Conversation agent updated to `{}` with model `{}`.{}{}",
-                            Self::render_agent_backend_value(selected_backend),
-                            effective_model_key,
-                            if compacted {
-                                " Existing context was compacted before the switch."
-                            } else {
-                                ""
-                            },
-                            if history_normalized {
-                                " Historical multimodal context was downgraded for the selected model and saved under `.context_attachments/` in the workspace."
-                            } else {
-                                ""
-                            }
-                        )),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        if let Some(argument) = parse_sandbox_command(incoming.text.as_deref()) {
-            if let Some(mode_name) = argument {
-                let selected_mode = if mode_name == "default" {
-                    None
-                } else {
-                    let parsed = parse_sandbox_mode_value(&mode_name)
-                        .ok_or_else(|| anyhow!("unknown sandbox mode {}", mode_name));
-                    let parsed = match parsed {
-                        Ok(mode) => mode,
-                        Err(error) => {
-                            self.send_user_error_message(&channel, &incoming.address, &error)
-                                .await;
-                            return Err(error);
-                        }
-                    };
-                    if !self.available_sandbox_modes().contains(&parsed) {
-                        let error =
-                            anyhow!("sandbox mode {} is not available on this system", mode_name);
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                    Some(parsed)
-                };
-                let conversation = self.with_conversations(|conversations| {
-                    conversations.set_sandbox_mode(&incoming.address, selected_mode)
-                })?;
-                let effective_mode = conversation
-                    .settings
-                    .sandbox_mode
-                    .unwrap_or(self.sandbox.mode);
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(format!(
-                        "Conversation sandbox mode updated to `{}`.",
-                        sandbox_mode_label(effective_mode)
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-            let current_mode = self.effective_sandbox_mode(&incoming.address)?;
-            let options = self
-                .available_sandbox_modes()
-                .into_iter()
-                .map(|mode| ShowOption {
-                    label: sandbox_mode_label(mode).to_string(),
-                    value: format!("/sandbox {}", sandbox_mode_value(mode)),
-                })
-                .chain(std::iter::once(ShowOption {
-                    label: "default".to_string(),
-                    value: "/sandbox default".to_string(),
-                }))
-                .collect::<Vec<_>>();
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::with_options(
-                    format!(
-                        "Current conversation sandbox mode: `{}`\nChoose a mode below or send `/sandbox <mode>`.",
-                        sandbox_mode_label(current_mode)
-                    ),
-                    "Choose a sandbox mode",
-                    options,
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if let Some(argument) = parse_think_command(incoming.text.as_deref()) {
-            if let Some(effort_name) = argument {
-                let selected_effort = if effort_name == "default" {
-                    None
-                } else {
-                    let parsed = parse_reasoning_effort_value(&effort_name)
-                        .ok_or_else(|| anyhow!("unknown reasoning effort {}", effort_name));
-                    let parsed = match parsed {
-                        Ok(effort) => effort,
-                        Err(error) => {
-                            self.send_user_error_message(&channel, &incoming.address, &error)
-                                .await;
-                            return Err(error);
-                        }
-                    };
-                    Some(parsed.to_string())
-                };
-                let conversation = self.with_conversations(|conversations| {
-                    conversations.set_reasoning_effort(&incoming.address, selected_effort)
-                })?;
-                let effective_effort = conversation
-                    .settings
-                    .reasoning_effort
-                    .clone()
-                    .or_else(|| {
-                        self.selected_main_model_key(&incoming.address)
-                            .ok()
-                            .flatten()
-                            .and_then(|model_key| {
-                                self.models.get(&model_key).and_then(|model| {
-                                    model
-                                        .reasoning
-                                        .as_ref()
-                                        .and_then(|reasoning| reasoning.effort.clone())
-                                })
-                            })
-                    })
-                    .unwrap_or_else(|| "default".to_string());
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(format!(
-                        "Conversation reasoning effort updated to `{}`.",
-                        effective_effort
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                self.reasoning_effort_message(&incoming.address)?,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if matches!(
-            parse_optional_command_argument(incoming.text.as_deref(), "/snapsave"),
-            Some(None)
-        ) {
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(
-                    "Usage: `/snapsave <name>`\nExample: `/snapsave demo`".to_string(),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
-            let session = self.ensure_foreground_session(&incoming.address)?;
-            let checkpoint =
-                self.with_sessions(|sessions| sessions.export_checkpoint(&incoming.address))?;
-            let bundle = SnapshotBundle {
-                saved_at: Utc::now(),
-                source_address: incoming.address.clone(),
-                settings: self.effective_conversation_settings(&incoming.address)?,
-                session: checkpoint,
-            };
-            let conversation_memory_root = conversation_memory_root(&session);
-            let record = self.with_snapshots(|snapshots| {
-                snapshots.save_snapshot(
-                    &incoming.address,
-                    &checkpoint_name,
-                    bundle,
-                    &session.workspace_root,
-                    Some(&conversation_memory_root),
-                )
-            })?;
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(format!(
-                    "Saved global snapshot `{}` at {}.",
-                    record.name, record.saved_at
-                )),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if parse_snap_list_command(incoming.text.as_deref())
-            || matches!(
-                parse_optional_command_argument(incoming.text.as_deref(), "/snapload"),
-                Some(None)
-            )
-        {
-            let snapshots = self.with_snapshots(|snapshots| Ok(snapshots.list_snapshots()))?;
-            if snapshots.is_empty() {
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(
-                        "There are no saved snapshots yet. Use `/snapsave <name>` first."
-                            .to_string(),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-            let lines = snapshots
-                .iter()
-                .map(|record| {
-                    format!(
-                        "- `{}` ({}, from `{}`)",
-                        record.name, record.saved_at, record.source_conversation_id
-                    )
-                })
-                .collect::<Vec<_>>();
-            let options = snapshots
-                .iter()
-                .map(|record| ShowOption {
-                    label: record.name.clone(),
-                    value: format!("/snapload {}", record.name),
-                })
-                .collect::<Vec<_>>();
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::with_options(
-                    format!(
-                        "Saved global snapshots:\n{}\n\nChoose one below or send `/snapload <name>`.",
-                        lines.join("\n")
-                    ),
-                    "Choose a snapshot to load",
-                    options,
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if let Some(checkpoint_name) = parse_snap_load_command(incoming.text.as_deref()) {
-            let loaded =
-                match self.with_snapshots(|snapshots| snapshots.load_snapshot(&checkpoint_name)) {
-                    Ok(loaded) => loaded,
-                    Err(error) => {
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                };
-            self.with_conversations(|conversations| {
-                conversations.set_agent_selection(
-                    &incoming.address,
-                    loaded.bundle.settings.agent_backend,
-                    loaded.bundle.settings.main_model.clone(),
-                )
-            })?;
-            self.with_conversations(|conversations| {
-                conversations
-                    .set_sandbox_mode(&incoming.address, loaded.bundle.settings.sandbox_mode)
-            })?;
-            self.with_conversations(|conversations| {
-                conversations.set_reasoning_effort(
-                    &incoming.address,
-                    loaded.bundle.settings.reasoning_effort.clone(),
-                )
-            })?;
-            self.with_conversations(|conversations| {
-                conversations.set_context_compaction_enabled(
-                    &incoming.address,
-                    loaded.bundle.settings.context_compaction_enabled,
-                )
-            })?;
-            let loaded_record = loaded.record.clone();
-            let loaded_workspace_dir = loaded.workspace_dir.clone();
-            let loaded_conversation_memory_dir = loaded.conversation_memory_dir.clone();
-            let loaded_session = loaded.bundle.session.clone();
-            self.destroy_foreground_session(&incoming.address)?;
-            let workspace = self.workspace_manager.create_workspace(
-                uuid::Uuid::new_v4(),
-                uuid::Uuid::new_v4(),
-                Some(&format!("snapshot-{}", loaded_record.name)),
-            )?;
-            replace_directory_contents(&workspace.files_dir, &loaded_workspace_dir)?;
-            let restored = self.with_sessions(|sessions| {
-                sessions.restore_foreground_from_checkpoint(
-                    &incoming.address,
-                    loaded_session,
-                    workspace.id.clone(),
-                    workspace.files_dir.clone(),
-                )
-            })?;
-            if let Some(memory_dir) = loaded_conversation_memory_dir.as_ref() {
-                let restored_memory_root = conversation_memory_root(&restored);
-                replace_directory_contents(&restored_memory_root, memory_dir)?;
-            }
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(format!(
-                    "Loaded snapshot `{}` into a new session with workspace `{}`.",
-                    loaded_record.name, restored.workspace_id
-                )),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if incoming
-            .text
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| command_starts_with(text, "/set_api_timeout"))
-            && parse_set_api_timeout_command(incoming.text.as_deref()).is_none()
-        {
-            let usage = "Usage: /set_api_timeout <seconds|default>\nExamples:\n/set_api_timeout 300\n/set_api_timeout default";
-            self.send_channel_message(&channel, &incoming.address, OutgoingMessage::text(usage))
-                .await?;
-            return Ok(());
-        }
-
-        if let Some(argument) = parse_set_api_timeout_command(incoming.text.as_deref()) {
-            let session = self.ensure_foreground_session(&incoming.address)?;
-            let effective_model_key = self.effective_main_model_key(&incoming.address)?;
-            let model_timeout_seconds =
-                self.model_upstream_timeout_seconds(&effective_model_key)?;
-            let (override_timeout, status_text) =
-                match format_api_timeout_update(&session, model_timeout_seconds, &argument) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.send_user_error_message(&channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                };
-            self.with_sessions(|sessions| {
-                sessions.set_api_timeout_override(&incoming.address, override_timeout)
-            })?;
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                OutgoingMessage::text(status_text),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if parse_continue_command(incoming.text.as_deref()) {
-            let session = self.ensure_foreground_session(&incoming.address)?;
-            let Some(pending_continue) =
-                self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?
-            else {
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(
-                        "There is no interrupted turn to continue right now.".to_string(),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            };
-            if let Some(agent_backend) = pending_continue.agent_backend {
-                self.with_conversations(|conversations| {
-                    conversations.set_agent_backend(&incoming.address, Some(agent_backend))
-                })?;
-            }
-            channel
-                .set_processing(&incoming.address, ProcessingState::Typing)
-                .await
-                .ok();
-            let typing_guard = spawn_processing_keepalive(
-                channel.clone(),
-                incoming.address.clone(),
-                ProcessingState::Typing,
-            );
-            let persistence_system_prompt = self
-                .build_foreground_agent(&session, &pending_continue.model_key)?
-                .system_prompt;
-            self.log_current_tools_for_user_message(
-                &session,
-                &pending_continue.model_key,
-                &incoming.remote_message_id,
-                "continue",
-            );
-            let (resume_messages, rebuilt_system_prompt) = rebuild_canonical_system_prompt(
-                &pending_continue.resume_messages,
-                &persistence_system_prompt,
-            );
-            if rebuilt_system_prompt {
-                self.with_conversations(|conversations| {
-                    conversations
-                        .rotate_chat_version_id(&incoming.address)
-                        .map(|_| ())
-                })?;
-            }
-            let outcome = self
-                .run_main_agent_turn_with_previous_messages(
-                    &session,
-                    &pending_continue.model_key,
-                    resume_messages,
-                    pending_continue.original_user_text.clone(),
-                    pending_continue.original_attachments.clone(),
-                )
-                .await
-                .context("failed to continue interrupted foreground turn");
-            if let Some(stop_sender) = typing_guard {
-                let _ = stop_sender.send(());
-            }
-            if let Err(error) = &outcome {
-                channel
-                    .set_processing(&incoming.address, ProcessingState::Idle)
-                    .await
-                    .ok();
-                self.send_user_error_message(&channel, &incoming.address, error)
-                    .await;
-            }
-            match outcome? {
-                ForegroundTurnOutcome::Replied {
-                    messages,
-                    outgoing,
-                    usage,
-                    compaction,
-                    response_checkpoint,
-                } => {
-                    let messages = normalize_messages_for_persistence(
-                        messages,
-                        &persistence_system_prompt,
-                        &[],
-                    );
-                    let loaded_skills =
-                        extract_loaded_skill_names(&messages, session.agent_message_count);
-                    self.with_sessions(|sessions| {
-                        sessions.record_agent_turn(
-                            &incoming.address,
-                            messages,
-                            &usage,
-                            &compaction,
-                            response_checkpoint,
-                        )
-                    })
-                    .context("failed to persist continued agent_frame messages")?;
-                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-                    self.with_sessions(|sessions| {
-                        sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
-                    })?;
-                    self.with_sessions(|sessions| {
-                        sessions.append_user_message(
-                            &incoming.address,
-                            pending_continue.original_user_text.clone(),
-                            pending_continue.original_attachments.clone(),
-                        )
-                    })?;
-                    self.with_sessions(|sessions| {
-                        sessions.append_assistant_message(
-                            &incoming.address,
-                            outgoing.text.clone(),
-                            Vec::new(),
-                        )
-                    })?;
-                    let foreground =
-                        self.build_foreground_agent(&session, &pending_continue.model_key)?;
-                    self.log_turn_usage(&session, &usage, false);
-                    info!(
-                        log_stream = "agent",
-                        log_key = %foreground.id,
-                        kind = "foreground_agent_replied",
-                        session_id = %foreground.session_id,
-                        channel_id = %foreground.channel_id,
-                        system_prompt_len = foreground.system_prompt.len() as u64,
-                        has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
-                        attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
-                        "foreground agent continued interrupted turn"
-                    );
-                    self.send_channel_message(&channel, &incoming.address, outgoing)
-                        .await?;
-                    channel
-                        .set_processing(&incoming.address, ProcessingState::Idle)
-                        .await
-                        .ok();
-                    return Ok(());
-                }
-                ForegroundTurnOutcome::Yielded {
-                    messages,
-                    usage,
-                    compaction,
-                    response_checkpoint,
-                } => {
-                    let messages = normalize_messages_for_persistence(
-                        messages,
-                        &persistence_system_prompt,
-                        &[],
-                    );
-                    let loaded_skills =
-                        extract_loaded_skill_names(&messages, session.agent_message_count);
-                    self.with_sessions(|sessions| {
-                        sessions.record_yielded_turn(
-                            &incoming.address,
-                            messages,
-                            &usage,
-                            &compaction,
-                            response_checkpoint,
-                        )
-                    })
-                    .context("failed to persist yielded continued agent_frame messages")?;
-                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-                    self.with_sessions(|sessions| {
-                        sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
-                    })?;
-                    channel
-                        .set_processing(&incoming.address, ProcessingState::Idle)
-                        .await
-                        .ok();
-                    return Ok(());
-                }
-                ForegroundTurnOutcome::Failed {
-                    mut pending_continue,
-                    compaction,
-                    error,
-                } => {
-                    pending_continue.resume_messages = normalize_messages_for_persistence(
-                        pending_continue.resume_messages,
-                        &persistence_system_prompt,
-                        &[],
-                    );
-                    self.with_sessions(|sessions| {
-                        sessions
-                            .set_pending_continue(&incoming.address, Some(pending_continue.clone()))
-                    })?;
-                    self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-                    channel
-                        .set_processing(&incoming.address, ProcessingState::Idle)
-                        .await
-                        .ok();
-                    self.send_channel_message(
-                        &channel,
-                        &incoming.address,
-                        OutgoingMessage::text(user_facing_continue_error_text(
-                            &self.main_agent.language,
-                            &error,
-                            &pending_continue.progress_summary,
-                        )),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        if !self.has_complete_agent_selection(&incoming.address)? {
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                    self.agent_selection_message(
-                        &incoming.address,
-                        "Choose an agent backend and model for this conversation before sending messages.",
-                    )?,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        let session = self.ensure_foreground_session(&incoming.address)?;
-        if session.agent_message_count == 0 {
-            if let Err(error) = self.initialize_foreground_session(&session, false).await {
-                self.send_user_error_message(&channel, &incoming.address, &error)
-                    .await;
-                return Err(error);
-            }
-        }
-        let session = self
-            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-            .expect("session should exist after initialization");
-        if session.idle_compaction_retry.is_some() {
-            info!(
-                log_stream = "session",
-                log_key = %session.id,
-                kind = "idle_context_compaction_retry_started_on_user_message",
-                channel_id = %incoming.address.channel_id,
-                conversation_id = %incoming.address.conversation_id,
-                "retrying idle context compaction before handling user message"
-            );
-            match self.attempt_idle_context_compaction(&session, true).await {
-                Ok(_) => {}
-                Err(error) => {
-                    self.with_sessions(|sessions| {
-                        sessions.mark_idle_compaction_retry_needed(
-                            &incoming.address,
-                            format!("{error:#}"),
-                        )
-                    })?;
-                    warn!(
-                        log_stream = "session",
-                        log_key = %session.id,
-                        kind = "idle_context_compaction_retry_failed_on_user_message",
-                        channel_id = %incoming.address.channel_id,
-                        conversation_id = %incoming.address.conversation_id,
-                        error = %format!("{error:#}"),
-                        "idle context compaction retry failed before handling user message"
-                    );
-                }
-            }
-        }
-        let session = self
-            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-            .expect("session should exist after idle retry");
-
-        let stored_attachments = self
-            .materialize_attachments(&session.attachments_dir, incoming.attachments)
-            .await?;
-        let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
-        let workspace_profile_notices = self.sync_runtime_profile_files(&session)?;
-        self.observe_runtime_profile_changes(&session)?;
-        self.observe_runtime_model_catalog_changes(&session)?;
-        self.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
-        let should_emit_runtime_change_notice =
-            should_emit_runtime_change_prompt(incoming.text.as_deref());
-        let profile_change_notices = if should_emit_runtime_change_notice {
-            self.take_runtime_profile_change_notices(&session)?
-        } else {
-            Vec::new()
-        };
-        let model_catalog_change_notice = if should_emit_runtime_change_notice {
-            render_model_catalog_change_notice(
-                &self.take_runtime_model_catalog_change_notices(&session)?,
-                &self.current_runtime_model_catalog(),
-            )
-        } else {
-            None
-        };
-        let now = Utc::now();
-        let user_time_tip = self
-            .main_agent
-            .time_awareness
-            .emit_idle_time_gap_hint
-            .then(|| render_last_user_message_time_tip(&session, now))
-            .flatten();
-        let system_date = self
-            .main_agent
-            .time_awareness
-            .emit_system_date_on_user_message
-            .then(|| render_system_date_on_user_message(now));
-        let effective_model_key = self.effective_main_model_key(&incoming.address)?;
-        self.log_current_tools_for_user_message(
-            &session,
-            &effective_model_key,
-            &incoming.remote_message_id,
-            "user_message",
-        );
-        let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
-        let user_message = build_user_turn_message(
-            incoming.text.as_deref(),
-            &stored_attachments,
-            &effective_model,
-            backend_supports_native_multimodal_input(
-                self.effective_agent_backend(&incoming.address)?,
-            ),
-            system_date.as_deref(),
-        )?;
-        let synthetic_system_messages = build_synthetic_system_messages(
-            user_time_tip.as_deref(),
-            model_catalog_change_notice.as_deref(),
-            skill_updates_prefix.as_deref(),
-            &profile_change_notices,
-        );
-        let persistence_system_prompt = self
-            .build_foreground_agent(&session, &effective_model_key)?
-            .system_prompt;
-        let pending_continue =
-            self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?;
-        let (previous_messages, rebuilt_system_prompt) =
-            build_previous_messages_for_turn_with_prompt(
-                &session.agent_messages,
-                pending_continue.as_ref(),
-                &synthetic_system_messages,
-                Some(user_message),
-                Some(&persistence_system_prompt),
-            );
-        if rebuilt_system_prompt {
-            self.with_conversations(|conversations| {
-                conversations
-                    .rotate_chat_version_id(&incoming.address)
-                    .map(|_| ())
-            })?;
-        }
-
-        channel
-            .set_processing(&incoming.address, ProcessingState::Typing)
+        self.handle_regular_foreground_message(&channel, incoming)
             .await
-            .ok();
-        let typing_guard = spawn_processing_keepalive(
-            channel.clone(),
-            incoming.address.clone(),
-            ProcessingState::Typing,
-        );
-
-        let turn_result = self
-            .run_main_agent_turn_with_previous_messages(
-                &session,
-                &effective_model_key,
-                previous_messages,
-                incoming.text.clone(),
-                stored_attachments.clone(),
-            )
-            .await
-            .context("foreground agent turn failed");
-        if let Some(stop_sender) = typing_guard {
-            let _ = stop_sender.send(());
-        }
-        if let Err(error) = &turn_result {
-            channel
-                .set_processing(&incoming.address, ProcessingState::Idle)
-                .await
-                .ok();
-            self.send_user_error_message(&channel, &incoming.address, error)
-                .await;
-        }
-        let outcome = turn_result?;
-        let (messages, outgoing, usage, compaction, response_checkpoint) = match outcome {
-            ForegroundTurnOutcome::Replied {
-                messages,
-                outgoing,
-                usage,
-                compaction,
-                response_checkpoint,
-            } => (messages, outgoing, usage, compaction, response_checkpoint),
-            ForegroundTurnOutcome::Yielded {
-                messages,
-                usage,
-                compaction,
-                response_checkpoint,
-            } => {
-                let messages = normalize_messages_for_persistence(
-                    messages,
-                    &persistence_system_prompt,
-                    &synthetic_system_messages,
-                );
-                let loaded_skills =
-                    extract_loaded_skill_names(&messages, session.agent_message_count);
-                self.with_sessions(|sessions| {
-                    sessions.record_yielded_turn(
-                        &incoming.address,
-                        messages,
-                        &usage,
-                        &compaction,
-                        response_checkpoint,
-                    )
-                })
-                .context("failed to persist yielded agent_frame messages")?;
-                self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-                self.with_sessions(|sessions| {
-                    sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_user_message(
-                        &incoming.address,
-                        incoming.text.clone(),
-                        stored_attachments.clone(),
-                    )
-                })?;
-                channel
-                    .set_processing(&incoming.address, ProcessingState::Idle)
-                    .await
-                    .ok();
-                return Ok(());
-            }
-            ForegroundTurnOutcome::Failed {
-                mut pending_continue,
-                compaction,
-                error,
-            } => {
-                pending_continue.resume_messages = normalize_messages_for_persistence(
-                    pending_continue.resume_messages,
-                    &persistence_system_prompt,
-                    &synthetic_system_messages,
-                );
-                self.with_sessions(|sessions| {
-                    sessions.set_pending_continue(&incoming.address, Some(pending_continue.clone()))
-                })?;
-                self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-                channel
-                    .set_processing(&incoming.address, ProcessingState::Idle)
-                    .await
-                    .ok();
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(user_facing_continue_error_text(
-                        &self.main_agent.language,
-                        &error,
-                        &pending_continue.progress_summary,
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-
-        let messages = normalize_messages_for_persistence(
-            messages,
-            &persistence_system_prompt,
-            &synthetic_system_messages,
-        );
-        let loaded_skills = extract_loaded_skill_names(&messages, session.agent_message_count);
-        self.with_sessions(|sessions| {
-            sessions.record_agent_turn(
-                &incoming.address,
-                messages,
-                &usage,
-                &compaction,
-                response_checkpoint,
-            )
-        })
-        .context("failed to persist agent_frame messages")?;
-        self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
-        self.with_sessions(|sessions| {
-            sessions.mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)
-        })?;
-        self.with_sessions(|sessions| {
-            sessions.append_user_message(
-                &incoming.address,
-                incoming.text.clone(),
-                stored_attachments.clone(),
-            )
-        })?;
-        self.with_sessions(|sessions| {
-            sessions.append_assistant_message(&incoming.address, outgoing.text.clone(), Vec::new())
-        })?;
-
-        let foreground = self.build_foreground_agent(&session, &effective_model_key)?;
-        self.log_turn_usage(&session, &usage, false);
-        info!(
-            log_stream = "agent",
-            log_key = %foreground.id,
-            kind = "foreground_agent_replied",
-            session_id = %foreground.session_id,
-            channel_id = %foreground.channel_id,
-            system_prompt_len = foreground.system_prompt.len() as u64,
-            has_text = outgoing
-                .text
-                .as_deref()
-                .is_some_and(|text: &str| !text.trim().is_empty()),
-            attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
-            "foreground agent produced reply"
-        );
-
-        self.send_channel_message(&channel, &incoming.address, outgoing)
-            .await?;
-        channel
-            .set_processing(&incoming.address, ProcessingState::Idle)
-            .await
-            .ok();
-        Ok(())
     }
 
     async fn materialize_attachments(
@@ -6532,31 +3855,6 @@ impl Server {
         Ok(())
     }
 
-    fn activate_existing_workspace(
-        &self,
-        address: &ChannelAddress,
-        workspace_id: &str,
-    ) -> Result<SessionSnapshot> {
-        self.workspace_manager.reactivate_workspace(workspace_id)?;
-        let session = self.with_sessions(|sessions| {
-            sessions.reset_foreground_to_workspace(address, workspace_id)
-        })?;
-        self.with_conversations(|conversations| {
-            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
-            Ok(())
-        })?;
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "workspace_reactivated",
-            channel_id = %address.channel_id,
-            conversation_id = %address.conversation_id,
-            workspace_id = %session.workspace_id,
-            "reactivated existing workspace in a new foreground session"
-        );
-        Ok(session)
-    }
-
     async fn compact_session_now(
         &self,
         session: &SessionSnapshot,
@@ -6564,7 +3862,7 @@ impl Server {
         force: bool,
     ) -> Result<bool> {
         if (!force && !self.effective_context_compaction_enabled(&session.address)?)
-            || session.agent_message_count == 0
+            || session.stable_message_count() == 0
         {
             return Ok(false);
         }
@@ -6598,13 +3896,17 @@ impl Server {
         let persistence_system_prompt = config.system_prompt.clone();
         let effective_backend = self.effective_agent_backend(&session.address)?;
         let model = self.model_config_or_main(model_key)?;
-        let sanitized_messages = sanitize_messages_for_model_capabilities(
-            &session.agent_messages,
-            model,
-            backend_supports_native_multimodal_input(effective_backend),
-        );
+        let compaction_messages = if effective_backend == AgentBackendKind::AgentFrame {
+            session.request_messages()
+        } else {
+            sanitize_messages_for_model_capabilities(
+                &session.request_messages(),
+                model,
+                backend_supports_native_multimodal_input(effective_backend),
+            )
+        };
         let report =
-            run_backend_compaction(effective_backend, sanitized_messages, config, extra_tools)?;
+            run_backend_compaction(effective_backend, compaction_messages, config, extra_tools)?;
         if !report.compacted {
             return Ok(false);
         }
@@ -6627,83 +3929,11 @@ impl Server {
     }
 
     fn available_sandbox_modes(&self) -> Vec<SandboxMode> {
-        let mut modes = vec![SandboxMode::Disabled, SandboxMode::Subprocess];
+        let mut modes = vec![SandboxMode::Subprocess];
         if bubblewrap_is_available(&self.sandbox) {
             modes.push(SandboxMode::Bubblewrap);
         }
         modes
-    }
-
-    async fn initialize_foreground_session(
-        &self,
-        session: &SessionSnapshot,
-        show_reply: bool,
-    ) -> Result<OutgoingMessage> {
-        if self.main_agent.memory_system == agent_frame::config::MemorySystem::ClaudeCode {
-            ensure_workspace_partclaw_file(&self.agent_workspace, &session.workspace_root)?;
-        }
-        let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
-        let effective_model_key = self.effective_main_model_key(&session.address)?;
-        let persistence_system_prompt = self
-            .build_foreground_agent(session, &effective_model_key)?
-            .system_prompt;
-        let outcome = self
-            .run_main_agent_turn(session, &effective_model_key, greeting, None, Vec::new())
-            .await
-            .context("failed to initialize foreground session")?;
-        let (messages, outgoing, usage, compaction, response_checkpoint) = match outcome {
-            ForegroundTurnOutcome::Replied {
-                messages,
-                outgoing,
-                usage,
-                compaction,
-                response_checkpoint,
-            } => (messages, outgoing, usage, compaction, response_checkpoint),
-            ForegroundTurnOutcome::Yielded {
-                messages,
-                usage,
-                compaction,
-                response_checkpoint,
-            } => {
-                let messages =
-                    normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
-                self.with_sessions(|sessions| {
-                    sessions.record_yielded_turn(
-                        &session.address,
-                        messages,
-                        &usage,
-                        &compaction,
-                        response_checkpoint,
-                    )
-                })?;
-                self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
-                return Ok(OutgoingMessage::default());
-            }
-            ForegroundTurnOutcome::Failed { error, .. } => return Err(error),
-        };
-        let messages =
-            normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
-        self.with_sessions(|sessions| {
-            sessions.record_agent_turn(
-                &session.address,
-                messages,
-                &usage,
-                &compaction,
-                response_checkpoint,
-            )
-        })?;
-        self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
-        self.log_turn_usage(session, &usage, true);
-        if show_reply {
-            self.with_sessions(|sessions| {
-                sessions.append_assistant_message(
-                    &session.address,
-                    outgoing.text.clone(),
-                    Vec::new(),
-                )
-            })?;
-        }
-        Ok(outgoing)
     }
 
     async fn summarize_active_workspaces_on_shutdown(&self) -> Result<()> {
@@ -6738,17 +3968,18 @@ impl Server {
         let entries =
             self.workspace_manager
                 .list_workspace_contents(&session.workspace_id, None, 3, 200)?;
-        if session.agent_message_count == 0 && entries.is_empty() {
+        let request_messages = session.request_messages();
+        let request_message_count = request_messages.len();
+        if request_message_count == 0 && entries.is_empty() {
             self.with_sessions(|sessions| {
                 sessions.mark_workspace_summary_state(&session.address, false, false)
             })?;
             return Ok(());
         }
 
-        let mut previous_messages = session.agent_messages.clone();
+        let mut previous_messages = request_messages;
         let effective_model_key = self.effective_main_model_key(&session.address)?;
-        if self.effective_context_compaction_enabled(&session.address)?
-            && session.agent_message_count > 1
+        if self.effective_context_compaction_enabled(&session.address)? && request_message_count > 1
         {
             let runtime = self.tool_runtime();
             let config = runtime.build_agent_frame_config(
@@ -6764,15 +3995,19 @@ impl Server {
                 session.agent_id,
                 None,
             );
-            let compaction = run_backend_compaction(
-                self.effective_agent_backend(&session.address)?,
+            let effective_backend = self.effective_agent_backend(&session.address)?;
+            let compaction_messages = if effective_backend == AgentBackendKind::AgentFrame {
+                previous_messages.clone()
+            } else {
                 sanitize_messages_for_model_capabilities(
                     &previous_messages,
                     self.model_config_or_main(&effective_model_key)?,
-                    backend_supports_native_multimodal_input(
-                        self.effective_agent_backend(&session.address)?,
-                    ),
-                ),
+                    backend_supports_native_multimodal_input(effective_backend),
+                )
+            };
+            let compaction = run_backend_compaction(
+                effective_backend,
+                compaction_messages,
                 config,
                 extra_tools,
             )?;
@@ -6814,27 +4049,16 @@ impl Server {
                 "workspace summary task join failed",
             )
             .await?;
-        let report = match outcome {
-            TimedRunOutcome::Completed(report) => report,
-            TimedRunOutcome::Yielded(report) => report,
+        let state = match outcome {
+            TimedRunOutcome::Completed(state) => state,
+            TimedRunOutcome::Yielded(state) => state,
             TimedRunOutcome::TimedOut {
-                checkpoint: Some(report),
-                ..
-            } => report,
-            TimedRunOutcome::TimedOut {
-                checkpoint: None,
-                error,
-            } => return Err(error),
-            TimedRunOutcome::Failed {
-                checkpoint: Some(report),
-                ..
-            } => report,
-            TimedRunOutcome::Failed {
-                checkpoint: None,
-                error,
-            } => return Err(error),
+                state: Some(state), ..
+            } => state,
+            TimedRunOutcome::TimedOut { state: None, error } => return Err(error),
+            TimedRunOutcome::Failed(error) => return Err(error),
         };
-        let summary_text = extract_assistant_text(&report.messages);
+        let summary_text = extract_assistant_text(&state.messages);
         let (clean_summary, _) =
             extract_attachment_references(&summary_text, &session.workspace_root)?;
         let clean_summary = clean_summary.trim();
@@ -6887,182 +4111,6 @@ impl Server {
             }
         }
         Ok(())
-    }
-
-    async fn run_main_agent_turn(
-        &self,
-        session: &SessionSnapshot,
-        model_key: &str,
-        next_user_message: ChatMessage,
-        original_user_text: Option<String>,
-        original_attachments: Vec<StoredAttachment>,
-    ) -> Result<ForegroundTurnOutcome> {
-        let mut previous_messages = session.agent_messages.clone();
-        previous_messages.push(next_user_message);
-        self.run_main_agent_turn_with_previous_messages(
-            session,
-            model_key,
-            previous_messages,
-            original_user_text,
-            original_attachments,
-        )
-        .await
-    }
-
-    async fn run_main_agent_turn_with_previous_messages(
-        &self,
-        session: &SessionSnapshot,
-        model_key: &str,
-        previous_messages: Vec<ChatMessage>,
-        original_user_text: Option<String>,
-        original_attachments: Vec<StoredAttachment>,
-    ) -> Result<ForegroundTurnOutcome> {
-        let effective_backend = self.effective_agent_backend(&session.address)?;
-        let model = self.model_config_or_main(model_key)?.clone();
-        let previous_messages = sanitize_messages_for_model_capabilities(
-            &previous_messages,
-            &model,
-            backend_supports_native_multimodal_input(effective_backend),
-        );
-        if self.foreground_uses_native_zgent(&session.address, model_key)? {
-            let active = self.ensure_native_zgent_session(session, model_key)?;
-            active.busy.store(true, Ordering::SeqCst);
-            let kernel = Arc::clone(&active.kernel);
-            let previous_messages_clone = previous_messages.clone();
-            let run_result = tokio::task::spawn_blocking(move || {
-                kernel.run_immediate_turn(&previous_messages_clone, "")
-            })
-            .await
-            .context("native zgent foreground task join failed");
-            active.busy.store(false, Ordering::SeqCst);
-            let messages = run_result??;
-            let session_summary = active.kernel.fetch_session_summary().ok();
-            self.with_sessions(|sessions| {
-                sessions.set_zgent_native_state(
-                    &session.address,
-                    Some(ZgentNativeSessionState {
-                        remote_session_id: Some(active.kernel.remote_session_id().to_string()),
-                        model_key: Some(model_key.to_string()),
-                        context_window_current: session_summary
-                            .as_ref()
-                            .and_then(|summary| summary.context_window_current),
-                        context_window_size: session_summary
-                            .as_ref()
-                            .and_then(|summary| summary.context_window_size),
-                    }),
-                )
-            })?;
-            let workspace_root = session.workspace_root.clone();
-            let assistant_text = extract_assistant_text(&messages);
-            let outgoing =
-                build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-            return Ok(ForegroundTurnOutcome::Replied {
-                messages,
-                outgoing,
-                usage: TokenUsage::default(),
-                compaction: SessionCompactionStats::default(),
-                response_checkpoint: None,
-            });
-        }
-
-        let workspace_root = session.workspace_root.clone();
-        let upstream_timeout_seconds = session
-            .api_timeout_override_seconds
-            .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
-        let runtime = self.tool_runtime_for_address(&session.address)?;
-        let active_controls = Arc::clone(&self.active_foreground_controls);
-        let session_key = session.address.session_key();
-        let control_observer: Arc<dyn Fn(SessionExecutionControl) + Send + Sync> =
-            Arc::new(move |control| {
-                if let Ok(mut controls) = active_controls.lock() {
-                    controls.insert(session_key.clone(), control);
-                }
-            });
-        let run_result = runtime
-            .run_agent_turn_with_timeout(
-                session.clone(),
-                AgentPromptKind::MainForeground,
-                session.agent_id,
-                effective_backend,
-                model_key.to_string(),
-                previous_messages.clone(),
-                String::new(),
-                Some(upstream_timeout_seconds),
-                Some(control_observer),
-                "agent_frame task join failed",
-            )
-            .await;
-        self.unregister_active_foreground_control(&session.address)?;
-        let run_result = run_result?;
-
-        match run_result {
-            TimedRunOutcome::Completed(report) => {
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing =
-                    build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok(ForegroundTurnOutcome::Replied {
-                    messages: report.messages,
-                    outgoing,
-                    usage: report.usage,
-                    compaction: report.compaction,
-                    response_checkpoint: report.response_checkpoint,
-                })
-            }
-            TimedRunOutcome::Yielded(report) => Ok(ForegroundTurnOutcome::Yielded {
-                messages: report.messages,
-                usage: report.usage,
-                compaction: report.compaction,
-                response_checkpoint: report.response_checkpoint,
-            }),
-            TimedRunOutcome::TimedOut { checkpoint, error } => {
-                let report = checkpoint.ok_or(error)?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing =
-                    build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok(ForegroundTurnOutcome::Replied {
-                    messages: report.messages,
-                    outgoing,
-                    usage: report.usage,
-                    compaction: report.compaction,
-                    response_checkpoint: report.response_checkpoint,
-                })
-            }
-            TimedRunOutcome::Failed { checkpoint, error } => {
-                let (resume_messages, compaction, response_checkpoint) = checkpoint
-                    .map(|report| {
-                        (
-                            report.messages,
-                            report.compaction,
-                            report.response_checkpoint,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            previous_messages.clone(),
-                            SessionCompactionStats::default(),
-                            session.response_checkpoint.clone(),
-                        )
-                    });
-                Ok(ForegroundTurnOutcome::Failed {
-                    pending_continue: PendingContinueState {
-                        agent_backend: Some(self.effective_agent_backend(&session.address)?),
-                        model_key: model_key.to_string(),
-                        progress_summary: summarize_resume_progress(
-                            &self.main_agent.language,
-                            &resume_messages,
-                        ),
-                        error_summary: format!("{error:#}"),
-                        failed_at: Utc::now(),
-                        resume_messages,
-                        original_user_text,
-                        original_attachments,
-                        response_checkpoint,
-                    },
-                    compaction,
-                    error,
-                })
-            }
-        }
     }
 
     fn effective_conversation_settings(
@@ -7468,86 +4516,6 @@ impl Server {
         self.with_sessions(|sessions| sessions.take_shared_profile_change_notices(&session.address))
     }
 
-    fn should_auto_close_conversation_after_send_error(
-        &self,
-        address: &ChannelAddress,
-        error: &anyhow::Error,
-    ) -> bool {
-        if !address.conversation_id.starts_with('-') {
-            return false;
-        }
-        let message = format!("{error:#}").to_ascii_lowercase();
-        message.contains("bot was kicked from the group chat")
-            || message.contains("chat not found")
-            || message.contains("group chat was deleted")
-            || message.contains("bot is not a member of the channel chat")
-            || message.contains("forbidden: bot was kicked")
-    }
-
-    async fn send_channel_message(
-        &self,
-        channel: &Arc<dyn Channel>,
-        address: &ChannelAddress,
-        message: OutgoingMessage,
-    ) -> Result<()> {
-        match channel.send(address, message).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if self.should_auto_close_conversation_after_send_error(address, &error) {
-                    warn!(
-                        log_stream = "session",
-                        kind = "channel_send_closed_conversation",
-                        channel_id = %address.channel_id,
-                        conversation_id = %address.conversation_id,
-                        error = %format!("{error:#}"),
-                        "channel send indicates the conversation no longer exists; closing foreground session"
-                    );
-                    self.destroy_foreground_session(address)?;
-                    let disabled = self.disable_cron_tasks_for_conversation(address)?;
-                    if disabled > 0 {
-                        warn!(
-                            log_stream = "cron",
-                            kind = "cron_tasks_auto_disabled_after_send_error",
-                            channel_id = %address.channel_id,
-                            conversation_id = %address.conversation_id,
-                            disabled_count = disabled as u64,
-                            "disabled cron tasks because the conversation no longer exists"
-                        );
-                    }
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn disable_cron_tasks_for_conversation(&self, address: &ChannelAddress) -> Result<usize> {
-        let mut manager = self
-            .cron_manager
-            .lock()
-            .map_err(|_| anyhow!("cron manager lock poisoned"))?;
-        manager.disable_for_address(address)
-    }
-
-    async fn send_user_error_message(
-        &self,
-        channel: &Arc<dyn Channel>,
-        address: &ChannelAddress,
-        error: &anyhow::Error,
-    ) {
-        let text = user_facing_error_text(&self.main_agent.language, error);
-        if let Err(send_error) = self
-            .send_channel_message(channel, address, OutgoingMessage::text(text))
-            .await
-        {
-            error!(
-                log_stream = "server",
-                kind = "send_user_error_failed",
-                error = %format!("{send_error:#}"),
-                "failed to send user-facing error message"
-            );
-        }
-    }
-
     fn log_turn_usage(&self, session: &SessionSnapshot, usage: &TokenUsage, initialization: bool) {
         log_turn_usage(
             session.agent_id,
@@ -7615,24 +4583,24 @@ mod tests {
     use super::{
         AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, Server, SinkTarget,
         SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
-        build_previous_messages_for_turn_with_prompt, build_synthetic_system_messages,
-        build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
-        downgrade_messages_for_model_switch, estimate_compaction_savings_usd, estimate_cost_usd,
-        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
-        infer_single_agent_backend, is_timeout_like, memory_search_files,
-        normalize_messages_for_persistence, parse_agent_command, parse_model_command,
-        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
-        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
-        render_model_catalog_change_notice, render_system_date_on_user_message,
-        request_yield_for_incoming, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, should_attempt_idle_context_compaction,
-        should_emit_runtime_change_prompt, summarize_resume_progress,
-        sync_workspace_shared_profile_files, tag_interrupted_followup_text,
-        update_active_foreground_phase, upload_workspace_shared_profile_files,
-        user_facing_continue_error_text, workspace_visible_in_list,
+        build_synthetic_system_messages, build_user_turn_message, channel_restart_backoff_seconds,
+        coalesce_buffered_conversation_messages, conversation_memory_root,
+        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
+        fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
+        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
+        parse_agent_command, parse_model_command, parse_sandbox_command,
+        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
+        parse_snap_load_command, parse_snap_save_command, parse_think_command,
+        persist_compaction_artifacts, rebuild_canonical_system_prompt,
+        render_last_user_message_time_tip, render_model_catalog_change_notice,
+        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
+        rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
+        summarize_resume_progress, sync_workspace_shared_profile_files,
+        tag_interrupted_followup_text, update_active_foreground_phase,
+        upload_workspace_shared_profile_files, user_facing_continue_error_text,
+        workspace_visible_in_list,
     };
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
@@ -7651,10 +4619,10 @@ mod tests {
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::SessionManager;
-    use crate::session::{ModelCatalogChangeNotice, PendingContinueState, SessionSnapshot};
+    use crate::session::{ModelCatalogChangeNotice, SessionErrno, SessionSnapshot};
     use crate::sink::SinkRouter;
     use crate::snapshot::SnapshotManager;
-    use crate::workspace::{CONTEXT_ATTACHMENT_STORE_DIR_NAME, WorkspaceManager};
+    use crate::workspace::WorkspaceManager;
     use agent_frame::config::MemorySystem;
     use agent_frame::message::{FunctionCall, ToolCall};
     use agent_frame::{
@@ -7697,8 +4665,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             workspace_root: temp_dir.path().join("workspace"),
             message_count: 0,
-            agent_message_count: 4,
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -7713,10 +4679,9 @@ mod tests {
             seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+            session_state: crate::session::DurableSessionState::default(),
         }
     }
 
@@ -7806,6 +4771,7 @@ mod tests {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             channel_auth: Arc::new(Mutex::new(channel_auth)),
@@ -8055,200 +5021,6 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_downgrades_multimodal_history_into_workspace_references() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_root = temp_dir.path().join("workspace");
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some(Value::Array(vec![
-                json!({
-                    "type": "text",
-                    "text": "先看这张图"
-                }),
-                json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,AQID"
-                    }
-                }),
-            ])),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-chat".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "chat".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            external_web_search: None,
-            capabilities: vec![ModelCapability::Chat],
-        };
-
-        let rewritten =
-            downgrade_messages_for_model_switch(&messages, &workspace_root, &model, true).unwrap();
-
-        let items = rewritten[0]
-            .content
-            .as_ref()
-            .and_then(Value::as_array)
-            .unwrap();
-        assert_eq!(items[1]["type"], "text");
-        let text = items[1]["text"].as_str().unwrap();
-        assert!(text.contains("downgraded during model switch"));
-        assert!(text.contains(CONTEXT_ATTACHMENT_STORE_DIR_NAME));
-
-        let store_root = workspace_root.join(CONTEXT_ATTACHMENT_STORE_DIR_NAME);
-        let batch_dir = fs::read_dir(&store_root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let artifact_path = fs::read_dir(&batch_dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(fs::read(&artifact_path).unwrap(), vec![1_u8, 2, 3]);
-        let relative = artifact_path
-            .strip_prefix(&workspace_root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        assert!(text.contains(&relative));
-    }
-
-    #[test]
-    fn model_switch_keeps_supported_multimodal_history_untouched() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_root = temp_dir.path().join("workspace");
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some(Value::Array(vec![
-                json!({
-                    "type": "text",
-                    "text": "继续参考这张图"
-                }),
-                json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,AQID"
-                    }
-                }),
-            ])),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            external_web_search: None,
-            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
-        };
-
-        let rewritten =
-            downgrade_messages_for_model_switch(&messages, &workspace_root, &model, true).unwrap();
-
-        assert_eq!(rewritten, messages);
-        assert!(
-            !workspace_root
-                .join(CONTEXT_ATTACHMENT_STORE_DIR_NAME)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn preserves_historical_multimodal_messages_for_vision_models() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some(Value::Array(vec![
-                json!({
-                    "type": "text",
-                    "text": "请继续参考前面的图片"
-                }),
-                json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,AAAA"
-                    }
-                }),
-            ])),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            external_web_search: None,
-            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
-        };
-
-        let sanitized = sanitize_messages_for_model_capabilities(&messages, &model, true);
-        let items = sanitized[0]
-            .content
-            .as_ref()
-            .and_then(Value::as_array)
-            .unwrap();
-        assert_eq!(items[1]["type"], "image_url");
-    }
-
-    #[test]
     fn immediate_channel_send_works_without_tokio_runtime() {
         let channel = Arc::new(RecordingChannel::default());
         let address = ChannelAddress {
@@ -8413,6 +5185,7 @@ mod tests {
             address,
             text: Some("继续".to_string()),
             attachments: Vec::new(),
+            stored_attachments: Vec::new(),
             control: None,
         };
 
@@ -8423,6 +5196,41 @@ mod tests {
         assert!(control.take_yield_requested());
         let phase = active_phases.lock().unwrap().get(&session_key).copied();
         assert_eq!(phase, Some(ForegroundRuntimePhase::Compacting));
+    }
+
+    #[test]
+    fn interrupted_followups_can_still_be_coalesced_before_runtime_returns() {
+        let address = ChannelAddress {
+            channel_id: "telegram".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            user_id: None,
+            display_name: None,
+        };
+        let initial = IncomingMessage {
+            remote_message_id: "msg-1".to_string(),
+            address: address.clone(),
+            text: Some("[Interrupted Follow-up]\n进度如何？".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        let later = IncomingMessage {
+            remote_message_id: "msg-2".to_string(),
+            address,
+            text: Some("[Interrupted Follow-up]\n继续".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        let mut queue = std::collections::VecDeque::from([later]);
+
+        let returned = coalesce_buffered_conversation_messages(initial, &mut queue);
+
+        assert_eq!(returned.remote_message_id, "msg-2");
+        assert!(queue.is_empty());
+        let text = returned.text.expect("merged follow-up text should exist");
+        assert!(text.contains("Follow-up 1"));
+        assert!(text.contains("Follow-up 2"));
     }
 
     #[test]
@@ -8440,14 +5248,9 @@ mod tests {
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3.")
         );
 
-        let (previous, rebuilt) = build_previous_messages_for_turn_with_prompt(
-            &[ChatMessage::text("assistant", "existing context")],
-            None,
-            &injected,
-            Some(ChatMessage::text("user", "继续")),
-            None,
-        );
-        assert!(!rebuilt);
+        let mut previous = vec![ChatMessage::text("assistant", "existing context")];
+        previous.extend(injected);
+        previous.push(ChatMessage::text("user", "继续"));
         assert_eq!(previous.len(), 3);
         assert_eq!(previous[1].role, "system");
         assert_eq!(previous[2].role, "user");
@@ -8482,16 +5285,15 @@ mod tests {
             None,
             &[],
         );
-        let (previous, rebuilt) = build_previous_messages_for_turn_with_prompt(
+        let (mut previous, rebuilt) = rebuild_canonical_system_prompt(
             &[
                 ChatMessage::text("system", "old prompt"),
                 ChatMessage::text("assistant", "existing context"),
             ],
-            None,
-            &injected,
-            Some(ChatMessage::text("user", "继续")),
-            Some("new prompt"),
+            "new prompt",
         );
+        previous.extend(injected);
+        previous.push(ChatMessage::text("user", "继续"));
 
         assert!(rebuilt);
         assert_eq!(
@@ -8888,8 +5690,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             workspace_root: PathBuf::from("/tmp/workspaces/workspace-1/files"),
             message_count: 0,
-            agent_message_count: 3,
-            agent_messages: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: Some(now - ChronoDuration::seconds(400)),
             last_compacted_at: None,
@@ -8904,10 +5704,9 @@ mod tests {
             seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
-            pending_continue: None,
-            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+            session_state: crate::session::DurableSessionState::default(),
         };
 
         assert!(should_attempt_idle_context_compaction(
@@ -8993,6 +5792,62 @@ mod tests {
         assert!(en.contains("Automatic context compaction failed"));
         assert!(en.contains("Failure reason"));
         assert!(en.contains("/continue"));
+    }
+
+    #[test]
+    fn completed_foreground_assistant_history_appends_assistant_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel);
+        let session = build_test_session(&temp_dir);
+        server
+            .with_sessions(|sessions| {
+                sessions.ensure_foreground(&session.address)?;
+                Ok(())
+            })
+            .unwrap();
+
+        server
+            .append_completed_foreground_assistant_history(
+                &session.address,
+                &OutgoingMessage::text("done"),
+            )
+            .unwrap();
+
+        let checkpoint = server
+            .with_sessions(|sessions| sessions.export_checkpoint(&session.address))
+            .unwrap();
+        assert_eq!(checkpoint.history.len(), 1);
+        assert_eq!(
+            checkpoint.history[0].role,
+            crate::domain::MessageRole::Assistant
+        );
+        assert_eq!(checkpoint.history[0].text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn turn_error_errno_classification_prefers_compaction_then_upstream() {
+        let threshold = anyhow!("threshold context compaction failed during round phase");
+        let tool_wait = anyhow!("tool-wait context compaction failed: upstream timed out");
+        let upstream = anyhow!("upstream provider returned 502");
+        let runtime = anyhow!("worker thread panicked");
+
+        assert_eq!(
+            session_errno_for_turn_error(&threshold),
+            SessionErrno::ThresholdCompactionFailure
+        );
+        assert_eq!(
+            session_errno_for_turn_error(&tool_wait),
+            SessionErrno::ToolWaitTimeout
+        );
+        assert_eq!(
+            session_errno_for_turn_error(&upstream),
+            SessionErrno::ApiFailure
+        );
+        assert_eq!(
+            session_errno_for_turn_error(&runtime),
+            SessionErrno::RuntimeFailure
+        );
     }
 
     #[test]
@@ -9154,20 +6009,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_oldspace_command_with_workspace_id() {
-        assert_eq!(
-            parse_oldspace_command(Some("/oldspace workspace-123")),
-            Some("workspace-123".to_string())
-        );
-        assert_eq!(
-            parse_oldspace_command(Some("  /oldspace   abc-def  ")),
-            Some("abc-def".to_string())
-        );
-        assert_eq!(parse_oldspace_command(Some("/oldspace")), None);
-        assert_eq!(parse_oldspace_command(Some("hello")), None);
-    }
-
-    #[test]
     fn parses_set_api_timeout_command_argument() {
         assert_eq!(
             parse_set_api_timeout_command(Some("/set_api_timeout 300")),
@@ -9262,57 +6103,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_continue_resume_messages_drive_followup_turn_inputs() {
-        let session_messages = vec![ChatMessage::text("assistant", "current session tail")];
-        let resume_messages = vec![ChatMessage::text("assistant", "preserved failure point")];
-        let pending_continue = PendingContinueState {
-            agent_backend: Some(AgentBackendKind::AgentFrame),
-            model_key: "demo-model".to_string(),
-            resume_messages: resume_messages.clone(),
-            original_user_text: Some("original request".to_string()),
-            original_attachments: Vec::new(),
-            error_summary: "error".to_string(),
-            progress_summary: "progress".to_string(),
-            response_checkpoint: None,
-            failed_at: Utc::now(),
-        };
-
-        let (continue_messages, rebuilt_continue) = build_previous_messages_for_turn_with_prompt(
-            &session_messages,
-            Some(&pending_continue),
-            &[],
-            None,
-            None,
-        );
-        assert!(!rebuilt_continue);
-        assert_eq!(continue_messages, resume_messages);
-
-        let (followup_messages, rebuilt_followup) = build_previous_messages_for_turn_with_prompt(
-            &session_messages,
-            Some(&pending_continue),
-            &[],
-            Some(ChatMessage::text("user", "new user message")),
-            None,
-        );
-        assert!(!rebuilt_followup);
-        assert_eq!(followup_messages.len(), 2);
-        assert_eq!(
-            followup_messages[0]
-                .content
-                .as_ref()
-                .and_then(|value| value.as_str()),
-            Some("preserved failure point")
-        );
-        assert_eq!(
-            followup_messages[1]
-                .content
-                .as_ref()
-                .and_then(|value| value.as_str()),
-            Some("new user message")
-        );
-    }
-
-    #[test]
     fn fast_path_skips_prompt_and_backfills_unique_backend_selection() {
         let temp_dir = TempDir::new().unwrap();
         let address = ChannelAddress {
@@ -9365,6 +6155,7 @@ mod tests {
             address: address.clone(),
             text: Some("继续".to_string()),
             attachments: Vec::new(),
+            stored_attachments: Vec::new(),
             control: None,
         };
 
