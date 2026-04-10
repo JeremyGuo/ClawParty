@@ -1810,112 +1810,113 @@ impl ServerRuntime {
         if matches!(
             kind,
             AgentPromptKind::MainForeground | AgentPromptKind::MainBackground
-        ) && self.main_agent.memory_system == agent_frame::config::MemorySystem::Layered
-        {
-            let runtime = self.clone();
-            let memory_session = session.clone();
-            tools.push(Tool::new(
-                "memory_search",
-                "Search the current conversation memory layers. Use this before opening rollout summaries or transcript snippets when you need older conversation context.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer"}
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }),
-                move |arguments| {
-                    let object = arguments
-                        .as_object()
-                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-                    runtime.memory_search(
-                        &memory_session,
-                        string_arg_required(object, "query")?,
-                        object.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize,
-                    )
-                },
-            ));
-
-            let runtime = self.clone();
-            let rollout_search_session = session.clone();
-            tools.push(Tool::new(
-                "rollout_search",
-                "Search rollout transcripts for exact historical evidence. Prefer passing rollout_id when you already know which rollout is relevant.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "rollout_id": {"type": "string"},
-                        "kinds": {
-                            "type": "array",
-                            "items": {"type": "string"}
+        ) {
+            if self.main_agent.memory_system == agent_frame::config::MemorySystem::Layered {
+                let runtime = self.clone();
+                let memory_session = session.clone();
+                tools.push(Tool::new(
+                    "memory_search",
+                    "Search the current conversation memory layers. Use this before opening rollout summaries or transcript snippets when you need older conversation context.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"}
                         },
-                        "limit": {"type": "integer"}
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }),
+                    move |arguments| {
+                        let object = arguments
+                            .as_object()
+                            .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                        runtime.memory_search(
+                            &memory_session,
+                            string_arg_required(object, "query")?,
+                            object.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize,
+                        )
                     },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }),
-                move |arguments| {
-                    let object = arguments
-                        .as_object()
-                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-                    let kinds = object
-                        .get("kinds")
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items.iter()
-                                .filter_map(Value::as_str)
-                                .map(ToOwned::to_owned)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    runtime.rollout_search(
-                        &rollout_search_session,
-                        string_arg_required(object, "query")?,
-                        optional_string_arg(object, "rollout_id")?,
-                        kinds,
-                        object.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize,
-                    )
-                },
-            ));
+                ));
 
-            let runtime = self.clone();
-            let rollout_read_session = session.clone();
-            tools.push(Tool::new(
-                "rollout_read",
-                "Read a small snippet around one rollout transcript event. Use this after rollout_search instead of opening the whole transcript.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "rollout_id": {"type": "string"},
-                        "anchor_event_id": {"type": "integer"},
-                        "mode": {"type": "string"},
-                        "before": {"type": "integer"},
-                        "after": {"type": "integer"}
+                let runtime = self.clone();
+                let rollout_search_session = session.clone();
+                tools.push(Tool::new(
+                    "rollout_search",
+                    "Search rollout transcripts for exact historical evidence. Prefer passing rollout_id when you already know which rollout is relevant.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "rollout_id": {"type": "string"},
+                            "kinds": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }),
+                    move |arguments| {
+                        let object = arguments
+                            .as_object()
+                            .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                        let kinds = object
+                            .get("kinds")
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        runtime.rollout_search(
+                            &rollout_search_session,
+                            string_arg_required(object, "query")?,
+                            optional_string_arg(object, "rollout_id")?,
+                            kinds,
+                            object.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize,
+                        )
                     },
-                    "required": ["rollout_id", "anchor_event_id"],
-                    "additionalProperties": false
-                }),
-                move |arguments| {
-                    let object = arguments
-                        .as_object()
-                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-                    runtime.rollout_read(
-                        &rollout_read_session,
-                        string_arg_required(object, "rollout_id")?,
-                        object
-                            .get("anchor_event_id")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| anyhow!("anchor_event_id must be an integer"))?
-                            as usize,
-                        optional_string_arg(object, "mode")?,
-                        object.get("before").and_then(Value::as_u64).unwrap_or(3) as usize,
-                        object.get("after").and_then(Value::as_u64).unwrap_or(3) as usize,
-                    )
-                },
-            ));
+                ));
+
+                let runtime = self.clone();
+                let rollout_read_session = session.clone();
+                tools.push(Tool::new(
+                    "rollout_read",
+                    "Read a small snippet around one rollout transcript event. Use this after rollout_search instead of opening the whole transcript.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "rollout_id": {"type": "string"},
+                            "anchor_event_id": {"type": "integer"},
+                            "mode": {"type": "string"},
+                            "before": {"type": "integer"},
+                            "after": {"type": "integer"}
+                        },
+                        "required": ["rollout_id", "anchor_event_id"],
+                        "additionalProperties": false
+                    }),
+                    move |arguments| {
+                        let object = arguments
+                            .as_object()
+                            .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                        runtime.rollout_read(
+                            &rollout_read_session,
+                            string_arg_required(object, "rollout_id")?,
+                            object
+                                .get("anchor_event_id")
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| anyhow!("anchor_event_id must be an integer"))?
+                                as usize,
+                            optional_string_arg(object, "mode")?,
+                            object.get("before").and_then(Value::as_u64).unwrap_or(3) as usize,
+                            object.get("after").and_then(Value::as_u64).unwrap_or(3) as usize,
+                        )
+                    },
+                ));
+            }
 
             let runtime = self.clone();
             let tell_session = session.clone();
@@ -4260,6 +4261,88 @@ impl Server {
         Ok(active)
     }
 
+    fn current_tool_names_for_foreground_turn(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<Vec<String>> {
+        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let frame_config = runtime.build_agent_frame_config(
+            session,
+            &session.workspace_root,
+            AgentPromptKind::MainForeground,
+            model_key,
+            None,
+        )?;
+        let skills = discover_skills(&frame_config.skills_dirs)?;
+        let extra_tools = runtime.build_extra_tools(
+            session,
+            AgentPromptKind::MainForeground,
+            session.agent_id,
+            None,
+        );
+        let registry = build_tool_registry(
+            &frame_config.enabled_tools,
+            &frame_config.workspace_root,
+            &frame_config.runtime_state_root,
+            &frame_config.upstream,
+            frame_config.image_tool_upstream.as_ref(),
+            frame_config.pdf_tool_upstream.as_ref(),
+            frame_config.audio_tool_upstream.as_ref(),
+            frame_config.image_generation_tool_upstream.as_ref(),
+            &frame_config.skills_dirs,
+            &skills,
+            &extra_tools,
+        )?;
+        Ok(registry.into_keys().collect())
+    }
+
+    fn log_current_tools_for_user_message(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+        remote_message_id: &str,
+        trigger: &str,
+    ) {
+        match self.current_tool_names_for_foreground_turn(session, model_key) {
+            Ok(tool_names) => {
+                let using_native_zgent = self
+                    .foreground_uses_native_zgent(&session.address, model_key)
+                    .unwrap_or(false);
+                info!(
+                    log_stream = "agent",
+                    log_key = %session.agent_id,
+                    kind = "foreground_tool_catalog",
+                    session_id = %session.id,
+                    channel_id = %session.address.channel_id,
+                    conversation_id = %session.address.conversation_id,
+                    remote_message_id = remote_message_id,
+                    model = model_key,
+                    trigger,
+                    native_zgent = using_native_zgent,
+                    tool_count = tool_names.len() as u64,
+                    tool_names = %tool_names.join(","),
+                    "resolved foreground tool catalog for user message"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    log_stream = "agent",
+                    log_key = %session.agent_id,
+                    kind = "foreground_tool_catalog_failed",
+                    session_id = %session.id,
+                    channel_id = %session.address.channel_id,
+                    conversation_id = %session.address.conversation_id,
+                    remote_message_id = remote_message_id,
+                    model = model_key,
+                    trigger,
+                    error = %format!("{error:#}"),
+                    "failed to resolve foreground tool catalog for user message"
+                );
+            }
+        }
+    }
+
     async fn try_forward_to_active_native_zgent_turn(
         &self,
         message: IncomingMessage,
@@ -4292,6 +4375,12 @@ impl Server {
         else {
             return Ok(Some(message));
         };
+        self.log_current_tools_for_user_message(
+            &session,
+            &model_key,
+            &message.remote_message_id,
+            "native_busy_steer",
+        );
         let stored_attachments = self
             .materialize_attachments(&session.attachments_dir, message.attachments)
             .await?;
@@ -5842,6 +5931,12 @@ impl Server {
             let persistence_system_prompt = self
                 .build_foreground_agent(&session, &pending_continue.model_key)?
                 .system_prompt;
+            self.log_current_tools_for_user_message(
+                &session,
+                &pending_continue.model_key,
+                &incoming.remote_message_id,
+                "continue",
+            );
             let (resume_messages, rebuilt_system_prompt) = rebuild_canonical_system_prompt(
                 &pending_continue.resume_messages,
                 &persistence_system_prompt,
@@ -6100,6 +6195,12 @@ impl Server {
             .emit_system_date_on_user_message
             .then(|| render_system_date_on_user_message(now));
         let effective_model_key = self.effective_main_model_key(&incoming.address)?;
+        self.log_current_tools_for_user_message(
+            &session,
+            &effective_model_key,
+            &incoming.remote_message_id,
+            "user_message",
+        );
         let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
             incoming.text.as_deref(),
