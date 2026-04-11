@@ -15,6 +15,21 @@
 ClawParty is a **production-grade agent hosting framework** that turns LLM agents into always-on, multi-channel services. Unlike CLI-only tools like Claude Code or OpenClaw, ClawParty is designed from day one as a **persistent service** — it runs 24/7, connects to messaging platforms like Telegram, and manages multiple independent conversations concurrently.
 
 <div align="center">
+<table><tr>
+<td align="center" width="340">
+  <img src="docs/imgs/telegram_conversations.png" alt="Multiple conversations via Telegram groups" width="300" />
+  <br />
+  <sub>💬 Each Telegram group = an independent agent conversation</sub>
+</td>
+<td align="center" width="500">
+  <img src="docs/imgs/tui_config_editor.jpg" alt="TUI Config Editor" width="480" />
+  <br />
+  <sub>⚙️ Built-in TUI config editor — no hand-editing JSON</sub>
+</td>
+</tr></table>
+</div>
+
+<div align="center">
   <img src="docs/imgs/architecture_svg.svg" alt="System Architecture" width="780" />
   <br />
   <sub>Layered architecture: Channels → Session → Agent Topology → Cron / Sink</sub>
@@ -58,13 +73,7 @@ Each Telegram group chat with the bot creates an **independent conversation** wi
 - Session history & memory
 - Sandbox mode
 
-Create a new group, add the bot, and you have a fresh conversation — no commands needed.
-
-<div align="center">
-  <img src="docs/imgs/telegram_conversations.png" alt="Multiple conversations via Telegram groups" width="320" />
-  <br />
-  <sub>Each group is an independent agent workspace with full context isolation</sub>
-</div>
+Create a new group, add the bot, and you have a fresh conversation — no commands needed. Each conversation is fully isolated — different groups can use different models, sandboxes, and skill sets simultaneously.
 
 ---
 
@@ -184,13 +193,7 @@ ClawParty ships with a built-in terminal UI for editing configurations — no ne
 ./target/release/partyclaw config deploy_telegram.json
 ```
 
-<div align="center">
-  <img src="docs/imgs/tui_config_editor.jpg" alt="TUI Config Editor" width="720" />
-  <br />
-  <sub><code>partyclaw config</code> — browse, edit, validate, and save configurations interactively</sub>
-</div>
-
-Sections include Models, Tooling, Main Agent, Runtime, Sandbox, and Channels. Supports keyboard navigation, inline validation, and one-key bootstrap for new configs.
+Sections include Models, Tooling, Main Agent, Runtime, Sandbox, and Channels. Supports keyboard navigation, inline validation (`v`), and one-key bootstrap (`b`) for new configs.
 
 ---
 
