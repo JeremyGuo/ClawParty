@@ -1,5 +1,5 @@
 use super::UpstreamProvider;
-use crate::config::UpstreamConfig;
+use crate::config::{CacheControlConfig, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionResponse, ChatCompletionSession,
     build_chat_completions_url, chat_completions_messages_payload, parse_usage,
@@ -42,7 +42,8 @@ impl UpstreamProvider for OpenRouterProvider {
         if let Some(cache_control) = &upstream.cache_control {
             payload.insert(
                 "cache_control".to_string(),
-                serde_json::to_value(cache_control).context("failed to serialize cache_control")?,
+                openrouter_cache_control_payload(cache_control)
+                    .context("failed to serialize cache_control")?,
             );
         }
         if let Some(reasoning) = &upstream.reasoning {
@@ -121,5 +122,50 @@ impl UpstreamProvider for OpenRouterProvider {
             usage,
             response_id: None,
         })
+    }
+}
+
+fn openrouter_cache_control_payload(cache_control: &CacheControlConfig) -> Result<Value> {
+    let mut cache_control = cache_control.clone();
+    if cache_control
+        .ttl
+        .as_deref()
+        .is_some_and(is_default_anthropic_cache_ttl)
+    {
+        cache_control.ttl = None;
+    }
+    serde_json::to_value(cache_control).context("failed to serialize cache_control")
+}
+
+fn is_default_anthropic_cache_ttl(ttl: &str) -> bool {
+    ttl.trim().eq_ignore_ascii_case("5m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openrouter_cache_control_payload;
+    use crate::config::CacheControlConfig;
+    use serde_json::json;
+
+    #[test]
+    fn cache_control_omits_five_minute_default_ttl() {
+        let value = openrouter_cache_control_payload(&CacheControlConfig {
+            cache_type: "ephemeral".to_string(),
+            ttl: Some("5m".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(value, json!({ "type": "ephemeral" }));
+    }
+
+    #[test]
+    fn cache_control_preserves_one_hour_ttl() {
+        let value = openrouter_cache_control_payload(&CacheControlConfig {
+            cache_type: "ephemeral".to_string(),
+            ttl: Some("1h".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(value, json!({ "type": "ephemeral", "ttl": "1h" }));
     }
 }

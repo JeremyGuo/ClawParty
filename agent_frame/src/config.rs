@@ -97,7 +97,7 @@ pub struct CodexAuthConfig {
 pub struct CacheControlConfig {
     #[serde(rename = "type")]
     pub cache_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
 }
 

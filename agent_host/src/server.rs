@@ -48,7 +48,7 @@ use crate::zgent::kernel::{
 };
 use crate::zgent::subagent::ZgentSubagentModel;
 use agent_frame::config::{
-    AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, ExternalWebSearchConfig,
+    AgentConfig as FrameAgentConfig, CodexAuthConfig, ExternalWebSearchConfig,
     NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
     load_codex_auth_tokens,
 };
@@ -529,10 +529,7 @@ impl ServerRuntime {
             auth_credentials_store_mode: model.auth_credentials_store_mode,
             timeout_seconds,
             context_window_tokens: model.context_window_tokens,
-            cache_control: model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
-                cache_type: "ephemeral".to_string(),
-                ttl: Some(ttl.clone()),
-            }),
+            cache_control: openrouter_automatic_cache_control(model),
             prompt_cache_retention,
             prompt_cache_key,
             reasoning,
@@ -3419,10 +3416,10 @@ impl Server {
         if !force_retry {
             let lead_time = Duration::from_secs(30);
             let now = Utc::now();
-            let Some(ttl) = model.cache_ttl.as_deref() else {
+            let Some(ttl) = openrouter_automatic_cache_ttl(&model) else {
                 return Ok(false);
             };
-            let ttl = parse_duration(ttl)
+            let ttl = parse_duration(&ttl)
                 .with_context(|| format!("failed to parse model cache_ttl '{}'", ttl))?;
             let Some(idle_threshold) = ttl.checked_sub(lead_time) else {
                 return Ok(false);
@@ -4588,14 +4585,15 @@ mod tests {
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
         fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
         is_timeout_like, memory_search_files, normalize_messages_for_persistence,
-        parse_agent_command, parse_model_command, parse_sandbox_command,
-        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
-        parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_model_catalog_change_notice,
-        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
-        rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
+        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
+        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
+        render_model_catalog_change_notice, render_system_date_on_user_message,
+        request_yield_for_incoming, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
         summarize_resume_progress, sync_workspace_shared_profile_files,
         tag_interrupted_followup_text, update_active_foreground_phase,
@@ -6257,12 +6255,11 @@ mod tests {
         assert!(text.contains("Rejected"));
     }
 
-    #[test]
-    fn estimates_openrouter_opus_cost_with_cache_formula() {
-        let model = ModelConfig {
+    fn openrouter_test_model(model: &str, cache_ttl: Option<&str>) -> ModelConfig {
+        ModelConfig {
             model_type: crate::config::ModelType::Openrouter,
             api_endpoint: "https://openrouter.ai/api/v1".to_string(),
-            model: "anthropic/claude-opus-4.6".to_string(),
+            model: model.to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
             image_tool_model: None,
@@ -6274,7 +6271,7 @@ mod tests {
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 300.0,
             context_window_tokens: 262_144,
-            cache_ttl: Some("5m".to_string()),
+            cache_ttl: cache_ttl.map(str::to_string),
             reasoning: None,
             headers: serde_json::Map::new(),
             description: "demo".to_string(),
@@ -6282,7 +6279,33 @@ mod tests {
             native_web_search: None,
             external_web_search: None,
             capabilities: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn openrouter_claude_defaults_to_five_minute_automatic_cache() {
+        let model = openrouter_test_model("anthropic/claude-opus-4.6", None);
+        let cache_control = openrouter_automatic_cache_control(&model).unwrap();
+
+        assert_eq!(
+            openrouter_automatic_cache_ttl(&model).as_deref(),
+            Some("5m")
+        );
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl.as_deref(), Some("5m"));
+    }
+
+    #[test]
+    fn openrouter_non_claude_does_not_get_anthropic_cache_control() {
+        let model = openrouter_test_model("z-ai/glm-5.1", None);
+
+        assert!(openrouter_automatic_cache_ttl(&model).is_none());
+        assert!(openrouter_automatic_cache_control(&model).is_none());
+    }
+
+    #[test]
+    fn estimates_openrouter_opus_cost_with_cache_formula() {
+        let model = openrouter_test_model("anthropic/claude-opus-4.6", Some("5m"));
         let usage = TokenUsage {
             llm_calls: 1,
             prompt_tokens: 10_000,
@@ -6301,30 +6324,7 @@ mod tests {
 
     #[test]
     fn estimates_compaction_savings_from_token_delta_and_compaction_cost() {
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://openrouter.ai/api/v1".to_string(),
-            model: "anthropic/claude-sonnet-4.6".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: true,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "OPENROUTER_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 300.0,
-            context_window_tokens: 262_144,
-            cache_ttl: Some("5m".to_string()),
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "demo".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            external_web_search: None,
-            capabilities: Vec::new(),
-        };
+        let model = openrouter_test_model("anthropic/claude-sonnet-4.6", Some("5m"));
         let compaction = SessionCompactionStats {
             run_count: 2,
             compacted_run_count: 2,

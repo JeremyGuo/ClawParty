@@ -782,6 +782,31 @@ fn model_pricing(model: &ModelConfig) -> Option<ModelPricing> {
     }
 }
 
+pub(super) fn openrouter_automatic_cache_ttl(model: &ModelConfig) -> Option<String> {
+    if !supports_openrouter_anthropic_automatic_cache(model) {
+        return None;
+    }
+    Some(model.cache_ttl.clone().unwrap_or_else(|| "5m".to_string()))
+}
+
+pub(super) fn openrouter_automatic_cache_control(
+    model: &ModelConfig,
+) -> Option<agent_frame::config::CacheControlConfig> {
+    if !supports_openrouter_anthropic_automatic_cache(model) {
+        return None;
+    }
+    openrouter_automatic_cache_ttl(model).map(|ttl| agent_frame::config::CacheControlConfig {
+        cache_type: "ephemeral".to_string(),
+        ttl: Some(ttl),
+    })
+}
+
+fn supports_openrouter_anthropic_automatic_cache(model: &ModelConfig) -> bool {
+    model.model_type == crate::config::ModelType::Openrouter
+        && model.api_endpoint.contains("openrouter.ai")
+        && model.model.starts_with("anthropic/claude-")
+}
+
 pub(super) fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {
     let pricing = model_pricing(model)?;
     let input_per_million = pricing.input_per_million;
