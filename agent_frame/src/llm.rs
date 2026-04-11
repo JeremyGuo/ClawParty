@@ -8,9 +8,11 @@ use crate::message::ChatMessage;
 use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use image::{GenericImageView, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fs;
+use std::io::Cursor;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +20,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static RETRY_RANDOM_SEED: AtomicU64 = AtomicU64::new(0);
+const MAX_INLINE_IMAGE_DIMENSION: u32 = 2000;
 
 #[derive(Deserialize)]
 pub(super) struct ChatCompletionChoice {
@@ -445,7 +448,12 @@ fn normalize_chat_completions_user_content(content: &mut Value) {
                 if let Some(image_url) = object.get_mut("image_url")
                     && let Some(url) = image_url.as_str().map(ToOwned::to_owned)
                 {
-                    *image_url = json!({ "url": url });
+                    *image_url = json!({ "url": normalize_inline_image_url(&url) });
+                } else if let Some(image_url) = object.get_mut("image_url")
+                    && let Some(url) = image_url.get_mut("url")
+                    && let Some(raw_url) = url.as_str().map(ToOwned::to_owned)
+                {
+                    *url = Value::String(normalize_inline_image_url(&raw_url));
                 }
             }
             _ => {}
@@ -488,6 +496,7 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
                                     .or_else(|| value.as_str())
                             })
                             .ok_or_else(|| anyhow!("image_url content item is missing a url"))?;
+                        let image_url = normalize_inline_image_url(image_url);
                         converted.push(json!({
                             "type": "input_image",
                             "image_url": image_url,
@@ -495,6 +504,7 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
                     }
                     "input_image" => {
                         if let Some(image_url) = item.get("image_url").and_then(Value::as_str) {
+                            let image_url = normalize_inline_image_url(image_url);
                             converted.push(json!({
                                 "type": "input_image",
                                 "image_url": image_url,
@@ -578,6 +588,51 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
             "text": other.to_string(),
         })]),
     }
+}
+
+fn normalize_inline_image_url(url: &str) -> String {
+    normalize_inline_image_data_url(url).unwrap_or_else(|| url.to_string())
+}
+
+fn normalize_inline_image_data_url(url: &str) -> Option<String> {
+    let encoded = parse_inline_image_data_url(url)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let image = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (width, height) = image.dimensions();
+    if width <= MAX_INLINE_IMAGE_DIMENSION && height <= MAX_INLINE_IMAGE_DIMENSION {
+        return None;
+    }
+
+    let resized = image.resize(
+        MAX_INLINE_IMAGE_DIMENSION,
+        MAX_INLINE_IMAGE_DIMENSION,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut output = Vec::new();
+    resized
+        .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
+        .ok()?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(output);
+    Some(format!("data:image/png;base64,{encoded}"))
+}
+
+fn parse_inline_image_data_url(url: &str) -> Option<&str> {
+    let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
+    let mut parts = metadata.split(';');
+    let media_type = parts.next()?.to_ascii_lowercase();
+    if !media_type.starts_with("image/") {
+        return None;
+    }
+    if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    Some(encoded)
 }
 
 fn message_text_content(content: Option<&Value>) -> Option<String> {
@@ -875,8 +930,9 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 mod tests {
     use super::{
         UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
-        chat_completions_messages_payload, parse_streamed_responses_body, parse_usage,
-        responses_value_to_chat_message, upstream_error_from_value,
+        chat_completions_messages_payload, normalize_inline_image_url,
+        parse_streamed_responses_body, parse_usage, responses_value_to_chat_message,
+        upstream_error_from_value,
     };
     use crate::config::{
         AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind,
@@ -884,7 +940,28 @@ mod tests {
     };
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use crate::tooling::Tool;
+    use base64::Engine as _;
+    use image::{GenericImageView, ImageBuffer, ImageFormat, Rgba};
     use serde_json::json;
+    use std::io::Cursor;
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("data:image/png;base64,{encoded}")
+    }
+
+    fn data_url_dimensions(url: &str) -> (u32, u32) {
+        let encoded = url.split_once(',').unwrap().1;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        image::load_from_memory(&bytes).unwrap().dimensions()
+    }
 
     #[test]
     fn extracts_error_payloads_before_choices_decoding() {
@@ -1084,6 +1161,60 @@ mod tests {
             payload[0]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AAAA"
         );
+    }
+
+    #[test]
+    fn inline_image_data_urls_are_resized_under_provider_limit() {
+        let original = png_data_url(2100, 100);
+        let normalized = normalize_inline_image_url(&original);
+
+        assert_ne!(normalized, original);
+        assert!(normalized.starts_with("data:image/png;base64,"));
+        let (width, height) = data_url_dimensions(&normalized);
+        assert!(width <= 2000);
+        assert!(height <= 2000);
+    }
+
+    #[test]
+    fn chat_completions_payload_resizes_object_image_urls() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                { "type": "text", "text": "Look" },
+                { "type": "image_url", "image_url": { "url": png_data_url(100, 2100) } }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let payload = chat_completions_messages_payload(&messages).unwrap();
+        let url = payload[0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        let (width, height) = data_url_dimensions(url);
+        assert!(width <= 2000);
+        assert!(height <= 2000);
+    }
+
+    #[test]
+    fn responses_input_resizes_inline_images() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                { "type": "text", "text": "Look" },
+                { "type": "input_image", "image_url": png_data_url(2400, 1200) }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_, input) = build_responses_input(&messages).unwrap();
+        let url = input[0]["content"][1]["image_url"].as_str().unwrap();
+        let (width, height) = data_url_dimensions(url);
+        assert!(width <= 2000);
+        assert!(height <= 2000);
     }
 
     #[test]

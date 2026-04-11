@@ -4910,6 +4910,27 @@ mod tests {
     }
 
     #[test]
+    fn extracts_absolute_attachment_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let file_path = outside_dir.path().join("note.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let (text, attachments) = extract_attachment_references(
+            &format!(
+                "Here you go.\n<attachment>{}</attachment>",
+                file_path.display()
+            ),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(text, "Here you go.");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
     fn builds_multimodal_user_message_for_vision_models() {
         let temp_dir = TempDir::new().unwrap();
         let image_path = temp_dir.path().join("photo.png");

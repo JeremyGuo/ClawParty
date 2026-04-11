@@ -830,27 +830,26 @@ pub(super) fn extract_attachment_references(
 
 fn resolve_outgoing_attachment(
     workspace_root: &Path,
-    relative_path: &str,
+    path_text: &str,
 ) -> Result<OutgoingAttachment> {
-    let candidate = PathBuf::from(relative_path);
-    if candidate.is_absolute() {
-        return Err(anyhow!(
-            "attachment path must be relative to workspace root, got absolute path {}",
-            candidate.display()
-        ));
-    }
-
-    let joined = workspace_root.join(&candidate);
-    let canonical_root = std::fs::canonicalize(workspace_root)
-        .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
-    let canonical_file = std::fs::canonicalize(&joined)
-        .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
-    if !canonical_file.starts_with(&canonical_root) {
-        return Err(anyhow!(
-            "attachment path escapes workspace root: {}",
-            canonical_file.display()
-        ));
-    }
+    let candidate = PathBuf::from(path_text);
+    let canonical_file = if candidate.is_absolute() {
+        std::fs::canonicalize(&candidate)
+            .with_context(|| format!("attachment path does not exist: {}", candidate.display()))?
+    } else {
+        let joined = workspace_root.join(&candidate);
+        let canonical_root = std::fs::canonicalize(workspace_root)
+            .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
+        let canonical_file = std::fs::canonicalize(&joined)
+            .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
+        if !canonical_file.starts_with(&canonical_root) {
+            return Err(anyhow!(
+                "attachment path escapes workspace root: {}",
+                canonical_file.display()
+            ));
+        }
+        canonical_file
+    };
 
     let extension = canonical_file
         .extension()
