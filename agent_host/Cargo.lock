@@ -46,6 +46,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "humantime",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",

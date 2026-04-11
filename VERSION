@@ -1,5 +1,16 @@
-version: 0.14.3
+version: 0.14.4
 ---
+
+# 0.14.4
+
+- 新增 Windows 原生运行兼容：
+  `partyclaw` 现在可通过 Windows target 编译，运行工具命令时会使用 `%COMSPEC% /C`，后台任务进程检测与终止改用 `tasklist` / `taskkill`；Unix 平台继续保留原有 `sh`、PTY 与 `kill` 行为。
+- 将 Unix-only 依赖收敛到目标平台依赖：
+  `agent_frame` 的 `nix` / `libc` 和 `agent_host` 的 `libc` 只在 Unix target 下启用，避免 Windows 原生构建拉入不兼容 API。
+- 更新部署文档：
+  `docs/DEPLOY.md` 现在分别给出 Linux、macOS 与 Windows 原生命令，Windows 服务化示例改为 PowerShell + 任务计划程序。
+- 本次不影响 `config` 或 `workdir` schema：
+  不需要新增 config loader 或 workdir upgrade step；按显式 patch 发布要求将仓库版本从 `0.14.3` 提升到 `0.14.4`。
 
 # 0.14.3
 

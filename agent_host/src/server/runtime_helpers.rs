@@ -191,6 +191,22 @@ pub(super) fn normalize_sink_target(target: SinkTarget, session: &SessionSnapsho
     }
 }
 
+fn build_shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command_builder = Command::new(shell);
+        command_builder.arg("/C").arg(command);
+        command_builder
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command_builder = Command::new("sh");
+        command_builder.arg("-c").arg(command);
+        command_builder
+    }
+}
+
 pub(super) fn evaluate_cron_checker(
     checker: &CronCheckerConfig,
     workspace_root: &Path,
@@ -211,9 +227,7 @@ pub(super) fn evaluate_cron_checker(
     let timeout_seconds = checker.timeout_seconds;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
+        let result = build_shell_command(&command)
             .current_dir(&cwd)
             .output()
             .with_context(|| format!("failed to execute checker in {}", cwd.display()))

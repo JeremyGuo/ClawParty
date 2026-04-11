@@ -1082,6 +1082,7 @@ fn read_exit_code(path: &Path) -> Option<i32> {
         .and_then(|value| value.trim().parse::<i32>().ok())
 }
 
+#[cfg(not(windows))]
 fn process_is_running(pid: u32) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -1091,6 +1092,24 @@ fn process_is_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let pid_text = pid.to_string();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().any(|part| part == pid_text))
+}
+
+#[cfg(not(windows))]
 fn terminate_process_pid(pid: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
@@ -1098,11 +1117,24 @@ fn terminate_process_pid(pid: u32) {
         .status();
 }
 
+#[cfg(windows)]
+fn terminate_process_pid(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+}
+
+#[cfg(not(windows))]
 fn terminate_process_group(pid: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{}", pid))
         .status();
+}
+
+#[cfg(windows)]
+fn terminate_process_group(pid: u32) {
+    terminate_process_pid(pid);
 }
 
 fn record_exit_code(path: &Path, code: i32) -> Result<()> {
@@ -2017,24 +2049,54 @@ fn spawn_background_worker_process(
     let stderr_file = fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
     let worker_executable = resolve_tool_worker_executable()?;
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg("\"$@\"; code=$?; printf '%s' \"$code\" > \"$AGENT_FRAME_EXIT_CODE_PATH\"; exit $code")
-        .arg("sh")
-        .arg(&worker_executable)
-        .arg("run-tool-worker")
-        .arg("--job-file")
-        .arg(&job_file)
-        .current_dir(runtime_state_root)
-        .env("AGENT_FRAME_EXIT_CODE_PATH", &exit_code_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .context("failed to spawn background tool worker")?;
+    let child_pid = {
+        #[cfg(windows)]
+        {
+            let mut child = Command::new(&worker_executable)
+                .arg("run-tool-worker")
+                .arg("--job-file")
+                .arg(&job_file)
+                .current_dir(runtime_state_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file))
+                .spawn()
+                .context("failed to spawn background tool worker")?;
+            let child_pid = child.id();
+            let exit_code_path = exit_code_path.clone();
+            thread::spawn(move || {
+                let code = child
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let _ = record_exit_code(&exit_code_path, code);
+            });
+            child_pid
+        }
+        #[cfg(not(windows))]
+        {
+            let child = Command::new("sh")
+                .arg("-c")
+                .arg("\"$@\"; code=$?; printf '%s' \"$code\" > \"$AGENT_FRAME_EXIT_CODE_PATH\"; exit $code")
+                .arg("sh")
+                .arg(&worker_executable)
+                .arg("run-tool-worker")
+                .arg("--job-file")
+                .arg(&job_file)
+                .current_dir(runtime_state_root)
+                .env("AGENT_FRAME_EXIT_CODE_PATH", &exit_code_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file))
+                .spawn()
+                .context("failed to spawn background tool worker")?;
+            child.id()
+        }
+    };
     Ok(BackgroundTaskMetadata {
         task_id: task_id.to_string(),
-        pid: child.id(),
+        pid: child_pid,
         label: label.to_string(),
         status_path: match job {
             ToolWorkerJob::Image { status_path, .. } => status_path.clone(),

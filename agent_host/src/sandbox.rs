@@ -79,6 +79,29 @@ fn binary_in_path(binary: &str) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn process_id_is_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 performs an existence check without sending a signal.
+    (unsafe { libc::kill(pid as libc::pid_t, 0) }) == 0
+}
+
+#[cfg(windows)]
+fn process_id_is_alive(pid: u32) -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let pid_text = pid.to_string();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().any(|part| part == pid_text))
+}
+
 /// Spawn a child process from a dedicated thread that remains alive (parked)
 /// until the child exits. This prevents `PR_SET_PDEATHSIG` (used by
 /// `bwrap --die-with-parent`) from firing when the original spawning thread
@@ -97,11 +120,7 @@ fn spawn_with_persistent_parent_thread(mut command: Command) -> Result<Child> {
             if let Some(pid) = child_id {
                 loop {
                     std::thread::park_timeout(std::time::Duration::from_secs(30));
-                    // Check if child is still alive via kill(pid, 0).
-                    // SAFETY: kill with signal 0 performs an existence check
-                    // without sending any signal.
-                    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-                    if !alive {
+                    if !process_id_is_alive(pid) {
                         break;
                     }
                 }

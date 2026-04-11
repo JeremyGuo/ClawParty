@@ -1,444 +1,583 @@
-# 部署说明
+# ClawParty 部署说明
 
-本文档推荐只用两个命令完成部署：
+ClawParty 是一个 Rust 写的常驻 agent host。主要二进制是 `partyclaw`，配置文件通常从 `deploy_telegram.json` 复制出来，运行时状态写入一个独立的 `workdir`。
 
-- `partyclaw config <config>`
-- `partyclaw setup <config> <workdir> [systemd-name]`
-
-建议把仓库里的 [`deploy_telegram.json`](/home/jeremyguo/services/ClawParty2.0/deploy_telegram.json) 当作模板复制一份，再编辑你自己的部署配置。不要直接覆盖模板文件。
-
-## 1. 前置条件
-
-- Linux
-- Rust stable toolchain
-- `systemd --user`
-- Git
-- 如果要启用 `bubblewrap` 沙盒：系统里需要有 `bwrap`
-
-`partyclaw setup` 目前只支持 Linux。非 Linux 环境下它会直接提示不兼容。
-
-## 2. 部署整体流程
-
-推荐流程：
-
-1. 拉代码
-2. 编译 `partyclaw`
-3. 复制一个新的 `deploy_xxxx.json`
-4. 在执行 `setup` 之前先准备好 `.env`
-5. 用 `partyclaw config` 编辑配置
-6. 用 `partyclaw setup` 生成 user systemd
-7. 启动、设置开机自启、按需启用 linger
-
-一个典型例子：
+最重要的三个入口是：
 
 ```bash
-git clone <your-repo-url>
-cd ClawParty2.0
-
 cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
-
-cp deploy_telegram.json deploy_mybot.json
-mkdir -p deploy_workdir
-
-cp .env.example .env
-# 编辑 .env，填入真实密钥
-
-./target/release/partyclaw config ./deploy_mybot.json
-./target/release/partyclaw setup ./deploy_mybot.json ./deploy_workdir mybot
-```
-
-## 3. 文件建议
-
-建议保留这几个文件的职责：
-
-- `deploy_telegram.json`
-  仓库自带模板，不要直接覆盖
-- `deploy_xxxx.json`
-  你自己的部署配置，例如 `deploy_prod.json`、`deploy_team_a.json`
-- `.env`
-  本机环境变量，存放 token 和 API key，不要提交
-- `deploy_workdir/`
-  运行时工作目录，保存 session、workspace、snapshot 等持久化数据
-
-推荐命名方式：
-
-```bash
-cp deploy_telegram.json deploy_prod.json
-```
-
-以后都编辑你自己的 `deploy_prod.json`，不要改模板。
-
-## 4. `backend`、`agent`、`model` 的关系
-
-这几个概念很容易混在一起，推荐按下面理解：
-
-- `models`
-  定义“模型别名 -> 上游模型配置”。这里描述的是模型本身能做什么，比如：
-  - 上游地址 `api_endpoint`
-  - 上游模型名 `model`
-  - 能力 `capabilities`
-  - 是否支持视觉输入
-- `agent`
-  定义“哪个 agent backend 可以把哪些模型当成对话 agent 来跑”
-- `backend`
-  指 agent 运行时后端，目前主要是：
-  - `agent_frame`
-  - `zgent`
-
-可以这样记：
-
-- `models` 决定“仓库里有哪些模型别名”
-- `agent.agent_frame.available_models` 决定“`agent_frame` 能选哪些模型”
-- `agent.zgent.available_models` 决定“`zgent` 能选哪些模型”
-- 会话里真正运行时，是“先选 backend，再从这个 backend 可用的模型里选 model”
-
-关系图：
-
-```mermaid
-flowchart LR
-    A[Conversation / Channel] --> B[Choose Agent Backend]
-    B --> C1[agent_frame]
-    B --> C2[zgent]
-    C1 --> D1[agent.agent_frame.available_models]
-    C2 --> D2[agent.zgent.available_models]
-    D1 --> E[models.<alias>]
-    D2 --> E
-    E --> F[Upstream Provider API]
-```
-
-再补一句最实用的：
-
-- `tooling.image`、`tooling.web_search`、`tooling.image_gen` 这些配置，填的是模型别名
-- 它们不是填 backend 名字
-- 它们最终会指向 `models` 里定义好的某个 alias
-
-### 一个最小理解例子
-
-如果你有：
-
-- `models.gpt54`
-- `models.opus-4.6`
-- `agent.agent_frame.available_models = ["gpt54"]`
-- `agent.zgent.available_models = ["opus-4.6"]`
-
-那含义就是：
-
-- `gpt54` 这个模型存在，并且能被 `agent_frame` 当成 agent 模型使用
-- `opus-4.6` 这个模型存在，并且能被 `zgent` 当成 agent 模型使用
-- 但并不是所有存在于 `models` 里的模型都一定能被拿来当 agent 模型
-- 比如专用搜索模型、专用图像模型，通常只放在 `tooling` 里使用，不放进 `agent.*.available_models`
-
-## 5. 先准备 `.env`
-
-建议在执行 `setup` 之前就把 `.env` 准备好。
-
-例如：
-
-```dotenv
-OPENROUTER_API_KEY=...
-OPENAI_API_KEY=...
-TELEGRAM_BOT_TOKEN=...
-```
-
-注意：
-
-- 不要把真实密钥写进 JSON 配置
-- 不要把填过值的 `.env` 提交到仓库
-- 后面 `setup` 会自动把发现到的 `.env` 写进 user systemd 的 `EnvironmentFile`
-
-`setup` 目前会自动查找：
-
-- `WorkingDirectory/.env`
-- `config` 所在目录的 `.env`
-
-所以最简单的做法就是把 `.env` 放在仓库根目录，然后从仓库根目录执行 `setup`。
-
-## 6. 用 `partyclaw config` 编辑部署配置
-
-先复制模板，再打开配置界面：
-
-```bash
-cp deploy_telegram.json deploy_prod.json
 ./target/release/partyclaw config ./deploy_prod.json
+./target/release/partyclaw --config ./deploy_prod.json --workdir ./deploy_workdir
 ```
 
-这个界面是分页面的：
-
-- `Models`
-- `Tooling`
-- `Main Agent`
-- `Runtime`
-- `Sandbox`
-- `Channels`
-
-建议编辑顺序：
-
-1. `Models`
-2. `Tooling`
-3. `Main Agent`
-4. `Channels`
-5. 保存
-
-### Model 页面
-
-`Models` 页面里可以：
-
-- 查看当前模型列表
-- `a` 新增模型
-- `Enter` 或 `e` 编辑模型
-- `d` 删除模型
-
-新增模型时会先选类型，再进入表单。
-
-模型里最重要的是这些字段：
-
-- `alias`
-  本地别名，给别的地方引用
-- `type`
-  上游适配类型，例如 `openrouter`、`openrouter-resp`、`codex-subscription`
-- `model`
-  真实上游模型名
-- `capabilities`
-  模型能力，多选
-
-常见能力：
-
-- `chat`
-- `web_search`
-- `image_in`
-- `image_out`
-- `pdf`
-- `audio_in`
-
-模型表单里还有两个很关键的开关：
-
-- `agent.agent_frame.available_models`
-- `agent.zgent.available_models`
-
-它们决定这个模型 alias 会不会被加入对应 backend 的可选模型列表。
-
-如果某个模型只是工具用途，例如只做搜索或图像生成，通常不要把它放进这里。
-
-### Main Agent 页面
-
-这里配置的是宿主级默认行为，例如：
-
-- 语言
-- context compaction
-- idle compaction
-- timeout observation compaction
-
-这一页不是拿来选模型的。
-
-### Tooling 页面
-
-这里配置工具路由，例如：
-
-- `tooling.web_search`
-- `tooling.image`
-- `tooling.image_gen`
-
-它们填写的是模型 alias，例如：
-
-- `sonar_pro`
-- `gpt54:self`
-- `gemini3.1-flash-image`
-
-## 7. Telegram Channel 怎么配
-
-如果你要部署 Telegram，直接在 `Channels` 页面新增一个 `telegram` channel。
-
-现在 Telegram channel 只需要关心两个输入：
-
-- `id`
-  频道唯一标识，例如 `telegram-main`
-- `bot_token_env`
-  Telegram Bot Token 对应的环境变量名，例如 `TELEGRAM_BOT_TOKEN`
-
-一个典型配置长这样：
-
-```json
-{
-  "kind": "telegram",
-  "id": "telegram-main",
-  "bot_token_env": "TELEGRAM_BOT_TOKEN"
-}
-```
-
-需要特别说明的是，下面这些东西现在是内建的，不需要你手动配置：
-
-- Telegram commands 列表
-- 默认 polling 行为
-- 默认 `https://api.telegram.org`
-
-所以 Telegram 部署时，真正要准备的关键是：
-
-1. 配置里有一个 `telegram` channel
-2. `.env` 里有 `TELEGRAM_BOT_TOKEN=...`
-
-## 8. 用 `partyclaw setup` 生成 systemd
-
-配置文件和 `.env` 都准备好以后，再执行：
+Linux 还可以用内置的 `setup` 命令生成 `systemd --user` 服务：
 
 ```bash
 ./target/release/partyclaw setup ./deploy_prod.json ./deploy_workdir mybot
 ```
 
-说明：
+`setup` 目前只支持 Linux。macOS 用 `launchd`，Windows 可以原生运行 `.exe`，服务化建议用任务计划程序或 NSSM / WinSW 这类服务包装器。
 
-- 第一个参数是配置文件
-- 第二个参数是 workdir
-- 第三个参数可选，是 systemd 服务名
-- 如果不写服务名，默认是 `partyclaw.service`
+## 共同准备
 
-这个命令会自动：
+部署前需要：
 
-- 创建 user systemd unit
-- 尽量解析当前实际执行的 `partyclaw` 绝对路径
-- 写入 `ExecStart`
-- 写入 `WorkingDirectory`
-- 如果发现 `.env`，自动写入 `EnvironmentFile`
-- 自动执行一次 `systemctl --user daemon-reload`
+- Git
+- Rust stable toolchain
+- 一个模型 API key，例如 `OPENROUTER_API_KEY`
+- 如果跑 Telegram channel，需要 `TELEGRAM_BOT_TOKEN`
 
-也就是说，推荐顺序是：
+推荐文件职责：
 
-1. 先写好 `.env`
-2. 再执行 `setup`
+- `deploy_telegram.json`: 仓库里的 Telegram 配置模板
+- `deploy_prod.json`: 你自己的部署配置
+- `.env`: 本机密钥，不要提交
+- `deploy_workdir/`: 运行时持久化目录，保存会话、workspace、日志、快照等数据
 
-### `.env` 会怎么进入 systemd
+`.env` 示例：
 
-`setup` 不是把密钥内容写死到 `.service` 里，而是写入类似：
-
-```ini
-EnvironmentFile=-"/path/to/.env"
+```dotenv
+OPENROUTER_API_KEY=sk-or-...
+TELEGRAM_BOT_TOKEN=...
+OPENAI_API_KEY=...
 ```
 
-这意味着：
+启动时，`partyclaw` 会自动读取：
 
-- systemd 会在启动服务时读取这个 `.env`
-- 以后你修改 `.env` 内容，不需要重新 `setup`
-- 只需要重启服务，新的环境变量就会生效
-- 但不要删除或改名这个 `.env`
+- 当前工作目录下的 `.env`
+- 配置文件所在目录下的 `.env`
 
-如果你删除或移动这个文件：
+所以最简单的方式是把 `.env` 放在仓库根目录，并从仓库根目录启动服务。
 
-- 旧的 `EnvironmentFile` 路径就失效了
-- 下次重启服务时，环境变量可能就没了
-- 如果路径变了，应该重新执行一次 `setup`
+## Linux
 
-## 9. 启动、开机自启、linger
+下面以 Ubuntu / Debian 为例。其他发行版把包管理命令换成对应命令即可。
 
-`setup` 执行完后，按它打印的提示继续做。
-
-典型命令：
+### 1. 安装依赖
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git curl build-essential pkg-config
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+如果要使用生产推荐的 `bubblewrap` 沙盒，再装：
+
+```bash
+sudo apt-get install -y bubblewrap
+```
+
+不想用 `bubblewrap` 时，在 `partyclaw config` 的 `Sandbox` 页面选择 `subprocess`。
+
+### 2. 拉代码并编译
+
+```bash
+git clone <your-repo-url> ClawParty2.0
+cd ClawParty2.0
+
+cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
+```
+
+编译完成后的二进制路径是：
+
+```bash
+./target/release/partyclaw
+```
+
+### 3. 准备配置和密钥
+
+```bash
+cp deploy_telegram.json deploy_prod.json
+mkdir -p deploy_workdir
+cp .env.example .env
+
+${EDITOR:-nano} .env
+```
+
+至少填好：
+
+```dotenv
+OPENROUTER_API_KEY=...
+TELEGRAM_BOT_TOKEN=...
+```
+
+然后打开配置 TUI：
+
+```bash
+./target/release/partyclaw config ./deploy_prod.json
+```
+
+在 TUI 中重点检查：
+
+- `Models`: 模型 alias、上游模型名、API key 环境变量
+- `Tooling`: `web_search`、`image`、`image_gen` 指向哪个模型 alias
+- `Main Agent`: 默认语言、memory、compaction
+- `Sandbox`: Linux 可选 `bubblewrap` 或 `subprocess`
+- `Channels`: Telegram 的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`
+
+### 4. 前台试运行
+
+```bash
+./target/release/partyclaw --config ./deploy_prod.json --workdir ./deploy_workdir --sandbox-auto
+```
+
+确认 Telegram 或 CLI channel 能正常响应后，再做服务化部署。
+
+### 5. systemd 用户服务部署
+
+```bash
+./target/release/partyclaw setup ./deploy_prod.json ./deploy_workdir mybot
+
 systemctl --user restart mybot.service
 systemctl --user enable mybot.service
 systemctl --user status mybot.service --no-pager
 ```
 
-如果你希望“机器重启后，即使用户没有登录，也自动拉起这个 user service”，还要执行：
+如果希望机器重启后，即使该用户没有登录也自动拉起服务：
 
 ```bash
 sudo loginctl enable-linger "$USER"
 loginctl show-user "$USER" -p Linger
 ```
 
-这是 user systemd 常见的坑：只 `enable` 还不一定能覆盖“未登录自动拉起”的场景。`setup` 会专门把这条提示打印出来，就是为了避免这个问题。
+查看日志：
 
-## 10. 修改配置或 `.env` 之后怎么生效
+```bash
+journalctl --user -u mybot.service -n 100 --no-pager
+journalctl --user -u mybot.service -f
+```
 
-这点一定要说清楚：
+## macOS
 
-- 改了 `deploy_xxxx.json`
-  需要重启服务才能生效
-- 改了 `.env`
-  也需要重启服务才能生效
+macOS 可以原生编译运行，但没有 `bubblewrap`。请在配置里使用 `subprocess` 沙盒。
 
-常用操作：
+### 1. 安装依赖
+
+如果还没有 Xcode Command Line Tools：
+
+```bash
+xcode-select --install
+```
+
+安装 Rust：
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+如果没有 Git，可以用 Homebrew 安装：
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install git
+```
+
+### 2. 拉代码并编译
+
+```bash
+git clone <your-repo-url> ClawParty2.0
+cd ClawParty2.0
+
+cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
+```
+
+编译完成后的二进制路径是：
+
+```bash
+./target/release/partyclaw
+```
+
+### 3. 准备配置和密钥
+
+```bash
+cp deploy_telegram.json deploy_prod.json
+mkdir -p deploy_workdir
+cp .env.example .env
+
+nano .env
+```
+
+打开配置 TUI：
 
 ```bash
 ./target/release/partyclaw config ./deploy_prod.json
-systemctl --user restart mybot.service
 ```
 
-如果只是修改 `.env`：
+在 `Sandbox` 页面选择：
 
-```bash
-$EDITOR .env
-systemctl --user restart mybot.service
+```text
+subprocess
 ```
 
-总结一下：
-
-- 改内容：重启服务
-- 改路径或文件名：重新 `setup`
-
-## 11. 后续更新流程
-
-后续升级通常不需要重新走整套部署。
-
-如果只是正常更新代码，推荐流程就是：
+### 4. 前台试运行
 
 ```bash
+./target/release/partyclaw --config ./deploy_prod.json --workdir ./deploy_workdir --sandbox-auto
+```
+
+### 5. launchd 用户服务部署
+
+先在仓库根目录生成 LaunchAgent：
+
+```bash
+REPO="$(pwd)"
+LABEL="com.clawparty.mybot"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SERVICE_PATH="gui/$(id -u)/$LABEL"
+
+mkdir -p "$HOME/Library/LaunchAgents"
+mkdir -p "$REPO/deploy_workdir/launchd"
+
+cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$REPO/target/release/partyclaw</string>
+    <string>--config</string>
+    <string>$REPO/deploy_prod.json</string>
+    <string>--workdir</string>
+    <string>$REPO/deploy_workdir</string>
+    <string>--sandbox-auto</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$REPO/deploy_workdir/launchd/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>$REPO/deploy_workdir/launchd/stderr.log</string>
+</dict>
+</plist>
+PLIST
+
+plutil -lint "$PLIST"
+```
+
+启动服务：
+
+```bash
+launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+launchctl kickstart -k "$SERVICE_PATH"
+launchctl print "$SERVICE_PATH"
+```
+
+查看日志：
+
+```bash
+tail -n 100 "$REPO/deploy_workdir/launchd/stdout.log"
+tail -n 100 "$REPO/deploy_workdir/launchd/stderr.log"
+tail -f "$REPO/deploy_workdir/launchd/stderr.log"
+```
+
+停止服务：
+
+```bash
+launchctl bootout "gui/$(id -u)" "$PLIST"
+```
+
+## Windows
+
+Windows 可以原生编译运行。请在配置里使用 `subprocess` 沙盒；`bubblewrap` 只适用于 Linux。
+
+当前 Windows 原生路径的行为：
+
+- agent 执行 shell 命令时使用 `%COMSPEC% /C`，通常是 `cmd.exe /C`
+- PTY 只在 Unix 平台启用；Windows 上请求 TTY 时会退化为普通管道执行
+- 后台任务进程用 Windows 的 `tasklist` / `taskkill` 检查和终止
+- `partyclaw setup` 仍然只支持 Linux，不会生成 Windows Service
+
+### 1. 安装依赖
+
+在 PowerShell 中执行：
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Rustlang.Rustup -e
+```
+
+重新打开 PowerShell，让 `cargo` 进入 `PATH`。确认版本：
+
+```powershell
+git --version
+cargo --version
+```
+
+### 2. 拉代码并编译
+
+```powershell
+git clone <your-repo-url> ClawParty2.0
+cd ClawParty2.0
+
+cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
+```
+
+编译完成后的二进制路径是：
+
+```powershell
+.\target\release\partyclaw.exe
+```
+
+### 3. 准备配置和密钥
+
+```powershell
+Copy-Item .\deploy_telegram.json .\deploy_prod.json
+New-Item -ItemType Directory -Force .\deploy_workdir
+Copy-Item .\.env.example .\.env
+
+notepad .\.env
+```
+
+至少填好：
+
+```dotenv
+OPENROUTER_API_KEY=...
+TELEGRAM_BOT_TOKEN=...
+```
+
+打开配置 TUI：
+
+```powershell
+.\target\release\partyclaw.exe config .\deploy_prod.json
+```
+
+在 `Sandbox` 页面选择：
+
+```text
+subprocess
+```
+
+### 4. 前台试运行
+
+```powershell
+.\target\release\partyclaw.exe --config .\deploy_prod.json --workdir .\deploy_workdir --sandbox-auto
+```
+
+确认 Telegram 或 CLI channel 能正常响应后，再做服务化部署。
+
+### 5. 任务计划程序部署
+
+Windows 原生没有使用 `partyclaw setup`。下面用系统自带的任务计划程序，在当前用户登录时启动。
+
+先在仓库根目录创建启动脚本：
+
+```powershell
+@'
+Set-Location $PSScriptRoot
+New-Item -ItemType Directory -Force .\deploy_workdir | Out-Null
+.\target\release\partyclaw.exe --config .\deploy_prod.json --workdir .\deploy_workdir --sandbox-auto *> .\deploy_workdir\partyclaw.log
+'@ | Set-Content -Encoding UTF8 .\run_partyclaw.ps1
+```
+
+注册并启动任务：
+
+```powershell
+$TaskName = "ClawParty\mybot"
+$Script = (Resolve-Path .\run_partyclaw.ps1).Path
+$Action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Script`""
+
+schtasks /Create /TN $TaskName /TR $Action /SC ONLOGON /F
+schtasks /Run /TN $TaskName
+schtasks /Query /TN $TaskName /V /FO LIST
+```
+
+查看日志：
+
+```powershell
+Get-Content .\deploy_workdir\partyclaw.log -Tail 100
+Get-Content .\deploy_workdir\partyclaw.log -Wait
+```
+
+停止任务：
+
+```powershell
+schtasks /End /TN "ClawParty\mybot"
+```
+
+删除任务：
+
+```powershell
+schtasks /Delete /TN "ClawParty\mybot" /F
+```
+
+如果需要“开机后未登录也运行”的真正 Windows Service，建议用 NSSM 或 WinSW 包装同一条前台启动命令。
+
+## 更新部署
+
+代码更新后，一般只需要重新编译并重启服务。
+
+Linux：
+
+```bash
+cd ClawParty2.0
 git pull --ff-only
 cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
 systemctl --user restart mybot.service
 systemctl --user status mybot.service --no-pager
 ```
 
-也就是说，常规更新通常只需要：
+macOS：
 
-1. `git pull`
-2. 重新编译
-3. 重启服务
+```bash
+cd ClawParty2.0
+git pull --ff-only
+cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
+launchctl kickstart -k "gui/$(id -u)/com.clawparty.mybot"
+```
 
-只要这些路径没变，一般不需要重新 `setup`：
+Windows：
+
+```powershell
+cd ClawParty2.0
+git pull --ff-only
+cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
+schtasks /End /TN "ClawParty\mybot"
+schtasks /Run /TN "ClawParty\mybot"
+schtasks /Query /TN "ClawParty\mybot" /V /FO LIST
+```
+
+如果这些路径没有变化，通常不需要重新执行 `setup` 或重写 plist：
 
 - `partyclaw` 二进制路径
 - 配置文件路径
-- workdir 路径
+- `deploy_workdir` 路径
 - `.env` 路径
 
-如果这些路径变了，再重新执行一次 `setup`。
-
-## 12. 一套推荐的初次部署命令
-
-如果你想从零开始走一遍，下面这组命令最接近推荐路径：
+如果移动了仓库、改了配置文件名、改了 workdir 路径，Linux 重新执行：
 
 ```bash
-git clone <your-repo-url>
-cd ClawParty2.0
-
-cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
-
-cp deploy_telegram.json deploy_prod.json
-mkdir -p deploy_workdir
-cp .env.example .env
-
-$EDITOR .env
-
-./target/release/partyclaw config ./deploy_prod.json
 ./target/release/partyclaw setup ./deploy_prod.json ./deploy_workdir mybot
-
 systemctl --user restart mybot.service
-systemctl --user enable mybot.service
-sudo loginctl enable-linger "$USER"
 ```
 
-## 13. 故障排查
+macOS 重新生成并加载 plist。
 
-如果服务没起来，优先检查：
+Windows 重新生成 `run_partyclaw.ps1` 并重新创建任务计划程序任务。
+
+## 修改配置或密钥后生效
+
+修改配置：
+
+```bash
+./target/release/partyclaw config ./deploy_prod.json
+```
+
+Windows：
+
+```powershell
+.\target\release\partyclaw.exe config .\deploy_prod.json
+```
+
+Linux 重启：
+
+```bash
+systemctl --user restart mybot.service
+```
+
+macOS 重启：
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.clawparty.mybot"
+```
+
+Windows 重启：
+
+```powershell
+schtasks /End /TN "ClawParty\mybot"
+schtasks /Run /TN "ClawParty\mybot"
+```
+
+修改 `.env` 后也需要重启服务。`.env` 的路径变了，则需要重新执行 Linux `setup`、重新生成 macOS plist，或重新生成 Windows 启动脚本。
+
+## 可选：构建 zgent-server
+
+只有启用 zgent 原生 kernel 路径时才需要额外构建 `./zgent` 里的 `zgent-server`。
+
+Linux：
+
+```bash
+./scripts/build_zgent_server.sh
+```
+
+如果依赖已经装好，只编译：
+
+```bash
+./scripts/build_zgent_server.sh --skip-install
+```
+
+macOS：
+
+```bash
+cargo build --manifest-path zgent/Cargo.toml --bin zgent-server
+```
+
+Windows：
+
+```powershell
+cargo build --manifest-path zgent\Cargo.toml --bin zgent-server
+```
+
+## 故障排查
+
+检查配置能否打开：
+
+```bash
+./target/release/partyclaw config ./deploy_prod.json
+```
+
+前台启动看直接错误：
+
+```bash
+./target/release/partyclaw --config ./deploy_prod.json --workdir ./deploy_workdir --sandbox-auto
+```
+
+Windows：
+
+```powershell
+.\target\release\partyclaw.exe --config .\deploy_prod.json --workdir .\deploy_workdir --sandbox-auto
+```
+
+Linux 服务状态：
 
 ```bash
 systemctl --user status mybot.service --no-pager
-journalctl --user -u mybot.service -n 100 --no-pager
+journalctl --user -u mybot.service -n 200 --no-pager
 ```
 
-如果是 Telegram 没响应，优先检查：
+macOS 服务状态：
 
-- `channels` 里是否存在 `telegram` channel
-- `bot_token_env` 填的变量名是否和 `.env` 一致
-- `.env` 是否还在原路径
-- 修改 `.env` 之后是否已经重启服务
+```bash
+launchctl print "gui/$(id -u)/com.clawparty.mybot"
+tail -n 200 deploy_workdir/launchd/stderr.log
+```
+
+Windows 服务状态：
+
+```powershell
+schtasks /Query /TN "ClawParty\mybot" /V /FO LIST
+Get-Content .\deploy_workdir\partyclaw.log -Tail 200
+```
+
+Telegram 没响应时优先检查：
+
+- `.env` 是否包含 `TELEGRAM_BOT_TOKEN=...`
+- `deploy_prod.json` 里的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`
+- bot 是否被加入目标群聊
+- 修改 `.env` 或配置后是否已经重启服务
+- 当前沙盒是否适合系统：Linux 可用 `bubblewrap`，macOS / Windows 使用 `subprocess`
