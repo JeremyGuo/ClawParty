@@ -17,7 +17,7 @@ ClawParty is a **production-grade agent hosting framework** that turns LLM agent
 <div align="center">
 <table><tr>
 <td align="center" width="340">
-  <img src="docs/imgs/telegram_conversations.png" alt="Multiple conversations via Telegram groups" width="300" />
+  <img src="docs/imgs/telegram_conversations.jpg" alt="Multiple conversations via Telegram groups" width="300" />
   <br />
   <sub>💬 Each Telegram group = an independent agent conversation</sub>
 </td>
