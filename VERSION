@@ -1,5 +1,12 @@
-version: 0.14.7
+version: 0.14.8
 ---
+
+# 0.14.8
+
+- 修复 exec 输出包含非 UTF-8 字节时阻塞上下文压缩的问题：
+  `exec_start`、`exec_wait`、`exec_observe` 与 active runtime summary 读取 stdout/stderr 时改为 bytes + lossy UTF-8 解码，避免 LaTeX、二进制片段或扩展编码输出导致 `stream did not contain valid UTF-8`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.7` 提升到 `0.14.8`。
 
 # 0.14.7
 

@@ -1117,8 +1117,8 @@ fn read_file_lines_window(path: &Path, start: usize, limit: usize) -> Result<(St
     if !path.exists() {
         return Ok((String::new(), 0));
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let text = String::from_utf8_lossy(&raw);
     let total_chars = text.chars().count();
     if limit == 0 {
         return Ok((String::new(), total_chars));
@@ -4696,6 +4696,12 @@ mod tests {
             serde_json::to_vec_pretty(&exec_metadata).unwrap(),
         )
         .unwrap();
+        fs::write(
+            processes_dir.join("exec-1.stdout"),
+            b"hello\nnon-utf8:\x9f\nstill visible\n",
+        )
+        .unwrap();
+        fs::write(processes_dir.join("exec-1.stderr"), b"").unwrap();
 
         let finished_status_path = processes_dir.join("exec-finished.status.json");
         fs::write(
