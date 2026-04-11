@@ -16,15 +16,20 @@ ClawParty is a **production-grade agent hosting framework** that turns LLM agent
 
 <div align="center">
 <table><tr>
-<td align="center" width="340">
-  <img src="docs/imgs/telegram_conversations.jpg" alt="Multiple conversations via Telegram groups" width="300" />
+<td align="center" width="260">
+  <img src="docs/imgs/telegram_conversations.jpg" alt="Multiple conversations via Telegram groups" width="240" />
   <br />
-  <sub>💬 Each Telegram group = an independent agent conversation</sub>
+  <sub>💬 Multi-conversation via group chats</sub>
 </td>
-<td align="center" width="500">
-  <img src="docs/imgs/tui_config_editor.jpg" alt="TUI Config Editor" width="480" />
+<td align="center" width="320">
+  <img src="docs/imgs/live_conversation.jpg" alt="Real-time interruptible conversation" width="300" />
   <br />
-  <sub>⚙️ Built-in TUI config editor — no hand-editing JSON</sub>
+  <sub>🔀 Interruptible turns with live feedback</sub>
+</td>
+<td align="center" width="420">
+  <img src="docs/imgs/tui_config_editor.jpg" alt="TUI Config Editor" width="400" />
+  <br />
+  <sub>⚙️ TUI config editor</sub>
 </td>
 </tr></table>
 </div>
@@ -62,6 +67,24 @@ ClawParty is a **production-grade agent hosting framework** that turns LLM agent
 - **Conversation = Group Chat**: Each Telegram group with the bot is an independent conversation with its own workspace, model, and agent state
 - **Graceful interruption**: User messages yield running turns at safe boundaries — no lost work
 - **Crash-safe**: All state is persisted; process restarts resume where they left off
+
+---
+
+## Interruptible Turns & Real-Time Feedback
+
+Traditional CLI agents are **blocking** — once a task starts, you wait silently until it finishes, or kill it and lose everything. ClawParty solves this with two key mechanisms:
+
+**🔀 Interruptible tools** — When you send a new message while the agent is working, ClawParty yields the current turn at a safe boundary. The agent sees your new input, adjusts its plan, and continues — no work is lost, no restart needed.
+
+**💬 `user_tell` — mid-turn progress messages** — The agent can push status updates to you *while still working*, as separate chat bubbles. You see what's happening in real time instead of staring at a spinner.
+
+Together, these turn a one-shot request-response pattern into a **continuous, collaborative conversation** — even during long-running tasks like code generation, web research, or multi-file refactoring.
+
+<div align="center">
+  <img src="docs/imgs/live_conversation.jpg" alt="Real-time interruptible conversation" width="420" />
+  <br />
+  <sub>Real interaction: user sends follow-up instructions mid-task → agent acknowledges immediately and adapts</sub>
+</div>
 
 ---
 
