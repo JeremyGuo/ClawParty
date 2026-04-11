@@ -44,22 +44,27 @@ ClawParty is a **production-grade agent hosting framework** that turns LLM agent
 
 ## Why ClawParty?
 
-### vs. Claude Code / OpenClaw
+### Landscape
 
-| Dimension | Claude Code / OpenClaw | **ClawParty** |
-|:----------|:----------------------|:--------------|
-| **Deployment** | CLI tool, one session at a time | Always-on service, `systemd` managed |
-| **Conversations** | Single terminal session | Multiple concurrent conversations via group chats |
-| **Channels** | Terminal only | Telegram, DingTalk, CLI — extensible |
-| **Multimodal** | Text + code only | Native image/PDF/audio input, image generation, file downloads |
-| **Agent topology** | Single agent | Main agent + background agents + sub-agents per conversation |
-| **Interruption** | Kill & restart | Mid-turn yield: new messages interrupt running tools gracefully |
-| **Persistence** | Session-scoped | Full state survives restarts — sessions, workspaces, cron tasks, agent registry |
-| **Scheduling** | None | Built-in cron with checker commands and sink routing |
-| **Sandbox** | OS-level only | Three modes: disabled / subprocess / bubblewrap (namespace isolation) |
-| **Memory** | Context window only | Multi-layer: context compaction + idle compaction + conversation memory + shared profiles |
-| **Skills** | Not available | `SKILL.md`-based reusable workflows with runtime change detection |
-| **Model flexibility** | Single provider | Multiple providers per instance, per-conversation model switching |
+There are several ways to run LLM agents today. Here's where ClawParty fits:
+
+| | **Claude Code** | **OpenClaw** | **ClawParty** |
+|:--|:----------------|:-------------|:--------------|
+| **What is it** | Anthropic's official CLI coding agent | Open-source self-hosted personal AI assistant | Self-hosted multi-agent service framework |
+| **Primary use case** | Interactive coding in a terminal | Personal automation across messaging apps | Developer / engineering workflows as always-on services |
+| **Stack** | Closed-source, Node.js | Open-source, JS/Python | Open-source, Rust |
+| **Deployment** | CLI, one session at a time | Local daemon or one-click cloud | `systemd` service, multi-conversation |
+| **Channels** | Terminal only | 50+ (WhatsApp, Telegram, Slack, Discord, …) | Telegram, DingTalk, CLI — extensible |
+| **Agent topology** | Single agent | Multi-agent routing, skill-based | Main + sub-agents + background agents, per-conversation |
+| **Interruption** | Kill & restart | — | Mid-turn yield: new messages interrupt gracefully, no work lost |
+| **Sandbox** | OS-level only | Optional container | Three modes: disabled / subprocess / bubblewrap (namespace isolation) |
+| **Memory** | Session-scoped | Persistent (SQLite / Markdown) | Multi-layer: compaction + idle compaction + conversation memory + shared profiles |
+| **Scheduling** | None | Cron, webhooks, wakeups | Cron with checker commands + configurable sink routing |
+| **Skills / Plugins** | — | 5,400+ via ClawHub | `SKILL.md`-based reusable workflows with runtime change detection |
+| **Model flexibility** | Claude only | Multi-model | Multiple providers per instance, per-conversation switching |
+| **Coding tool depth** | Deep (native) | General-purpose | Deep: 40+ built-in tools (file I/O, shell with PTY, grep/glob, patch, sub-agents) |
+
+**TL;DR**: Claude Code is the polished single-user coding CLI. OpenClaw is the Swiss-army-knife personal assistant with massive platform coverage. ClawParty sits in between — it's a **lightweight, Rust-native service** focused on engineering workflows, with deep coding tools, robust crash recovery, and the ability to run multiple independent agent conversations as a persistent daemon.
 
 ### Key Design Principles
 
