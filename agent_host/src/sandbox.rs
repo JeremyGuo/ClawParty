@@ -79,6 +79,41 @@ fn binary_in_path(binary: &str) -> bool {
     false
 }
 
+/// Spawn a child process from a dedicated thread that remains alive (parked)
+/// until the child exits. This prevents `PR_SET_PDEATHSIG` (used by
+/// `bwrap --die-with-parent`) from firing when the original spawning thread
+/// is reaped by a thread pool (e.g. tokio's blocking pool).
+fn spawn_with_persistent_parent_thread(mut command: Command) -> Result<Child> {
+    let (child_sender, child_receiver) = std::sync::mpsc::channel::<Result<Child>>();
+    std::thread::Builder::new()
+        .name("bwrap-parent-keeper".to_string())
+        .spawn(move || {
+            let result = command.spawn();
+            let child_id = result.as_ref().ok().map(|c| c.id());
+            let _ = child_sender.send(result.map_err(|e| anyhow::anyhow!(e)));
+            // Keep this thread alive so PR_SET_PDEATHSIG does not fire.
+            // Park until the child process exits. We detect this by periodically
+            // checking if the child PID is still alive via a zero-signal kill.
+            if let Some(pid) = child_id {
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(30));
+                    // Check if child is still alive via kill(pid, 0).
+                    // SAFETY: kill with signal 0 performs an existence check
+                    // without sending any signal.
+                    let alive =
+                        unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                    if !alive {
+                        break;
+                    }
+                }
+            }
+        })
+        .context("failed to spawn bwrap parent keeper thread")?;
+    child_receiver
+        .recv()
+        .map_err(|_| anyhow!("bwrap parent keeper thread terminated before sending child"))?
+}
+
 fn next_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("tool-req-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -349,9 +384,21 @@ impl PersistentChildRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .context("failed to spawn child agent runner")?;
+        // IMPORTANT: When using bubblewrap with --die-with-parent, bwrap sets
+        // PR_SET_PDEATHSIG(SIGKILL) which is tracked per-thread on Linux, not
+        // per-process. If the spawning thread exits (e.g. a tokio blocking pool
+        // thread being reaped after idle timeout), the child receives SIGKILL
+        // even though the parent process is still alive. To prevent this, we
+        // spawn the child from a dedicated thread that stays alive (parked)
+        // until the child process exits.
+        let mut child = if matches!(sandbox.mode, SandboxMode::Bubblewrap) {
+            spawn_with_persistent_parent_thread(command)
+                .context("failed to spawn child agent runner")?
+        } else {
+            command
+                .spawn()
+                .context("failed to spawn child agent runner")?
+        };
         let child_stdin = child.stdin.take().context("child stdin unavailable")?;
         let child_stdout = child.stdout.take().context("child stdout unavailable")?;
         let child_stderr = child.stderr.take().context("child stderr unavailable")?;
