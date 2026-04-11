@@ -969,6 +969,55 @@ fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+const EXEC_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
+const EXEC_OUTPUT_MAX_CHARS: usize = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecTimeoutAction {
+    Continue,
+    Kill,
+}
+
+impl ExecTimeoutAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+fn exec_timeout_action_arg(
+    arguments: &Map<String, Value>,
+    key: &str,
+    default: ExecTimeoutAction,
+) -> Result<ExecTimeoutAction> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(default);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("argument {} must be a string", key))?
+        .trim()
+        .to_ascii_lowercase();
+    match text.as_str() {
+        "continue" => Ok(ExecTimeoutAction::Continue),
+        "kill" => Ok(ExecTimeoutAction::Kill),
+        _ => Err(anyhow!("argument {} must be one of: continue, kill", key)),
+    }
+}
+
+fn max_output_chars_arg(arguments: &Map<String, Value>) -> Result<usize> {
+    let value = usize_arg_with_default(arguments, "max_output_chars", EXEC_OUTPUT_MAX_CHARS)?;
+    if value > EXEC_OUTPUT_MAX_CHARS {
+        return Err(anyhow!(
+            "argument max_output_chars must be less than or equal to {}",
+            EXEC_OUTPUT_MAX_CHARS
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct ProcessMetadata {
     exec_id: String,
@@ -1064,16 +1113,126 @@ fn write_process_metadata(dir: &Path, metadata: &ProcessMetadata) -> Result<()> 
         .with_context(|| format!("failed to write process metadata for {}", metadata.exec_id))
 }
 
-fn read_file_lines_window(path: &Path, start: usize, limit: usize) -> Result<String> {
-    if !path.exists() || limit == 0 {
-        return Ok(String::new());
+fn read_file_lines_window(path: &Path, start: usize, limit: usize) -> Result<(String, usize)> {
+    if !path.exists() {
+        return Ok((String::new(), 0));
     }
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let total_chars = text.chars().count();
+    if limit == 0 {
+        return Ok((String::new(), total_chars));
+    }
     let lines = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     let end = lines.len().saturating_sub(start);
     let begin = end.saturating_sub(limit);
-    Ok(lines[begin..end].join("\n"))
+    Ok((lines[begin..end].join("\n"), total_chars))
+}
+
+fn truncate_exec_output(text: &str, max_chars: usize) -> (String, bool) {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return (text.to_string(), false);
+    }
+    if max_chars == 0 {
+        return (String::new(), true);
+    }
+
+    let head_chars = max_chars.saturating_mul(4) / 10;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    (format!("{head}{tail}"), true)
+}
+
+fn workspace_output_relative_path(exec_id: &str, stream: &str) -> PathBuf {
+    PathBuf::from(".agent_frame")
+        .join("exec")
+        .join(format!("{exec_id}.{stream}"))
+}
+
+fn format_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn sync_workspace_output_file(
+    workspace_root: Option<&Path>,
+    metadata: &ProcessMetadata,
+    source: &Path,
+    stream: &str,
+) -> Result<Option<String>> {
+    let Some(workspace_root) = workspace_root else {
+        return Ok(None);
+    };
+    let relative_path = workspace_output_relative_path(&metadata.exec_id, stream);
+    let destination = workspace_root.join(&relative_path);
+    if source != destination {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if source.exists() {
+            fs::copy(source, &destination).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        } else {
+            fs::write(&destination, b"")
+                .with_context(|| format!("failed to write {}", destination.display()))?;
+        }
+    }
+    Ok(Some(format_relative_path(&relative_path)))
+}
+
+fn insert_exec_output_fields(
+    object: &mut Map<String, Value>,
+    metadata: &ProcessMetadata,
+    workspace_root: Option<&Path>,
+    start: usize,
+    limit: usize,
+    max_output_chars: usize,
+) -> Result<()> {
+    let stdout_path = Path::new(&metadata.stdout_path);
+    let stderr_path = Path::new(&metadata.stderr_path);
+    let (stdout_window, stdout_chars) = read_file_lines_window(stdout_path, start, limit)?;
+    let (stderr_window, stderr_chars) = read_file_lines_window(stderr_path, start, limit)?;
+    let (stdout, stdout_truncated) = truncate_exec_output(&stdout_window, max_output_chars);
+    let (stderr, stderr_truncated) = truncate_exec_output(&stderr_window, max_output_chars);
+
+    object.insert("stdout".to_string(), Value::String(stdout));
+    object.insert("stderr".to_string(), Value::String(stderr));
+    object.insert(
+        "stdout_truncated".to_string(),
+        Value::Bool(stdout_truncated || stdout_chars > stdout_window.chars().count()),
+    );
+    object.insert(
+        "stderr_truncated".to_string(),
+        Value::Bool(stderr_truncated || stderr_chars > stderr_window.chars().count()),
+    );
+    object.insert("stdout_chars".to_string(), Value::from(stdout_chars));
+    object.insert("stderr_chars".to_string(), Value::from(stderr_chars));
+    if let Some(path) = sync_workspace_output_file(workspace_root, metadata, stdout_path, "stdout")?
+    {
+        object.insert("stdout_path".to_string(), Value::String(path));
+    }
+    if let Some(path) = sync_workspace_output_file(workspace_root, metadata, stderr_path, "stderr")?
+    {
+        object.insert("stderr_path".to_string(), Value::String(path));
+    }
+    Ok(())
 }
 
 fn read_exit_code(path: &Path) -> Option<i32> {
@@ -1259,13 +1418,17 @@ fn write_exec_snapshot(
 fn spawn_managed_process(
     runtime_state_root: &Path,
     state_dir: &Path,
+    workspace_root: &Path,
     command: &str,
     cwd: &Path,
     tty: bool,
 ) -> Result<ProcessMetadata> {
     let exec_id = Uuid::new_v4().to_string();
-    let stdout_path = state_dir.join(format!("{}.stdout", exec_id));
-    let stderr_path = state_dir.join(format!("{}.stderr", exec_id));
+    let output_dir = workspace_root.join(".agent_frame").join("exec");
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let stdout_path = output_dir.join(format!("{}.stdout", exec_id));
+    let stderr_path = output_dir.join(format!("{}.stderr", exec_id));
     let status_path = state_dir.join(format!("{}.status.json", exec_id));
     let requests_dir = state_dir.join(format!("{}.requests", exec_id));
     fs::create_dir_all(&requests_dir)
@@ -1335,6 +1498,8 @@ fn read_process_snapshot(
     exec_id: &str,
     start: usize,
     limit: usize,
+    max_output_chars: usize,
+    workspace_root: Option<&Path>,
 ) -> Result<Value> {
     let metadata = match read_process_metadata(state_dir, exec_id) {
         Ok(metadata) => metadata,
@@ -1371,22 +1536,14 @@ fn read_process_snapshot(
     object
         .entry("tty".to_string())
         .or_insert_with(|| Value::Bool(metadata.tty));
-    object.insert(
-        "stdout".to_string(),
-        Value::String(read_file_lines_window(
-            Path::new(&metadata.stdout_path),
-            start,
-            limit,
-        )?),
-    );
-    object.insert(
-        "stderr".to_string(),
-        Value::String(read_file_lines_window(
-            Path::new(&metadata.stderr_path),
-            start,
-            limit,
-        )?),
-    );
+    insert_exec_output_fields(
+        &mut object,
+        &metadata,
+        workspace_root,
+        start,
+        limit,
+        max_output_chars,
+    )?;
     Ok(Value::Object(object))
 }
 
@@ -1417,7 +1574,14 @@ fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> 
                 true,
             ),
         };
-        let snapshot = match read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0) {
+        let snapshot = match read_process_snapshot(
+            &state_dir,
+            &metadata.exec_id,
+            0,
+            0,
+            EXEC_OUTPUT_MAX_CHARS,
+            None,
+        ) {
             Ok(snapshot) => snapshot,
             Err(_) if allow_missing_snapshot => continue,
             Err(err) => return Err(err),
@@ -1449,26 +1613,22 @@ pub fn terminate_all_managed_processes() -> Result<()> {
         .collect::<Vec<_>>();
     drop(registry);
     for process in processes {
+        let state_dir = Path::new(&process.status_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
         let snapshot = read_process_snapshot(
-            Path::new(&process.stdout_path)
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
+            state_dir,
             &process.exec_id,
             0,
             0,
+            EXEC_OUTPUT_MAX_CHARS,
+            None,
         )
         .ok();
-        let meta_path = process_meta_path(
-            Path::new(&process.stdout_path)
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-            &process.exec_id,
-        );
+        let meta_path = process_meta_path(state_dir, &process.exec_id);
         let _ = fs::remove_file(meta_path);
         let _ = fs::remove_file(&process.worker_exit_code_path);
         let _ = fs::remove_file(&process.status_path);
-        let _ = fs::remove_file(&process.stdout_path);
-        let _ = fs::remove_file(&process.stderr_path);
         let _ = fs::remove_dir_all(&process.requests_dir);
         kill_exec_processes(&process, snapshot.as_ref());
     }
@@ -1482,8 +1642,16 @@ fn wait_for_managed_process(
     input: Option<&str>,
     start: usize,
     limit: usize,
+    max_output_chars: usize,
+    workspace_root: Option<&Path>,
+    on_timeout: ExecTimeoutAction,
     cancel_flag: Option<&Arc<InterruptSignal>>,
 ) -> Result<Value> {
+    if !wait_timeout_seconds.is_finite() || wait_timeout_seconds < 0.0 {
+        return Err(anyhow!(
+            "argument wait_timeout_seconds must be a finite non-negative number"
+        ));
+    }
     let pending_input_result = if let Some(input) = input {
         let metadata = read_process_metadata(state_dir, exec_id)
             .map_err(|_| process_missing_error(exec_id))?;
@@ -1495,7 +1663,14 @@ fn wait_for_managed_process(
     let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
     let mut input_acknowledged = pending_input_result.is_none();
     loop {
-        let snapshot = read_process_snapshot(state_dir, exec_id, start, limit)?;
+        let snapshot = read_process_snapshot(
+            state_dir,
+            exec_id,
+            start,
+            limit,
+            max_output_chars,
+            workspace_root,
+        )?;
         if !input_acknowledged && let Some(result_path) = pending_input_result.as_ref() {
             if let Some(result) = read_exec_input_result(result_path)? {
                 let _ = fs::remove_file(result_path);
@@ -1552,19 +1727,46 @@ fn wait_for_managed_process(
             }));
         }
         if std::time::Instant::now() >= deadline {
-            return Ok(json!({
-                "exec_id": snapshot["exec_id"].clone(),
-                "pid": snapshot["pid"].clone(),
-                "command": snapshot["command"].clone(),
-                "cwd": snapshot["cwd"].clone(),
-                "tty": snapshot["tty"].clone(),
-                "running": true,
-                "completed": false,
-                "returncode": Value::Null,
-                "wait_timed_out": true,
-                "stdout": snapshot["stdout"].clone(),
-                "stderr": snapshot["stderr"].clone(),
-            }));
+            if on_timeout == ExecTimeoutAction::Kill {
+                let metadata = read_process_metadata(state_dir, exec_id)
+                    .map_err(|_| process_missing_error(exec_id))?;
+                kill_exec_processes(&metadata, Some(&snapshot));
+                let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
+                let mut extra = Map::new();
+                extra.insert("killed".to_string(), Value::Bool(true));
+                extra.insert("wait_timed_out".to_string(), Value::Bool(true));
+                extra.insert(
+                    "on_timeout".to_string(),
+                    Value::String(on_timeout.as_str().to_string()),
+                );
+                extra.insert("stdin_closed".to_string(), Value::Bool(true));
+                extra.insert("failed".to_string(), Value::Bool(false));
+                extra.insert("error".to_string(), Value::Null);
+                write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
+                live_processes().lock().unwrap().remove(exec_id);
+                return read_process_snapshot(
+                    state_dir,
+                    exec_id,
+                    start,
+                    limit,
+                    max_output_chars,
+                    workspace_root,
+                );
+            }
+
+            let mut object = snapshot
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
+            object.insert("wait_timed_out".to_string(), Value::Bool(true));
+            object.insert(
+                "on_timeout".to_string(),
+                Value::String(on_timeout.as_str().to_string()),
+            );
+            object.insert("running".to_string(), Value::Bool(true));
+            object.insert("completed".to_string(), Value::Bool(false));
+            object.insert("returncode".to_string(), Value::Null);
+            return Ok(Value::Object(object));
         }
         if let Some(cancel_receiver) = &cancel_receiver {
             crossbeam_channel::select! {
@@ -1586,11 +1788,11 @@ fn wait_for_managed_process(
 fn exec_start_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
-    _cancel_flag: Option<Arc<InterruptSignal>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new(
+    Tool::new_interruptible(
         "exec_start",
-        "Start a shell command or executable and return immediately with an exec_id plus the latest observable stdout/stderr window. Set tty=true when the command needs terminal semantics or interactive prompts. Prefer commands that write progress directly to stdout/stderr instead of redirecting output to files so exec_observe can inspect progress.",
+        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
         json!({
             "type": "object",
             "properties": {
@@ -1599,7 +1801,11 @@ fn exec_start_tool(
                 "tty": {"type": "boolean"},
                 "include_stdout": {"type": "boolean"},
                 "start": {"type": "integer"},
-                "limit": {"type": "integer"}
+                "limit": {"type": "integer"},
+                "return_immediate": {"type": "boolean"},
+                "wait_timeout_seconds": {"type": "number"},
+                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
             },
             "required": ["command"],
             "additionalProperties": false
@@ -1617,6 +1823,18 @@ fn exec_start_tool(
                 .get("tty")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let return_immediate = arguments
+                .get("return_immediate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let wait_timeout_seconds = arguments
+                .get("wait_timeout_seconds")
+                .map(|_| f64_arg(arguments, "wait_timeout_seconds"))
+                .transpose()?
+                .unwrap_or(EXEC_START_DEFAULT_WAIT_TIMEOUT_SECONDS);
+            let on_timeout =
+                exec_timeout_action_arg(arguments, "on_timeout", ExecTimeoutAction::Continue)?;
+            let max_output_chars = max_output_chars_arg(arguments)?;
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let cwd = arguments
@@ -1625,9 +1843,37 @@ fn exec_start_tool(
                 .map(|value| resolve_path(value, &workspace_root))
                 .unwrap_or_else(|| workspace_root.clone());
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let metadata =
-                spawn_managed_process(&runtime_state_root, &state_dir, &command, &cwd, tty)?;
-            let mut result = read_process_snapshot(&state_dir, &metadata.exec_id, start, limit)?;
+            let metadata = spawn_managed_process(
+                &runtime_state_root,
+                &state_dir,
+                &workspace_root,
+                &command,
+                &cwd,
+                tty,
+            )?;
+            let mut result = if return_immediate {
+                read_process_snapshot(
+                    &state_dir,
+                    &metadata.exec_id,
+                    start,
+                    limit,
+                    max_output_chars,
+                    Some(&workspace_root),
+                )?
+            } else {
+                wait_for_managed_process(
+                    &state_dir,
+                    &metadata.exec_id,
+                    wait_timeout_seconds,
+                    None,
+                    start,
+                    limit,
+                    max_output_chars,
+                    Some(&workspace_root),
+                    on_timeout,
+                    cancel_flag.as_ref(),
+                )?
+            };
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
                 object.remove("stderr");
@@ -1642,18 +1888,20 @@ fn exec_start_tool(
 }
 
 fn exec_observe_tool(
+    workspace_root: PathBuf,
     runtime_state_root: PathBuf,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "exec_observe",
-        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines.",
+        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
         json!({
             "type": "object",
             "properties": {
                 "exec_id": {"type": "string"},
                 "start": {"type": "integer"},
-                "limit": {"type": "integer"}
+                "limit": {"type": "integer"},
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
             },
             "required": ["exec_id"],
             "additionalProperties": false
@@ -1665,16 +1913,28 @@ fn exec_observe_tool(
             let exec_id = string_arg(arguments, "exec_id")?;
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
+            let max_output_chars = max_output_chars_arg(arguments)?;
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            read_process_snapshot(&state_dir, &exec_id, start, limit)
+            read_process_snapshot(
+                &state_dir,
+                &exec_id,
+                start,
+                limit,
+                max_output_chars,
+                Some(&workspace_root),
+            )
         },
     )
 }
 
-fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn exec_wait_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new_interruptible(
         "exec_wait",
-        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
+        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
         json!({
             "type": "object",
             "properties": {
@@ -1683,7 +1943,9 @@ fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 "input": {"type": "string"},
                 "include_stdout": {"type": "boolean"},
                 "start": {"type": "integer"},
-                "limit": {"type": "integer"}
+                "limit": {"type": "integer"},
+                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
             },
             "required": ["exec_id", "wait_timeout_seconds"],
             "additionalProperties": false
@@ -1698,6 +1960,9 @@ fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 .get("include_stdout")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let on_timeout =
+                exec_timeout_action_arg(arguments, "on_timeout", ExecTimeoutAction::Continue)?;
+            let max_output_chars = max_output_chars_arg(arguments)?;
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let input = arguments
@@ -1711,6 +1976,9 @@ fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<Interrupt
                 input.as_deref(),
                 start,
                 limit,
+                max_output_chars,
+                Some(&workspace_root),
+                on_timeout,
                 cancel_flag.as_ref(),
             )?;
             if !include_stdout && let Some(object) = result.as_object_mut() {
@@ -1746,7 +2014,8 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let metadata = read_process_metadata(&state_dir, &exec_id)
                 .map_err(|_| process_missing_error(&exec_id))?;
-            let previous = read_process_snapshot(&state_dir, &exec_id, 0, 0).ok();
+            let previous =
+                read_process_snapshot(&state_dir, &exec_id, 0, 0, EXEC_OUTPUT_MAX_CHARS, None).ok();
             kill_exec_processes(&metadata, previous.as_ref());
             let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
             let mut extra = Map::new();
@@ -2321,7 +2590,14 @@ fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize> {
                 true,
             ),
         };
-        let snapshot = match read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0) {
+        let snapshot = match read_process_snapshot(
+            &state_dir,
+            &metadata.exec_id,
+            0,
+            0,
+            EXEC_OUTPUT_MAX_CHARS,
+            None,
+        ) {
             Ok(snapshot) => Some(snapshot),
             Err(_) if allow_missing_snapshot => None,
             Err(err) => return Err(err),
@@ -3368,11 +3644,19 @@ pub fn build_tool_registry_with_cancel(
         ),
         (
             "exec_observe".to_string(),
-            exec_observe_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+            exec_observe_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "exec_wait".to_string(),
-            exec_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+            exec_wait_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "exec_kill".to_string(),

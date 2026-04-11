@@ -297,7 +297,10 @@ fn compose_zgent_system_prompt(
         ZGENT_COMPAT_MARKER.to_string(),
         "You are running inside ZGent through AgentHost's compatibility layer. Use tools when they materially help.".to_string(),
         "Only tools that explicitly expose timeout fields require the model to choose timeout_seconds.".to_string(),
-        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe.".to_string(),
+        "exec_start waits for short commands by default. Set return_immediate=true for long-running servers, watchers, daemons, interactive commands, or background work.".to_string(),
+        "When multiple exec commands have no causal dependency, issue them in the same tool-call batch instead of serializing them across model rounds.".to_string(),
+        "Use non-interactive exec commands where possible. If large output is expected, set max_output_chars=0 and inspect the returned workspace-relative stdout_path and stderr_path with targeted follow-up commands.".to_string(),
+        "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe and saved output files.".to_string(),
         "When a command expects terminal semantics or interactive prompts, call exec_start with tty=true so the runtime allocates a PTY.".to_string(),
     ];
     if !config.system_prompt.is_empty() {

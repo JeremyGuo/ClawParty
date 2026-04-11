@@ -413,11 +413,81 @@ fn builtin_tools_work() -> Result<()> {
     let shell_result =
         execute_tool_call(&registry, "exec_start", Some(r#"{"command":"printf 123"}"#));
     assert!(shell_result.contains("\"exec_id\""));
+    assert!(shell_result.contains("\"completed\": true"));
+    assert!(shell_result.contains("\"stdout\": \"123\""));
+
+    let timeout_process = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(
+            r#"{"command":"sleep 1; printf late","wait_timeout_seconds":0.05,"max_output_chars":0}"#,
+        ),
+    );
+    let timeout_json: Value = serde_json::from_str(&timeout_process)?;
+    assert_eq!(timeout_json["wait_timed_out"], json!(true));
+    assert_eq!(timeout_json["running"], json!(true));
+    assert_eq!(timeout_json["stdout"], json!(""));
+    assert!(
+        timeout_json["stdout_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(".stdout")
+    );
+    let timeout_exec_id = timeout_json["exec_id"].as_str().unwrap();
+    let timeout_kill = execute_tool_call(
+        &registry,
+        "exec_kill",
+        Some(&format!(r#"{{"exec_id":"{}"}}"#, timeout_exec_id)),
+    );
+    assert!(timeout_kill.contains("\"killed\": true"));
+
+    let killed_on_timeout = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(
+            r#"{"command":"sleep 1","wait_timeout_seconds":0.05,"on_timeout":"kill","include_stdout":false}"#,
+        ),
+    );
+    let killed_on_timeout_json: Value = serde_json::from_str(&killed_on_timeout)?;
+    assert_eq!(killed_on_timeout_json["wait_timed_out"], json!(true));
+    assert_eq!(killed_on_timeout_json["killed"], json!(true));
+    assert_eq!(killed_on_timeout_json["completed"], json!(true));
+
+    let large_output = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(
+            r#"{"command":"python3 -c \"print('a'*700 + 'b'*700, end='')\"","max_output_chars":1000,"limit":100}"#,
+        ),
+    );
+    let large_output_json: Value = serde_json::from_str(&large_output)?;
+    assert_eq!(large_output_json["completed"], json!(true));
+    assert_eq!(large_output_json["stdout_chars"], json!(1400));
+    assert_eq!(large_output_json["stdout_truncated"], json!(true));
+    assert!(
+        large_output_json["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            <= 1000
+    );
+    let stdout_path = temp_dir
+        .path()
+        .join(large_output_json["stdout_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(stdout_path)?.chars().count(), 1400);
+
+    let max_output_too_large = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(r#"{"command":"printf no","max_output_chars":1001}"#),
+    );
+    assert!(max_output_too_large.contains("max_output_chars"));
 
     let background_process = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"sleep 0.2; printf bg"}"#),
+        Some(r#"{"command":"sleep 0.2; printf bg","return_immediate":true}"#),
     );
     let background_json: Value = serde_json::from_str(&background_process)?;
     let background_exec_id = background_json
@@ -445,7 +515,7 @@ fn builtin_tools_work() -> Result<()> {
     let cat_process = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"cat","include_stdout":false}"#),
+        Some(r#"{"command":"cat","include_stdout":false,"return_immediate":true}"#),
     );
     let cat_json: Value = serde_json::from_str(&cat_process)?;
     let cat_wait = execute_tool_call(
@@ -549,7 +619,7 @@ fn builtin_tools_work() -> Result<()> {
         &registry,
         "exec_start",
         Some(&format!(
-            r#"{{"command":"sleep 1; printf late > {}"}}"#,
+            r#"{{"command":"sleep 1; printf late > {}","return_immediate":true}}"#,
             timeout_target.display()
         )),
     );
@@ -584,7 +654,7 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
     let started = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"sleep 10","include_stdout":false}"#),
+        Some(r#"{"command":"sleep 10","include_stdout":false,"return_immediate":true}"#),
     );
     let started_json: Value = serde_json::from_str(&started)?;
     let exec_id = started_json["exec_id"].as_str().unwrap();
@@ -634,7 +704,9 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     let started = execute_tool_call(
         &starter,
         "exec_start",
-        Some(r#"{"command":"read line; printf 'got:%s\n' \"$line\"","include_stdout":false}"#),
+        Some(
+            r#"{"command":"read line; printf 'got:%s\n' \"$line\"","include_stdout":false,"return_immediate":true}"#,
+        ),
     );
     let started_json: Value = serde_json::from_str(&started)?;
     let exec_id = started_json["exec_id"].as_str().unwrap();
@@ -1877,7 +1949,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
     let exec_start = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"sleep 10","include_stdout":false}"#),
+        Some(r#"{"command":"sleep 10","include_stdout":false,"return_immediate":true}"#),
     );
     let exec_start_json: Value = serde_json::from_str(&exec_start)?;
     let exec_id = exec_start_json["exec_id"]

@@ -4589,6 +4589,7 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 
 #[cfg(test)]
 mod tests {
+    use super::foreground::register_active_foreground_control;
     use super::{
         AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, Server, SinkTarget,
         SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
@@ -5231,6 +5232,24 @@ mod tests {
         assert!(control.take_yield_requested());
         let phase = active_phases.lock().unwrap().get(&session_key).copied();
         assert_eq!(phase, Some(ForegroundRuntimePhase::Compacting));
+    }
+
+    #[test]
+    fn pending_interrupt_is_applied_to_next_foreground_control() {
+        let session_key = "telegram:conversation-1".to_string();
+        let active_controls = Arc::new(Mutex::new(HashMap::new()));
+        let pending_interrupts = Arc::new(Mutex::new(HashSet::from([session_key.clone()])));
+        let control = SessionExecutionControl::new();
+
+        register_active_foreground_control(
+            &active_controls,
+            &pending_interrupts,
+            &session_key,
+            control.clone(),
+        );
+
+        assert!(control.take_yield_requested());
+        assert!(active_controls.lock().unwrap().contains_key(&session_key));
     }
 
     #[test]

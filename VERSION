@@ -1,5 +1,18 @@
-version: 0.14.5
+version: 0.14.6
 ---
+
+# 0.14.6
+
+- 优化 exec 工具轮次开销：
+  `exec_start` 默认等待命令完成，默认等待 270 秒；长任务可显式传 `return_immediate=true` 保持原来的后台启动行为。等待超时默认 `on_timeout=continue`，进程继续运行；也可传 `on_timeout=kill` 在超时时终止进程。
+- 收紧 exec 输出返回体积：
+  `exec_start`、`exec_wait` 与 `exec_observe` 的 `max_output_chars` 硬限制为 0 到 1000；超过限制时只返回前部与尾部片段，并提供完整 stdout/stderr 的 workspace 相对路径 `.agent_frame/exec/<exec_id>.stdout|stderr` 供后续定向读取。
+- 更新 agent prompt：
+  鼓励模型把无因果依赖的 exec 调用并发发起，优先使用 `exec_start` 默认等待完成模式，并在预期大输出时设置 `max_output_chars=0` 后读取保存的输出文件。
+- 修复前台 user_tell 中断竞态：
+  当用户插话刚好发生在旧 foreground turn 完成或 yield 的边界时，新的 foreground control 会立即消费 pending interrupt，避免 user_tell 打断信号丢失。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；`.agent_frame/exec/` 是 exec 输出工件目录，不需要迁移历史 workdir；按 patch 发布将仓库版本从 `0.14.5` 提升到 `0.14.6`。
 
 # 0.14.5
 

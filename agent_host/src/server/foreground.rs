@@ -1,5 +1,23 @@
 use super::*;
 
+pub(super) fn register_active_foreground_control(
+    active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
+    pending_interrupts: &Arc<Mutex<HashSet<String>>>,
+    session_key: &str,
+    control: SessionExecutionControl,
+) {
+    if pending_interrupts
+        .lock()
+        .ok()
+        .is_some_and(|interrupts| interrupts.contains(session_key))
+    {
+        control.request_yield();
+    }
+    if let Ok(mut controls) = active_controls.lock() {
+        controls.insert(session_key.to_string(), control);
+    }
+}
+
 impl Server {
     pub(super) async fn handle_continue_command(
         &self,
@@ -611,6 +629,7 @@ impl Server {
                             })?
                             .expect("session should exist after persisting error yielded state");
                         *active_session = refreshed;
+                        self.unregister_active_foreground_control(&active_session.address)?;
                         return Ok(ForegroundTurnOutcome::Yielded(SessionState {
                             messages: active_session.request_messages(),
                             pending_messages: active_session.session_state.pending_messages.clone(),
@@ -639,6 +658,7 @@ impl Server {
                         ephemeral_system_messages.clear();
                         continue;
                     }
+                    self.unregister_active_foreground_control(&active_session.address)?;
                     return Ok(ForegroundTurnOutcome::Yielded(SessionState {
                         messages: active_session.request_messages(),
                         pending_messages: active_session.session_state.pending_messages.clone(),
@@ -650,7 +670,10 @@ impl Server {
                     }));
                 }
                 Ok(other) => return Ok(other),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.unregister_active_foreground_control(&active_session.address)?;
+                    return Err(error);
+                }
             }
         }
     }
@@ -781,12 +804,16 @@ impl Server {
             .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
         let runtime = self.tool_runtime_for_address(&session.address)?;
         let active_controls = Arc::clone(&self.active_foreground_controls);
+        let pending_interrupts = Arc::clone(&self.pending_foreground_interrupts);
         let session_key = session.address.session_key();
         let control_observer: Arc<dyn Fn(SessionExecutionControl) + Send + Sync> =
             Arc::new(move |control| {
-                if let Ok(mut controls) = active_controls.lock() {
-                    controls.insert(session_key.clone(), control);
-                }
+                register_active_foreground_control(
+                    &active_controls,
+                    &pending_interrupts,
+                    &session_key,
+                    control,
+                );
             });
         let run_result = runtime
             .run_agent_turn_with_timeout(
@@ -802,18 +829,24 @@ impl Server {
                 "agent_frame task join failed",
             )
             .await;
-        self.unregister_active_foreground_control(&session.address)?;
+        if run_result.is_err() {
+            self.unregister_active_foreground_control(&session.address)?;
+        }
         let run_result = run_result?;
 
         match run_result {
-            TimedRunOutcome::Completed(state) => foreground_reply_from_completed_state(
-                session,
-                state,
-                &workspace_root,
-                &self.main_agent.language,
-            ),
+            TimedRunOutcome::Completed(state) => {
+                self.unregister_active_foreground_control(&session.address)?;
+                foreground_reply_from_completed_state(
+                    session,
+                    state,
+                    &workspace_root,
+                    &self.main_agent.language,
+                )
+            }
             TimedRunOutcome::Yielded(state) => Ok(ForegroundTurnOutcome::Yielded(state)),
             TimedRunOutcome::TimedOut { state, error } => {
+                self.unregister_active_foreground_control(&session.address)?;
                 let state = state.ok_or(error)?;
                 foreground_reply_from_completed_state(
                     session,
@@ -823,6 +856,7 @@ impl Server {
                 )
             }
             TimedRunOutcome::Failed(error) => {
+                self.unregister_active_foreground_control(&session.address)?;
                 let (resume_messages, compaction) =
                     (previous_messages.clone(), SessionCompactionStats::default());
                 let progress_summary =
