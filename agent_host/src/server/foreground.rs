@@ -63,6 +63,9 @@ impl Server {
                 "failed to continue interrupted foreground turn",
             )
             .await;
+        if let Ok(mut interrupts) = self.pending_foreground_interrupts.lock() {
+            interrupts.remove(&incoming.address.session_key());
+        }
         if let Some(stop_sender) = typing_guard {
             let _ = stop_sender.send(());
         }
@@ -259,6 +262,12 @@ impl Server {
                 "foreground agent turn failed",
             )
             .await;
+        // Clear the pending-interrupt flag for this session so future turns
+        // resume normally. The flag was set by the main event loop when a user
+        // message arrived during this turn.
+        if let Ok(mut interrupts) = self.pending_foreground_interrupts.lock() {
+            interrupts.remove(&incoming.address.session_key());
+        }
         if let Some(stop_sender) = typing_guard {
             let _ = stop_sender.send(());
         }
@@ -317,9 +326,23 @@ impl Server {
     }
 
     fn should_auto_resume_yielded_session(&self, session: &SessionSnapshot) -> bool {
-        session.session_state.phase == SessionPhase::Yielded
-            && session.session_state.pending_messages.is_empty()
-            && session.session_state.errno.is_none()
+        if session.session_state.phase != SessionPhase::Yielded
+            || !session.session_state.pending_messages.is_empty()
+            || session.session_state.errno.is_some()
+        {
+            return false;
+        }
+        // If a user message arrived while this turn was running (yield was requested
+        // by request_yield_for_incoming), don't auto-resume — let the handler finish
+        // so the conversation worker can process the queued interrupting message as
+        // the next turn.
+        let session_key = session.address.session_key();
+        if let Ok(interrupts) = self.pending_foreground_interrupts.lock() {
+            if interrupts.contains(&session_key) {
+                return false;
+            }
+        }
+        true
     }
 
     fn persist_failed_foreground_turn(
@@ -661,7 +684,11 @@ impl Server {
                 &mut ephemeral_system_messages,
                 "failed to initialize foreground session",
             )
-            .await?;
+            .await;
+        if let Ok(mut interrupts) = self.pending_foreground_interrupts.lock() {
+            interrupts.remove(&session.address.session_key());
+        }
+        let outcome = outcome?;
         let (state, outgoing) = match outcome {
             ForegroundTurnOutcome::Replied { state, outgoing } => (state, outgoing),
             ForegroundTurnOutcome::Yielded(state) => {

@@ -2649,6 +2649,10 @@ pub struct Server {
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
+    /// Session keys with pending user interrupts — when a new user message arrives while a
+    /// foreground turn is running, the session key is inserted here so that
+    /// `should_auto_resume_yielded_session` knows not to auto-resume.
+    pending_foreground_interrupts: Arc<Mutex<HashSet<String>>>,
     active_foreground_agent_frame_runtimes:
         Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
     active_native_zgent_sessions: Arc<Mutex<HashMap<String, Arc<ActiveNativeZgentSession>>>>,
@@ -3109,6 +3113,7 @@ impl Server {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
@@ -3237,6 +3242,11 @@ impl Server {
                             let message = if interrupted_followup.interrupted {
                                 let mut message = message;
                                 message.text = tag_interrupted_followup_text(message.text);
+                                if let Ok(mut interrupts) =
+                                    server.pending_foreground_interrupts.lock()
+                                {
+                                    interrupts.insert(message.address.session_key());
+                                }
                                 message
                             } else {
                                 message
@@ -4770,6 +4780,7 @@ mod tests {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
