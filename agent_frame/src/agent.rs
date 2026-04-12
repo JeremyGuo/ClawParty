@@ -1214,10 +1214,16 @@ fn apply_pending_prefix_rewrite(
 }
 
 fn tool_result_looks_like_error(result: &str) -> bool {
-    serde_json::from_str::<Value>(result)
-        .ok()
-        .and_then(|value| value.get("error").cloned())
-        .is_some()
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    value
+        .get("error")
+        .is_some_and(|error| !matches!(error, Value::Null))
+        || value
+            .get("failed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn synthesize_tool_timeout_observation(
@@ -1247,7 +1253,7 @@ mod tests {
     use super::{
         ExecutionSignal, ResponseContinuation, SessionExecutionControl,
         finish_pending_tool_wait_compaction, start_pending_tool_wait_compaction,
-        synthetic_user_message_from_tool_result,
+        synthetic_user_message_from_tool_result, tool_result_looks_like_error,
     };
     use crate::config::{AgentConfig, CacheControlConfig, MemorySystem, UpstreamConfig};
     use crate::message::ChatMessage;
@@ -1256,6 +1262,20 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[test]
+    fn tool_result_error_detection_ignores_null_error_fields() {
+        assert!(!tool_result_looks_like_error(
+            r#"{"error": null, "failed": false, "stdout": "ok"}"#
+        ));
+        assert!(!tool_result_looks_like_error(r#"{"stdout": "ok"}"#));
+        assert!(tool_result_looks_like_error(
+            r#"{"error": "boom", "failed": false}"#
+        ));
+        assert!(tool_result_looks_like_error(
+            r#"{"error": null, "failed": true}"#
+        ));
+    }
 
     #[test]
     fn pending_tool_wait_compaction_requests_timeout_observation_after_deadline() {

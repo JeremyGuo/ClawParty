@@ -412,9 +412,12 @@ fn builtin_tools_work() -> Result<()> {
 
     let shell_result =
         execute_tool_call(&registry, "exec_start", Some(r#"{"command":"printf 123"}"#));
-    assert!(shell_result.contains("\"exec_id\""));
-    assert!(shell_result.contains("\"completed\": true"));
-    assert!(shell_result.contains("\"stdout\": \"123\""));
+    let shell_json: Value = serde_json::from_str(&shell_result)?;
+    assert!(shell_json.get("exec_id").is_some());
+    assert_eq!(shell_json["completed"], json!(true));
+    assert_eq!(shell_json["stdout"], json!("123"));
+    assert_eq!(shell_json["stdout_truncated"], json!(false));
+    assert_eq!(shell_json["stderr_truncated"], json!(false));
 
     let timeout_process = execute_tool_call(
         &registry,

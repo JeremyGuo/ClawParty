@@ -1,5 +1,14 @@
-version: 0.14.8
+version: 0.14.9
 ---
+
+# 0.14.9
+
+- 修正 exec 工具结果的成功/失败标记：
+  正常 exec 返回体里的 `"error": null` 不再被 session event 误判为 `errored=true`；显式错误或 `"failed": true` 仍会按失败记录。
+- 修正 exec stdout/stderr 截断状态：
+  完整短输出（例如 `echo hello`、`printf 123`）不再因为末尾换行计数差异被误标为 `stdout_truncated=true`，只有行窗口或字符窗口实际裁剪时才标记为截断。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.8` 提升到 `0.14.9`。
 
 # 0.14.8
 

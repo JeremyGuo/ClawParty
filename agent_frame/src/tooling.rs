@@ -1113,20 +1113,29 @@ fn write_process_metadata(dir: &Path, metadata: &ProcessMetadata) -> Result<()> 
         .with_context(|| format!("failed to write process metadata for {}", metadata.exec_id))
 }
 
-fn read_file_lines_window(path: &Path, start: usize, limit: usize) -> Result<(String, usize)> {
+fn read_file_lines_window(
+    path: &Path,
+    start: usize,
+    limit: usize,
+) -> Result<(String, usize, bool)> {
     if !path.exists() {
-        return Ok((String::new(), 0));
+        return Ok((String::new(), 0, false));
     }
     let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let text = String::from_utf8_lossy(&raw);
     let total_chars = text.chars().count();
     if limit == 0 {
-        return Ok((String::new(), total_chars));
+        return Ok((String::new(), total_chars, total_chars > 0));
     }
     let lines = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     let end = lines.len().saturating_sub(start);
     let begin = end.saturating_sub(limit);
-    Ok((lines[begin..end].join("\n"), total_chars))
+    let line_window_truncated = begin > 0 || start > 0;
+    Ok((
+        lines[begin..end].join("\n"),
+        total_chars,
+        line_window_truncated,
+    ))
 }
 
 fn truncate_exec_output(text: &str, max_chars: usize) -> (String, bool) {
@@ -1207,8 +1216,10 @@ fn insert_exec_output_fields(
 ) -> Result<()> {
     let stdout_path = Path::new(&metadata.stdout_path);
     let stderr_path = Path::new(&metadata.stderr_path);
-    let (stdout_window, stdout_chars) = read_file_lines_window(stdout_path, start, limit)?;
-    let (stderr_window, stderr_chars) = read_file_lines_window(stderr_path, start, limit)?;
+    let (stdout_window, stdout_chars, stdout_line_truncated) =
+        read_file_lines_window(stdout_path, start, limit)?;
+    let (stderr_window, stderr_chars, stderr_line_truncated) =
+        read_file_lines_window(stderr_path, start, limit)?;
     let (stdout, stdout_truncated) = truncate_exec_output(&stdout_window, max_output_chars);
     let (stderr, stderr_truncated) = truncate_exec_output(&stderr_window, max_output_chars);
 
@@ -1216,11 +1227,11 @@ fn insert_exec_output_fields(
     object.insert("stderr".to_string(), Value::String(stderr));
     object.insert(
         "stdout_truncated".to_string(),
-        Value::Bool(stdout_truncated || stdout_chars > stdout_window.chars().count()),
+        Value::Bool(stdout_truncated || stdout_line_truncated),
     );
     object.insert(
         "stderr_truncated".to_string(),
-        Value::Bool(stderr_truncated || stderr_chars > stderr_window.chars().count()),
+        Value::Bool(stderr_truncated || stderr_line_truncated),
     );
     object.insert("stdout_chars".to_string(), Value::from(stdout_chars));
     object.insert("stderr_chars".to_string(), Value::from(stderr_chars));
