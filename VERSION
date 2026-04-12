@@ -1,5 +1,14 @@
-version: 0.14.11
+version: 0.14.12
 ---
+
+# 0.14.12
+
+- 调整 `image_load` 过量保护策略：
+  不再把超过请求预算的图片静默降级为文本占位符；改为在 prompt 和工具描述中明确要求同一批最多并发 3 个 `image_load`，运行时也会让第 4 个及之后的同批 `image_load` 返回失败，避免模型误以为仍然看到了图片。
+- 保留 Codex WebSocket 坏连接恢复改进：
+  旧连接发送失败后，如果恢复请求仍失败，会尽力替换掉已关闭的 socket，避免后续 `/continue` 先复用坏连接并报 `Sending after closing`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.11` 提升到 `0.14.12`。
 
 # 0.14.11
 

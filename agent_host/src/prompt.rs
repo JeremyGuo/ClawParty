@@ -104,6 +104,7 @@ pub fn build_agent_system_prompt(
         "When multiple exec commands have no causal dependency on one another, issue them in the same tool-call batch instead of serializing them across model rounds. Keep dependent commands ordered when one command needs another command's output or side effects.".to_string(),
         "Prefer non-interactive exec commands. Use flags such as --yes, --no-pager, CI=1, explicit timeouts, and batch-mode SSH where appropriate so commands do not wait for prompts.".to_string(),
         "exec_start, exec_wait, and exec_observe cap returned stdout/stderr to at most 1000 characters. If you expect large output, set max_output_chars=0 and inspect the saved workspace-relative stdout_path and stderr_path with targeted tools or narrow commands such as grep, sed, head, tail, or structured filters.".to_string(),
+        "When using image_load, do not issue more than 3 image_load calls in the same tool-call batch. Load at most 3 images, inspect them, then load more in a later round if needed; excess concurrent image_load calls will fail instead of being silently downgraded.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root
@@ -384,6 +385,7 @@ mod tests {
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
+        assert!(prompt.contains("do not issue more than 3 image_load calls"));
         assert!(
             prompt
                 .contains("Anti-fabrication rules: if you are unsure, do not answer from memory.")

@@ -2805,7 +2805,7 @@ fn image_load_tool(
 ) -> Tool {
     Tool::new(
         "image_load",
-        "Load a local image file into the next model request for direct multimodal inspection by the current model. Returns immediately.",
+        "Load a local image file into the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_load more than 3 times in the same assistant tool-call batch; excess image_load calls in that batch will fail. Load more images after inspecting the first batch.",
         json!({
             "type": "object",
             "properties": {

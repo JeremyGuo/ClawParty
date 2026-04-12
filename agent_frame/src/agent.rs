@@ -538,6 +538,31 @@ struct CompletedToolCall {
     result: String,
 }
 
+const MAX_IMAGE_LOADS_PER_TOOL_BATCH: usize = 3;
+
+fn enforce_image_load_batch_limit(completed: &mut [CompletedToolCall]) {
+    let mut seen = 0usize;
+    for completed_tool in completed {
+        if completed_tool.tool_name != "image_load" {
+            continue;
+        }
+        seen = seen.saturating_add(1);
+        if seen <= MAX_IMAGE_LOADS_PER_TOOL_BATCH {
+            continue;
+        }
+        completed_tool.result = json!({
+            "error": format!(
+                "too many image_load calls in one tool batch: maximum is {MAX_IMAGE_LOADS_PER_TOOL_BATCH}; load additional images in a later turn or after inspecting the first batch"
+            ),
+            "tool": "image_load",
+            "failed": true,
+            "max_per_tool_batch": MAX_IMAGE_LOADS_PER_TOOL_BATCH,
+            "position_in_batch": seen,
+        })
+        .to_string();
+    }
+}
+
 impl SessionExecutionControl {
     pub fn new() -> Self {
         let (signal_sender, signal_receiver) = unbounded();
@@ -1008,6 +1033,7 @@ fn run_session_state_controlled_internal(
                     .map_err(|_| anyhow!("tool worker thread panicked"))?,
             );
         }
+        enforce_image_load_batch_limit(&mut completed);
         finish_pending_tool_wait_compaction(pending_compaction)?;
 
         let timeout_observation_requested = config.timeout_observation_compaction.enabled
@@ -1251,9 +1277,10 @@ fn synthesize_tool_timeout_observation(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionSignal, ResponseContinuation, SessionExecutionControl,
-        finish_pending_tool_wait_compaction, start_pending_tool_wait_compaction,
-        synthetic_user_message_from_tool_result, tool_result_looks_like_error,
+        CompletedToolCall, ExecutionSignal, ResponseContinuation, SessionExecutionControl,
+        enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
+        start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
+        tool_result_looks_like_error,
     };
     use crate::config::{AgentConfig, CacheControlConfig, MemorySystem, UpstreamConfig};
     use crate::message::ChatMessage;
@@ -1275,6 +1302,38 @@ mod tests {
         assert!(tool_result_looks_like_error(
             r#"{"error": null, "failed": true}"#
         ));
+    }
+
+    #[test]
+    fn image_load_batch_limit_fails_excess_calls() {
+        let mut completed = (0..5)
+            .map(|index| CompletedToolCall {
+                tool_call_id: format!("call_{index}"),
+                tool_name: "image_load".to_string(),
+                result: serde_json::json!({
+                    "loaded": true,
+                    "kind": "synthetic_user_multimodal",
+                    "media": [{
+                        "type": "input_image",
+                        "path": format!("/tmp/image-{index}.png"),
+                    }],
+                })
+                .to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        enforce_image_load_batch_limit(&mut completed);
+
+        for result in completed.iter().take(3).map(|tool| &tool.result) {
+            assert!(result.contains("synthetic_user_multimodal"));
+            assert!(!tool_result_looks_like_error(result));
+        }
+        for result in completed.iter().skip(3).map(|tool| &tool.result) {
+            assert!(tool_result_looks_like_error(result));
+            let value: Value = serde_json::from_str(result).unwrap();
+            assert_eq!(value["tool"], "image_load");
+            assert_eq!(value["max_per_tool_batch"], 3);
+        }
     }
 
     #[test]
