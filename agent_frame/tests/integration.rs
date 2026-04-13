@@ -1669,7 +1669,7 @@ fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
         temp_dir.path(),
     )?;
 
-    let report = run_session_state_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "What is 6 times 7?",
         config,
@@ -1788,7 +1788,7 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
     };
     *control_holder.lock().unwrap() = Some(control.clone());
 
-    let report = run_session_state_until_end(
+    let report = run_session_state_controlled(
         Vec::new(),
         "What is 6 times 7?",
         config,

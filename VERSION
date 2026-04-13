@@ -1,8 +1,12 @@
-version: 0.15.3
+version: 0.15.4
 ---
 
-# 0.15.3
+# 0.15.4
 
+- 修复 `agent_frame` integration tests 的 CI 回归：
+  部分测试应保持单次 controlled run 或自动 resume 到结束，现已恢复各自原有语义，避免取消测试被错误地继续执行以及 usage 聚合测试只跑到 yielded 状态。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增配置字段或 workdir migration；按普通 bug fix 将仓库版本从 `0.15.3` 提升到 `0.15.4`。
 - 新增实时 interactive channel feedback：
   AgentFrame 会通过独立 progress API 向 AgentHost 推送当前执行状态；模型调用阶段显示“思考中...”，工具执行阶段显示当前工具列表以及每个工具的执行中/已完成/失败状态。
 - Telegram 进度消息现在绑定到 foreground session 的 `session_state.progress_message`：
