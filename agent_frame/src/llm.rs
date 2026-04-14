@@ -5,6 +5,7 @@ use crate::config::{
     UpstreamConfig,
 };
 use crate::message::ChatMessage;
+use crate::token_estimation::observe_prompt_tokens_for_upstream;
 use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -153,7 +154,16 @@ pub(crate) fn create_chat_completion(
         );
 
         match result {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                observe_prompt_tokens_for_upstream(
+                    upstream,
+                    messages,
+                    tools,
+                    "",
+                    outcome.usage.prompt_tokens,
+                );
+                return Ok(outcome);
+            }
             Err(error) if attempt < max_retries && should_retry_completion_error(&error) => {
                 attempt += 1;
                 if let Some(delay) = retry_delay_duration(&upstream.retry_mode) {
@@ -1029,6 +1039,7 @@ mod tests {
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         }
     }
 

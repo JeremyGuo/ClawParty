@@ -111,6 +111,7 @@ impl ConfigLoader for LegacyConfigLoader {
                     agent_model_enabled: true,
                     capabilities: Vec::new(),
                     native_web_search: model.native_web_search,
+                    token_estimation: None,
                     external_web_search: search_alias
                         .as_ref()
                         .and_then(|alias| web_search_catalog.get(alias))

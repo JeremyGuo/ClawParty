@@ -20,7 +20,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const TOOLING_FIELD_COUNT: usize = 5;
-const MAIN_AGENT_FIELD_COUNT: usize = 13;
+const MAIN_AGENT_FIELD_COUNT: usize = 15;
 const RUNTIME_FIELD_COUNT: usize = 2;
 const SANDBOX_FIELD_COUNT: usize = 3;
 
@@ -384,6 +384,24 @@ impl ConfigEditorApp {
                 nested_string(&self.value, &["main_agent", "global_install_root"])
                     .unwrap_or("/opt")
                     .to_string(),
+            ),
+            (
+                "token_estimation_cache.template.hf",
+                nested_string(
+                    &self.value,
+                    &["main_agent", "token_estimation_cache", "template", "hf"],
+                )
+                .unwrap_or("template-cache/hf")
+                .to_string(),
+            ),
+            (
+                "token_estimation_cache.tokenizer.hf",
+                nested_string(
+                    &self.value,
+                    &["main_agent", "token_estimation_cache", "tokenizer", "hf"],
+                )
+                .unwrap_or("tokenizer-cache/hf")
+                .to_string(),
             ),
             (
                 "language",
@@ -1423,6 +1441,43 @@ impl ConfigEditorApp {
                             target: SelectTarget::ModelForm(field),
                         }));
                     }
+                    ModelFormField::TokenTemplateSource => {
+                        self.modal = Some(ModalState::Select(SelectState {
+                            title: "Token Template Source".to_string(),
+                            options: vec![
+                                "builtin".to_string(),
+                                "local".to_string(),
+                                "huggingface".to_string(),
+                            ],
+                            selected: token_template_source_index(&current_value),
+                            target: SelectTarget::ModelForm(field),
+                        }));
+                    }
+                    ModelFormField::TokenTokenizerSource => {
+                        self.modal = Some(ModalState::Select(SelectState {
+                            title: "Token Tokenizer Source".to_string(),
+                            options: vec![
+                                "tiktoken".to_string(),
+                                "local".to_string(),
+                                "huggingface".to_string(),
+                            ],
+                            selected: token_tokenizer_source_index(&current_value),
+                            target: SelectTarget::ModelForm(field),
+                        }));
+                    }
+                    ModelFormField::TokenTokenizerEncoding => {
+                        self.modal = Some(ModalState::Select(SelectState {
+                            title: "Tiktoken Encoding".to_string(),
+                            options: vec![
+                                "auto".to_string(),
+                                "o200k_base".to_string(),
+                                "cl100k_base".to_string(),
+                                "o200k_harmony".to_string(),
+                            ],
+                            selected: token_tokenizer_encoding_index(&current_value),
+                            target: SelectTarget::ModelForm(field),
+                        }));
+                    }
                     ModelFormField::Capabilities => {
                         self.open_model_capabilities_picker();
                     }
@@ -1783,6 +1838,42 @@ impl ConfigEditorApp {
                 }
                 Ok(())
             }
+            SelectTarget::ModelForm(ModelFormField::TokenTemplateSource) => {
+                let sources = ["builtin", "local", "huggingface"];
+                let value = sources
+                    .get(selected)
+                    .ok_or_else(|| anyhow!("invalid token template source selection"))?;
+                if let ScreenState::ModelForm(form) = &mut self.screen {
+                    form.token_template_source = (*value).to_string();
+                    form.selected = form
+                        .selected
+                        .min(form.visible_fields().len().saturating_sub(1));
+                }
+                Ok(())
+            }
+            SelectTarget::ModelForm(ModelFormField::TokenTokenizerSource) => {
+                let sources = ["tiktoken", "local", "huggingface"];
+                let value = sources
+                    .get(selected)
+                    .ok_or_else(|| anyhow!("invalid token tokenizer source selection"))?;
+                if let ScreenState::ModelForm(form) = &mut self.screen {
+                    form.token_tokenizer_source = (*value).to_string();
+                    form.selected = form
+                        .selected
+                        .min(form.visible_fields().len().saturating_sub(1));
+                }
+                Ok(())
+            }
+            SelectTarget::ModelForm(ModelFormField::TokenTokenizerEncoding) => {
+                let encodings = ["auto", "o200k_base", "cl100k_base", "o200k_harmony"];
+                let value = encodings
+                    .get(selected)
+                    .ok_or_else(|| anyhow!("invalid token tokenizer encoding selection"))?;
+                if let ScreenState::ModelForm(form) = &mut self.screen {
+                    form.token_tokenizer_encoding = (*value).to_string();
+                }
+                Ok(())
+            }
             SelectTarget::ChannelKind => {
                 let kinds = ["command_line", "telegram", "dingtalk"];
                 let value = kinds
@@ -1913,17 +2004,34 @@ impl ConfigEditorApp {
     fn set_main_agent_value(&mut self, field: MainAgentField, raw: &str) -> Result<()> {
         match field {
             MainAgentField::GlobalInstallRoot
+            | MainAgentField::TokenEstimationTemplateHfCache
+            | MainAgentField::TokenEstimationTokenizerHfCache
             | MainAgentField::Language
-            | MainAgentField::MemorySystem => {
-                let main_agent = ensure_nested_object_mut(&mut self.value, &["main_agent"]);
-                match field {
-                    MainAgentField::MemorySystem => {
-                        let memory_system = parse_memory_system(raw)?;
-                        set_string(main_agent, field.key(), memory_system.as_config_value());
-                    }
-                    _ => set_optional_trimmed_string(main_agent, field.key(), raw),
+            | MainAgentField::MemorySystem => match field {
+                MainAgentField::MemorySystem => {
+                    let main_agent = ensure_nested_object_mut(&mut self.value, &["main_agent"]);
+                    let memory_system = parse_memory_system(raw)?;
+                    set_string(main_agent, field.key(), memory_system.as_config_value());
                 }
-            }
+                MainAgentField::TokenEstimationTemplateHfCache => {
+                    let cache = ensure_nested_object_mut(
+                        &mut self.value,
+                        &["main_agent", "token_estimation_cache", "template"],
+                    );
+                    set_optional_trimmed_string(cache, field.key(), raw);
+                }
+                MainAgentField::TokenEstimationTokenizerHfCache => {
+                    let cache = ensure_nested_object_mut(
+                        &mut self.value,
+                        &["main_agent", "token_estimation_cache", "tokenizer"],
+                    );
+                    set_optional_trimmed_string(cache, field.key(), raw);
+                }
+                _ => {
+                    let main_agent = ensure_nested_object_mut(&mut self.value, &["main_agent"]);
+                    set_optional_trimmed_string(main_agent, field.key(), raw);
+                }
+            },
             MainAgentField::TimeAwarenessEmitSystemDateOnUserMessage
             | MainAgentField::TimeAwarenessEmitIdleTimeGapHint
             | MainAgentField::EnableContextCompression
@@ -2073,6 +2181,23 @@ impl ConfigEditorApp {
         } else {
             model.remove("context_window_tokens");
         }
+        set_token_estimation_object(
+            &mut model,
+            &form.token_template_source,
+            &form.token_template_path,
+            &form.token_template_repo,
+            &form.token_template_revision,
+            &form.token_template_file,
+            &form.token_template_field,
+            &form.token_template_cache_dir,
+            &form.token_tokenizer_source,
+            &form.token_tokenizer_encoding,
+            &form.token_tokenizer_path,
+            &form.token_tokenizer_repo,
+            &form.token_tokenizer_revision,
+            &form.token_tokenizer_file,
+            &form.token_tokenizer_cache_dir,
+        )?;
 
         let capabilities = parse_csv_items(&form.capabilities)
             .into_iter()
@@ -2262,6 +2387,18 @@ impl ConfigEditorApp {
                     .unwrap_or("/opt")
                     .to_string()
             }
+            MainAgentField::TokenEstimationTemplateHfCache => nested_string(
+                &self.value,
+                &["main_agent", "token_estimation_cache", "template", "hf"],
+            )
+            .unwrap_or("template-cache/hf")
+            .to_string(),
+            MainAgentField::TokenEstimationTokenizerHfCache => nested_string(
+                &self.value,
+                &["main_agent", "token_estimation_cache", "tokenizer", "hf"],
+            )
+            .unwrap_or("tokenizer-cache/hf")
+            .to_string(),
             MainAgentField::Language => nested_string(&self.value, &["main_agent", "language"])
                 .unwrap_or("zh-CN")
                 .to_string(),
@@ -2635,6 +2772,8 @@ impl ToolingField {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainAgentField {
     GlobalInstallRoot,
+    TokenEstimationTemplateHfCache,
+    TokenEstimationTokenizerHfCache,
     Language,
     MemorySystem,
     TimeAwarenessEmitSystemDateOnUserMessage,
@@ -2653,17 +2792,19 @@ impl MainAgentField {
     fn from_index(index: usize) -> Self {
         match index {
             0 => Self::GlobalInstallRoot,
-            1 => Self::Language,
-            2 => Self::MemorySystem,
-            3 => Self::TimeAwarenessEmitSystemDateOnUserMessage,
-            4 => Self::TimeAwarenessEmitIdleTimeGapHint,
-            5 => Self::EnableContextCompression,
-            6 => Self::ContextTriggerRatio,
-            7 => Self::ContextTokenLimitOverride,
-            8 => Self::ContextRecentFidelityTargetRatio,
-            9 => Self::IdleCompactionEnabled,
-            10 => Self::IdleCompactionPollIntervalSeconds,
-            11 => Self::IdleCompactionMinRatio,
+            1 => Self::TokenEstimationTemplateHfCache,
+            2 => Self::TokenEstimationTokenizerHfCache,
+            3 => Self::Language,
+            4 => Self::MemorySystem,
+            5 => Self::TimeAwarenessEmitSystemDateOnUserMessage,
+            6 => Self::TimeAwarenessEmitIdleTimeGapHint,
+            7 => Self::EnableContextCompression,
+            8 => Self::ContextTriggerRatio,
+            9 => Self::ContextTokenLimitOverride,
+            10 => Self::ContextRecentFidelityTargetRatio,
+            11 => Self::IdleCompactionEnabled,
+            12 => Self::IdleCompactionPollIntervalSeconds,
+            13 => Self::IdleCompactionMinRatio,
             _ => Self::TimeoutObservationCompactionEnabled,
         }
     }
@@ -2671,6 +2812,8 @@ impl MainAgentField {
     fn key(self) -> &'static str {
         match self {
             Self::GlobalInstallRoot => "global_install_root",
+            Self::TokenEstimationTemplateHfCache => "hf",
+            Self::TokenEstimationTokenizerHfCache => "hf",
             Self::Language => "language",
             Self::MemorySystem => "memory_system",
             Self::TimeAwarenessEmitSystemDateOnUserMessage => "emit_system_date_on_user_message",
@@ -2689,6 +2832,8 @@ impl MainAgentField {
     fn title(self) -> &'static str {
         match self {
             Self::GlobalInstallRoot => "main_agent.global_install_root",
+            Self::TokenEstimationTemplateHfCache => "token_estimation_cache.template.hf",
+            Self::TokenEstimationTokenizerHfCache => "token_estimation_cache.tokenizer.hf",
             Self::Language => "main_agent.language",
             Self::MemorySystem => "main_agent.memory_system",
             Self::TimeAwarenessEmitSystemDateOnUserMessage => {
@@ -2722,6 +2867,12 @@ impl MainAgentField {
     fn help(self) -> &'static str {
         match self {
             Self::GlobalInstallRoot => "Directory used for global installs",
+            Self::TokenEstimationTemplateHfCache => {
+                "HuggingFace chat template cache root, relative paths resolve under workdir"
+            }
+            Self::TokenEstimationTokenizerHfCache => {
+                "HuggingFace tokenizer cache root, relative paths resolve under workdir"
+            }
             Self::Language => "Language tag such as zh-CN or en-US",
             Self::MemorySystem => "Choose layered memory or Claude-style PARTCLAW memory",
             Self::TimeAwarenessEmitSystemDateOnUserMessage => {
@@ -2852,6 +3003,20 @@ enum ModelFormField {
     RetryMaxRetries,
     RetryRandomMean,
     ContextWindowTokens,
+    TokenTemplateSource,
+    TokenTemplatePath,
+    TokenTemplateRepo,
+    TokenTemplateRevision,
+    TokenTemplateFile,
+    TokenTemplateField,
+    TokenTemplateCacheDir,
+    TokenTokenizerSource,
+    TokenTokenizerEncoding,
+    TokenTokenizerPath,
+    TokenTokenizerRepo,
+    TokenTokenizerRevision,
+    TokenTokenizerFile,
+    TokenTokenizerCacheDir,
     Capabilities,
     SupportsVisionInput,
     AgentModelEnabled,
@@ -2879,6 +3044,20 @@ impl ModelFormField {
             Self::RetryMaxRetries => "retry_mode.max_retries",
             Self::RetryRandomMean => "retry_mode.retry_random_mean",
             Self::ContextWindowTokens => "context_window_tokens",
+            Self::TokenTemplateSource => "token_estimation.template.source",
+            Self::TokenTemplatePath => "token_estimation.template.path",
+            Self::TokenTemplateRepo => "token_estimation.template.repo",
+            Self::TokenTemplateRevision => "token_estimation.template.revision",
+            Self::TokenTemplateFile => "token_estimation.template.file",
+            Self::TokenTemplateField => "token_estimation.template.field",
+            Self::TokenTemplateCacheDir => "token_estimation.template.cache_dir",
+            Self::TokenTokenizerSource => "token_estimation.tokenizer.source",
+            Self::TokenTokenizerEncoding => "token_estimation.tokenizer.encoding",
+            Self::TokenTokenizerPath => "token_estimation.tokenizer.path",
+            Self::TokenTokenizerRepo => "token_estimation.tokenizer.repo",
+            Self::TokenTokenizerRevision => "token_estimation.tokenizer.revision",
+            Self::TokenTokenizerFile => "token_estimation.tokenizer.file",
+            Self::TokenTokenizerCacheDir => "token_estimation.tokenizer.cache_dir",
             Self::Capabilities => "capabilities",
             Self::SupportsVisionInput => "supports_vision_input",
             Self::AgentModelEnabled => "agent_model_enabled",
@@ -2906,6 +3085,22 @@ impl ModelFormField {
             Self::RetryMaxRetries => "Integer retry attempt count",
             Self::RetryRandomMean => "Mean random delay in seconds",
             Self::ContextWindowTokens => "Integer token window size",
+            Self::TokenTemplateSource => "Select builtin, local, or huggingface prompt template",
+            Self::TokenTemplatePath => "Path to tokenizer_config.json or a direct template file",
+            Self::TokenTemplateRepo => "HuggingFace model repo id",
+            Self::TokenTemplateRevision => "HuggingFace revision, branch, tag, or commit",
+            Self::TokenTemplateFile => "HuggingFace template metadata filename",
+            Self::TokenTemplateField => "JSON field containing the chat template",
+            Self::TokenTemplateCacheDir => "Optional HuggingFace cache directory",
+            Self::TokenTokenizerSource => "Select tiktoken, local, or huggingface tokenizer",
+            Self::TokenTokenizerEncoding => {
+                "Select auto, o200k_base, cl100k_base, or o200k_harmony"
+            }
+            Self::TokenTokenizerPath => "Path to tokenizer.json",
+            Self::TokenTokenizerRepo => "HuggingFace model repo id",
+            Self::TokenTokenizerRevision => "HuggingFace revision, branch, tag, or commit",
+            Self::TokenTokenizerFile => "HuggingFace tokenizer filename",
+            Self::TokenTokenizerCacheDir => "Optional HuggingFace cache directory",
             Self::Capabilities => "Pick one or more capability names",
             Self::SupportsVisionInput => "Toggle for image input support",
             Self::AgentModelEnabled => "Toggle whether it can act as a chat agent",
@@ -2932,6 +3127,57 @@ impl ModelFormField {
     }
 }
 
+fn token_estimation_object(raw: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    raw.get("token_estimation").and_then(Value::as_object)
+}
+
+fn token_estimation_section<'a>(
+    raw: &'a Map<String, Value>,
+    section: &str,
+) -> Option<&'a Map<String, Value>> {
+    token_estimation_object(raw)?
+        .get(section)
+        .and_then(Value::as_object)
+}
+
+fn token_estimation_root_str<'a>(raw: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    token_estimation_object(raw)?
+        .get(key)
+        .and_then(Value::as_str)
+}
+
+fn token_estimation_section_str<'a>(
+    raw: &'a Map<String, Value>,
+    section: &str,
+    key: &str,
+) -> Option<&'a str> {
+    token_estimation_section(raw, section)?
+        .get(key)
+        .and_then(Value::as_str)
+}
+
+fn token_estimation_source(raw: &Map<String, Value>, section: &str, default: &str) -> String {
+    token_estimation_section_str(raw, section, "source")
+        .or_else(|| {
+            (token_estimation_root_str(raw, "source") == Some("huggingface"))
+                .then_some("huggingface")
+        })
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn token_estimation_section_or_root_str(
+    raw: &Map<String, Value>,
+    section: &str,
+    key: &str,
+    default: &str,
+) -> String {
+    token_estimation_section_str(raw, section, key)
+        .or_else(|| token_estimation_root_str(raw, key))
+        .unwrap_or(default)
+        .to_string()
+}
+
 #[derive(Clone)]
 struct ModelFormState {
     existing_alias: Option<String>,
@@ -2950,6 +3196,20 @@ struct ModelFormState {
     retry_max_retries: String,
     retry_random_mean: String,
     context_window_tokens: String,
+    token_template_source: String,
+    token_template_path: String,
+    token_template_repo: String,
+    token_template_revision: String,
+    token_template_file: String,
+    token_template_field: String,
+    token_template_cache_dir: String,
+    token_tokenizer_source: String,
+    token_tokenizer_encoding: String,
+    token_tokenizer_path: String,
+    token_tokenizer_repo: String,
+    token_tokenizer_revision: String,
+    token_tokenizer_file: String,
+    token_tokenizer_cache_dir: String,
     capabilities: String,
     supports_vision_input: bool,
     agent_model_enabled: bool,
@@ -2981,6 +3241,20 @@ impl ModelFormState {
             retry_max_retries: "2".to_string(),
             retry_random_mean: "8".to_string(),
             context_window_tokens: "128000".to_string(),
+            token_template_source: "builtin".to_string(),
+            token_template_path: String::new(),
+            token_template_repo: String::new(),
+            token_template_revision: "main".to_string(),
+            token_template_file: "tokenizer_config.json".to_string(),
+            token_template_field: "chat_template".to_string(),
+            token_template_cache_dir: String::new(),
+            token_tokenizer_source: "tiktoken".to_string(),
+            token_tokenizer_encoding: "auto".to_string(),
+            token_tokenizer_path: String::new(),
+            token_tokenizer_repo: String::new(),
+            token_tokenizer_revision: "main".to_string(),
+            token_tokenizer_file: "tokenizer.json".to_string(),
+            token_tokenizer_cache_dir: String::new(),
             capabilities: defaults.capabilities.to_string(),
             supports_vision_input: defaults.supports_vision_input,
             agent_model_enabled: defaults.agent_model_enabled,
@@ -3066,6 +3340,72 @@ impl ModelFormState {
                 .get("context_window_tokens")
                 .and_then(value_to_string)
                 .unwrap_or_else(|| "128000".to_string()),
+            token_template_source: token_estimation_source(&raw, "template", "builtin"),
+            token_template_path: raw
+                .get("token_estimation")
+                .and_then(Value::as_object)
+                .and_then(|token| token.get("template"))
+                .and_then(Value::as_object)
+                .and_then(|template| template.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            token_template_repo: token_estimation_section_or_root_str(&raw, "template", "repo", ""),
+            token_template_revision: token_estimation_section_or_root_str(
+                &raw, "template", "revision", "main",
+            ),
+            token_template_file: token_estimation_section_str(&raw, "template", "file")
+                .unwrap_or("tokenizer_config.json")
+                .to_string(),
+            token_template_field: token_estimation_section_str(&raw, "template", "field")
+                .unwrap_or("chat_template")
+                .to_string(),
+            token_template_cache_dir: token_estimation_section_or_root_str(
+                &raw,
+                "template",
+                "cache_dir",
+                "",
+            ),
+            token_tokenizer_source: token_estimation_source(&raw, "tokenizer", "tiktoken"),
+            token_tokenizer_encoding: raw
+                .get("token_estimation")
+                .and_then(Value::as_object)
+                .and_then(|token| token.get("tokenizer"))
+                .and_then(Value::as_object)
+                .and_then(|tokenizer| tokenizer.get("encoding"))
+                .and_then(Value::as_str)
+                .unwrap_or("auto")
+                .to_string(),
+            token_tokenizer_path: raw
+                .get("token_estimation")
+                .and_then(Value::as_object)
+                .and_then(|token| token.get("tokenizer"))
+                .and_then(Value::as_object)
+                .and_then(|tokenizer| tokenizer.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            token_tokenizer_repo: token_estimation_section_or_root_str(
+                &raw,
+                "tokenizer",
+                "repo",
+                "",
+            ),
+            token_tokenizer_revision: token_estimation_section_or_root_str(
+                &raw,
+                "tokenizer",
+                "revision",
+                "main",
+            ),
+            token_tokenizer_file: token_estimation_section_str(&raw, "tokenizer", "file")
+                .unwrap_or("tokenizer.json")
+                .to_string(),
+            token_tokenizer_cache_dir: token_estimation_section_or_root_str(
+                &raw,
+                "tokenizer",
+                "cache_dir",
+                "",
+            ),
             capabilities: raw
                 .get("capabilities")
                 .and_then(Value::as_array)
@@ -3129,6 +3469,8 @@ impl ModelFormState {
             ModelFormField::TimeoutSeconds,
             ModelFormField::RetryMode,
             ModelFormField::ContextWindowTokens,
+            ModelFormField::TokenTemplateSource,
+            ModelFormField::TokenTokenizerSource,
             ModelFormField::Capabilities,
             ModelFormField::SupportsVisionInput,
             ModelFormField::AgentModelEnabled,
@@ -3150,6 +3492,46 @@ impl ModelFormState {
         {
             fields.insert(index + 1, ModelFormField::RetryMaxRetries);
             fields.insert(index + 2, ModelFormField::RetryRandomMean);
+        }
+        if self.token_template_source == "local"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::TokenTemplateSource)
+        {
+            fields.insert(index + 1, ModelFormField::TokenTemplatePath);
+            fields.insert(index + 2, ModelFormField::TokenTemplateField);
+        } else if self.token_template_source == "huggingface"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::TokenTemplateSource)
+        {
+            fields.insert(index + 1, ModelFormField::TokenTemplateRepo);
+            fields.insert(index + 2, ModelFormField::TokenTemplateRevision);
+            fields.insert(index + 3, ModelFormField::TokenTemplateFile);
+            fields.insert(index + 4, ModelFormField::TokenTemplateField);
+            fields.insert(index + 5, ModelFormField::TokenTemplateCacheDir);
+        }
+        if self.token_tokenizer_source == "tiktoken"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::TokenTokenizerSource)
+        {
+            fields.insert(index + 1, ModelFormField::TokenTokenizerEncoding);
+        } else if self.token_tokenizer_source == "local"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::TokenTokenizerSource)
+        {
+            fields.insert(index + 1, ModelFormField::TokenTokenizerPath);
+        } else if self.token_tokenizer_source == "huggingface"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::TokenTokenizerSource)
+        {
+            fields.insert(index + 1, ModelFormField::TokenTokenizerRepo);
+            fields.insert(index + 2, ModelFormField::TokenTokenizerRevision);
+            fields.insert(index + 3, ModelFormField::TokenTokenizerFile);
+            fields.insert(index + 4, ModelFormField::TokenTokenizerCacheDir);
         }
         fields
     }
@@ -3205,6 +3587,20 @@ impl ModelFormState {
             ModelFormField::RetryMaxRetries => self.retry_max_retries.clone(),
             ModelFormField::RetryRandomMean => self.retry_random_mean.clone(),
             ModelFormField::ContextWindowTokens => self.context_window_tokens.clone(),
+            ModelFormField::TokenTemplateSource => self.token_template_source.clone(),
+            ModelFormField::TokenTemplatePath => self.token_template_path.clone(),
+            ModelFormField::TokenTemplateRepo => self.token_template_repo.clone(),
+            ModelFormField::TokenTemplateRevision => self.token_template_revision.clone(),
+            ModelFormField::TokenTemplateFile => self.token_template_file.clone(),
+            ModelFormField::TokenTemplateField => self.token_template_field.clone(),
+            ModelFormField::TokenTemplateCacheDir => self.token_template_cache_dir.clone(),
+            ModelFormField::TokenTokenizerSource => self.token_tokenizer_source.clone(),
+            ModelFormField::TokenTokenizerEncoding => self.token_tokenizer_encoding.clone(),
+            ModelFormField::TokenTokenizerPath => self.token_tokenizer_path.clone(),
+            ModelFormField::TokenTokenizerRepo => self.token_tokenizer_repo.clone(),
+            ModelFormField::TokenTokenizerRevision => self.token_tokenizer_revision.clone(),
+            ModelFormField::TokenTokenizerFile => self.token_tokenizer_file.clone(),
+            ModelFormField::TokenTokenizerCacheDir => self.token_tokenizer_cache_dir.clone(),
             ModelFormField::Capabilities => self.capabilities.clone(),
             ModelFormField::SupportsVisionInput => bool_string(self.supports_vision_input),
             ModelFormField::AgentModelEnabled => bool_string(self.agent_model_enabled),
@@ -3232,6 +3628,20 @@ impl ModelFormState {
             ModelFormField::RetryMaxRetries => self.retry_max_retries = value,
             ModelFormField::RetryRandomMean => self.retry_random_mean = value,
             ModelFormField::ContextWindowTokens => self.context_window_tokens = value,
+            ModelFormField::TokenTemplateSource => self.token_template_source = value,
+            ModelFormField::TokenTemplatePath => self.token_template_path = value,
+            ModelFormField::TokenTemplateRepo => self.token_template_repo = value,
+            ModelFormField::TokenTemplateRevision => self.token_template_revision = value,
+            ModelFormField::TokenTemplateFile => self.token_template_file = value,
+            ModelFormField::TokenTemplateField => self.token_template_field = value,
+            ModelFormField::TokenTemplateCacheDir => self.token_template_cache_dir = value,
+            ModelFormField::TokenTokenizerSource => self.token_tokenizer_source = value,
+            ModelFormField::TokenTokenizerEncoding => self.token_tokenizer_encoding = value,
+            ModelFormField::TokenTokenizerPath => self.token_tokenizer_path = value,
+            ModelFormField::TokenTokenizerRepo => self.token_tokenizer_repo = value,
+            ModelFormField::TokenTokenizerRevision => self.token_tokenizer_revision = value,
+            ModelFormField::TokenTokenizerFile => self.token_tokenizer_file = value,
+            ModelFormField::TokenTokenizerCacheDir => self.token_tokenizer_cache_dir = value,
             ModelFormField::Capabilities => self.capabilities = value,
             ModelFormField::ImageToolModel => self.image_tool_model = value,
             ModelFormField::ModelWebSearch => self.model_web_search = value,
@@ -3293,6 +3703,23 @@ impl ModelFormState {
             &self.retry_mode,
             &self.retry_max_retries,
             &self.retry_random_mean,
+        );
+        let _ = set_token_estimation_object(
+            &mut model,
+            &self.token_template_source,
+            &self.token_template_path,
+            &self.token_template_repo,
+            &self.token_template_revision,
+            &self.token_template_file,
+            &self.token_template_field,
+            &self.token_template_cache_dir,
+            &self.token_tokenizer_source,
+            &self.token_tokenizer_encoding,
+            &self.token_tokenizer_path,
+            &self.token_tokenizer_repo,
+            &self.token_tokenizer_revision,
+            &self.token_tokenizer_file,
+            &self.token_tokenizer_cache_dir,
         );
         if !self.capabilities.trim().is_empty() {
             model.insert(
@@ -3688,6 +4115,76 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
             "128000 or 262144",
             "Used to size prompt compaction and budgeting.",
         ),
+        ModelFormField::TokenTemplateSource => (
+            "Which chat template renderer to use for local token estimates.",
+            "builtin, local, or huggingface",
+            "builtin is the default. huggingface downloads only tokenizer_config.json by default.",
+        ),
+        ModelFormField::TokenTemplatePath => (
+            "Local path to tokenizer_config.json or a direct Jinja chat template.",
+            "./tokenizers/qwen/tokenizer_config.json",
+            "Relative paths are resolved from the config file directory.",
+        ),
+        ModelFormField::TokenTemplateRepo => (
+            "HuggingFace repo id for the chat template metadata.",
+            "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "Only small tokenizer metadata files are fetched; model weights are never requested.",
+        ),
+        ModelFormField::TokenTemplateRevision => (
+            "HuggingFace branch, tag, or commit for the template file.",
+            "main or a commit hash",
+            "Pinned commits are best for stable production estimates.",
+        ),
+        ModelFormField::TokenTemplateFile => (
+            "HuggingFace filename containing the chat template.",
+            "tokenizer_config.json",
+            "Allowed files are limited to tokenizer/template metadata, not weights.",
+        ),
+        ModelFormField::TokenTemplateField => (
+            "JSON field containing the chat template.",
+            "chat_template",
+            "Used for local JSON and HuggingFace tokenizer_config.json templates.",
+        ),
+        ModelFormField::TokenTemplateCacheDir => (
+            "Optional HuggingFace cache directory for template metadata.",
+            "./hf-cache",
+            "Leave blank to use the normal HF_HOME/default HuggingFace cache.",
+        ),
+        ModelFormField::TokenTokenizerSource => (
+            "Which tokenizer implementation to use for local token estimates.",
+            "tiktoken, local, or huggingface",
+            "huggingface downloads only tokenizer.json by default. tiktoken uses the configured encoding.",
+        ),
+        ModelFormField::TokenTokenizerEncoding => (
+            "Which tiktoken encoding to use.",
+            "auto, o200k_base, cl100k_base, o200k_harmony",
+            "auto chooses from the model name. Use an explicit value to override the heuristic.",
+        ),
+        ModelFormField::TokenTokenizerPath => (
+            "Local path to HuggingFace tokenizer.json.",
+            "./tokenizers/qwen/tokenizer.json",
+            "Relative paths are resolved from the config file directory.",
+        ),
+        ModelFormField::TokenTokenizerRepo => (
+            "HuggingFace repo id for tokenizer.json.",
+            "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "Only tokenizer metadata is fetched; model weights are never requested.",
+        ),
+        ModelFormField::TokenTokenizerRevision => (
+            "HuggingFace branch, tag, or commit for tokenizer.json.",
+            "main or a commit hash",
+            "Pinned commits are best for stable production estimates.",
+        ),
+        ModelFormField::TokenTokenizerFile => (
+            "HuggingFace tokenizer filename.",
+            "tokenizer.json",
+            "Keep this as tokenizer.json unless the repo stores a compatible tokenizer file elsewhere.",
+        ),
+        ModelFormField::TokenTokenizerCacheDir => (
+            "Optional HuggingFace cache directory for tokenizer metadata.",
+            "./hf-cache",
+            "Leave blank to use the normal HF_HOME/default HuggingFace cache.",
+        ),
         ModelFormField::Capabilities => (
             "Pick every capability this model can serve from the checklist.",
             "chat, web_search, image_in, image_out, pdf, audio_in",
@@ -4022,6 +4519,31 @@ fn retry_mode_index(retry_mode: &str) -> usize {
     }
 }
 
+fn token_template_source_index(source: &str) -> usize {
+    match source {
+        "local" => 1,
+        "huggingface" => 2,
+        _ => 0,
+    }
+}
+
+fn token_tokenizer_source_index(source: &str) -> usize {
+    match source {
+        "local" => 1,
+        "huggingface" => 2,
+        _ => 0,
+    }
+}
+
+fn token_tokenizer_encoding_index(encoding: &str) -> usize {
+    match encoding {
+        "o200k_base" => 1,
+        "cl100k_base" => 2,
+        "o200k_harmony" => 3,
+        _ => 0,
+    }
+}
+
 fn current_sandbox_mode_index(value: &Value) -> usize {
     match nested_string(value, &["sandbox", "mode"]).unwrap_or("subprocess") {
         "subprocess" | "disabled" => 0,
@@ -4191,6 +4713,14 @@ fn latest_server_config_skeleton() -> Value {
             },
             "language": "zh-CN",
             "memory_system": "layered",
+            "token_estimation_cache": {
+                "template": {
+                    "hf": "template-cache/hf"
+                },
+                "tokenizer": {
+                    "hf": "tokenizer-cache/hf"
+                }
+            },
             "time_awareness": {
                 "emit_system_date_on_user_message": false,
                 "emit_idle_time_gap_hint": true
@@ -4355,6 +4885,155 @@ fn set_retry_mode_object(
     Ok(())
 }
 
+fn set_token_estimation_object(
+    object: &mut Map<String, Value>,
+    template_source: &str,
+    template_path: &str,
+    template_repo: &str,
+    template_revision: &str,
+    template_file: &str,
+    template_field: &str,
+    template_cache_dir: &str,
+    tokenizer_source: &str,
+    tokenizer_encoding: &str,
+    tokenizer_path: &str,
+    tokenizer_repo: &str,
+    tokenizer_revision: &str,
+    tokenizer_file: &str,
+    tokenizer_cache_dir: &str,
+) -> Result<()> {
+    let template_source = template_source.trim();
+    let tokenizer_source = tokenizer_source.trim();
+    let template_is_default = template_source.is_empty() || template_source == "builtin";
+    let tokenizer_is_default = (tokenizer_source.is_empty() || tokenizer_source == "tiktoken")
+        && (tokenizer_encoding.trim().is_empty() || tokenizer_encoding.trim() == "auto");
+    if template_is_default && tokenizer_is_default {
+        object.remove("token_estimation");
+        return Ok(());
+    }
+
+    let mut token_estimation = Map::new();
+    match template_source {
+        "" | "builtin" => {}
+        "local" => {
+            let path = trim_non_empty(template_path, "token_estimation.template.path")?;
+            let field = if template_field.trim().is_empty() {
+                "chat_template"
+            } else {
+                template_field.trim()
+            };
+            token_estimation.insert(
+                "template".to_string(),
+                json!({
+                    "source": "local",
+                    "path": path,
+                    "field": field
+                }),
+            );
+        }
+        "huggingface" => {
+            let repo = trim_non_empty(template_repo, "token_estimation.template.repo")?;
+            let revision = if template_revision.trim().is_empty() {
+                "main"
+            } else {
+                template_revision.trim()
+            };
+            let file = if template_file.trim().is_empty() {
+                "tokenizer_config.json"
+            } else {
+                template_file.trim()
+            };
+            let field = if template_field.trim().is_empty() {
+                "chat_template"
+            } else {
+                template_field.trim()
+            };
+            let mut template = json!({
+                "source": "huggingface",
+                "repo": repo,
+                "revision": revision,
+                "file": file,
+                "field": field
+            });
+            if let Some(object) = template.as_object_mut() {
+                set_optional_trimmed_string(object, "cache_dir", template_cache_dir);
+            }
+            token_estimation.insert("template".to_string(), template);
+        }
+        _ if !template_is_default => {
+            bail!("token_estimation.template.source must be builtin, local, or huggingface");
+        }
+        _ => {}
+    }
+
+    match tokenizer_source {
+        "" | "tiktoken" => {
+            let encoding = if tokenizer_encoding.trim().is_empty() {
+                "auto"
+            } else {
+                tokenizer_encoding.trim()
+            };
+            if !matches!(
+                encoding,
+                "auto" | "o200k_base" | "cl100k_base" | "o200k_harmony"
+            ) {
+                bail!(
+                    "token_estimation.tokenizer.encoding must be auto, o200k_base, cl100k_base, or o200k_harmony"
+                );
+            }
+            if encoding != "auto" {
+                token_estimation.insert(
+                    "tokenizer".to_string(),
+                    json!({
+                        "source": "tiktoken",
+                        "encoding": encoding
+                    }),
+                );
+            }
+        }
+        "local" => {
+            let path = trim_non_empty(tokenizer_path, "token_estimation.tokenizer.path")?;
+            token_estimation.insert(
+                "tokenizer".to_string(),
+                json!({
+                    "source": "local",
+                    "path": path
+                }),
+            );
+        }
+        "huggingface" => {
+            let repo = trim_non_empty(tokenizer_repo, "token_estimation.tokenizer.repo")?;
+            let revision = if tokenizer_revision.trim().is_empty() {
+                "main"
+            } else {
+                tokenizer_revision.trim()
+            };
+            let file = if tokenizer_file.trim().is_empty() {
+                "tokenizer.json"
+            } else {
+                tokenizer_file.trim()
+            };
+            let mut tokenizer = json!({
+                "source": "huggingface",
+                "repo": repo,
+                "revision": revision,
+                "file": file
+            });
+            if let Some(object) = tokenizer.as_object_mut() {
+                set_optional_trimmed_string(object, "cache_dir", tokenizer_cache_dir);
+            }
+            token_estimation.insert("tokenizer".to_string(), tokenizer);
+        }
+        _ => bail!("token_estimation.tokenizer.source must be tiktoken, local, or huggingface"),
+    }
+
+    object.insert(
+        "token_estimation".to_string(),
+        Value::Object(token_estimation),
+    );
+    Ok(())
+}
+
 fn parse_u64(raw: &str) -> Result<Option<u64>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4464,6 +5143,14 @@ mod tests {
         let skeleton = latest_server_config_skeleton();
         assert_eq!(skeleton["version"], json!(LATEST_CONFIG_VERSION));
         assert_eq!(skeleton["main_agent"]["memory_system"], json!("layered"));
+        assert_eq!(
+            skeleton["main_agent"]["token_estimation_cache"]["template"]["hf"],
+            json!("template-cache/hf")
+        );
+        assert_eq!(
+            skeleton["main_agent"]["token_estimation_cache"]["tokenizer"]["hf"],
+            json!("tokenizer-cache/hf")
+        );
         assert_eq!(skeleton["sandbox"]["mode"], json!("subprocess"));
         assert_eq!(skeleton["sandbox"]["map_docker_socket"], json!(false));
         assert_eq!(

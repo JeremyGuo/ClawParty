@@ -384,6 +384,7 @@ impl PersistentChildRuntime {
         workspace_root: &Path,
         runtime_state_root: &Path,
         global_install_root: PathBuf,
+        token_estimation_cache_roots: Vec<PathBuf>,
         skill_memory_source: PathBuf,
         skills_source_root: PathBuf,
         skills_dirs: &[std::path::PathBuf],
@@ -403,6 +404,7 @@ impl PersistentChildRuntime {
                 workspace_root,
                 runtime_state_root,
                 &global_install_root,
+                &token_estimation_cache_roots,
                 &workspace_root.join(".skill_memory"),
                 &skill_memory_source,
                 &skills_source_root,
@@ -629,6 +631,7 @@ pub fn run_one_shot_child_turn(
     config: agent_frame::config::AgentConfig,
     execution_options: BackendExecutionOptions,
     global_install_root: PathBuf,
+    token_estimation_cache_roots: Vec<PathBuf>,
     skill_memory_source: PathBuf,
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
@@ -639,6 +642,7 @@ pub fn run_one_shot_child_turn(
         &config.workspace_root,
         &config.runtime_state_root,
         global_install_root,
+        token_estimation_cache_roots,
         skill_memory_source,
         skills_source_root,
         &config.skills_dirs,
@@ -666,6 +670,7 @@ fn build_bubblewrap_command(
     workspace_root: &Path,
     runtime_state_root: &Path,
     global_install_root: &Path,
+    token_estimation_cache_roots: &[PathBuf],
     skill_memory_target: &Path,
     skill_memory_source: &Path,
     skills_source_root: &Path,
@@ -723,6 +728,9 @@ fn build_bubblewrap_command(
         let home_skeleton = prepare_sandbox_home_skeleton(runtime_state_root, &home_dir)?;
         ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, workspace_root)?;
         ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, runtime_state_root)?;
+        for cache_root in token_estimation_cache_roots {
+            ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, cache_root)?;
+        }
         bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
     }
     bind_path(&mut command, workspace_root, false)?;
@@ -735,6 +743,18 @@ fn build_bubblewrap_command(
             )
         })?;
         bind_path(&mut command, global_install_root, false)?;
+    }
+    for cache_root in token_estimation_cache_roots {
+        if cache_root.as_os_str().is_empty() {
+            continue;
+        }
+        fs::create_dir_all(cache_root).with_context(|| {
+            format!(
+                "failed to prepare token estimation cache root {}",
+                cache_root.display()
+            )
+        })?;
+        bind_path(&mut command, cache_root, false)?;
     }
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
@@ -890,6 +910,7 @@ mod tests {
             &workspace_root,
             &runtime_state_root,
             &global_install_root,
+            &[],
             &workspace_root.join(".skill_memory"),
             &skill_memory_source,
             &skills_source_root,
@@ -937,6 +958,7 @@ mod tests {
             &workspace_root,
             &runtime_state_root,
             &missing_global_install_root,
+            &[],
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -956,6 +978,60 @@ mod tests {
             "bubblewrap args did not reference created global_install_root: {:?}",
             args
         );
+    }
+
+    #[test]
+    fn bubblewrap_mounts_token_estimation_cache_roots_as_writable_binds() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let global_install_root = temp_dir.path().join("global");
+        let template_cache_root = temp_dir.path().join("template-cache").join("hf");
+        let tokenizer_cache_root = temp_dir.path().join("tokenizer-cache").join("hf");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&global_install_root).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &global_install_root,
+            &[template_cache_root.clone(), tokenizer_cache_root.clone()],
+            &workspace_root.join(".skill_memory"),
+            &temp_dir.path().join("skill_memory"),
+            &temp_dir.path().join("skills-source"),
+            &[],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for cache_root in [&template_cache_root, &tokenizer_cache_root] {
+            assert!(cache_root.is_dir());
+            let expected = vec![
+                "--bind".to_string(),
+                cache_root.to_string_lossy().into_owned(),
+                cache_root.to_string_lossy().into_owned(),
+            ];
+            assert!(
+                args.windows(expected.len())
+                    .any(|window| window == expected),
+                "bubblewrap args did not include writable token cache bind: {:?}",
+                args
+            );
+        }
     }
 
     #[test]
@@ -981,6 +1057,7 @@ mod tests {
             &workspace_root,
             &runtime_state_root,
             &global_install_root,
+            &[],
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),

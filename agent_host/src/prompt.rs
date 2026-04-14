@@ -266,7 +266,7 @@ mod tests {
     use crate::bootstrap::AgentWorkspace;
     use crate::config::{
         ContextCompactionConfig, IdleCompactionConfig, MainAgentConfig, ModelConfig,
-        TimeAwarenessConfig, TimeoutObservationCompactionConfig,
+        TimeAwarenessConfig, TimeoutObservationCompactionConfig, TokenEstimationCacheConfig,
     };
     use crate::domain::ChannelAddress;
     use crate::session::SessionSnapshot;
@@ -345,6 +345,7 @@ mod tests {
             cache_ttl: None,
             reasoning: None,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: Vec::new(),
         };
@@ -373,6 +374,7 @@ mod tests {
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
             time_awareness: TimeAwarenessConfig::default(),
+            token_estimation_cache: TokenEstimationCacheConfig::default(),
             memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
@@ -522,6 +524,7 @@ mod tests {
             cache_ttl: None,
             reasoning: None,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: Vec::new(),
         };
@@ -547,6 +550,7 @@ mod tests {
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
             time_awareness: TimeAwarenessConfig::default(),
+            token_estimation_cache: TokenEstimationCacheConfig::default(),
             memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
@@ -659,6 +663,7 @@ mod tests {
             cache_ttl: None,
             reasoning: None,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: Vec::new(),
         };
@@ -684,6 +689,7 @@ mod tests {
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
             time_awareness: TimeAwarenessConfig::default(),
+            token_estimation_cache: TokenEstimationCacheConfig::default(),
             memory_system: agent_frame::config::MemorySystem::ClaudeCode,
         };
 

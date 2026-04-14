@@ -528,9 +528,9 @@ pub(super) fn format_session_status(
         .and_then(|state| state.context_window_current)
         .is_some()
     {
-        "native actual"
+        "native actual".to_string()
     } else {
-        "local estimate"
+        format!("local estimate, {}", token_estimation_status_label(model))
     };
     let language = language.to_ascii_lowercase();
     if language.starts_with("zh") {
@@ -564,7 +564,7 @@ pub(super) fn format_session_status(
                 current_context_estimate,
                 current_context_limit,
                 context_percent,
-                context_source_label
+                context_source_label.as_str()
             ),
             String::new(),
             "Token 用量：".to_string(),
@@ -656,7 +656,7 @@ pub(super) fn format_session_status(
                 current_context_estimate,
                 current_context_limit,
                 context_percent,
-                context_source_label
+                context_source_label.as_str()
             ),
             String::new(),
             "Token usage:".to_string(),
@@ -720,6 +720,47 @@ pub(super) fn format_session_status(
         }
         lines.join("\n")
     }
+}
+
+fn token_estimation_status_label(model: &ModelConfig) -> String {
+    let Some(config) = model.token_estimation.as_ref() else {
+        return format!(
+            "template=builtin, tokenizer={}",
+            token_estimator_label_for_model(&model.model)
+        );
+    };
+    let template = match config.template.as_ref() {
+        Some(TokenEstimationTemplateConfig::Builtin) => "builtin".to_string(),
+        Some(TokenEstimationTemplateConfig::Local { .. }) => "local".to_string(),
+        Some(TokenEstimationTemplateConfig::Huggingface { repo, .. }) => {
+            format!("huggingface:{repo}")
+        }
+        None if config.source == Some(TokenEstimationSource::Huggingface) => config
+            .repo
+            .as_deref()
+            .map(|repo| format!("huggingface:{repo}"))
+            .unwrap_or_else(|| "huggingface".to_string()),
+        None => "builtin".to_string(),
+    };
+    let tokenizer = match config.tokenizer.as_ref() {
+        Some(TokenEstimationTokenizerConfig::Tiktoken { encoding }) => {
+            format!("tiktoken:{encoding:?}")
+        }
+        Some(TokenEstimationTokenizerConfig::Local { .. }) => "local".to_string(),
+        Some(TokenEstimationTokenizerConfig::Huggingface { repo, .. }) => {
+            format!("huggingface:{repo}")
+        }
+        None if config.source == Some(TokenEstimationSource::Huggingface) => config
+            .repo
+            .as_deref()
+            .map(|repo| format!("huggingface:{repo}"))
+            .unwrap_or_else(|| "huggingface".to_string()),
+        None => token_estimator_label_for_model(&model.model).to_string(),
+    };
+    let calibration = prompt_token_calibration_for_model(&model.model)
+        .map(|(ratio, samples)| format!(", calibration={ratio:.3}x/{samples} samples"))
+        .unwrap_or_default();
+    format!("template={template}, tokenizer={tokenizer}{calibration}")
 }
 
 fn format_idle_compaction_error_status(language: &str, session: &SessionSnapshot) -> String {
@@ -905,13 +946,26 @@ pub(super) fn estimate_current_context_tokens_for_session(
         model_key,
         None,
     )?;
-    let skills = discover_skills(&frame_config.skills_dirs)?;
     let extra_tools = runtime.build_extra_tools(
         session,
         AgentPromptKind::MainForeground,
         session.agent_id,
         None,
     );
+    let model = runtime.model_config(model_key)?;
+    let effective_backend = runtime
+        .selected_agent_backend()
+        .or_else(|| runtime.inferred_agent_backend_for_model(model_key))
+        .unwrap_or(AgentBackendKind::AgentFrame);
+    if effective_backend == AgentBackendKind::AgentFrame {
+        return estimate_configured_session_tokens(
+            session.request_messages(),
+            "",
+            frame_config,
+            extra_tools,
+        );
+    }
+    let skills = discover_skills(&frame_config.skills_dirs)?;
     let registry = build_tool_registry(
         &frame_config.enabled_tools,
         &frame_config.workspace_root,
@@ -926,17 +980,18 @@ pub(super) fn estimate_current_context_tokens_for_session(
         &extra_tools,
     )?;
     let tools = registry.into_values().collect::<Vec<_>>();
-    let model = runtime.model_config(model_key)?;
-    let effective_backend = runtime
-        .selected_agent_backend()
-        .or_else(|| runtime.inferred_agent_backend_for_model(model_key))
-        .unwrap_or(AgentBackendKind::AgentFrame);
     let sanitized_messages = sanitize_messages_for_model_capabilities(
         &session.request_messages(),
         model,
         backend_supports_native_multimodal_input(effective_backend),
     );
-    Ok(estimate_session_tokens(&sanitized_messages, &tools, ""))
+    Ok(estimate_session_tokens_for_model_with_config(
+        &sanitized_messages,
+        &tools,
+        "",
+        &model.model,
+        model.token_estimation.as_ref(),
+    ))
 }
 
 pub(super) fn effective_context_window_limit_for_session(

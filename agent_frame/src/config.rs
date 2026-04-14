@@ -100,6 +100,129 @@ pub struct UpstreamConfig {
     pub native_audio_input: bool,
     #[serde(default)]
     pub native_image_generation: bool,
+    #[serde(default)]
+    pub token_estimation: Option<TokenEstimationConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEstimationTiktokenEncoding {
+    #[default]
+    Auto,
+    O200kBase,
+    Cl100kBase,
+    O200kHarmony,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEstimationSource {
+    Huggingface,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TokenEstimationTemplateConfig {
+    Builtin,
+    Local {
+        path: PathBuf,
+        #[serde(default = "default_token_estimation_template_field")]
+        field: String,
+    },
+    Huggingface {
+        repo: String,
+        #[serde(default = "default_huggingface_revision")]
+        revision: String,
+        #[serde(default = "default_huggingface_template_file")]
+        file: String,
+        #[serde(default = "default_token_estimation_template_field")]
+        field: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TokenEstimationTokenizerConfig {
+    Tiktoken {
+        #[serde(default)]
+        encoding: TokenEstimationTiktokenEncoding,
+    },
+    Local {
+        path: PathBuf,
+    },
+    Huggingface {
+        repo: String,
+        #[serde(default = "default_huggingface_revision")]
+        revision: String,
+        #[serde(default = "default_huggingface_tokenizer_file")]
+        file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenEstimationConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TokenEstimationSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TokenEstimationTemplateConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<TokenEstimationTokenizerConfig>,
+}
+
+impl TokenEstimationConfig {
+    pub fn resolve_paths(&self, base_dir: &Path) -> Self {
+        let mut resolved = self.clone();
+        if let Some(TokenEstimationTemplateConfig::Local { path, .. }) = &mut resolved.template {
+            *path = resolve_path(&path.to_string_lossy(), base_dir);
+        }
+        if let Some(TokenEstimationTemplateConfig::Huggingface {
+            cache_dir: Some(cache_dir),
+            ..
+        }) = &mut resolved.template
+        {
+            *cache_dir = resolve_path(&cache_dir.to_string_lossy(), base_dir);
+        }
+        if let Some(TokenEstimationTokenizerConfig::Local { path }) = &mut resolved.tokenizer {
+            *path = resolve_path(&path.to_string_lossy(), base_dir);
+        }
+        if let Some(TokenEstimationTokenizerConfig::Huggingface {
+            cache_dir: Some(cache_dir),
+            ..
+        }) = &mut resolved.tokenizer
+        {
+            *cache_dir = resolve_path(&cache_dir.to_string_lossy(), base_dir);
+        }
+        if let Some(cache_dir) = &mut resolved.cache_dir {
+            *cache_dir = resolve_path(&cache_dir.to_string_lossy(), base_dir);
+        }
+        resolved
+    }
+}
+
+fn default_token_estimation_template_field() -> String {
+    "chat_template".to_string()
+}
+
+fn default_huggingface_revision() -> String {
+    "main".to_string()
+}
+
+fn default_huggingface_template_file() -> String {
+    "tokenizer_config.json".to_string()
+}
+
+fn default_huggingface_tokenizer_file() -> String {
+    "tokenizer.json".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,6 +434,8 @@ struct UpstreamConfigRaw {
     native_audio_input: bool,
     #[serde(default)]
     native_image_generation: bool,
+    #[serde(default)]
+    token_estimation: Option<TokenEstimationConfig>,
 }
 
 fn default_api_key_env() -> String {
@@ -390,7 +515,7 @@ fn resolve_path(path: &str, base_dir: &Path) -> PathBuf {
     }
 }
 
-fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
+fn resolve_upstream(raw: UpstreamConfigRaw, base_dir: &Path) -> UpstreamConfig {
     let reasoning = match (&raw.reasoning, &raw.reasoning_effort) {
         (Some(reasoning), _) => Some(reasoning.clone()),
         (None, Some(effort)) => Some(ReasoningConfig {
@@ -428,6 +553,9 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         native_pdf_input: raw.native_pdf_input,
         native_audio_input: raw.native_audio_input,
         native_image_generation: raw.native_image_generation,
+        token_estimation: raw
+            .token_estimation
+            .map(|config| config.resolve_paths(base_dir)),
     }
 }
 
@@ -553,11 +681,19 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
 
     Ok(AgentConfig {
         enabled_tools: normalize_enabled_tools(raw.enabled_tools),
-        upstream: resolve_upstream(raw.upstream),
-        image_tool_upstream: raw.image_tool_upstream.map(resolve_upstream),
-        pdf_tool_upstream: raw.pdf_tool_upstream.map(resolve_upstream),
-        audio_tool_upstream: raw.audio_tool_upstream.map(resolve_upstream),
-        image_generation_tool_upstream: raw.image_generation_tool_upstream.map(resolve_upstream),
+        upstream: resolve_upstream(raw.upstream, base_dir),
+        image_tool_upstream: raw
+            .image_tool_upstream
+            .map(|upstream| resolve_upstream(upstream, base_dir)),
+        pdf_tool_upstream: raw
+            .pdf_tool_upstream
+            .map(|upstream| resolve_upstream(upstream, base_dir)),
+        audio_tool_upstream: raw
+            .audio_tool_upstream
+            .map(|upstream| resolve_upstream(upstream, base_dir)),
+        image_generation_tool_upstream: raw
+            .image_generation_tool_upstream
+            .map(|upstream| resolve_upstream(upstream, base_dir)),
         skills_dirs: raw
             .skills_dirs
             .iter()

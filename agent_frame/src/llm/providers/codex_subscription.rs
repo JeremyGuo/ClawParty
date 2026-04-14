@@ -601,6 +601,7 @@ mod tests {
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         }
     }
 

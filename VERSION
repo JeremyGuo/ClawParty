@@ -1,5 +1,49 @@
-version: 0.15.5
+version: 0.18.0
 ---
+
+# 0.18.0
+
+- 新增 `main_agent.token_estimation_cache` 全局配置：
+  HuggingFace template/tokenizer 的默认缓存根目录分别为 `<workdir>/template-cache/hf` 与 `<workdir>/tokenizer-cache/hf`，运行时会再按模型 key 分子目录，避免不同模型的估算资产混在一起。
+- 改进 bubblewrap 兼容：
+  使用 bubblewrap 时会把全局 template/tokenizer cache 根目录以可写 bind mount 映射进沙盒，子进程不再因为看不到默认 HuggingFace 用户缓存而重复下载或回退估算。
+- 更新配置版本到 `0.18`：
+  新增 `agent_host/src/config/v0_18.rs` loader，保留 `0.17` 及更早配置升级路径；TUI 配置编辑器、最新配置骨架和示例配置均补齐 `main_agent.token_estimation_cache`。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  没有新增 workdir upgrade step；按配置变更策略将仓库版本从 `0.17.1` 提升到 `0.18.0`。
+
+# 0.17.1
+
+- 新增 prompt token 估算校准：
+  `agent_frame` 每次 LLM 请求返回后会用 provider 的真实 `usage.prompt_tokens` 与本地未校准估算值计算按模型的 EMA ratio；后续同一 runtime 进程内的 token 估算会自动应用该校准系数。
+- `/status` 会显示当前模型的校准信息：
+  当本进程已有观测样本时，本地估算来源说明会附带 `calibration=<ratio>x/<samples> samples`。
+- 本次不影响 `config` 或 `workdir` schema：
+  校准状态目前是进程内缓存，没有新增配置字段或持久化 migration；按普通 patch 将仓库版本从 `0.17.0` 提升到 `0.17.1`。
+
+# 0.17.0
+
+- 新增 HuggingFace token estimation 资产源：
+  `token_estimation.template.source="huggingface"` 会通过 `hf-hub` 只下载 `tokenizer_config.json` 等 tokenizer/template 元数据文件并读取 `chat_template`；`token_estimation.tokenizer.source="huggingface"` 会只下载 `tokenizer.json` 用于本地计数。
+- 新增 HuggingFace shorthand 配置：
+  `token_estimation.source="huggingface"` + `repo` + 可选 `revision/cache_dir` 会自动等价于 `tokenizer_config.json.chat_template` + `tokenizer.json`；不会请求 `*.safetensors`、`pytorch_model.bin`、`*.gguf` 等权重文件。
+- 改进 `/status` 的本地估算来源说明：
+  当模型配置使用 local/HuggingFace template 或 tokenizer 时，状态输出会显示对应估算来源，而不是固定显示 builtin+tiktoken。
+- 更新配置版本到 `0.17`：
+  新增 `agent_host/src/config/v0_17.rs` loader，保留 `0.16` 及更早配置升级路径；TUI 配置编辑器、最新配置骨架和示例配置均补齐 HuggingFace token estimation 选项。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  没有新增 workdir upgrade step；按配置变更策略将仓库版本从 `0.16.0` 提升到 `0.17.0`。
+
+# 0.16.0
+
+- 新增 per-model `token_estimation` 配置：
+  可为模型指定本地 chat template 与本地 `tokenizer.json`，token 估算会先按模板渲染完整 prompt，再使用配置的 tokenizer 计数；未配置时继续使用 builtin prompt renderer 与自动 tiktoken 估算。
+- 支持本地 tokenizer/template 资产缓存：
+  本地 `tokenizer_config.json` 的 `chat_template` 和 HuggingFace `tokenizer.json` 会按文件指纹缓存，避免每次 `/status` 或 compaction 判断都重复加载。
+- 更新配置版本到 `0.16`：
+  新增 `agent_host/src/config/v0_16.rs` loader，保留 `0.15` 及更早配置升级路径；TUI 配置编辑器、最新配置骨架和示例配置均补齐 `token_estimation`。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  没有新增 workdir upgrade step；按配置变更策略将仓库版本从 `0.15.5` 提升到 `0.16.0`。
 
 # 0.15.5
 

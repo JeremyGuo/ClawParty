@@ -151,6 +151,7 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         agent_model_enabled: raw.agent_model_enabled,
         capabilities: raw.capabilities,
         native_web_search: raw.native_web_search,
+        token_estimation: None,
         external_web_search: None,
     }
 }

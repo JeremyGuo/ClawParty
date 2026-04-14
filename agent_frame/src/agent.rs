@@ -9,6 +9,7 @@ use crate::llm::{
 use crate::message::ChatMessage;
 use crate::modality::materialize_messages_for_upstream;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
+use crate::token_estimation::estimate_session_tokens_for_upstream;
 use crate::tooling::{
     InterruptSignal, Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool,
 };
@@ -1457,6 +1458,7 @@ mod tests {
                 native_pdf_input: false,
                 native_audio_input: false,
                 native_image_generation: false,
+                token_estimation: None,
             },
             image_tool_upstream: None,
             pdf_tool_upstream: None,
@@ -1670,4 +1672,36 @@ pub fn compact_session_messages_with_report(
         report.messages = messages;
     }
     Ok(report)
+}
+
+pub fn estimate_configured_session_tokens(
+    previous_messages: Vec<ChatMessage>,
+    prompt: impl Into<String>,
+    config: AgentConfig,
+    extra_tools: Vec<Tool>,
+) -> Result<usize> {
+    let discovered_skills = discover_skills(&config.skills_dirs)?;
+    let system_prompt = compose_system_prompt(&config, &discovered_skills);
+    let messages = ensure_system_message(&previous_messages, &system_prompt);
+    let registry = build_tool_registry(
+        &config.enabled_tools,
+        &config.workspace_root,
+        &config.runtime_state_root,
+        &config.upstream,
+        config.image_tool_upstream.as_ref(),
+        config.pdf_tool_upstream.as_ref(),
+        config.audio_tool_upstream.as_ref(),
+        config.image_generation_tool_upstream.as_ref(),
+        &config.skills_dirs,
+        &discovered_skills,
+        &extra_tools,
+    )?;
+    let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
+    let request_messages = materialize_messages_for_upstream(&messages, &config)?;
+    Ok(estimate_session_tokens_for_upstream(
+        &request_messages,
+        &tool_definitions,
+        &prompt.into(),
+        &config.upstream,
+    ))
 }

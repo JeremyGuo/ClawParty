@@ -4584,6 +4584,7 @@ mod tests {
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         }
     }
 
@@ -4740,6 +4741,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -4814,6 +4816,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5171,6 +5174,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5237,6 +5241,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5305,6 +5310,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5371,6 +5377,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &["image_load".to_string()],
@@ -5435,6 +5442,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5493,6 +5501,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let image_helper = UpstreamConfig {
             supports_vision_input: true,
@@ -5555,6 +5564,7 @@ remote_command="$*"
             native_pdf_input: true,
             native_audio_input: false,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],
@@ -5611,6 +5621,7 @@ remote_command="$*"
             native_pdf_input: false,
             native_audio_input: true,
             native_image_generation: false,
+            token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
             &[],

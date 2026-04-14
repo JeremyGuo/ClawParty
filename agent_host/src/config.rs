@@ -2,7 +2,8 @@ use crate::backend::AgentBackendKind;
 use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
     AuthCredentialsStoreMode, ExternalWebSearchConfig, MemorySystem, NativeWebSearchConfig,
-    ReasoningConfig, RetryModeConfig, UpstreamApiKind, UpstreamAuthKind, expand_home_path,
+    ReasoningConfig, RetryModeConfig, TokenEstimationConfig, UpstreamApiKind, UpstreamAuthKind,
+    expand_home_path,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ mod v0_12;
 mod v0_13;
 mod v0_14;
 mod v0_15;
+mod v0_16;
+mod v0_17;
+mod v0_18;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -28,7 +32,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.15";
+pub const LATEST_CONFIG_VERSION: &str = "0.18";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -42,6 +46,9 @@ pub const VERSION_0_11: &str = "0.11";
 pub const VERSION_0_12: &str = "0.12";
 pub const VERSION_0_13: &str = "0.13";
 pub const VERSION_0_14: &str = "0.14";
+pub const VERSION_0_15: &str = "0.15";
+pub const VERSION_0_16: &str = "0.16";
+pub const VERSION_0_17: &str = "0.17";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -138,6 +145,8 @@ pub struct ModelConfig {
     pub capabilities: Vec<ModelCapability>,
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
+    #[serde(default)]
+    pub token_estimation: Option<TokenEstimationConfig>,
     #[serde(default)]
     #[serde(skip_serializing)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
@@ -386,6 +395,41 @@ impl Default for TimeAwarenessConfig {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenEstimationSourceCacheConfig {
+    #[serde(default)]
+    pub hf: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenEstimationCacheConfig {
+    #[serde(default = "default_token_estimation_template_cache")]
+    pub template: TokenEstimationSourceCacheConfig,
+    #[serde(default = "default_token_estimation_tokenizer_cache")]
+    pub tokenizer: TokenEstimationSourceCacheConfig,
+}
+
+impl Default for TokenEstimationCacheConfig {
+    fn default() -> Self {
+        Self {
+            template: default_token_estimation_template_cache(),
+            tokenizer: default_token_estimation_tokenizer_cache(),
+        }
+    }
+}
+
+impl TokenEstimationCacheConfig {
+    fn normalized(mut self) -> Self {
+        if self.template.hf.trim().is_empty() {
+            self.template.hf = default_token_estimation_hf_template_cache_dir();
+        }
+        if self.tokenizer.hf.trim().is_empty() {
+            self.tokenizer.hf = default_token_estimation_hf_tokenizer_cache_dir();
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MainAgentConfig {
     #[serde(default)]
@@ -410,6 +454,8 @@ pub struct MainAgentConfig {
     pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
     #[serde(default)]
     pub time_awareness: TimeAwarenessConfig,
+    #[serde(default)]
+    pub token_estimation_cache: TokenEstimationCacheConfig,
     #[serde(default)]
     pub memory_system: MemorySystem,
 }
@@ -438,6 +484,8 @@ struct MainAgentConfigRaw {
     timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
     #[serde(default)]
     time_awareness: Option<TimeAwarenessConfig>,
+    #[serde(default)]
+    token_estimation_cache: Option<TokenEstimationCacheConfig>,
     #[serde(default)]
     memory_system: MemorySystem,
     #[serde(default = "default_compact_trigger_ratio")]
@@ -491,6 +539,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
             }),
             timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
             time_awareness: raw.time_awareness.unwrap_or_default(),
+            token_estimation_cache: raw.token_estimation_cache.unwrap_or_default().normalized(),
             memory_system: raw.memory_system,
         })
     }
@@ -693,6 +742,26 @@ fn default_emit_idle_time_gap_hint() -> bool {
     true
 }
 
+fn default_token_estimation_hf_template_cache_dir() -> String {
+    "template-cache/hf".to_string()
+}
+
+fn default_token_estimation_hf_tokenizer_cache_dir() -> String {
+    "tokenizer-cache/hf".to_string()
+}
+
+fn default_token_estimation_template_cache() -> TokenEstimationSourceCacheConfig {
+    TokenEstimationSourceCacheConfig {
+        hf: default_token_estimation_hf_template_cache_dir(),
+    }
+}
+
+fn default_token_estimation_tokenizer_cache() -> TokenEstimationSourceCacheConfig {
+    TokenEstimationSourceCacheConfig {
+        hf: default_token_estimation_hf_tokenizer_cache_dir(),
+    }
+}
+
 fn default_telegram_bot_token_env() -> String {
     "TELEGRAM_BOT_TOKEN".to_string()
 }
@@ -830,7 +899,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 15] = [
+    let loaders: [&dyn ConfigLoader; 18] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -846,14 +915,29 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_13::LatestConfigLoader,
         &v0_14::LatestConfigLoader,
         &v0_15::LatestConfigLoader,
+        &v0_16::LatestConfigLoader,
+        &v0_17::LatestConfigLoader,
+        &v0_18::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
         .find(|loader| loader.version() == version)
         .ok_or_else(|| anyhow!("unsupported config version '{}'", version))?;
-    let config = loader.load_and_upgrade(value)?;
+    let mut config = loader.load_and_upgrade(value)?;
+    resolve_config_token_estimation_paths(
+        &mut config,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+    );
     validate_server_config(&config)?;
     Ok(config)
+}
+
+fn resolve_config_token_estimation_paths(config: &mut ServerConfig, base_dir: &Path) {
+    for model in config.models.values_mut() {
+        if let Some(token_estimation) = &model.token_estimation {
+            model.token_estimation = Some(token_estimation.resolve_paths(base_dir));
+        }
+    }
 }
 
 pub(crate) fn build_server_config(
@@ -946,8 +1030,8 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let config = {
-        let loaders: [&dyn ConfigLoader; 15] = [
+    let mut config = {
+        let loaders: [&dyn ConfigLoader; 18] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -963,6 +1047,9 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_13::LatestConfigLoader,
             &v0_14::LatestConfigLoader,
             &v0_15::LatestConfigLoader,
+            &v0_16::LatestConfigLoader,
+            &v0_17::LatestConfigLoader,
+            &v0_18::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -970,6 +1057,10 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             .ok_or_else(|| anyhow!("unsupported config version '{}'", version))?;
         loader.load_and_upgrade(value)?
     };
+    resolve_config_token_estimation_paths(
+        &mut config,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+    );
     validate_server_config(&config)?;
     let upgraded = version != LATEST_CONFIG_VERSION;
     if upgraded {
@@ -990,6 +1081,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         idle_compaction: &'a IdleCompactionConfig,
         timeout_observation_compaction: &'a TimeoutObservationCompactionConfig,
         time_awareness: &'a TimeAwarenessConfig,
+        token_estimation_cache: &'a TokenEstimationCacheConfig,
         memory_system: MemorySystem,
     }
 
@@ -1023,6 +1115,8 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         agent_model_enabled: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         native_web_search: &'a Option<NativeWebSearchConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_estimation: &'a Option<TokenEstimationConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
         supports_vision_input: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1076,6 +1170,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
                     description: &model.description,
                     agent_model_enabled: model.agent_model_enabled,
                     native_web_search: &model.native_web_search,
+                    token_estimation: &model.token_estimation,
                     supports_vision_input: model
                         .supports_vision_input
                         .then_some(model.supports_vision_input),
@@ -1104,6 +1199,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
             idle_compaction: &config.main_agent.idle_compaction,
             timeout_observation_compaction: &config.main_agent.timeout_observation_compaction,
             time_awareness: &config.main_agent.time_awareness,
+            token_estimation_cache: &config.main_agent.token_estimation_cache,
             memory_system: config.main_agent.memory_system,
         },
         sandbox: &config.sandbox,
@@ -1459,6 +1555,9 @@ mod tests {
     };
     use crate::backend::AgentBackendKind;
     use crate::zgent::zgent_runtime_available;
+    use agent_frame::config::{
+        TokenEstimationSource, TokenEstimationTemplateConfig, TokenEstimationTokenizerConfig,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -1499,6 +1598,181 @@ mod tests {
             }
             _ => panic!("expected telegram channel"),
         }
+    }
+
+    #[test]
+    fn token_estimation_config_loads_and_resolves_local_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.16",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "capabilities": ["chat"],
+                  "token_estimation": {
+                    "template": {
+                      "source": "local",
+                      "path": "assets/tokenizer_config.json",
+                      "field": "chat_template"
+                    },
+                    "tokenizer": {
+                      "source": "local",
+                      "path": "assets/tokenizer.json"
+                    }
+                  }
+                }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]},
+                "zgent": {"available_models": []}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        let token_estimation = config.models["main"].token_estimation.as_ref().unwrap();
+        match token_estimation.template.as_ref().unwrap() {
+            TokenEstimationTemplateConfig::Local { path, field } => {
+                assert_eq!(path, &temp_dir.path().join("assets/tokenizer_config.json"));
+                assert_eq!(field, "chat_template");
+            }
+            other => panic!("expected local template, got {other:?}"),
+        }
+        match token_estimation.tokenizer.as_ref().unwrap() {
+            TokenEstimationTokenizerConfig::Local { path } => {
+                assert_eq!(path, &temp_dir.path().join("assets/tokenizer.json"));
+            }
+            other => panic!("expected local tokenizer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_estimation_huggingface_shorthand_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.17",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "capabilities": ["chat"],
+                  "token_estimation": {
+                    "source": "huggingface",
+                    "repo": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                    "revision": "main",
+                    "cache_dir": "hf-cache"
+                  }
+                }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]},
+                "zgent": {"available_models": []}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        let token_estimation = config.models["main"].token_estimation.as_ref().unwrap();
+        assert_eq!(
+            token_estimation.source,
+            Some(TokenEstimationSource::Huggingface)
+        );
+        assert_eq!(
+            token_estimation.repo.as_deref(),
+            Some("Qwen/Qwen2.5-Coder-7B-Instruct")
+        );
+        assert_eq!(token_estimation.revision.as_deref(), Some("main"));
+        let expected_cache_dir = temp_dir.path().join("hf-cache");
+        assert_eq!(
+            token_estimation.cache_dir.as_deref(),
+            Some(expected_cache_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn main_agent_token_estimation_cache_defaults_and_persists() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.17",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "capabilities": ["chat"]
+                }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]},
+                "zgent": {"available_models": []}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(
+            config.main_agent.token_estimation_cache.template.hf,
+            "template-cache/hf"
+        );
+        assert_eq!(
+            config.main_agent.token_estimation_cache.tokenizer.hf,
+            "tokenizer-cache/hf"
+        );
+
+        let written = fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("\"version\": \"0.18\""));
+        assert!(written.contains("\"token_estimation_cache\""));
+        assert!(written.contains("\"template-cache/hf\""));
+        assert!(written.contains("\"tokenizer-cache/hf\""));
     }
 
     #[test]

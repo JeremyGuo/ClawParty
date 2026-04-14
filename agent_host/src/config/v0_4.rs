@@ -197,6 +197,7 @@ fn upgrade_versioned_model(
         agent_model_enabled: true,
         capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
+        token_estimation: None,
         external_web_search,
     })
 }

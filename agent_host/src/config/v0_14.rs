@@ -9,6 +9,7 @@ use super::{
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
     AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, RetryModeConfig,
+    TokenEstimationConfig,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -80,6 +81,8 @@ struct VersionedModelConfigRaw {
     pub agent_model_enabled: bool,
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
+    #[serde(default)]
+    pub token_estimation: Option<TokenEstimationConfig>,
 }
 
 impl ConfigLoader for LatestConfigLoader {
@@ -161,6 +164,7 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         agent_model_enabled: raw.agent_model_enabled,
         capabilities: raw.capabilities,
         native_web_search: raw.native_web_search,
+        token_estimation: raw.token_estimation,
         external_web_search: None,
     }
 }

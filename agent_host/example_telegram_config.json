@@ -1,5 +1,5 @@
 {
-  "version": "0.15",
+  "version": "0.18",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -38,6 +38,14 @@
     "model": "main",
     "language": "zh-CN",
     "memory_system": "layered",
+    "token_estimation_cache": {
+      "template": {
+        "hf": "template-cache/hf"
+      },
+      "tokenizer": {
+        "hf": "tokenizer-cache/hf"
+      }
+    },
     "time_awareness": {
       "emit_system_date_on_user_message": false,
       "emit_idle_time_gap_hint": true

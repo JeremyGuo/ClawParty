@@ -1,5 +1,5 @@
 {
-  "version": "0.15",
+  "version": "0.18",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",
@@ -25,18 +25,32 @@
     "glm-5.1": {
       "type": "openrouter",
       "api_endpoint": "https://openrouter.ai/api/v1",
-      "model": "z-ai/glm-5.1",
+      "model": "z-ai/glm-5.1:nitro",
       "capabilities": [
         "chat"
       ],
       "api_key_env": "OPENROUTER_API_KEY",
       "chat_completions_path": "/chat/completions",
       "auth_credentials_store_mode": "auto",
-      "timeout_seconds": 300.0,
+      "timeout_seconds": 600.0,
       "retry_mode": {
         "mode": "no"
       },
       "context_window_tokens": 200000,
+      "token_estimation": {
+        "template": {
+          "source": "huggingface",
+          "repo": "zai-org/GLM-5.1",
+          "revision": "main",
+          "file": "chat_template.jinja"
+        },
+        "tokenizer": {
+          "source": "huggingface",
+          "repo": "zai-org/GLM-5.1",
+          "revision": "main",
+          "file": "tokenizer.json"
+        }
+      },
       "description": "Don't use this model as subagent, unless you are this model, or with the permission of user."
     },
     "gpt54": {
@@ -78,7 +92,7 @@
       "retry_mode": {
         "mode": "random",
         "max_retries": 2,
-        "retry_random_mean": 8
+        "retry_random_mean": 8.0
       },
       "context_window_tokens": 262144,
       "description": "Don't use this model as subagent, unless you are this model, or with the permission of user.",
@@ -126,10 +140,6 @@
     "model": null,
     "global_install_root": "/opt",
     "language": "zh-CN",
-    "time_awareness": {
-      "emit_system_date_on_user_message": true,
-      "emit_idle_time_gap_hint": true
-    },
     "max_tool_roundtrips": 120,
     "enable_context_compression": true,
     "context_compaction": {
@@ -144,6 +154,18 @@
     },
     "timeout_observation_compaction": {
       "enabled": true
+    },
+    "time_awareness": {
+      "emit_system_date_on_user_message": true,
+      "emit_idle_time_gap_hint": true
+    },
+    "token_estimation_cache": {
+      "template": {
+        "hf": "template-cache/hf"
+      },
+      "tokenizer": {
+        "hf": "tokenizer-cache/hf"
+      }
     },
     "memory_system": "claude_code"
   },

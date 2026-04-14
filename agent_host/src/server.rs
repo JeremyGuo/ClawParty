@@ -51,15 +51,16 @@ use crate::zgent::kernel::{
 use crate::zgent::subagent::ZgentSubagentModel;
 use agent_frame::config::{
     AgentConfig as FrameAgentConfig, CodexAuthConfig, ExternalWebSearchConfig,
-    NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
-    load_codex_auth_tokens,
+    NativeWebSearchConfig, ReasoningConfig, TokenEstimationSource, TokenEstimationTemplateConfig,
+    TokenEstimationTokenizerConfig, UpstreamApiKind, UpstreamConfig, load_codex_auth_tokens,
 };
 use agent_frame::skills::discover_skills;
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
     ChatMessage, ContextCompactionReport, ExecutionProgress, SessionCompactionStats, SessionEvent,
     SessionExecutionControl, SessionState, StructuredCompactionOutput, TokenUsage, Tool,
-    estimate_session_tokens, extract_assistant_text,
+    estimate_configured_session_tokens, estimate_session_tokens_for_model_with_config,
+    extract_assistant_text, prompt_token_calibration_for_model, token_estimator_label_for_model,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -144,6 +145,12 @@ struct PersistedYieldedForegroundTurn {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum TokenEstimationCacheKind {
+    Template,
+    Tokenizer,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum ToolingFamily {
     WebSearch,
     Image,
@@ -181,6 +188,22 @@ impl ToolingFamily {
             Self::Pdf => ModelCapability::Pdf,
             Self::AudioInput => ModelCapability::AudioIn,
         }
+    }
+}
+
+fn sanitize_cache_path_segment(value: &str) -> String {
+    let mut sanitized = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            sanitized.push(character);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "model".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -451,6 +474,7 @@ impl ServerRuntime {
             &config.workspace_root,
             &config.runtime_state_root,
             PathBuf::from(&self.main_agent.global_install_root),
+            self.token_estimation_cache_roots(),
             self.agent_workspace.rundir.join("skill_memory"),
             self.agent_workspace.skills_dir.clone(),
             &config.skills_dirs,
@@ -508,6 +532,7 @@ impl ServerRuntime {
 
     fn build_upstream_config(
         &self,
+        model_key: &str,
         model: &ModelConfig,
         timeout_seconds: f64,
         prompt_cache_key: Option<String>,
@@ -520,6 +545,10 @@ impl ServerRuntime {
         native_audio_input: bool,
         native_image_generation: bool,
     ) -> Result<UpstreamConfig> {
+        let token_estimation = model
+            .token_estimation
+            .clone()
+            .map(|config| self.apply_global_token_estimation_cache(model_key, config));
         Ok(UpstreamConfig {
             base_url: model.api_endpoint.clone(),
             model: model.model.clone(),
@@ -548,7 +577,113 @@ impl ServerRuntime {
             native_pdf_input,
             native_audio_input,
             native_image_generation,
+            token_estimation,
         })
+    }
+
+    fn apply_global_token_estimation_cache(
+        &self,
+        model_key: &str,
+        mut config: agent_frame::config::TokenEstimationConfig,
+    ) -> agent_frame::config::TokenEstimationConfig {
+        let template_cache_dir =
+            self.token_estimation_model_cache_dir(TokenEstimationCacheKind::Template, model_key);
+        let tokenizer_cache_dir =
+            self.token_estimation_model_cache_dir(TokenEstimationCacheKind::Tokenizer, model_key);
+
+        if let Some(TokenEstimationTemplateConfig::Huggingface { cache_dir, .. }) =
+            &mut config.template
+            && cache_dir.is_none()
+        {
+            *cache_dir = Some(
+                config
+                    .cache_dir
+                    .clone()
+                    .unwrap_or_else(|| template_cache_dir.clone()),
+            );
+        }
+        if let Some(TokenEstimationTokenizerConfig::Huggingface { cache_dir, .. }) =
+            &mut config.tokenizer
+            && cache_dir.is_none()
+        {
+            *cache_dir = Some(
+                config
+                    .cache_dir
+                    .clone()
+                    .unwrap_or_else(|| tokenizer_cache_dir.clone()),
+            );
+        }
+
+        if config.source == Some(TokenEstimationSource::Huggingface)
+            && config.cache_dir.is_none()
+            && let Some(repo) = config.repo.clone()
+        {
+            let revision = config
+                .revision
+                .clone()
+                .unwrap_or_else(|| "main".to_string());
+            if config.template.is_none() {
+                config.template = Some(TokenEstimationTemplateConfig::Huggingface {
+                    repo: repo.clone(),
+                    revision: revision.clone(),
+                    file: "tokenizer_config.json".to_string(),
+                    field: "chat_template".to_string(),
+                    cache_dir: Some(template_cache_dir),
+                });
+            }
+            if config.tokenizer.is_none() {
+                config.tokenizer = Some(TokenEstimationTokenizerConfig::Huggingface {
+                    repo,
+                    revision,
+                    file: "tokenizer.json".to_string(),
+                    cache_dir: Some(tokenizer_cache_dir),
+                });
+            }
+        }
+
+        config
+    }
+
+    fn token_estimation_cache_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for root in [
+            self.resolve_token_estimation_cache_root(
+                &self.main_agent.token_estimation_cache.template.hf,
+            ),
+            self.resolve_token_estimation_cache_root(
+                &self.main_agent.token_estimation_cache.tokenizer.hf,
+            ),
+        ] {
+            if !roots.iter().any(|existing| existing == &root) {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
+    fn token_estimation_model_cache_dir(
+        &self,
+        kind: TokenEstimationCacheKind,
+        model_key: &str,
+    ) -> PathBuf {
+        let root = match kind {
+            TokenEstimationCacheKind::Template => self.resolve_token_estimation_cache_root(
+                &self.main_agent.token_estimation_cache.template.hf,
+            ),
+            TokenEstimationCacheKind::Tokenizer => self.resolve_token_estimation_cache_root(
+                &self.main_agent.token_estimation_cache.tokenizer.hf,
+            ),
+        };
+        root.join(sanitize_cache_path_segment(model_key))
+    }
+
+    fn resolve_token_estimation_cache_root(&self, raw: &str) -> PathBuf {
+        let expanded = agent_frame::config::expand_home_path(raw);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.agent_workspace.root_dir.join(expanded)
+        }
     }
 
     fn synthesize_external_web_search_config(
@@ -620,6 +755,7 @@ impl ServerRuntime {
             );
         }
         self.build_upstream_config(
+            image_model_key,
             image_model,
             image_model.timeout_seconds,
             None,
@@ -671,6 +807,7 @@ impl ServerRuntime {
             );
         }
         self.build_upstream_config(
+            &target.alias,
             tool_model,
             tool_model.timeout_seconds,
             None,
@@ -1380,6 +1517,7 @@ impl ServerRuntime {
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
             upstream: self.build_upstream_config(
+                model_key,
                 model,
                 upstream_timeout_seconds
                     .unwrap_or(model.timeout_seconds)
@@ -2290,6 +2428,7 @@ impl ServerRuntime {
                 config,
                 backend_execution_options,
                 PathBuf::from(&self.main_agent.global_install_root),
+                self.token_estimation_cache_roots(),
                 self.agent_workspace.rundir.join("skill_memory"),
                 self.agent_workspace.skills_dir.clone(),
                 extra_tools,
@@ -5017,6 +5156,7 @@ mod tests {
                 description: "demo".to_string(),
                 agent_model_enabled: true,
                 native_web_search: None,
+                token_estimation: None,
                 external_web_search: None,
                 capabilities: vec![ModelCapability::Chat],
             },
@@ -5050,6 +5190,7 @@ mod tests {
                 idle_compaction: Default::default(),
                 timeout_observation_compaction: Default::default(),
                 time_awareness: Default::default(),
+                token_estimation_cache: Default::default(),
                 memory_system: MemorySystem::default(),
             },
             sandbox: SandboxConfig::default(),
@@ -5281,6 +5422,7 @@ mod tests {
             description: "vision".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: vec![ModelCapability::ImageIn],
         };
@@ -5348,6 +5490,7 @@ mod tests {
             description: "chat".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: vec![ModelCapability::Chat],
         };
@@ -5416,6 +5559,7 @@ mod tests {
             description: "image model".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
         };
@@ -5470,6 +5614,7 @@ mod tests {
             description: "image model".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
         };
@@ -6313,6 +6458,7 @@ mod tests {
             description: "test model".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: Vec::new(),
         };
@@ -6543,6 +6689,7 @@ mod tests {
                 agent_model_enabled: true,
                 capabilities: vec![ModelCapability::Chat],
                 native_web_search: None,
+                token_estimation: None,
                 external_web_search: None,
             },
         );
@@ -6782,6 +6929,7 @@ mod tests {
             description: "demo".to_string(),
             agent_model_enabled: true,
             native_web_search: None,
+            token_estimation: None,
             external_web_search: None,
             capabilities: Vec::new(),
         }

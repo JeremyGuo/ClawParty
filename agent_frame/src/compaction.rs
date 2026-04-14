@@ -1,12 +1,12 @@
 use crate::config::{AgentConfig, MemorySystem};
 use crate::llm::{ChatCompletionSession, TokenUsage, create_chat_completion};
 use crate::message::{ChatMessage, ToolCall};
+use crate::token_estimation::estimate_session_tokens_for_upstream;
 use crate::tooling::Tool;
 use crate::tooling::active_runtime_state_summary;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tiktoken_rs::o200k_base_singleton;
 
 pub const COMPACTION_MARKER: &str = "[AgentFrame Context Compression]";
 
@@ -272,167 +272,19 @@ fn sanitize_messages_for_compaction_request(messages: &[ChatMessage]) -> Vec<Cha
         .collect()
 }
 
+#[cfg(test)]
 fn estimate_text_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    o200k_base_singleton()
-        .encode_with_special_tokens(text)
-        .len()
-        .max(1)
-}
-
-// Mirrors Codex's approach: do not estimate inline base64 image payloads as
-// raw text. Replace them with a fixed per-image byte estimate before turning
-// bytes into tokens. 7,373 bytes is approximately 1,844 tokens at 4 bytes/token.
-const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
-const INLINE_FILE_BYTES_ESTIMATE: usize = 12_000;
-const INLINE_AUDIO_BYTES_ESTIMATE: usize = 16_000;
-
-fn parse_base64_image_data_url(url: &str) -> Option<&str> {
-    if !url
-        .get(.."data:".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
-    {
-        return None;
-    }
-    let comma_index = url.find(',')?;
-    let metadata = &url[..comma_index];
-    let payload = &url[comma_index + 1..];
-    let metadata_without_scheme = &metadata["data:".len()..];
-    let mut metadata_parts = metadata_without_scheme.split(';');
-    let mime_type = metadata_parts.next().unwrap_or_default();
-    let has_base64_marker = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
-    if !mime_type
-        .get(.."image/".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
-    {
-        return None;
-    }
-    if !has_base64_marker {
-        return None;
-    }
-    Some(payload)
-}
-
-fn estimate_payload_bytes_as_tokens(bytes: usize) -> usize {
-    bytes.div_ceil(4).max(1)
-}
-
-fn replace_inline_payloads_for_token_estimate(content: Option<&mut Value>) -> usize {
-    let Some(Value::Array(items)) = content else {
-        return 0;
-    };
-
-    let mut extra_tokens = 0usize;
-    for item in items {
-        let Some(object) = item.as_object_mut() else {
-            continue;
-        };
-        let kind = object
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if (kind.as_str() == "input_image" || kind.as_str() == "image_url")
-            && let Some(image_url) = object.get_mut("image_url")
-        {
-            let url = match image_url {
-                Value::String(url) => Some(url.as_str()),
-                Value::Object(map) => map.get("url").and_then(Value::as_str),
-                _ => None,
-            };
-            if url.and_then(parse_base64_image_data_url).is_some() {
-                match image_url {
-                    Value::String(url) => {
-                        *url = "[inline image payload omitted for token estimate]".to_string();
-                    }
-                    Value::Object(map) => {
-                        map.insert(
-                            "url".to_string(),
-                            Value::String(
-                                "[inline image payload omitted for token estimate]".to_string(),
-                            ),
-                        );
-                    }
-                    _ => {}
-                }
-                extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
-                    RESIZED_IMAGE_BYTES_ESTIMATE,
-                ));
-            }
-            continue;
-        }
-
-        if kind == "file"
-            && let Some(file_object) = object.get_mut("file").and_then(Value::as_object_mut)
-            && file_object
-                .get("file_data")
-                .and_then(Value::as_str)
-                .is_some()
-        {
-            file_object.insert(
-                "file_data".to_string(),
-                Value::String("[inline file payload omitted for token estimate]".to_string()),
-            );
-            extra_tokens = extra_tokens
-                .saturating_add(estimate_payload_bytes_as_tokens(INLINE_FILE_BYTES_ESTIMATE));
-            continue;
-        }
-
-        if kind == "input_file" && object.get("file_data").and_then(Value::as_str).is_some() {
-            object.insert(
-                "file_data".to_string(),
-                Value::String("[inline file payload omitted for token estimate]".to_string()),
-            );
-            extra_tokens = extra_tokens
-                .saturating_add(estimate_payload_bytes_as_tokens(INLINE_FILE_BYTES_ESTIMATE));
-            continue;
-        }
-
-        if kind == "input_audio"
-            && let Some(audio) = object.get_mut("input_audio").and_then(Value::as_object_mut)
-            && audio.get("data").and_then(Value::as_str).is_some()
-        {
-            audio.insert(
-                "data".to_string(),
-                Value::String("[inline audio payload omitted for token estimate]".to_string()),
-            );
-            extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
-                INLINE_AUDIO_BYTES_ESTIMATE,
-            ));
-        }
-    }
-
-    extra_tokens
+    crate::token_estimation::estimate_text_tokens_for_estimator(
+        text,
+        crate::token_estimation::TokenEstimator::TiktokenO200k,
+    )
 }
 
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    let mut value = serde_json::to_value(message).unwrap_or_default();
-    let inline_payload_tokens = replace_inline_payloads_for_token_estimate(
-        value
-            .as_object_mut()
-            .and_then(|object| object.get_mut("content")),
-    );
-    let serialized = serde_json::to_string(&value).unwrap_or_default();
-    estimate_text_tokens(&serialized) + inline_payload_tokens + 6
-}
-
-pub fn estimate_session_tokens(
-    messages: &[ChatMessage],
-    tools: &[Tool],
-    pending_user_prompt: &str,
-) -> usize {
-    let message_tokens = messages.iter().map(estimate_message_tokens).sum::<usize>();
-    let tool_tokens = if tools.is_empty() {
-        0
-    } else {
-        estimate_text_tokens(
-            &serde_json::to_string(&tools.iter().map(Tool::as_openai_tool).collect::<Vec<_>>())
-                .unwrap_or_default(),
-        )
-    };
-    message_tokens + tool_tokens + estimate_text_tokens(pending_user_prompt)
+    crate::token_estimation::estimate_message_tokens_for_estimator(
+        message,
+        crate::token_estimation::TokenEstimator::TiktokenO200k,
+    )
 }
 
 fn auto_compact_token_limit(config: &AgentConfig) -> usize {
@@ -759,7 +611,12 @@ pub(crate) fn maybe_compact_messages_with_report_with_session(
     pending_user_prompt: &str,
     mut session: Option<&mut ChatCompletionSession>,
 ) -> Result<ContextCompactionReport> {
-    let estimated_tokens_before = estimate_session_tokens(messages, tools, pending_user_prompt);
+    let estimated_tokens_before = estimate_session_tokens_for_upstream(
+        messages,
+        tools,
+        pending_user_prompt,
+        &config.upstream,
+    );
     if !config.enable_context_compression {
         return Ok(ContextCompactionReport {
             messages: messages.to_vec(),
@@ -804,12 +661,23 @@ pub(crate) fn maybe_compact_messages_with_report_with_session(
             structured_output = step_structured_output;
             compacted_messages = step_compacted_messages;
         }
-        if estimate_session_tokens(&compacted, tools, pending_user_prompt) < limit {
+        if estimate_session_tokens_for_upstream(
+            &compacted,
+            tools,
+            pending_user_prompt,
+            &config.upstream,
+        ) < limit
+        {
             break;
         }
         retain_recent_token_budget = (retain_recent_token_budget / 2).max(512);
     }
-    let estimated_tokens_after = estimate_session_tokens(&compacted, tools, pending_user_prompt);
+    let estimated_tokens_after = estimate_session_tokens_for_upstream(
+        &compacted,
+        tools,
+        pending_user_prompt,
+        &config.upstream,
+    );
     Ok(ContextCompactionReport {
         compacted: compacted != messages,
         messages: compacted,
