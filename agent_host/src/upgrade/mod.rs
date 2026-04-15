@@ -17,6 +17,7 @@ mod v0_21;
 mod v0_22;
 mod v0_23;
 mod v0_24;
+mod v0_25;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -24,7 +25,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.24";
+pub const LATEST_WORKDIR_VERSION: &str = "0.25";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -40,7 +41,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 20] = [
+    let upgraders: [&dyn WorkdirUpgrader; 21] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -61,6 +62,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_22::Upgrade,
         &v0_23::Upgrade,
         &v0_24::Upgrade,
+        &v0_25::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -109,6 +111,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.21" => Ok("0.21"),
         "0.22" => Ok("0.22"),
         "0.23" => Ok("0.23"),
+        "0.24" => Ok("0.24"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

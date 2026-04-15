@@ -1,5 +1,14 @@
-version: 0.19.0
+version: 0.19.1
 ---
+
+# 0.19.1
+
+- 优化 host/frame 内部模块边界：
+  `FrameAgentConfig` 构建、extra tool 构建、remote/cwd helper、通用参数解析和 file tools 已从大文件中拆出，降低后续改动互相影响的风险；本次不改变用户可见工具接口。
+- 升级 `workdir` 结构版本到 `0.25`：
+  `0.24 -> 0.25` upgrade step 会规范化 `conversation` 与 `snapshot` 中的 `settings.remote_workpaths`，确保每个 remote host 只保留一个 workpath，并以最后一条记录为准。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.19.0` 提升到 `0.19.1`。
 
 # 0.19.0
 

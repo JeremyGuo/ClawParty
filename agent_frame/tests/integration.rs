@@ -847,7 +847,7 @@ fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
     let completed = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"printf remote-ok","remote":"fake-host"}"#),
+        Some(r#"{"command":"printf remote-ok","remote":"fake-host","cwd":"/"}"#),
     );
     let completed_json: Value = serde_json::from_str(&completed)?;
     assert_eq!(completed_json["completed"], json!(true));
@@ -858,7 +858,7 @@ fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
         &registry,
         "exec_start",
         Some(
-            r#"{"command":"sleep 0.2; printf remote-bg","remote":"fake-host","return_immediate":true}"#,
+            r#"{"command":"sleep 0.2; printf remote-bg","remote":"fake-host","cwd":"/","return_immediate":true}"#,
         ),
     );
     let started_json: Value = serde_json::from_str(&started)?;
