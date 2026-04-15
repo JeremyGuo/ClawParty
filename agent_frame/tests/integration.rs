@@ -22,7 +22,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -114,6 +114,12 @@ fn structured_compaction_response_text() -> String {
         "next_step": "Continue the task."
     })
     .to_string()
+}
+
+fn long_distinct_text(prefix: &str, count: usize) -> String {
+    (0..count)
+        .map(|index| format!("{prefix}-{index:04}-payload "))
+        .collect()
 }
 
 impl TestServer {
@@ -1232,12 +1238,12 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
     }));
 
     let previous_messages = vec![
-        ChatMessage::text("user", "A".repeat(1800)),
-        ChatMessage::text("assistant", "B".repeat(1800)),
-        ChatMessage::text("user", "C".repeat(1800)),
-        ChatMessage::text("assistant", "D".repeat(1800)),
-        ChatMessage::text("user", "E".repeat(1800)),
-        ChatMessage::text("assistant", "F".repeat(1800)),
+        ChatMessage::text("user", long_distinct_text("auto-user-a", 900)),
+        ChatMessage::text("assistant", long_distinct_text("auto-assistant-b", 900)),
+        ChatMessage::text("user", long_distinct_text("auto-user-c", 900)),
+        ChatMessage::text("assistant", long_distinct_text("auto-assistant-d", 900)),
+        ChatMessage::text("user", long_distinct_text("auto-user-e", 900)),
+        ChatMessage::text("assistant", long_distinct_text("auto-assistant-f", 900)),
     ];
 
     let config = load_config_value(
@@ -1250,7 +1256,8 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
             },
             "system_prompt": "Test system prompt.",
             "context_compaction": {
-                "trigger_ratio": 0.9
+                "trigger_ratio": 0.9,
+                "token_limit_override": 2000
             }
         }),
         ".",
@@ -1437,10 +1444,10 @@ fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<(
 
     let previous_messages = vec![
         ChatMessage::text("system", "Test system prompt."),
-        ChatMessage::text("user", "A".repeat(1800)),
-        ChatMessage::text("assistant", "B".repeat(1800)),
-        ChatMessage::text("user", "C".repeat(1800)),
-        ChatMessage::text("assistant", "D".repeat(1800)),
+        ChatMessage::text("user", long_distinct_text("report-user-a", 900)),
+        ChatMessage::text("assistant", long_distinct_text("report-assistant-b", 900)),
+        ChatMessage::text("user", long_distinct_text("report-user-c", 900)),
+        ChatMessage::text("assistant", long_distinct_text("report-assistant-d", 900)),
     ];
 
     let config = load_config_value(
@@ -1453,7 +1460,8 @@ fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<(
             },
             "system_prompt": "Test system prompt.",
             "context_compaction": {
-                "trigger_ratio": 0.9
+                "trigger_ratio": 0.9,
+                "token_limit_override": 2000
             }
         }),
         ".",
@@ -2011,17 +2019,30 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
         }
     }));
 
+    let active_tools = Arc::new(AtomicUsize::new(0));
+    let max_active_tools = Arc::new(AtomicUsize::new(0));
+    let active_tools_a = Arc::clone(&active_tools);
+    let max_active_tools_a = Arc::clone(&max_active_tools);
+    let active_tools_b = Arc::clone(&active_tools);
+    let max_active_tools_b = Arc::clone(&max_active_tools);
+
     let slow_a = tool! {
         description: "Sleep briefly and return A.",
         fn slow_a() -> String {
+            let active = active_tools_a.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active_tools_a.fetch_max(active, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(250));
+            active_tools_a.fetch_sub(1, Ordering::SeqCst);
             "A".to_string()
         }
     };
     let slow_b = tool! {
         description: "Sleep briefly and return B.",
         fn slow_b() -> String {
+            let active = active_tools_b.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active_tools_b.fetch_max(active, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(250));
+            active_tools_b.fetch_sub(1, Ordering::SeqCst);
             "B".to_string()
         }
     };
@@ -2035,7 +2056,6 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
         ".",
     )?;
 
-    let started = std::time::Instant::now();
     let report = run_session_state_until_end(
         Vec::new(),
         "Run both tools.",
@@ -2043,9 +2063,8 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
         vec![slow_a, slow_b],
         None,
     )?;
-    let elapsed = started.elapsed();
     assert_eq!(extract_assistant_text(&report.messages), "done");
-    assert!(elapsed < Duration::from_millis(430));
+    assert_eq!(max_active_tools.load(Ordering::SeqCst), 2);
     Ok(())
 }
 
