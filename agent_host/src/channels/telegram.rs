@@ -612,6 +612,7 @@ impl TelegramChannel {
         let message = format!("{error:#}").to_ascii_lowercase();
         message.contains("chat not found")
             || message.contains("group chat was deleted")
+            || message.contains("group chat was upgraded to a supergroup chat")
             || message.contains("bot was kicked from the group chat")
             || message.contains("bot is not a member of the channel chat")
             || message.contains("forbidden: bot was kicked")
@@ -3752,6 +3753,9 @@ mod tests {
         )));
         assert!(channel.is_terminal_chat_error(&anyhow!(
             "telegram API getChat failed: Bad Request: group chat was deleted"
+        )));
+        assert!(channel.is_terminal_chat_error(&anyhow!(
+            "telegram API getChatMemberCount failed: Bad Request: group chat was upgraded to a supergroup chat"
         )));
         assert!(
             !channel
