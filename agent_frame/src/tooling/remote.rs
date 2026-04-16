@@ -62,7 +62,7 @@ fn validate_remote_host(host: &str) -> Result<String> {
 pub(super) fn remote_schema_property() -> Value {
     json!({
         "type": "string",
-        "description": "Optional execution target. Format: \"<host>|local\". Omit remote, set remote=\"\", or set remote=\"local\" for local execution. For SSH execution, use an actual SSH alias such as \"wuwen-dev6\"; do not pass the literal placeholder \"host\"."
+        "description": "Optional execution target. Format: \"<host>|local\". Omit remote, set remote=\"\", or set remote=\"local\" for local execution. For SSH execution, use an actual SSH alias such as \"wuwen-dev6\"; do not pass the literal placeholder \"host\". Remote path resolution is unified: when a tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise a registered workpath is used as the root, falling back to the remote user's home directory."
     })
 }
 
@@ -144,30 +144,25 @@ fn join_remote_path(base: &str, relative: &str) -> String {
     }
 }
 
+fn remote_default_root<'a>(host: &str, remote_workpaths: &'a BTreeMap<String, String>) -> &'a str {
+    remote_workpaths
+        .get(host)
+        .map(String::as_str)
+        .unwrap_or("~")
+}
+
 pub(super) fn resolve_remote_cwd(
     host: &str,
     cwd: Option<&str>,
     remote_workpaths: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let workpath = remote_workpaths.get(host).map(String::as_str);
-    match (
-        cwd.map(str::trim).filter(|value| !value.is_empty()),
-        workpath,
-    ) {
+    let root = remote_default_root(host, remote_workpaths);
+    match (cwd.map(str::trim).filter(|value| !value.is_empty()), root) {
         (Some(cwd), _) if is_remote_absolute_path(cwd) || cwd == "~" || cwd.starts_with("~/") => {
             Ok(cwd.to_string())
         }
-        (Some(cwd), Some(workpath)) => Ok(join_remote_path(workpath, cwd)),
-        (Some(cwd), None) => Err(anyhow!(
-            "remote cwd '{}' is relative but remote host '{}' has no registered workpath; pass an absolute remote cwd or add one with workpath_add",
-            cwd,
-            host
-        )),
-        (None, Some(workpath)) => Ok(workpath.to_string()),
-        (None, None) => Err(anyhow!(
-            "remote host '{}' has no registered workpath; pass an absolute remote cwd/path or add one with workpath_add",
-            host
-        )),
+        (Some(cwd), root) => Ok(join_remote_path(root, cwd)),
+        (None, root) => Ok(root.to_string()),
     }
 }
 
@@ -188,25 +183,15 @@ pub(super) fn remote_file_root(
     arguments: &Map<String, Value>,
     remote_workpaths: &BTreeMap<String, String>,
 ) -> Result<(String, String)> {
-    if let Some(workpath) = remote_workpaths.get(host) {
-        return Ok((workpath.clone(), ".".to_string()));
+    if let Some(path) = remote_file_path_arg(operation, arguments)
+        && is_remote_absolute_path(path)
+    {
+        return Ok(("/".to_string(), "/".to_string()));
     }
-    let path = remote_file_path_arg(operation, arguments).ok_or_else(|| {
-        anyhow!(
-            "remote {} tool on '{}' has no registered workpath; pass an absolute remote path or add one with workpath_add",
-            operation,
-            host
-        )
-    })?;
-    if !is_remote_absolute_path(path) {
-        return Err(anyhow!(
-            "remote {} path '{}' is relative but remote host '{}' has no registered workpath; pass an absolute remote path or add one with workpath_add",
-            operation,
-            path,
-            host
-        ));
-    }
-    Ok(("/".to_string(), "/".to_string()))
+    Ok((
+        remote_default_root(host, remote_workpaths).to_string(),
+        ".".to_string(),
+    ))
 }
 
 pub(super) fn remote_python_command(script: &str) -> String {

@@ -554,13 +554,13 @@ impl AgentRuntimeView {
             let create_session = session.clone();
             tools.push(Tool::new(
                 "create_cron_task",
-                "Create a persisted cron task that later launches a main background agent. Use a standard cron expression. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
+                "Create a persisted cron task that later launches a main background agent. Use a 6-field cron expression with seconds first, e.g. '0 0 * * * *' for hourly at minute 0, or '0 * * * * *' for every minute. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
                 json!({
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
                         "description": {"type": "string"},
-                        "schedule": {"type": "string"},
+                        "schedule": {"type": "string", "description": "6-field cron expression with seconds first. Example: '0 0 * * * *' means hourly at minute 0; '0 * * * * *' means every minute."},
                         "task": {"type": "string"},
                         "enabled": {"type": "boolean"},
                         "checker_command": {"type": "string"},

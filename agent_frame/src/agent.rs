@@ -27,13 +27,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const AGENT_FRAME_MARKER: &str = "[AgentFrame Runtime]";
+const EMPTY_FINAL_ASSISTANT_RETRY_PROMPT: &str = "The previous upstream response was empty. Continue from the preserved context and tool results, and produce the final user-facing answer now.";
 
 fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> String {
     let skills_prompt = build_skills_meta_prompt(skills);
     let mut parts = vec![
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
-        "When a supported tool has remote=\"<host>|local\" and the task is on an SSH host, you MUST set remote to the actual SSH alias instead of manually running ssh <host> inside a shell command; this avoids brittle quoting and escaping retries. Omit remote for local work.".to_string(),
+        "When a supported tool has remote=\"<host>|local\" and the task is on an SSH host, you MUST set remote to the actual SSH alias instead of manually running ssh <host> inside a shell command; this avoids brittle quoting and escaping retries. Omit remote for local work. Remote path resolution is unified: if a tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise the registered workpath is used as the root, falling back to the remote user's home directory when no workpath is registered.".to_string(),
         "DSL tool guidance: use dsl_start/dsl_wait/dsl_kill only for finite multi-step orchestration that reduces multiple dependent LLM/tool rounds. DSL code runs in a restricted CPython worker, so normal Python expressions, assignments, if statements, f-strings, list/dict operations, slices, string methods, and type() work. Available globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape; do not call tool(\"tool_name\", arg=value). DSL LLM calls always use the same model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). LLM is only a callable handle factory; do not call LLM.llm(), LLM.tool(), LLM.gen(), LLM.json(), or LLM.select(). Use emit(text) for DSL output; emitted text is joined into the default result, while quit(value) returns an explicit result. Assign tool(...) results to variables and access returned JSON with normal Python dict/list syntax. DSL jobs are exec-like long-running jobs: interrupting dsl_start or dsl_wait only interrupts the outer wait, while the DSL job continues in the background regardless of what it is doing internally. User interrupts do not cancel DSL code, DSL LLM calls, DSL tool calls, or child long-running tools; use dsl_kill to stop the DSL job and kill child tools explicitly when needed. DSL code must not use loops, comprehensions, generators, imports, functions, classes, lambdas, private '_' names/attributes, or recursive DSL calls. DSL cannot directly mutate canonical system prompts; dynamic prompt changes still arrive through system notifications and are folded into the canonical system prompt after compaction.".to_string(),
     ];
     if config
@@ -883,6 +884,7 @@ fn run_session_state_controlled_internal(
     }
 
     let round_index = 0usize;
+    let mut empty_final_assistant_retries = 0usize;
     loop {
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
@@ -1001,6 +1003,14 @@ fn run_session_state_controlled_internal(
         }
         if tool_calls.is_empty() && !assistant_message_has_content_or_tool_calls(&outcome.message) {
             runtime.continuation = None;
+            if empty_final_assistant_retries == 0 {
+                empty_final_assistant_retries += 1;
+                messages.push(ChatMessage::text(
+                    "user",
+                    EMPTY_FINAL_ASSISTANT_RETRY_PROMPT,
+                ));
+                continue;
+            }
             return Ok(SessionState {
                 messages,
                 pending_messages: Vec::new(),

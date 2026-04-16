@@ -31,6 +31,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
   - wait/observe/progress: check or wait for completion; waits must be interruptible and must not kill the underlying job merely because the user interrupted the agent turn.
   - kill/cancel: explicitly terminate the job/process/task.
 - `exec_start` follows the start shape while supporting default wait-until-complete; `exec_wait` is interruptible; `exec_kill` terminates explicitly.
+- Remote-capable tools should use `remote="<host>"` instead of shelling out to `ssh <host>` manually. If the tool has `cwd` and `cwd` is non-empty, that `cwd` controls the remote working directory. If `cwd` is omitted or empty, the remote root is the registered workpath, falling back to the remote user's home directory when no workpath is registered.
 - Download/image-style background jobs follow start + wait/progress + cancel where applicable.
 - Regression coverage should protect tool execution mode annotations and the start/wait/terminate schemas for long-running tool families.
 

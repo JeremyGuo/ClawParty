@@ -340,7 +340,7 @@ impl AgentRuntimeView {
     }
 
     pub(super) async fn run_background_job(&self, job: BackgroundJobRequest) -> Result<()> {
-        let session = self.background_session_snapshot(job.session.id)?;
+        let mut session = self.background_session_snapshot(job.session.id)?;
         self.mark_managed_agent_running(job.agent_id);
         info!(
             log_stream = "agent",
@@ -353,178 +353,187 @@ impl AgentRuntimeView {
             model = %job.model_key,
             "background agent started"
         );
-        let run_result = self
-            .run_background_agent_turn(
-                &session,
-                job.agent_id,
-                job.agent_backend,
-                &job.model_key,
-                job.prompt.clone(),
-                "background agent task join failed",
-            )
-            .await;
-
-        if self.take_background_terminate_requested(job.agent_id) {
-            let usage = match &run_result {
-                Ok(TimedRunOutcome::Completed(report)) | Ok(TimedRunOutcome::Yielded(report)) => {
-                    self.persist_background_report(session.id, report)?;
-                    report.usage.clone()
-                }
-                Ok(TimedRunOutcome::TimedOut { state, .. }) => {
-                    if let Some(state) = state {
-                        self.persist_background_report(session.id, state)?;
-                        state.usage.clone()
-                    } else {
-                        TokenUsage::default()
-                    }
-                }
-                Ok(TimedRunOutcome::Failed(_)) | Err(_) => TokenUsage::default(),
-            };
-            self.mark_managed_agent_completed(job.agent_id, &usage);
-            info!(
-                log_stream = "agent",
-                log_key = %job.agent_id,
-                kind = "background_agent_terminated_silently",
-                parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
-                cron_task_id = job.cron_task_id.map(|value| value.to_string()),
-                session_id = %session.id,
-                channel_id = %session.address.channel_id,
-                "background agent terminated without user-facing reply"
-            );
-            let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
-            return Ok(());
-        }
-
-        let outcome = match run_result {
-            Ok(TimedRunOutcome::Completed(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_turn(
-                        session.id,
-                        report.messages.clone(),
-                        &report.usage,
-                        &report.compaction,
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(job.prompt.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
+        let mut next_prompt = job.prompt.clone();
+        let mut accumulated_usage = TokenUsage::default();
+        let outcome = loop {
+            let run_result = self
+                .run_background_agent_turn(
                     &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                log_turn_usage(
                     job.agent_id,
-                    &session,
-                    &report.usage,
-                    false,
-                    "main_background",
-                    job.parent_agent_id,
-                );
+                    job.agent_backend,
+                    &job.model_key,
+                    std::mem::take(&mut next_prompt),
+                    "background agent task join failed",
+                )
+                .await;
+
+            if self.take_background_terminate_requested(job.agent_id) {
+                match &run_result {
+                    Ok(TimedRunOutcome::Completed(report))
+                    | Ok(TimedRunOutcome::Yielded(report)) => {
+                        self.persist_background_report(session.id, report)?;
+                        accumulated_usage.add_assign(&report.usage);
+                    }
+                    Ok(TimedRunOutcome::TimedOut { state, .. }) => {
+                        if let Some(state) = state {
+                            self.persist_background_report(session.id, state)?;
+                            accumulated_usage.add_assign(&state.usage);
+                        }
+                    }
+                    Ok(TimedRunOutcome::Failed(_)) | Err(_) => {}
+                };
+                self.mark_managed_agent_completed(job.agent_id, &accumulated_usage);
                 info!(
                     log_stream = "agent",
                     log_key = %job.agent_id,
-                    kind = "background_agent_replied",
+                    kind = "background_agent_terminated_silently",
                     parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
                     cron_task_id = job.cron_task_id.map(|value| value.to_string()),
                     session_id = %session.id,
                     channel_id = %session.address.channel_id,
-                    has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
-                    attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
-                    "background agent produced reply"
+                    "background agent terminated without user-facing reply"
                 );
-                if let Err(error) = self
-                    .deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
-                    .await
-                    .context("failed to deliver background agent reply")
-                {
-                    self.mark_managed_agent_failed(job.agent_id, &report.usage, &error);
-                    let recovery = self
-                        .handle_background_job_failure(&job, &session, &error)
-                        .await
-                        .with_context(|| format!("{error:#}"));
-                    let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
-                    return recovery;
-                }
-                self.mark_managed_agent_completed(job.agent_id, &report.usage);
-                Ok(())
+                break Ok(());
             }
-            Ok(TimedRunOutcome::Yielded(report)) => {
-                self.with_sessions(|sessions| {
-                    sessions.record_background_yielded_turn(
-                        session.id,
-                        report.messages.clone(),
+
+            match run_result {
+                Ok(TimedRunOutcome::Completed(report)) => {
+                    accumulated_usage.add_assign(&report.usage);
+                    self.with_sessions(|sessions| {
+                        sessions.record_background_turn(
+                            session.id,
+                            report.messages.clone(),
+                            &report.usage,
+                            &report.compaction,
+                        )
+                    })?;
+                    self.with_sessions(|sessions| {
+                        sessions.append_background_user_message(
+                            session.id,
+                            Some(job.prompt.clone()),
+                            Vec::new(),
+                        )
+                    })?;
+                    let assistant_text = extract_assistant_text(&report.messages);
+                    let outgoing = build_outgoing_message_for_session(
+                        &session,
+                        &assistant_text,
+                        &session.workspace_root,
+                    )?;
+                    self.with_sessions(|sessions| {
+                        sessions.append_background_assistant_message(
+                            session.id,
+                            outgoing.text.clone(),
+                            Vec::new(),
+                        )
+                    })?;
+                    log_turn_usage(
+                        job.agent_id,
+                        &session,
                         &report.usage,
-                        &report.compaction,
-                    )
-                })?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_user_message(
-                        session.id,
-                        Some(job.prompt.clone()),
-                        Vec::new(),
-                    )
-                })?;
-                let assistant_text = extract_assistant_text(&report.messages);
-                let outgoing = build_outgoing_message_for_session(
-                    &session,
-                    &assistant_text,
-                    &session.workspace_root,
-                )?;
-                self.with_sessions(|sessions| {
-                    sessions.append_background_assistant_message(
-                        session.id,
-                        outgoing.text.clone(),
-                        Vec::new(),
-                    )
-                })?;
-                log_turn_usage(
-                    job.agent_id,
-                    &session,
-                    &report.usage,
-                    false,
-                    "main_background",
-                    job.parent_agent_id,
-                );
-                self.deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
-                    .await
-                    .context("failed to deliver yielded background agent reply")?;
-                self.mark_managed_agent_completed(job.agent_id, &report.usage);
-                Ok(())
-            }
-            Ok(TimedRunOutcome::TimedOut { state, error }) => {
-                if let Some(state) = &state {
-                    self.persist_background_report(session.id, state)?;
+                        false,
+                        "main_background",
+                        job.parent_agent_id,
+                    );
+                    info!(
+                        log_stream = "agent",
+                        log_key = %job.agent_id,
+                        kind = "background_agent_replied",
+                        parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
+                        cron_task_id = job.cron_task_id.map(|value| value.to_string()),
+                        session_id = %session.id,
+                        channel_id = %session.address.channel_id,
+                        has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
+                        attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
+                        "background agent produced reply"
+                    );
+                    if let Err(error) = self
+                        .deliver_background_outgoing_to_foreground(
+                            &session,
+                            &job.model_key,
+                            outgoing,
+                        )
+                        .await
+                        .context("failed to deliver background agent reply")
+                    {
+                        self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                        let recovery = self
+                            .handle_background_job_failure(&job, &session, &error)
+                            .await
+                            .with_context(|| format!("{error:#}"));
+                        let _ =
+                            self.with_sessions(|sessions| sessions.close_background(session.id));
+                        return recovery;
+                    }
+                    self.mark_managed_agent_completed(job.agent_id, &accumulated_usage);
+                    break Ok(());
                 }
-                let usage = state
-                    .as_ref()
-                    .map(|state| state.usage.clone())
-                    .unwrap_or_default();
-                self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
-            }
-            Ok(TimedRunOutcome::Failed(error)) => {
-                self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
-            }
-            Err(error) => {
-                self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
-                self.handle_background_job_failure(&job, &session, &error)
-                    .await
+                Ok(TimedRunOutcome::Yielded(report)) => {
+                    accumulated_usage.add_assign(&report.usage);
+                    if report.errno.is_some() {
+                        self.persist_background_report(session.id, &report)?;
+                        let error = anyhow!(
+                            "{}",
+                            report
+                                .errinfo
+                                .clone()
+                                .unwrap_or_else(|| "agent_frame yielded with an error".to_string())
+                        );
+                        self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                        break self
+                            .handle_background_job_failure(&job, &session, &error)
+                            .await;
+                    }
+                    self.with_sessions(|sessions| {
+                        sessions.record_background_yielded_turn(
+                            session.id,
+                            report.messages.clone(),
+                            &report.usage,
+                            &report.compaction,
+                        )
+                    })?;
+                    log_turn_usage(
+                        job.agent_id,
+                        &session,
+                        &report.usage,
+                        false,
+                        "main_background",
+                        job.parent_agent_id,
+                    );
+                    info!(
+                        log_stream = "agent",
+                        log_key = %job.agent_id,
+                        kind = "background_agent_auto_resuming_yield",
+                        parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
+                        cron_task_id = job.cron_task_id.map(|value| value.to_string()),
+                        session_id = %session.id,
+                        channel_id = %session.address.channel_id,
+                        "background agent yielded after tool work; resuming to final reply"
+                    );
+                    session = self.background_session_snapshot(session.id)?;
+                }
+                Ok(TimedRunOutcome::TimedOut { state, error }) => {
+                    if let Some(state) = &state {
+                        self.persist_background_report(session.id, state)?;
+                        accumulated_usage.add_assign(&state.usage);
+                    }
+                    self.mark_managed_agent_timed_out(job.agent_id, &accumulated_usage, &error);
+                    break self
+                        .handle_background_job_failure(&job, &session, &error)
+                        .await;
+                }
+                Ok(TimedRunOutcome::Failed(error)) => {
+                    self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                    break self
+                        .handle_background_job_failure(&job, &session, &error)
+                        .await;
+                }
+                Err(error) => {
+                    self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                    break self
+                        .handle_background_job_failure(&job, &session, &error)
+                        .await;
+                }
             }
         };
         let _ = self.with_sessions(|sessions| sessions.close_background(session.id));

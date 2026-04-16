@@ -228,12 +228,10 @@ fn run_remote_apply_patch(
     reverse: bool,
     check: bool,
 ) -> Result<Value> {
-    let remote_cwd = remote_workpaths.get(host).ok_or_else(|| {
-        anyhow!(
-            "remote apply_patch on '{}' requires a registered workpath; add one with workpath_add first",
-            host
-        )
-    })?;
+    let remote_cwd = remote_workpaths
+        .get(host)
+        .map(String::as_str)
+        .unwrap_or("~");
     let mut args = vec![
         "git".to_string(),
         "apply".to_string(),
@@ -264,7 +262,7 @@ fn apply_patch_tool(
 ) -> Tool {
     Tool::new(
         "apply_patch",
-        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Optional remote=\"<host>|local\" applies this single patch over SSH when set to an actual host alias; omit remote or set remote=\"\" for local patches.",
+        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Optional remote=\"<host>|local\" applies this single patch over SSH when set to an actual host alias; omit remote or set remote=\"\" for local patches. If the remote host has no registered workpath, the patch is applied from the remote user's home directory.",
         json!({
             "type": "object",
             "properties": {
@@ -1081,10 +1079,13 @@ remote_command="$*"
     }
 
     #[test]
-    fn remote_file_root_without_workpath_requires_absolute_path() {
+    fn remote_file_root_without_workpath_defaults_to_home_for_relative_path() {
         let workpaths = BTreeMap::new();
         let relative_args = json!({"path": "src/main.rs"}).as_object().cloned().unwrap();
-        assert!(remote_file_root("wuwen-dev3", "edit", &relative_args, &workpaths).is_err());
+        let (relative_cwd, relative_root) =
+            remote_file_root("wuwen-dev3", "edit", &relative_args, &workpaths).unwrap();
+        assert_eq!(relative_cwd, "~");
+        assert_eq!(relative_root, ".");
 
         let absolute_args = json!({"path": "/srv/project/src/main.rs"})
             .as_object()
@@ -1097,12 +1098,26 @@ remote_command="$*"
     }
 
     #[test]
+    fn remote_file_root_without_path_defaults_to_home() {
+        let workpaths = BTreeMap::new();
+        let arguments = json!({}).as_object().cloned().unwrap();
+        let (remote_cwd, workspace_root) =
+            remote_file_root("wuwen-dev3", "ls", &arguments, &workpaths).unwrap();
+        assert_eq!(remote_cwd, "~");
+        assert_eq!(workspace_root, ".");
+    }
+
+    #[test]
     fn remote_cwd_uses_workpath_for_relative_paths() {
         let mut workpaths = BTreeMap::new();
         workpaths.insert("wuwen-dev3".to_string(), "/srv/project".to_string());
 
         assert_eq!(
             resolve_remote_cwd("wuwen-dev3", None, &workpaths).unwrap(),
+            "/srv/project"
+        );
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev3", Some(""), &workpaths).unwrap(),
             "/srv/project"
         );
         assert_eq!(
@@ -1113,7 +1128,18 @@ remote_command="$*"
             resolve_remote_cwd("wuwen-dev3", Some("/tmp"), &workpaths).unwrap(),
             "/tmp"
         );
-        assert!(resolve_remote_cwd("wuwen-dev6", Some("scripts"), &workpaths).is_err());
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev6", None, &workpaths).unwrap(),
+            "~"
+        );
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev6", Some(""), &workpaths).unwrap(),
+            "~"
+        );
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev6", Some("scripts"), &workpaths).unwrap(),
+            "~/scripts"
+        );
     }
 
     #[test]

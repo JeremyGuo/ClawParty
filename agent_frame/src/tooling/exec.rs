@@ -956,14 +956,14 @@ pub(super) fn exec_start_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "exec_start",
-        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Optional remote=\"<host>|local\" runs this single command over SSH when set to an actual host alias; omit remote or set remote=\"\" for local commands.",
+        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Optional remote=\"<host>|local\" runs this single command over SSH when set to an actual host alias; omit remote or set remote=\"\" for local commands. Remote cwd resolution is unified: non-empty cwd controls the remote working directory; empty or omitted cwd uses the registered workpath, or the remote user's home directory if no workpath is registered.",
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the command. Prefer relative paths for normal workspace work. When remote is set to an SSH host, cwd is resolved as a directory on that target host."
+                    "description": "Working directory for the command. Prefer relative paths for normal workspace work. When remote is set to an SSH host, a non-empty cwd controls the remote working directory; empty or omitted cwd uses the registered workpath, or the remote user's home directory if no workpath is registered."
                 },
                 "tty": {"type": "boolean"},
                 "include_stdout": {"type": "boolean"},
