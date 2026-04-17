@@ -1728,6 +1728,18 @@ fn empty_final_assistant_response_yields_api_failure_state() -> Result<()> {
             "total_tokens": 12
         }
     }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12
+        }
+    }));
     let temp_dir = TempDir::new()?;
     let config = load_config_value(
         json!({
@@ -1755,7 +1767,7 @@ fn empty_final_assistant_response_yields_api_failure_state() -> Result<()> {
         state.messages.last().map(|message| message.role.as_str()),
         Some("user")
     );
-    assert_eq!(state.usage.completion_tokens, 2);
+    assert_eq!(state.usage.completion_tokens, 4);
     Ok(())
 }
 
