@@ -23,6 +23,7 @@ use crate::conversation::{
 };
 use crate::cron::{
     ClaimedCronTask, CronCheckerConfig, CronCreateRequest, CronManager, CronUpdateRequest,
+    running_trigger_outcome,
 };
 use crate::domain::{
     AttachmentKind, ChannelAddress, MessageRole, OutgoingAttachment, OutgoingMessage,
@@ -1513,6 +1514,32 @@ impl AgentRuntimeView {
         Ok(serde_json::to_value(view).context("failed to serialize removed cron task")?)
     }
 
+    fn record_cron_trigger_result(&self, id: Option<uuid::Uuid>, outcome: &'static str) {
+        let Some(id) = id else {
+            return;
+        };
+        let Ok(mut manager) = self.cron_manager.lock() else {
+            warn!(
+                log_stream = "agent",
+                kind = "cron_task_trigger_result_failed",
+                cron_task_id = %id,
+                outcome,
+                "failed to record cron trigger result because cron manager lock was poisoned"
+            );
+            return;
+        };
+        if let Err(error) = manager.record_trigger_result(id, Utc::now(), outcome.to_string()) {
+            warn!(
+                log_stream = "agent",
+                kind = "cron_task_trigger_result_failed",
+                cron_task_id = %id,
+                outcome,
+                error = %format!("{error:#}"),
+                "failed to record cron trigger result"
+            );
+        }
+    }
+
     async fn poll_cron_once(&self) -> Result<()> {
         let now = Utc::now();
         let due_tasks = {
@@ -1603,7 +1630,11 @@ impl AgentRuntimeView {
                 .cron_manager
                 .lock()
                 .map_err(|_| anyhow!("cron manager lock poisoned"))?;
-            manager.record_trigger_result(task.id, Utc::now(), "enqueued".to_string())?;
+            manager.record_trigger_result(
+                task.id,
+                Utc::now(),
+                running_trigger_outcome(background_agent_id),
+            )?;
         }
         info!(
             log_stream = "agent",
@@ -4356,6 +4387,33 @@ mod tests {
                 .get("properties")
                 .and_then(Value::as_object)
                 .is_some_and(|properties| !properties.contains_key("sink"))
+        );
+        let create_cron = foreground_tools
+            .iter()
+            .find(|tool| tool.name == "create_cron_task")
+            .expect("foreground should expose create_cron_task");
+        let create_cron_properties = create_cron
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("create_cron_task properties");
+        assert!(!create_cron_properties.contains_key("schedule"));
+        assert!(create_cron_properties.contains_key("cron_second"));
+        assert!(create_cron_properties.contains_key("cron_minute"));
+        let create_cron_required = create_cron
+            .parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("create_cron_task required fields");
+        assert!(
+            create_cron_required
+                .iter()
+                .any(|value| value.as_str() == Some("cron_second"))
+        );
+        assert!(
+            create_cron_required
+                .iter()
+                .any(|value| value.as_str() == Some("cron_day_of_week"))
         );
         assert!(!foreground_tools.iter().any(|tool| tool.name == "terminate"));
 

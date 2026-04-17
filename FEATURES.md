@@ -52,6 +52,13 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Main Background Agents have a `terminate` tool that ends the background job silently without sending a user-facing reply or inserting foreground context.
 - Regression coverage should protect final reply insertion, durable mailbox delivery while the foreground is active, compaction-after-insert behavior, and silent termination.
 
+### Cron Scheduling
+
+- Cron task tools expose schedule timing through named fields such as `cron_second`, `cron_minute`, `cron_hour`, `cron_day_of_month`, `cron_month`, `cron_day_of_week`, and optional `cron_year`; models should not assemble positional cron strings themselves.
+- Internally, named cron fields are compiled to the persisted seconds-first cron expression and interpreted in the server's local timezone.
+- A cron task must not enqueue overlapping background jobs for the same task; if a previous trigger is still running, the due time is skipped rather than queued for catch-up.
+- Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, local-time exact schedules, and non-overlapping trigger behavior.
+
 ### Session Actor Architecture
 
 ```mermaid

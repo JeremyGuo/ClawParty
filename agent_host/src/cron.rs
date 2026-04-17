@@ -141,12 +141,23 @@ impl CronManager {
         let file: CronStoreFile =
             serde_json::from_str(&raw).context("failed to parse cron task store")?;
         let mut tasks = BTreeMap::new();
-        for task in file.tasks {
+        let mut normalized_stale_running = false;
+        let now = Utc::now();
+        for mut task in file.tasks {
             validate_task(&task)?;
+            if trigger_outcome_is_running(task.last_trigger_outcome.as_deref()) {
+                task.last_trigger_outcome = Some("interrupted_by_restart".to_string());
+                task.updated_at = now;
+                normalized_stale_running = true;
+            }
             tasks.insert(task.id, task);
         }
 
-        Ok(Self { store_path, tasks })
+        let manager = Self { store_path, tasks };
+        if normalized_stale_running {
+            manager.persist()?;
+        }
+        Ok(manager)
     }
 
     pub fn list(&self) -> Result<Vec<CronTaskView>> {
@@ -276,6 +287,7 @@ impl CronManager {
 
     pub fn claim_due_tasks(&mut self, now: DateTime<Utc>) -> Result<Vec<ClaimedCronTask>> {
         let mut claimed = Vec::new();
+        let mut skipped_running = false;
         for task in self.tasks.values_mut() {
             if !task.enabled {
                 continue;
@@ -289,6 +301,12 @@ impl CronManager {
                 continue;
             };
             if next_run <= now {
+                if trigger_outcome_is_running(task.last_trigger_outcome.as_deref()) {
+                    task.last_scheduled_for = Some(next_run);
+                    task.updated_at = now;
+                    skipped_running = true;
+                    continue;
+                }
                 task.last_scheduled_for = Some(next_run);
                 task.updated_at = now;
                 claimed.push(ClaimedCronTask {
@@ -297,7 +315,7 @@ impl CronManager {
                 });
             }
         }
-        if !claimed.is_empty() {
+        if !claimed.is_empty() || skipped_running {
             self.persist()?;
         }
         Ok(claimed)
@@ -343,6 +361,14 @@ impl CronManager {
         fs::write(&self.store_path, raw)
             .with_context(|| format!("failed to write {}", self.store_path.display()))
     }
+}
+
+pub fn running_trigger_outcome(agent_id: Uuid) -> String {
+    format!("running:{agent_id}")
+}
+
+fn trigger_outcome_is_running(outcome: Option<&str>) -> bool {
+    outcome.is_some_and(|value| value.starts_with("running:"))
 }
 
 fn task_view(task: &CronTaskRecord) -> Result<CronTaskView> {
@@ -428,12 +454,13 @@ fn validate_checker(checker: &CronCheckerConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CronCreateRequest, CronManager};
+    use super::{CronCreateRequest, CronManager, running_trigger_outcome};
     use crate::backend::AgentBackendKind;
     use crate::domain::ChannelAddress;
     use crate::sink::SinkTarget;
     use chrono::{Datelike, Local, TimeZone, Timelike};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     #[test]
     fn cron_manager_roundtrip_and_claim() {
@@ -466,6 +493,121 @@ mod tests {
         assert_eq!(manager.list().unwrap().len(), 1);
         let due = manager
             .claim_due_tasks(task.created_at + chrono::Duration::seconds(5))
+            .unwrap();
+        assert_eq!(due.len(), 1);
+    }
+
+    #[test]
+    fn cron_manager_skips_due_task_while_previous_trigger_is_running() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
+        let task = manager
+            .create(CronCreateRequest {
+                name: "progress".to_string(),
+                description: "send progress".to_string(),
+                schedule: "0 * * * * *".to_string(),
+                agent_backend: AgentBackendKind::AgentFrame,
+                model_key: "main".to_string(),
+                prompt: "ping".to_string(),
+                sink: SinkTarget::Direct(ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                }),
+                address: ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                },
+                enabled: true,
+                checker: None,
+            })
+            .unwrap();
+
+        let first_due_at = task.created_at + chrono::Duration::minutes(1);
+        let due = manager.claim_due_tasks(first_due_at).unwrap();
+        assert_eq!(due.len(), 1);
+        manager
+            .record_trigger_result(
+                task.id,
+                first_due_at,
+                running_trigger_outcome(Uuid::new_v4()),
+            )
+            .unwrap();
+
+        let skipped = manager
+            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .unwrap();
+        assert!(skipped.is_empty());
+        let skipped_again = manager
+            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .unwrap();
+        assert!(skipped_again.is_empty());
+
+        manager
+            .record_trigger_result(task.id, first_due_at, "completed".to_string())
+            .unwrap();
+        let next_due = manager
+            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .unwrap();
+        assert!(next_due.is_empty());
+        let future_due = manager
+            .claim_due_tasks(first_due_at + chrono::Duration::minutes(3))
+            .unwrap();
+        assert_eq!(future_due.len(), 1);
+    }
+
+    #[test]
+    fn cron_manager_clears_running_trigger_after_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
+        let task = manager
+            .create(CronCreateRequest {
+                name: "progress".to_string(),
+                description: "send progress".to_string(),
+                schedule: "0 * * * * *".to_string(),
+                agent_backend: AgentBackendKind::AgentFrame,
+                model_key: "main".to_string(),
+                prompt: "ping".to_string(),
+                sink: SinkTarget::Direct(ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                }),
+                address: ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                },
+                enabled: true,
+                checker: None,
+            })
+            .unwrap();
+
+        let first_due_at = task.created_at + chrono::Duration::minutes(1);
+        {
+            let stored = manager.tasks.get_mut(&task.id).unwrap();
+            stored.last_scheduled_for = Some(first_due_at);
+            stored.last_triggered_at = Some(first_due_at);
+            stored.last_trigger_outcome = Some(running_trigger_outcome(Uuid::new_v4()));
+        }
+        manager.persist().unwrap();
+
+        let mut restored = CronManager::load_or_create(temp_dir.path()).unwrap();
+        assert_eq!(
+            restored
+                .get(task.id)
+                .unwrap()
+                .last_trigger_outcome
+                .as_deref(),
+            Some("interrupted_by_restart")
+        );
+        let due = restored
+            .claim_due_tasks(first_due_at + chrono::Duration::minutes(1))
             .unwrap();
         assert_eq!(due.len(), 1);
     }

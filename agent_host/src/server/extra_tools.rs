@@ -562,20 +562,26 @@ impl AgentRuntimeView {
             let create_session = session.clone();
             tools.push(Tool::new(
                 "create_cron_task",
-                "Create a persisted cron task that later launches a main background agent. Use a cron expression with seconds first, interpreted in the server's local timezone, e.g. '0 0 * * * *' for hourly at minute 0, or '0 * * * * *' for every minute. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
+                "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the server's local timezone. Example hourly at minute 0: cron_second='0', cron_minute='0', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Example every minute: cron_second='0', cron_minute='*', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Use cron_year for exact one-off calendar years when needed. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
                 json!({
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
                         "description": {"type": "string"},
-                        "schedule": {"type": "string", "description": "Cron expression with seconds first, interpreted in the server's local timezone. Example: '0 0 * * * *' means hourly at minute 0; '0 * * * * *' means every minute."},
+                        "cron_second": {"type": "string", "description": "Seconds field. Examples: '0', '*/30', '*'."},
+                        "cron_minute": {"type": "string", "description": "Minutes field. Examples: '0', '*/5', '*'."},
+                        "cron_hour": {"type": "string", "description": "Hours field in server local time. Examples: '13', '9-17', '*'."},
+                        "cron_day_of_month": {"type": "string", "description": "Day-of-month field in server local time. Examples: '17', '1,15', '*'."},
+                        "cron_month": {"type": "string", "description": "Month field in server local time. Examples: '4', '1-12', '*'."},
+                        "cron_day_of_week": {"type": "string", "description": "Day-of-week field in server local time. Examples: '*', 'Mon-Fri', '0'."},
+                        "cron_year": {"type": "string", "description": "Optional year field in server local time. Example: '2026'."},
                         "task": {"type": "string"},
                         "enabled": {"type": "boolean"},
                         "checker_command": {"type": "string"},
                         "checker_timeout_seconds": {"type": "number"},
                         "checker_cwd": {"type": "string"}
                     },
-                    "required": ["name", "description", "schedule", "task"],
+                    "required": ["name", "description", "cron_second", "cron_minute", "cron_hour", "cron_day_of_month", "cron_month", "cron_day_of_week", "task"],
                     "additionalProperties": false
                 }),
                 move |arguments| {
@@ -588,7 +594,7 @@ impl AgentRuntimeView {
                         CronCreateRequest {
                             name: string_arg_required(object, "name")?,
                             description: string_arg_required(object, "description")?,
-                            schedule: string_arg_required(object, "schedule")?,
+                            schedule: cron_schedule_from_required_tool_args(object)?,
                             agent_backend: runtime.effective_agent_backend()?,
                             model_key: runtime.effective_main_model_key()?,
                             prompt: string_arg_required(object, "task")?,
@@ -607,14 +613,20 @@ impl AgentRuntimeView {
             let runtime = self.clone();
             tools.push(Tool::new(
                 "update_cron_task",
-                "Update a cron task. Cron schedules are interpreted in the server's local timezone. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
+                "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Cron fields are interpreted in the server's local timezone. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
                         "name": {"type": "string"},
                         "description": {"type": "string"},
-                        "schedule": {"type": "string"},
+                        "cron_second": {"type": "string"},
+                        "cron_minute": {"type": "string"},
+                        "cron_hour": {"type": "string"},
+                        "cron_day_of_month": {"type": "string"},
+                        "cron_month": {"type": "string"},
+                        "cron_day_of_week": {"type": "string"},
+                        "cron_year": {"type": "string"},
                         "task": {"type": "string"},
                         "model": {"type": "string"},
                         "enabled": {"type": "boolean"},
@@ -650,7 +662,7 @@ impl AgentRuntimeView {
                         CronUpdateRequest {
                             name: optional_string_arg(object, "name")?,
                             description: optional_string_arg(object, "description")?,
-                            schedule: optional_string_arg(object, "schedule")?,
+                            schedule: optional_cron_schedule_from_tool_args(object)?,
                             agent_backend: None,
                             model_key: optional_string_arg(object, "model")?,
                             prompt: optional_string_arg(object, "task")?,

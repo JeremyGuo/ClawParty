@@ -1706,6 +1706,7 @@ impl AgentRuntimeView {
                 )?;
                 self.unregister_session_actor_runtime_control(&session)?;
                 self.mark_managed_agent_completed(job.agent_id, &accumulated_usage);
+                self.record_cron_trigger_result(job.cron_task_id, "terminated_silently");
                 info!(
                     log_stream = "agent",
                     log_key = %job.agent_id,
@@ -1727,12 +1728,14 @@ impl AgentRuntimeView {
                         .await
                     {
                         self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                        self.record_cron_trigger_result(job.cron_task_id, "failed");
                         break self
                             .handle_background_job_failure(&job, &session, &error)
                             .await
                             .with_context(|| format!("{error:#}"));
                     }
                     self.mark_managed_agent_completed(job.agent_id, &accumulated_usage);
+                    self.record_cron_trigger_result(job.cron_task_id, "completed");
                     break Ok(());
                 }
                 Ok(TimedRunOutcome::Yielded(report)) => {
@@ -1742,6 +1745,7 @@ impl AgentRuntimeView {
                         self.unregister_session_actor_runtime_control(&session)?;
                         let error = Self::background_yield_error(&report);
                         self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                        self.record_cron_trigger_result(job.cron_task_id, "failed");
                         break self
                             .handle_background_job_failure(&job, &session, &error)
                             .await;
@@ -1758,6 +1762,7 @@ impl AgentRuntimeView {
                     }
                     self.unregister_session_actor_runtime_control(&session)?;
                     self.mark_managed_agent_timed_out(job.agent_id, &accumulated_usage, &error);
+                    self.record_cron_trigger_result(job.cron_task_id, "timed_out");
                     break self
                         .handle_background_job_failure(&job, &session, &error)
                         .await;
@@ -1765,6 +1770,7 @@ impl AgentRuntimeView {
                 Ok(TimedRunOutcome::Failed(error)) => {
                     self.unregister_session_actor_runtime_control(&session)?;
                     self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                    self.record_cron_trigger_result(job.cron_task_id, "failed");
                     break self
                         .handle_background_job_failure(&job, &session, &error)
                         .await;
@@ -1772,6 +1778,7 @@ impl AgentRuntimeView {
                 Err(error) => {
                     let _ = self.unregister_session_actor_runtime_control(&session);
                     self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
+                    self.record_cron_trigger_result(job.cron_task_id, "failed");
                     break self
                         .handle_background_job_failure(&job, &session, &error)
                         .await;

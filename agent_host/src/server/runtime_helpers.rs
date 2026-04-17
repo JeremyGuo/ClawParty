@@ -40,6 +40,133 @@ pub(super) fn optional_string_arg(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args};
+    use serde_json::{Value, json};
+
+    fn object(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().cloned().expect("test object")
+    }
+
+    #[test]
+    fn named_cron_fields_compile_to_seconds_first_schedule() {
+        let args = object(json!({
+            "cron_second": "0",
+            "cron_minute": "0",
+            "cron_hour": "*",
+            "cron_day_of_month": "*",
+            "cron_month": "*",
+            "cron_day_of_week": "*"
+        }));
+
+        let schedule = cron_schedule_from_required_tool_args(&args).unwrap();
+        assert_eq!(schedule, "0 0 * * * *");
+    }
+
+    #[test]
+    fn named_cron_fields_include_optional_year() {
+        let args = object(json!({
+            "cron_second": "0",
+            "cron_minute": "7",
+            "cron_hour": "13",
+            "cron_day_of_month": "17",
+            "cron_month": "4",
+            "cron_day_of_week": "*",
+            "cron_year": "2026"
+        }));
+
+        let schedule = cron_schedule_from_required_tool_args(&args).unwrap();
+        assert_eq!(schedule, "0 7 13 17 4 * 2026");
+    }
+
+    #[test]
+    fn optional_named_cron_fields_reject_partial_updates() {
+        let args = object(json!({
+            "cron_minute": "0"
+        }));
+
+        assert!(optional_cron_schedule_from_tool_args(&args).is_err());
+    }
+
+    #[test]
+    fn optional_named_cron_fields_ignore_absent_schedule() {
+        let args = object(json!({
+            "task": "leave timing alone"
+        }));
+
+        assert_eq!(optional_cron_schedule_from_tool_args(&args).unwrap(), None);
+    }
+}
+
+pub(super) fn cron_schedule_from_required_tool_args(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<String> {
+    build_cron_schedule_from_tool_args(arguments, true)
+        .and_then(|schedule| schedule.ok_or_else(|| anyhow!("cron schedule is required")))
+}
+
+pub(super) fn optional_cron_schedule_from_tool_args(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<Option<String>> {
+    build_cron_schedule_from_tool_args(arguments, false)
+}
+
+fn build_cron_schedule_from_tool_args(
+    arguments: &serde_json::Map<String, Value>,
+    required: bool,
+) -> Result<Option<String>> {
+    let keys = [
+        "cron_second",
+        "cron_minute",
+        "cron_hour",
+        "cron_day_of_month",
+        "cron_month",
+        "cron_day_of_week",
+    ];
+    let has_required_field = keys.iter().any(|key| arguments.contains_key(*key));
+    let has_year = arguments.contains_key("cron_year");
+    if !required && !has_required_field && !has_year {
+        return Ok(None);
+    }
+
+    let mut fields = Vec::with_capacity(7);
+    for key in keys {
+        fields.push(cron_field_arg_required(arguments, key)?);
+    }
+    if let Some(year) = optional_cron_field_arg(arguments, "cron_year")? {
+        fields.push(year);
+    }
+    Ok(Some(fields.join(" ")))
+}
+
+fn cron_field_arg_required(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String> {
+    let field = string_arg_required(arguments, key)?;
+    validate_cron_field_arg(key, field)
+}
+
+fn optional_cron_field_arg(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>> {
+    optional_string_arg(arguments, key)?
+        .map(|field| validate_cron_field_arg(key, field))
+        .transpose()
+}
+
+fn validate_cron_field_arg(key: &str, field: String) -> Result<String> {
+    if field.chars().any(char::is_whitespace) {
+        return Err(anyhow!(
+            "{} must be a single cron field without whitespace",
+            key
+        ));
+    }
+    Ok(field)
+}
+
 pub(super) fn parse_checker_from_tool_args(
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Option<CronCheckerConfig>> {
