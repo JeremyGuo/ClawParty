@@ -28,14 +28,14 @@ pub struct SessionSkillState {
 }
 
 #[derive(Clone, Debug)]
-pub struct SessionSkillObservation {
-    pub name: String,
-    pub description: String,
-    pub content: String,
+pub(crate) struct SessionSkillObservation {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) content: String,
 }
 
 #[derive(Clone, Debug)]
-pub enum SkillChangeNotice {
+pub(crate) enum SkillChangeNotice {
     DescriptionChanged {
         name: String,
         description: String,
@@ -48,13 +48,13 @@ pub enum SkillChangeNotice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SharedProfileChangeNotice {
+pub(crate) enum SharedProfileChangeNotice {
     UserUpdated,
     IdentityUpdated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModelCatalogChangeNotice {
+pub(crate) enum ModelCatalogChangeNotice {
     Updated,
 }
 
@@ -166,9 +166,9 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SystemPromptStateObservation {
-    pub static_changed: bool,
-    pub dynamic_notice_keys: BTreeSet<String>,
+pub(crate) struct SystemPromptStateObservation {
+    pub(crate) static_changed: bool,
+    pub(crate) dynamic_notice_keys: BTreeSet<String>,
 }
 
 pub const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
@@ -176,12 +176,12 @@ pub const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const COMPACTION_WAIT_NOTICE_TEXT: &str = "正在压缩上下文，可能要等待压缩完毕后才能回复。";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionActorOutbound {
+pub(crate) enum SessionActorOutbound {
     UserVisibleText(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionRuntimePhase {
+enum SessionRuntimePhase {
     Running,
     Compacting,
 }
@@ -193,32 +193,32 @@ struct SessionYieldDisposition {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionUserMessageReceipt {
-    pub text: Option<String>,
-    pub interrupted: bool,
-    pub compaction_in_progress: bool,
-    pub outbound: Vec<SessionActorOutbound>,
+pub(crate) struct SessionUserMessageReceipt {
+    pub(crate) text: Option<String>,
+    pub(crate) interrupted: bool,
+    pub(crate) compaction_in_progress: bool,
+    pub(crate) outbound: Vec<SessionActorOutbound>,
 }
 
 #[derive(Clone, Debug)]
-pub struct SessionActorMessage {
-    pub from_session_id: Uuid,
-    pub role: MessageRole,
-    pub text: Option<String>,
-    pub attachments: Vec<StoredAttachment>,
+pub(crate) struct SessionActorMessage {
+    pub(crate) from_session_id: Uuid,
+    pub(crate) role: MessageRole,
+    pub(crate) text: Option<String>,
+    pub(crate) attachments: Vec<StoredAttachment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionActorMessageReceipt {
-    pub message_id: Uuid,
-    pub applied_to_context: bool,
+pub(crate) struct SessionActorMessageReceipt {
+    pub(crate) message_id: Uuid,
+    pub(crate) applied_to_context: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct SessionUserMessage {
-    pub pending_message: ChatMessage,
-    pub text: Option<String>,
-    pub attachments: Vec<StoredAttachment>,
+pub(crate) struct SessionUserMessage {
+    pub(crate) pending_message: ChatMessage,
+    pub(crate) text: Option<String>,
+    pub(crate) attachments: Vec<StoredAttachment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -254,15 +254,15 @@ fn default_actor_message_role() -> MessageRole {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SessionTurnTimeHintConfig {
-    pub emit_idle_time_gap_hint: bool,
-    pub emit_system_date_on_user_message: bool,
+pub(crate) struct SessionTurnTimeHintConfig {
+    pub(crate) emit_idle_time_gap_hint: bool,
+    pub(crate) emit_system_date_on_user_message: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionTurnTimeHints {
-    pub user_time_tip: Option<String>,
-    pub system_date: Option<String>,
+pub(crate) struct SessionTurnTimeHints {
+    pub(crate) user_time_tip: Option<String>,
+    pub(crate) system_date: Option<String>,
 }
 
 pub struct SessionRuntimeTurnCommit {
@@ -278,17 +278,17 @@ pub struct SessionRuntimeTurnCommit {
     pub assistant_history_text: Option<String>,
 }
 
-pub struct SessionRuntimeTurnFailure {
-    pub resume_messages: Vec<ChatMessage>,
-    pub errno: SessionErrno,
-    pub errinfo: Option<String>,
-    pub compaction: SessionCompactionStats,
-    pub system_prompt_static_hash_after_compaction: Option<String>,
-    pub system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
+pub(crate) struct SessionRuntimeTurnFailure {
+    pub(crate) resume_messages: Vec<ChatMessage>,
+    pub(crate) errno: SessionErrno,
+    pub(crate) errinfo: Option<String>,
+    pub(crate) compaction: SessionCompactionStats,
+    pub(crate) system_prompt_static_hash_after_compaction: Option<String>,
+    pub(crate) system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
-pub enum SessionEffect {
+pub(crate) enum SessionEffect {
     UpdateProgress(ProgressFeedback),
 }
 
@@ -323,6 +323,7 @@ pub struct SessionActorRef {
 }
 
 impl SessionActorRef {
+    #[cfg(test)]
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -409,14 +410,14 @@ impl SessionActorRef {
         self.shutdown()
     }
 
-    pub fn tell_user_message(
+    pub(crate) fn tell_user_message(
         &self,
         message: SessionUserMessage,
     ) -> Result<SessionUserMessageReceipt> {
         self.update(move |actor| actor.tell_user_message(message))
     }
 
-    pub fn tell_actor_message(
+    pub(crate) fn tell_actor_message(
         &self,
         message: SessionActorMessage,
     ) -> Result<SessionActorMessageReceipt> {
