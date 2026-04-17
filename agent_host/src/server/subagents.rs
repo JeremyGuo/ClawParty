@@ -268,6 +268,7 @@ impl AgentRuntimeView {
 
     fn subagent_session_snapshot(&self, subagent: &HostedSubagent) -> SessionSnapshot {
         SessionSnapshot {
+            kind: crate::session::SessionKind::Background,
             id: subagent.session_id,
             agent_id: subagent.id,
             address: subagent.address.clone(),
@@ -469,6 +470,7 @@ impl AgentRuntimeView {
                 }
             });
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Background,
             id: subagent.session_id,
             agent_id: subagent.id,
             address: subagent.address.clone(),
@@ -500,6 +502,8 @@ impl AgentRuntimeView {
                 errno: None,
                 errinfo: None,
                 progress_message: None,
+                actor_mailbox: Vec::new(),
+                user_mailbox: Vec::new(),
             },
         };
         let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&model_key)?;

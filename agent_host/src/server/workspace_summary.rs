@@ -5,9 +5,9 @@ impl Server {
         let snapshots = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
         let mut first_error = None;
         for session in snapshots {
-            let _ = self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, true, false)
-            });
+            let _ = self
+                .with_sessions(|sessions| sessions.resolve_foreground_by_address(&session.address))
+                .and_then(|actor| actor.mark_workspace_summary_state(true, false));
             if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
                 warn!(
                     log_stream = "session",
@@ -36,9 +36,10 @@ impl Server {
         let request_messages = session.request_messages();
         let request_message_count = request_messages.len();
         if request_message_count == 0 && entries.is_empty() {
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
+            let actor = self.with_sessions(|sessions| {
+                sessions.resolve_foreground_by_address(&session.address)
             })?;
+            actor.mark_workspace_summary_state(false, false)?;
             return Ok(());
         }
 
@@ -123,9 +124,10 @@ impl Server {
             extract_attachment_references(&summary_text, &session.workspace_root)?;
         let clean_summary = clean_summary.trim();
         if clean_summary.is_empty() {
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
+            let actor = self.with_sessions(|sessions| {
+                sessions.resolve_foreground_by_address(&session.address)
             })?;
+            actor.mark_workspace_summary_state(false, false)?;
             return Ok(());
         }
         let updated = self.workspace_manager.update_summary(
@@ -133,9 +135,9 @@ impl Server {
             clean_summary.to_string(),
             None,
         )?;
-        self.with_sessions(|sessions| {
-            sessions.mark_workspace_summary_state(&session.address, false, false)
-        })?;
+        let actor = self
+            .with_sessions(|sessions| sessions.resolve_foreground_by_address(&session.address))?;
+        actor.mark_workspace_summary_state(false, false)?;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -163,9 +165,10 @@ impl Server {
                 );
                 continue;
             }
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
+            let actor = self.with_sessions(|sessions| {
+                sessions.resolve_foreground_by_address(&session.address)
             })?;
+            actor.mark_workspace_summary_state(false, false)?;
             if session.close_after_summary {
                 self.destroy_foreground_session(&session.address)?;
             }

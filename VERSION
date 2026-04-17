@@ -1,5 +1,27 @@
-version: 0.19.1
+version: 0.19.3
 ---
+
+# 0.19.3
+
+- 新增持久化 SessionActor user mailbox：
+  普通用户消息在进入 SessionActor 后会先写入 `session_state.user_mailbox`，运行中的 Session 只请求 yield，不再由 Conversation worker 维护长时间排队；Session 空闲后自行 drain 到 pending context 和可见 history。
+- 移除 Conversation worker 的长队列语义：
+  Incoming dispatch 不再按 conversation session key 维护内存 worker 队列；普通消息作为非阻塞任务进入 Conversation 准备阶段，再交给 SessionActor 自己排队和 claim runtime。
+- 升级 `workdir` 结构版本到 `0.27`：
+  `0.26 -> 0.27` upgrade step 会为 `sessions/*/session.json` 的 `session_state` 以及 snapshot 的 `session` checkpoint 回填 `user_mailbox: []`。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.19.2` 提升到 `0.19.3`。
+
+# 0.19.2
+
+- 新增持久化 SessionActor mailbox：
+  actor-to-actor 消息会先写入接收 Session 的 durable mailbox，发送方不再等待接收方空闲；接收方空闲或运行结束后自行 drain 到上下文与可见历史。
+- 改进重启恢复语义：
+  服务重启后，已持久化但尚未处理的 actor mailbox 消息会随 foreground session 恢复并在空闲时进入 session context，避免 background result 在前台运行期间或进程重启窗口中丢失。
+- 升级 `workdir` 结构版本到 `0.26`：
+  `0.25 -> 0.26` upgrade step 会为 `sessions/*/session.json` 的 `session_state` 以及 snapshot 的 `session` checkpoint 回填 `actor_mailbox: []`。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.19.1` 提升到 `0.19.2`。
 
 # 0.19.1
 

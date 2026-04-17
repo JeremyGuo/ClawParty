@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(test)]
+use crate::session::QUEUED_USER_UPDATES_MARKER;
+#[cfg(test)]
+use std::collections::VecDeque;
 
 pub(super) fn send_outgoing_message_now(
     channel: Arc<dyn Channel>,
@@ -64,6 +68,7 @@ fn prepend_system_date_section(
     sections
 }
 
+#[cfg(test)]
 pub(super) fn coalesce_buffered_conversation_messages(
     initial: IncomingMessage,
     pending_messages: &mut VecDeque<IncomingMessage>,
@@ -94,6 +99,7 @@ pub(super) fn coalesce_buffered_conversation_messages(
     merge_buffered_messages(grouped)
 }
 
+#[cfg(test)]
 fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage {
     if grouped.len() == 1 {
         return grouped.remove(0);
@@ -129,6 +135,7 @@ fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage
     }
 }
 
+#[cfg(test)]
 fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> String {
     let mut sections = vec![
         QUEUED_USER_UPDATES_MARKER.to_string(),
@@ -145,90 +152,6 @@ fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> Stri
         sections.push(format!("Follow-up {}:\n{}", index + 1, body));
     }
     sections.join("\n\n")
-}
-
-pub(super) fn should_emit_runtime_change_prompt(text: Option<&str>) -> bool {
-    let trimmed = text.map(str::trim_start).unwrap_or("");
-    !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
-        && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
-}
-
-pub(super) struct IncomingYieldDisposition {
-    pub(super) interrupted: bool,
-    pub(super) compaction_in_progress: bool,
-}
-
-pub(super) fn request_yield_for_incoming(
-    active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
-    active_phases: &Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
-    message: &IncomingMessage,
-) -> IncomingYieldDisposition {
-    if message.control.is_some() {
-        return IncomingYieldDisposition {
-            interrupted: false,
-            compaction_in_progress: false,
-        };
-    }
-    let session_key = message.address.session_key();
-    let control = active_controls
-        .lock()
-        .ok()
-        .and_then(|controls| controls.get(&session_key).cloned());
-    let compaction_in_progress = active_phases
-        .lock()
-        .ok()
-        .and_then(|phases| phases.get(&session_key).copied())
-        .is_some_and(|phase| phase == ForegroundRuntimePhase::Compacting);
-    if let Some(control) = control {
-        control.request_yield();
-        IncomingYieldDisposition {
-            interrupted: true,
-            compaction_in_progress,
-        }
-    } else {
-        IncomingYieldDisposition {
-            interrupted: false,
-            compaction_in_progress: false,
-        }
-    }
-}
-
-pub(super) fn update_active_foreground_phase(
-    active_phases: &Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
-    session_key: &str,
-    event: &SessionEvent,
-) {
-    let phase = match event {
-        SessionEvent::CompactionStarted { .. } | SessionEvent::ToolWaitCompactionStarted { .. } => {
-            Some(ForegroundRuntimePhase::Compacting)
-        }
-        SessionEvent::CompactionCompleted { .. }
-        | SessionEvent::ToolWaitCompactionCompleted { .. }
-        | SessionEvent::SessionStarted { .. }
-        | SessionEvent::RoundStarted { .. }
-        | SessionEvent::ModelCallStarted { .. }
-        | SessionEvent::ModelCallCompleted { .. }
-        | SessionEvent::ToolWaitCompactionScheduled { .. }
-        | SessionEvent::ToolCallStarted { .. }
-        | SessionEvent::ToolCallCompleted { .. }
-        | SessionEvent::SessionYielded { .. }
-        | SessionEvent::PrefixRewriteApplied { .. }
-        | SessionEvent::SessionCompleted { .. } => Some(ForegroundRuntimePhase::Running),
-    };
-    if let Some(phase) = phase
-        && let Ok(mut phases) = active_phases.lock()
-    {
-        phases.insert(session_key.to_string(), phase);
-    }
-}
-
-pub(super) fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
-    match text {
-        Some(text) if !text.trim().is_empty() => {
-            Some(format!("{INTERRUPTED_FOLLOWUP_MARKER}\n{text}"))
-        }
-        _ => Some(INTERRUPTED_FOLLOWUP_MARKER.to_string()),
-    }
 }
 
 pub(super) fn fast_path_agent_selection_message(
@@ -415,6 +338,7 @@ pub(super) fn build_synthetic_system_messages(
     messages
 }
 
+#[cfg(test)]
 pub(super) fn render_last_user_message_time_tip(
     session: &SessionSnapshot,
     now: chrono::DateTime<chrono::Utc>,
@@ -433,6 +357,7 @@ pub(super) fn render_last_user_message_time_tip(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn render_system_date_on_user_message(now: chrono::DateTime<chrono::Utc>) -> String {
     let local_now = now.with_timezone(&chrono::Local);
     format!(

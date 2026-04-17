@@ -16,10 +16,10 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 ### Parallel Conversations
 
 - Different conversations must be able to run foreground work concurrently; a long-running turn in one conversation must not block normal message dispatch for another conversation.
-- Foreground workers are scoped by conversation session key so messages from the same conversation remain ordered while messages from different conversations can progress independently.
-- Interrupt, yield, compaction-phase, and pending-interrupt state must be scoped to the matching conversation session key only.
+- Incoming dispatch and Conversation routing must not maintain long-running per-conversation queues; they may prepare and route messages, but durable ordering and waiting belong to the receiving SessionActor.
+- Session actors own the per-session run claim, interrupt, yield, compaction-phase, and pending-interrupt state so independent sessions can progress concurrently.
 - Server maintenance work such as idle context compaction must not run inline on the incoming-message dispatch loop in a way that globally pauses new conversation dispatch.
-- Regression coverage should protect per-conversation interrupt scoping and non-leaking conversation queues/control messages.
+- Regression coverage should protect per-session interrupt scoping and non-leaking conversation queues/control messages.
 
 ### Tool Execution Lifecycle
 
@@ -47,10 +47,47 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 - A main background agent final user-facing reply is delivered to the same foreground conversation that started or owns it.
 - The same final reply is inserted into the Main Foreground Agent stable context as an assistant message so later foreground turns can see it without separate sink plumbing.
-- If the foreground agent is currently running, background delivery waits for that foreground turn to finish or yield before inserting the reply.
+- If the foreground agent is currently running, background delivery tells the foreground actor through its durable mailbox and returns without blocking on the receiver turn.
 - After inserting a background result, the runtime checks foreground context size and compacts when the normal compaction threshold is reached.
 - Main Background Agents have a `terminate` tool that ends the background job silently without sending a user-facing reply or inserting foreground context.
-- Regression coverage should protect final reply insertion, foreground-active waiting, compaction-after-insert behavior, and silent termination.
+- Regression coverage should protect final reply insertion, durable mailbox delivery while the foreground is active, compaction-after-insert behavior, and silent termination.
+
+### Session Actor Architecture
+
+```mermaid
+flowchart TD
+    Channel["Channel Actor\nTelegram / Dingtalk / CLI\nNormalize platform updates\nSend user-visible effects"]
+    Dispatcher["Incoming Dispatcher\nFast-path model selection\nImmediate command routing\nConversation inbox dispatch"]
+    Conversation["Conversation Actor\nConversation config and routing\nWorkspace selection\nAttachment materialization\nForeground actor reference"]
+    SessionManager["SessionManager\nFactory and registry\nLoad/create SessionActor refs\nNo turn/message state decisions"]
+    Session["SessionActor\nPer-session durable/runtime state\nUser and actor mailbox\nInterrupt/yield/progress\nTurn commit/failure persistence"]
+    Runtime["Agent Runtime Adapter\nAgentFrame execution\nRuntime events/progress\nCompleted/yielded/failed reports"]
+
+    Channel --> Dispatcher
+    Dispatcher --> Conversation
+    Conversation --> SessionManager
+    SessionManager --> Session
+    Conversation --> Session
+    Session --> Runtime
+    Runtime --> Session
+    Session --> Channel
+```
+
+- Session actors are the only owner of per-session durable state and runtime state, including pending/stable messages, visible history, active runtime phase, pending interrupts, progress state, prompt/profile/model/skill observations, usage, compaction stats, and turn completion/yield/failure state.
+- Foreground and background main agents share one session actor lifecycle; differences should be expressed through session policy such as system prompt kind, enabled tools, delivery behavior, and whether final output is told to a foreground actor.
+- Conversation state owns conversation-level routing and configuration: current workspace, remote workpaths, selected model/backend/sandbox settings, chat version, current foreground actor reference, and user attachment materialization for that conversation. It should hand prepared messages to session actors rather than maintaining long-running turn serialization.
+- SessionManager acts as a factory and registry for `SessionId -> SessionActorRef` style actor loading/creation. It must not decide user-message handling, turn commit semantics, interrupt behavior, progress behavior, or background-to-foreground delivery semantics.
+- `SessionActorRef` is the external production boundary for session operations. Production code should call explicit actor methods such as `tell_user_message`, `tell_actor_message`, runtime commit/failure, progress, interrupt, and observation APIs instead of locking or mutating actor internals directly.
+- `SessionActorRef` dispatches production operations through a mailbox-backed actor loop so each session serializes its own state transitions independently of Conversation routing.
+- Session actor workers have explicit lifecycle management: closing or destroying a session must persist the closed state and shut down that actor's mailbox loop so stale actor refs stop accepting production commands.
+- Agent runtime adapters report runtime events, progress, yielded/completed/failed results, and user-visible messages back to the owning session actor immediately; the actor updates and persists state before emitting outbound effects for channels or runtime adapters to execute.
+- User messages and actor-to-actor messages enter a session actor through actor message methods. External code should not directly mutate pending/stable/history state or separately tag interrupted follow-ups.
+- A complete user message should reach the session actor after conversation-level preparation such as attachment materialization and routing; entry dispatchers must not call session interrupt hooks with raw, partially prepared text.
+- Prepared user messages are persisted in the receiving session actor's durable user mailbox before they are drained into pending context, so queued user input survives service restarts and Conversation does not own session-level waiting.
+- Every foreground runtime turn, including initialization, normal user turns, and `/continue`, must claim the foreground session actor before building prompt state or entering AgentFrame; failed or early-returning paths must release that claim through the actor.
+- Actor-to-actor messages are persisted in the receiving session actor's durable mailbox before being applied, and tell-style delivery returns only a lightweight receipt instead of the receiver snapshot. Senders must not depend on receiver internals and queued messages survive service restarts.
+- Background-to-foreground delivery should flow through the owning conversation: a background actor resolves its conversation, obtains the current foreground actor reference, and tells an actor message to that foreground actor.
+- Regression coverage should protect conversation-owned foreground actor routing, actor-owned interrupt/follow-up handling, actor-owned runtime phase/progress persistence, and background result delivery through actor messages.
 
 ### DSL Orchestration Runtime
 

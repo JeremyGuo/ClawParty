@@ -673,9 +673,9 @@ impl Server {
                     return Err(error);
                 }
             };
-        self.with_sessions(|sessions| {
-            sessions.set_api_timeout_override(&incoming.address, override_timeout)
-        })?;
+        let actor = self
+            .with_sessions(|sessions| sessions.resolve_foreground_by_address(&incoming.address))?;
+        actor.set_api_timeout_override(override_timeout)?;
         self.send_channel_message(
             channel,
             &incoming.address,

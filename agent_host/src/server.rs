@@ -18,13 +18,15 @@ use crate::config::{
     SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
     default_dingtalk_commands, default_telegram_commands,
 };
-use crate::conversation::{ConversationManager, ConversationSettings};
+use crate::conversation::{
+    ConversationManager, ConversationSettings, materialize_conversation_attachments,
+};
 use crate::cron::{
     ClaimedCronTask, CronCheckerConfig, CronCreateRequest, CronManager, CronUpdateRequest,
 };
 use crate::domain::{
-    AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
-    ShowOption, StoredAttachment,
+    AttachmentKind, ChannelAddress, MessageRole, OutgoingAttachment, OutgoingMessage,
+    ProcessingState, ShowOption, StoredAttachment,
 };
 use crate::prompt::{
     AgentPromptKind, AgentSystemPromptState, build_agent_system_prompt_state,
@@ -35,9 +37,11 @@ use crate::sandbox::{
     is_child_transport_error, run_one_shot_child_turn,
 };
 use crate::session::{
-    ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase,
-    SessionProgressMessageState, SessionSkillObservation, SessionSnapshot,
-    SharedProfileChangeNotice, SkillChangeNotice,
+    ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
+    SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimeTurnCommit,
+    SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot, SessionTurnTimeHintConfig,
+    SessionUserMessage, SharedProfileChangeNotice, SkillChangeNotice,
+    should_emit_runtime_change_prompt,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -64,7 +68,7 @@ use chrono::Utc;
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -80,12 +84,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod agent_runtime;
-mod background;
 mod command_routing;
 mod commands;
 mod context;
 mod extra_tools;
-mod foreground;
 mod frame_config;
 mod incoming;
 mod messaging;
@@ -93,6 +95,7 @@ mod persistence;
 mod progress;
 mod runtime_helpers;
 mod security;
+mod session_runner;
 mod subagents;
 mod workspace_summary;
 
@@ -108,8 +111,6 @@ use self::runtime_helpers::*;
 
 const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
 const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
-const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
-const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
 const CONVERSATION_CLEANUP_POLL_SECONDS: u64 = 300;
 const SYSTEM_RESTART_NOTICE: &str =
@@ -124,12 +125,6 @@ struct BackgroundJobRequest {
     agent_backend: AgentBackendKind,
     model_key: String,
     prompt: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ForegroundRuntimePhase {
-    Running,
-    Compacting,
 }
 
 struct ActiveForegroundAgentFrameRuntime {
@@ -382,26 +377,6 @@ impl AgentRuntimeView {
             .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
             .insert(session_key, Arc::clone(&entry));
         Ok(entry)
-    }
-
-    fn invalidate_foreground_agent_frame_runtime(&self, address: &ChannelAddress) -> Result<()> {
-        let session_key = address.session_key();
-        let runtime = self
-            .active_foreground_agent_frame_runtimes
-            .lock()
-            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
-            .remove(&session_key);
-        if let Some(runtime) = runtime
-            && let Ok(mut runtime) = runtime.lock()
-        {
-            let _ = runtime.runtime.shutdown();
-            if runtime.sandbox_mode == SandboxMode::Bubblewrap {
-                let _ = self
-                    .workspace_manager
-                    .cleanup_transient_mounts(&runtime.workspace_id);
-            }
-        }
-        Ok(())
     }
 
     fn model_config(&self, model_key: &str) -> Result<&ModelConfig> {
@@ -665,12 +640,13 @@ impl AgentRuntimeView {
                 .settings
                 .workspace_id)
         })?;
-        let session = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
+        let actor = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
             Some(workspace_id) => {
-                sessions.create_background_in_workspace(address, agent_id, workspace_id)
+                sessions.create_background_in_workspace_actor(address, agent_id, workspace_id)
             }
-            None => sessions.create_background(address, agent_id),
+            None => sessions.create_background_actor(address, agent_id),
         })?;
+        let session = actor.snapshot()?;
         self.with_conversations(|conversations| {
             conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
             Ok(())
@@ -1136,29 +1112,27 @@ impl AgentRuntimeView {
         let join_label = join_label.to_string();
         let event_session = session.clone();
         let event_model_key = model_key.clone();
-        let phase_session_key = event_session.address.session_key();
-        let active_foreground_phases = Arc::clone(&self.active_foreground_phases);
+        let phase_conversations = Arc::clone(&self.conversations);
+        let phase_sessions = Arc::clone(&self.sessions);
+        let phase_address = event_session.address.clone();
+        let track_foreground_phase = matches!(kind, AgentPromptKind::MainForeground);
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
         let execution_control = SessionExecutionControl::new()
             .with_event_callback(move |event| {
-                update_active_foreground_phase(
-                    &active_foreground_phases,
-                    &phase_session_key,
-                    &event,
-                );
+                if track_foreground_phase
+                    && let Ok(mut conversations) = phase_conversations.lock()
+                    && let Ok(mut sessions) = phase_sessions.lock()
+                    && let Ok(Some(actor)) =
+                        conversations.resolve_foreground_actor(&phase_address, &mut sessions)
+                    && actor.receive_runtime_event(&event).is_ok()
+                {}
                 let _ = event_sender.send(event);
             })
             .with_progress_callback(move |progress| {
                 let _ = progress_sender.send(progress);
             });
         if let Some(observer) = control_observer {
-            if let Ok(mut phases) = self.active_foreground_phases.lock() {
-                phases.insert(
-                    event_session.address.session_key(),
-                    ForegroundRuntimePhase::Running,
-                );
-            }
             observer(execution_control.clone());
         }
         let worker_session = session;
@@ -1309,20 +1283,22 @@ impl AgentRuntimeView {
 
         let event_session = session.clone();
         let event_model_key = model_key.clone();
-        let phase_session_key = event_session.address.session_key();
-        let active_foreground_phases = Arc::clone(&self.active_foreground_phases);
+        let phase_conversations = Arc::clone(&self.conversations);
+        let phase_sessions = Arc::clone(&self.sessions);
+        let phase_address = event_session.address.clone();
+        let track_foreground_phase = matches!(kind, AgentPromptKind::MainForeground);
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let execution_control = SessionExecutionControl::new().with_event_callback(move |event| {
-            update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
+            if track_foreground_phase
+                && let Ok(mut conversations) = phase_conversations.lock()
+                && let Ok(mut sessions) = phase_sessions.lock()
+                && let Ok(Some(actor)) =
+                    conversations.resolve_foreground_actor(&phase_address, &mut sessions)
+                && actor.receive_runtime_event(&event).is_ok()
+            {}
             let _ = event_sender.send(event);
         });
         if let Some(observer) = control_observer {
-            if let Ok(mut phases) = self.active_foreground_phases.lock() {
-                phases.insert(
-                    event_session.address.session_key(),
-                    ForegroundRuntimePhase::Running,
-                );
-            }
             observer(execution_control.clone());
         }
         let cancellation_handle = execution_control.clone();
@@ -1647,11 +1623,6 @@ pub struct Server {
     telegram_channel_ids: Arc<HashSet<String>>,
     sandbox: SandboxConfig,
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
-    active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
-    /// Session keys with pending user interrupts — when a new user message arrives while a
-    /// foreground turn is running, the session key is inserted here so that
-    /// `should_auto_resume_yielded_session` knows not to auto-resume.
-    pending_foreground_interrupts: Arc<Mutex<HashSet<String>>>,
     pending_process_restart_notices: Arc<Mutex<HashSet<String>>>,
     channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
 }
@@ -1792,7 +1763,8 @@ impl Server {
         session: &SessionSnapshot,
         missing_model_key: &str,
     ) -> Result<()> {
-        self.with_sessions(|sessions| sessions.clear_idle_compaction_failure(&session.address))?;
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.clear_idle_compaction_failure()?;
         let Some(channel) = self.channels.get(&session.address.channel_id).cloned() else {
             warn!(
                 log_stream = "session",
@@ -1935,7 +1907,6 @@ impl Server {
         let snapshots = Arc::new(Mutex::new(SnapshotManager::new(&workdir)?));
         let sink_router = Arc::new(RwLock::new(SinkRouter::new()));
         let summary_tracker = Arc::new(SummaryTracker::new());
-        let active_foreground_phases = Arc::new(Mutex::new(HashMap::new()));
         let active_foreground_agent_frame_runtimes = Arc::new(Mutex::new(HashMap::new()));
         let subagents = Arc::new(Mutex::new(HashMap::new()));
         let background_terminate_flags = Arc::new(Mutex::new(HashSet::new()));
@@ -1961,7 +1932,6 @@ impl Server {
             background_job_sender,
             background_terminate_flags,
             summary_tracker,
-            active_foreground_phases,
             active_foreground_agent_frame_runtimes,
             subagents,
             conversations,
@@ -1973,8 +1943,6 @@ impl Server {
             telegram_channel_ids: Arc::new(telegram_channel_ids),
             sandbox: config.sandbox,
             background_job_receiver: Some(background_job_receiver),
-            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
-            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             pending_process_restart_notices: Arc::new(Mutex::new(pending_process_restart_notices)),
             channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(
                 &context.workdir,
@@ -2128,9 +2096,8 @@ impl Server {
 
         for session in snapshots {
             if let Err(error) = self.attempt_idle_context_compaction(&session, false).await {
-                self.with_sessions(|sessions| {
-                    sessions.mark_idle_compaction_failed(&session.address, format!("{error:#}"))
-                })?;
+                let actor = self.ensure_foreground_actor(&session.address)?;
+                actor.mark_idle_compaction_failed(format!("{error:#}"))?;
                 warn!(
                     log_stream = "session",
                     log_key = %session.id,
@@ -2228,9 +2195,8 @@ impl Server {
         )
         .with_context(|| format!("failed to compact idle session {}", session.id))?;
         if !report.compacted {
-            self.with_sessions(|sessions| {
-                sessions.clear_idle_compaction_failure(&session.address)
-            })?;
+            let actor = self.ensure_foreground_actor(&session.address)?;
+            actor.clear_idle_compaction_failure()?;
             return Ok(false);
         }
         let normalized_messages = normalize_messages_for_persistence(
@@ -2243,22 +2209,15 @@ impl Server {
         })?;
 
         let compaction_stats = compaction_stats_from_report(&report);
-        self.with_sessions(|sessions| {
-            sessions.record_idle_compaction(
-                &session.address,
-                normalized_messages,
-                &compaction_stats,
-            )
-        })
-        .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor
+            .record_idle_compaction(normalized_messages, &compaction_stats)
+            .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
         let prompt_state = self.build_foreground_prompt_state(session, &model_key)?;
-        self.with_sessions(|sessions| {
-            sessions.mark_system_prompt_state_current(
-                &session.address,
-                prompt_state.static_hash,
-                prompt_state.dynamic_hashes,
-            )
-        })?;
+        actor.mark_system_prompt_state_current(
+            prompt_state.static_hash,
+            prompt_state.dynamic_hashes,
+        )?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
         info!(
             log_stream = "session",
@@ -2328,53 +2287,11 @@ impl Server {
         Ok(runtime)
     }
 
-    fn ensure_foreground_session(&self, address: &ChannelAddress) -> Result<SessionSnapshot> {
-        let preferred_workspace_id = self.with_conversations(|conversations| {
-            Ok(conversations
-                .ensure_conversation(address)?
-                .settings
-                .workspace_id)
-        })?;
-        let session = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
-            Some(workspace_id) => sessions.ensure_foreground_in_workspace(address, workspace_id),
-            None => sessions.ensure_foreground(address),
-        })?;
-        self.with_conversations(|conversations| {
-            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
-            Ok(())
-        })?;
-        Ok(session)
-    }
-
-    fn unregister_active_foreground_control(&self, address: &ChannelAddress) -> Result<()> {
-        let session_key = address.session_key();
-        let mut controls = self
-            .active_foreground_controls
-            .lock()
-            .map_err(|_| anyhow!("active foreground controls lock poisoned"))?;
-        controls.remove(&session_key);
-        drop(controls);
-        if let Ok(mut phases) = self.active_foreground_phases.lock() {
-            phases.remove(&session_key);
-        }
-        Ok(())
-    }
-
-    fn invalidate_foreground_agent_frame_runtime(&self, address: &ChannelAddress) -> Result<()> {
-        let session_key = address.session_key();
-        let runtime = self
-            .active_foreground_agent_frame_runtimes
-            .lock()
-            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
-            .remove(&session_key);
-        if let Some(runtime) = runtime
-            && let Ok(mut runtime) = runtime.lock()
-        {
-            let _ = runtime.runtime.shutdown();
-            if runtime.sandbox_mode == SandboxMode::Bubblewrap {
-                let _ = self
-                    .workspace_manager
-                    .cleanup_transient_mounts(&runtime.workspace_id);
+    fn unregister_session_runtime_control(&self, address: &ChannelAddress) -> Result<()> {
+        if let Some(actor) = self.resolve_foreground_actor(address)? {
+            let drained = actor.unregister_control()?;
+            if drained {
+                self.mark_conversation_context_changed(address)?;
             }
         }
         Ok(())
@@ -2383,15 +2300,10 @@ impl Server {
     fn destroy_foreground_session(&self, address: &ChannelAddress) -> Result<()> {
         let snapshot = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
         self.invalidate_foreground_agent_frame_runtime(address)?;
-        if let Some(control) = self
-            .active_foreground_controls
-            .lock()
-            .ok()
-            .and_then(|controls| controls.get(&address.session_key()).cloned())
-        {
-            control.request_cancel();
+        if let Some(actor) = self.resolve_foreground_actor(address)? {
+            let _ = actor.request_cancel();
         }
-        self.unregister_active_foreground_control(address)?;
+        self.unregister_session_runtime_control(address)?;
         if let Some(session) = snapshot {
             let destroyed_subagents = self
                 .agent_runtime_view()
@@ -2422,6 +2334,10 @@ impl Server {
                 );
             }
         }
+        self.with_conversations(|conversations| {
+            conversations.clear_foreground_actor(address);
+            Ok(())
+        })?;
         self.with_sessions(|sessions| sessions.destroy_foreground(address))
     }
 
@@ -2486,29 +2402,9 @@ impl Server {
             return Ok(());
         }
 
+        let incoming = self.prepare_regular_conversation_message(incoming).await?;
         self.handle_regular_foreground_message(&channel, incoming)
             .await
-    }
-
-    async fn materialize_attachments(
-        &self,
-        attachments_dir: &Path,
-        attachments: Vec<crate::channel::PendingAttachment>,
-    ) -> Result<Vec<StoredAttachment>> {
-        let mut stored = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
-            let item = attachment.materialize(attachments_dir).await?;
-            info!(
-                log_stream = "server",
-                kind = "attachment_materialized",
-                attachment_id = %item.id,
-                path = %item.path.display(),
-                size_bytes = item.size_bytes,
-                "attachment persisted to session storage"
-            );
-            stored.push(item);
-        }
-        Ok(stored)
     }
 
     pub async fn dispatch_background_message(
@@ -2676,21 +2572,13 @@ impl Server {
         );
         persist_compaction_artifacts(session, &report)?;
         let compaction_stats = compaction_stats_from_report(&report);
-        self.with_sessions(|sessions| {
-            sessions.record_idle_compaction(
-                &session.address,
-                normalized_messages,
-                &compaction_stats,
-            )
-        })?;
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.record_idle_compaction(normalized_messages, &compaction_stats)?;
         let prompt_state = self.build_foreground_prompt_state(session, model_key)?;
-        self.with_sessions(|sessions| {
-            sessions.mark_system_prompt_state_current(
-                &session.address,
-                prompt_state.static_hash,
-                prompt_state.dynamic_hashes,
-            )
-        })?;
+        actor.mark_system_prompt_state_current(
+            prompt_state.static_hash,
+            prompt_state.dynamic_hashes,
+        )?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
         Ok(true)
     }
@@ -2776,15 +2664,17 @@ impl Server {
         if compaction.compacted_run_count == 0 {
             return Ok(());
         }
-        self.with_conversations(|conversations| {
-            conversations.rotate_chat_version_id(address).map(|_| ())
-        })
+        self.mark_conversation_context_changed(address)
     }
 
     fn rotate_chat_version_after_external_compaction(
         &self,
         address: &ChannelAddress,
     ) -> Result<()> {
+        self.mark_conversation_context_changed(address)
+    }
+
+    fn mark_conversation_context_changed(&self, address: &ChannelAddress) -> Result<()> {
         self.with_conversations(|conversations| {
             conversations.rotate_chat_version_id(address).map(|_| ())
         })
@@ -2979,9 +2869,8 @@ impl Server {
 
     fn observe_runtime_skill_changes(&self, session: &SessionSnapshot) -> Result<Option<String>> {
         let observed = self.current_runtime_skill_observations()?;
-        let notices = self.with_sessions(|sessions| {
-            sessions.observe_skill_changes(&session.address, &observed)
-        })?;
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        let notices = actor.observe_skill_changes(&observed)?;
         let rendered = render_skill_change_notices(&notices);
         Ok((!rendered.is_empty()).then_some(rendered))
     }
@@ -3013,14 +2902,11 @@ impl Server {
             })?;
         let user_profile_version = stable_content_version(&user_markdown);
         let identity_profile_version = stable_content_version(&identity_markdown);
-        self.with_sessions(|sessions| {
-            sessions.observe_shared_profile_changes(
-                &session.address,
-                user_profile_version,
-                identity_profile_version,
-            )?;
-            Ok(())
-        })
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor
+            .observe_shared_profile_changes(user_profile_version, identity_profile_version)
+            .map(|_| ())?;
+        Ok(())
     }
 
     fn current_runtime_model_catalog(&self) -> String {
@@ -3033,16 +2919,16 @@ impl Server {
     ) -> Result<Vec<ModelCatalogChangeNotice>> {
         let catalog = self.current_runtime_model_catalog();
         let version = stable_content_version(&catalog);
-        self.with_sessions(|sessions| {
-            sessions.observe_model_catalog_changes(&session.address, version)
-        })
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.observe_model_catalog_changes(version)
     }
 
     fn take_runtime_model_catalog_change_notices(
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        self.with_sessions(|sessions| sessions.take_model_catalog_change_notices(&session.address))
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.take_model_catalog_change_notices()
     }
 
     fn stage_runtime_profile_change_notices(
@@ -3050,16 +2936,16 @@ impl Server {
         session: &SessionSnapshot,
         notices: &[SharedProfileChangeNotice],
     ) -> Result<()> {
-        self.with_sessions(|sessions| {
-            sessions.stage_shared_profile_change_notices(&session.address, notices)
-        })
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.stage_shared_profile_change_notices(notices)
     }
 
     fn take_runtime_profile_change_notices(
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<SharedProfileChangeNotice>> {
-        self.with_sessions(|sessions| sessions.take_shared_profile_change_notices(&session.address))
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.take_shared_profile_change_notices()
     }
 
     fn log_turn_usage(&self, session: &SessionSnapshot, usage: &TokenUsage, initialization: bool) {
@@ -3126,11 +3012,10 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 
 #[cfg(test)]
 mod tests {
-    use super::foreground::register_active_foreground_control;
     use super::{
-        AgentCommand, AgentPromptKind, ForegroundRuntimePhase, ImageGenerationRouting,
-        IncomingCommandLane, RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SummaryTracker,
-        TokenUsage, background_timeout_with_active_children_text, build_synthetic_system_messages,
+        AgentCommand, AgentPromptKind, ImageGenerationRouting, IncomingCommandLane, RuntimeContext,
+        SYSTEM_RESTART_NOTICE, Server, SummaryTracker, TokenUsage,
+        background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -3142,12 +3027,11 @@ mod tests {
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
         render_last_user_message_time_tip, render_model_catalog_change_notice,
-        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
-        rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
         summarize_resume_progress, sync_workspace_shared_profile_files,
-        tag_interrupted_followup_text, update_active_foreground_phase,
         upload_workspace_shared_profile_files, user_facing_continue_error_text,
         workspace_visible_in_list,
     };
@@ -3167,8 +3051,12 @@ mod tests {
     use crate::cron::CronManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
-    use crate::session::SessionManager;
+    use crate::session::tag_interrupted_followup_text;
     use crate::session::{ModelCatalogChangeNotice, SessionErrno, SessionSnapshot};
+    use crate::session::{
+        SessionManager, SessionPhase, SessionRuntimePhase, SessionRuntimeTurnCommit,
+        session_runtime_phase_for_event,
+    };
     use crate::sink::SinkRouter;
     use crate::snapshot::SnapshotManager;
     use crate::workspace::WorkspaceManager;
@@ -3203,6 +3091,7 @@ mod tests {
 
     fn build_test_session(temp_dir: &TempDir) -> SessionSnapshot {
         SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             address: ChannelAddress {
@@ -3315,7 +3204,6 @@ mod tests {
             background_job_sender,
             background_terminate_flags: Arc::new(Mutex::new(HashSet::new())),
             summary_tracker: Arc::new(SummaryTracker::new()),
-            active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             conversations: Arc::new(Mutex::new(conversations)),
@@ -3327,8 +3215,6 @@ mod tests {
             telegram_channel_ids: Arc::new(HashSet::new()),
             sandbox: SandboxConfig::default(),
             background_job_receiver: Some(background_job_receiver),
-            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
-            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             pending_process_restart_notices: Arc::new(Mutex::new(HashSet::new())),
             channel_auth: Arc::new(Mutex::new(channel_auth)),
         }
@@ -3787,7 +3673,7 @@ mod tests {
         );
         assert_eq!(
             incoming_command_lane(Some("/compact@party_claw_bot")),
-            Some(IncomingCommandLane::ConversationWorker)
+            Some(IncomingCommandLane::Conversation)
         );
         assert_eq!(
             incoming_command_lane(Some("/unknown_command@party_claw_bot arg")),
@@ -3805,47 +3691,43 @@ mod tests {
 
     #[test]
     fn yield_request_detects_compaction_in_progress() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = ChannelAddress {
             channel_id: "telegram".to_string(),
             conversation_id: "conversation-1".to_string(),
             user_id: None,
             display_name: None,
         };
-        let session_key = address.session_key();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
         let control = SessionExecutionControl::new();
-        let active_controls = Arc::new(Mutex::new(HashMap::from([(
-            session_key.clone(),
-            control.clone(),
-        )])));
-        let active_phases = Arc::new(Mutex::new(HashMap::new()));
-        update_active_foreground_phase(
-            &active_phases,
-            &session_key,
-            &SessionEvent::CompactionStarted {
-                phase: "initial".to_string(),
-                message_count: 3,
-            },
-        );
-        let incoming = IncomingMessage {
-            remote_message_id: "msg-1".to_string(),
-            address,
-            text: Some("继续".to_string()),
-            attachments: Vec::new(),
-            stored_attachments: Vec::new(),
-            control: None,
-        };
+        actor.register_control(control.clone()).unwrap();
+        let phase = session_runtime_phase_for_event(&SessionEvent::CompactionStarted {
+            phase: "initial".to_string(),
+            message_count: 3,
+        })
+        .unwrap();
+        actor.debug_set_runtime_phase(phase).unwrap();
 
-        let disposition = request_yield_for_incoming(&active_controls, &active_phases, &incoming);
+        let disposition = actor
+            .debug_receive_user_message(Some("进度如何？".to_string()))
+            .unwrap();
 
         assert!(disposition.interrupted);
         assert!(disposition.compaction_in_progress);
+        assert_eq!(
+            disposition.text.as_deref(),
+            Some("[Interrupted Follow-up]\n进度如何？")
+        );
         assert!(control.take_yield_requested());
-        let phase = active_phases.lock().unwrap().get(&session_key).copied();
-        assert_eq!(phase, Some(ForegroundRuntimePhase::Compacting));
     }
 
     #[test]
     fn yield_request_is_scoped_to_matching_conversation() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let active_address = ChannelAddress {
             channel_id: "telegram".to_string(),
             conversation_id: "conversation-active".to_string(),
@@ -3858,26 +3740,24 @@ mod tests {
             user_id: None,
             display_name: None,
         };
-        let active_session_key = active_address.session_key();
+        let active_actor = sessions.ensure_foreground_actor(&active_address).unwrap();
         let active_control = SessionExecutionControl::new();
-        let active_controls = Arc::new(Mutex::new(HashMap::from([(
-            active_session_key.clone(),
-            active_control.clone(),
-        )])));
-        let active_phases = Arc::new(Mutex::new(HashMap::from([(
-            active_session_key,
-            ForegroundRuntimePhase::Compacting,
-        )])));
-        let incoming = IncomingMessage {
-            remote_message_id: "msg-1".to_string(),
-            address: other_address,
-            text: Some("另一个会话的新消息".to_string()),
-            attachments: Vec::new(),
-            stored_attachments: Vec::new(),
-            control: None,
-        };
+        active_actor
+            .register_control(active_control.clone())
+            .unwrap();
+        active_actor
+            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .unwrap();
 
-        let disposition = request_yield_for_incoming(&active_controls, &active_phases, &incoming);
+        let disposition = sessions
+            .resolve_foreground_by_address(&other_address)
+            .ok()
+            .and_then(|actor| {
+                actor
+                    .debug_receive_user_message(Some("hello".to_string()))
+                    .ok()
+            })
+            .unwrap_or_default();
 
         assert!(!disposition.interrupted);
         assert!(!disposition.compaction_in_progress);
@@ -3885,21 +3765,29 @@ mod tests {
     }
 
     #[test]
-    fn pending_interrupt_is_applied_to_next_foreground_control() {
-        let session_key = "telegram:conversation-1".to_string();
-        let active_controls = Arc::new(Mutex::new(HashMap::new()));
-        let pending_interrupts = Arc::new(Mutex::new(HashSet::from([session_key.clone()])));
-        let control = SessionExecutionControl::new();
+    fn pending_interrupt_is_applied_to_next_runtime_control() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = ChannelAddress {
+            channel_id: "telegram".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            user_id: None,
+            display_name: None,
+        };
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        let first_control = SessionExecutionControl::new();
+        actor.register_control(first_control.clone()).unwrap();
+        let disposition = actor
+            .debug_receive_user_message(Some("继续".to_string()))
+            .unwrap();
+        assert!(disposition.interrupted);
+        actor.unregister_control().unwrap();
+        let next_control = SessionExecutionControl::new();
+        actor.register_control(next_control.clone()).unwrap();
 
-        register_active_foreground_control(
-            &active_controls,
-            &pending_interrupts,
-            &session_key,
-            control.clone(),
-        );
-
-        assert!(control.take_yield_requested());
-        assert!(active_controls.lock().unwrap().contains_key(&session_key));
+        assert!(first_control.take_yield_requested());
+        assert!(next_control.take_yield_requested());
     }
 
     #[test]
@@ -4160,6 +4048,7 @@ mod tests {
     fn user_time_tip_is_emitted_after_five_minutes_of_idle_time() {
         let now = Utc::now();
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             last_user_message_at: Some(now - ChronoDuration::minutes(6)),
             last_agent_returned_at: Some(now - ChronoDuration::minutes(5)),
             ..build_test_session(&TempDir::new().unwrap())
@@ -4174,6 +4063,7 @@ mod tests {
     fn user_time_tip_is_not_emitted_before_five_minutes_of_idle_time() {
         let now = Utc::now();
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             last_user_message_at: Some(now - ChronoDuration::minutes(10)),
             last_agent_returned_at: Some(now - ChronoDuration::minutes(4)),
             ..build_test_session(&TempDir::new().unwrap())
@@ -4472,6 +4362,20 @@ mod tests {
             Some(SessionExecutionControl::new()),
         );
         assert!(background_tools.iter().any(|tool| tool.name == "terminate"));
+        let background_user_tell = background_tools
+            .iter()
+            .find(|tool| tool.name == "user_tell")
+            .expect("background should expose user_tell for genuine progress");
+        assert!(
+            background_user_tell
+                .description
+                .contains("do not use user_tell for the primary result")
+        );
+        assert!(
+            background_user_tell
+                .description
+                .contains("Put that primary user-facing message in your final answer instead")
+        );
         assert!(
             !background_tools
                 .iter()
@@ -4483,6 +4387,7 @@ mod tests {
     fn idle_context_compaction_requires_idle_time_new_turns_and_min_tokens() {
         let now = Utc::now();
         let base_snapshot = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             address: ChannelAddress {
@@ -4521,6 +4426,7 @@ mod tests {
         ));
 
         let no_new_turn = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             last_compacted_turn_count: 2,
             ..base_snapshot.clone()
         };
@@ -4533,6 +4439,7 @@ mod tests {
         ));
 
         let not_idle_long_enough = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             last_agent_returned_at: Some(now - ChronoDuration::seconds(60)),
             ..base_snapshot.clone()
         };
@@ -4545,6 +4452,7 @@ mod tests {
         ));
 
         let no_return_yet = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             last_agent_returned_at: None,
             ..base_snapshot
         };
@@ -4558,6 +4466,7 @@ mod tests {
 
         assert!(!should_attempt_idle_context_compaction(
             &SessionSnapshot {
+                kind: crate::session::SessionKind::Foreground,
                 last_agent_returned_at: Some(now - ChronoDuration::seconds(400)),
                 ..no_return_yet
             },
@@ -4605,16 +4514,27 @@ mod tests {
         let session = build_test_session(&temp_dir);
         server
             .with_sessions(|sessions| {
-                sessions.ensure_foreground(&session.address)?;
+                sessions.ensure_foreground_actor(&session.address)?;
                 Ok(())
             })
             .unwrap();
 
-        server
-            .append_completed_foreground_assistant_history(
-                &session.address,
-                &OutgoingMessage::text("done"),
-            )
+        let actor = server
+            .with_sessions(|sessions| sessions.resolve_foreground_by_address(&session.address))
+            .unwrap();
+        actor
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: Vec::new(),
+                consumed_pending_messages: Vec::new(),
+                usage: TokenUsage::default(),
+                compaction: SessionCompactionStats::default(),
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: None,
+                system_prompt_component_hashes_after_compaction: None,
+                loaded_skills: Vec::new(),
+                user_history_text: None,
+                assistant_history_text: Some("done".to_string()),
+            })
             .unwrap();
 
         let checkpoint = server
@@ -4764,11 +4684,9 @@ mod tests {
             .unwrap();
         server
             .with_sessions(|sessions| {
-                sessions.ensure_foreground(&session.address)?;
-                sessions.mark_idle_compaction_failed(
-                    &session.address,
-                    "model disappeared".to_string(),
-                )?;
+                sessions.ensure_foreground_actor(&session.address)?;
+                let actor = sessions.resolve_foreground_by_address(&session.address)?;
+                actor.mark_idle_compaction_failed("model disappeared".to_string())?;
                 Ok(())
             })
             .unwrap();

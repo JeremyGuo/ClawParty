@@ -7,7 +7,9 @@ use agent_host::bootstrap::AgentWorkspace;
 use agent_host::channel::{LocalFileAttachmentSource, PendingAttachment};
 use agent_host::domain::{AttachmentKind, ChannelAddress};
 use agent_host::prompt::greeting_for_language;
-use agent_host::session::{SessionErrno, SessionManager, SessionPhase};
+use agent_host::session::{
+    SessionErrno, SessionManager, SessionPhase, SessionRuntimeTurnCommit, SessionSnapshot,
+};
 use agent_host::upgrade::upgrade_workdir;
 use agent_host::workspace::WorkspaceManager;
 use chrono::Utc;
@@ -15,6 +17,14 @@ use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+fn ensure_foreground_snapshot(
+    manager: &mut SessionManager,
+    address: &ChannelAddress,
+) -> SessionSnapshot {
+    let actor = manager.ensure_foreground_actor(address).unwrap();
+    actor.snapshot().unwrap()
+}
 
 #[tokio::test]
 async fn session_uploads_are_materialized_into_workspace_upload_directory() {
@@ -31,7 +41,7 @@ async fn session_uploads_are_materialized_into_workspace_upload_directory() {
 
     let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
     let mut manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-    let session = manager.ensure_foreground(&address).unwrap();
+    let session = ensure_foreground_snapshot(&mut manager, &address);
     let attachment = PendingAttachment::new(
         AttachmentKind::File,
         Some("note.txt".to_string()),
@@ -68,7 +78,7 @@ fn closing_session_keeps_session_record_but_does_not_restore_it_as_active() {
     let original = {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-        let session = manager.ensure_foreground(&address).unwrap();
+        let session = ensure_foreground_snapshot(&mut manager, &address);
         let root_dir = session.root_dir.clone();
         manager.destroy_foreground(&address).unwrap();
         assert!(root_dir.exists());
@@ -82,7 +92,7 @@ fn closing_session_keeps_session_record_but_does_not_restore_it_as_active() {
     let mut restored_manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
     assert!(restored_manager.get_snapshot(&address).is_none());
 
-    let new_session = restored_manager.ensure_foreground(&address).unwrap();
+    let new_session = ensure_foreground_snapshot(&mut restored_manager, &address);
     assert_ne!(new_session.id, original.id);
     assert!(original.root_dir.exists());
 }
@@ -117,24 +127,19 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     let original = {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-        let _session = manager.ensure_foreground(&address).unwrap();
-        manager
-            .append_user_message(&address, Some("hello".to_string()), Vec::new())
-            .unwrap();
-        manager
-            .set_api_timeout_override(&address, Some(321.0))
-            .unwrap();
+        manager.ensure_foreground_actor(&address).unwrap();
+        let actor = manager.resolve_foreground_by_address(&address).unwrap();
+        actor.set_api_timeout_override(Some(321.0)).unwrap();
         let mut usage = agent_frame::TokenUsage::default();
         usage.prompt_tokens = 123;
         usage.completion_tokens = 45;
         usage.total_tokens = 168;
-        manager
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "persist me")],
-                &[],
-                &usage,
-                &SessionCompactionStats {
+        actor
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: vec![ChatMessage::text("assistant", "persist me")],
+                consumed_pending_messages: Vec::new(),
+                usage,
+                compaction: SessionCompactionStats {
                     run_count: 1,
                     compacted_run_count: 1,
                     estimated_tokens_before: 1000,
@@ -150,14 +155,20 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
                         cache_write_tokens: 0,
                     },
                 },
-            )
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: None,
+                system_prompt_component_hashes_after_compaction: None,
+                loaded_skills: Vec::new(),
+                user_history_text: Some("hello".to_string()),
+                assistant_history_text: None,
+            })
             .unwrap();
         manager.get_snapshot(&address).unwrap()
     };
 
     let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
     let mut restored_manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-    let restored = restored_manager.ensure_foreground(&address).unwrap();
+    let restored = ensure_foreground_snapshot(&mut restored_manager, &address);
     assert_eq!(restored.id, original.id);
     assert_eq!(restored.agent_id, original.agent_id);
     assert_eq!(restored.workspace_id, original.workspace_id);
@@ -196,19 +207,24 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
     let original = {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-        let _session = manager.ensure_foreground(&address).unwrap();
-        manager
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "before compact")],
-                &[],
-                &agent_frame::TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
+        manager.ensure_foreground_actor(&address).unwrap();
+        let actor = manager.resolve_foreground_by_address(&address).unwrap();
+        actor
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: vec![ChatMessage::text("assistant", "before compact")],
+                consumed_pending_messages: Vec::new(),
+                usage: agent_frame::TokenUsage::default(),
+                compaction: SessionCompactionStats::default(),
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: None,
+                system_prompt_component_hashes_after_compaction: None,
+                loaded_skills: Vec::new(),
+                user_history_text: None,
+                assistant_history_text: None,
+            })
             .unwrap();
-        manager
+        actor
             .record_idle_compaction(
-                &address,
                 vec![ChatMessage::text(
                     "assistant",
                     "[AgentFrame Context Compression]\n\ncompressed",
@@ -291,58 +307,6 @@ fn agent_registry_restores_background_agent_history_after_restart() {
     assert_eq!(record.model_key, "main");
     assert_eq!(record.usage.total_tokens, 15);
     assert_eq!(record.error.as_deref(), Some("boom"));
-}
-
-#[test]
-fn session_manager_migrates_legacy_session_without_workspace_id() {
-    let temp_dir = TempDir::new().unwrap();
-    let session_id = Uuid::new_v4();
-    let agent_id = Uuid::new_v4();
-    let address = ChannelAddress {
-        channel_id: "telegram-main".to_string(),
-        conversation_id: "1717801091".to_string(),
-        user_id: Some("user-1".to_string()),
-        display_name: Some("Telegram User".to_string()),
-    };
-    let session_dir = temp_dir
-        .path()
-        .join("sessions")
-        .join(session_id.to_string());
-    std::fs::create_dir_all(&session_dir).unwrap();
-    std::fs::write(
-        session_dir.join("session.json"),
-        serde_json::to_string_pretty(&json!({
-            "id": session_id,
-            "agent_id": agent_id,
-            "address": address,
-            "history": [],
-            "agent_messages": [{"role": "assistant", "content": "legacy"}],
-            "turn_count": 1,
-            "last_compacted_turn_count": 0
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
-    let manager = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-    let restored = manager.get_snapshot(&ChannelAddress {
-        channel_id: "telegram-main".to_string(),
-        conversation_id: "1717801091".to_string(),
-        user_id: Some("user-1".to_string()),
-        display_name: Some("Telegram User".to_string()),
-    });
-
-    let restored = restored.expect("legacy session should be restored");
-    assert!(!restored.workspace_id.is_empty());
-    assert!(restored.workspace_root.exists());
-    assert_eq!(
-        restored.session_state.messages,
-        vec![ChatMessage::text("assistant", "legacy")]
-    );
-    assert_eq!(restored.session_state.phase, SessionPhase::End);
-    let persisted = std::fs::read_to_string(session_dir.join("session.json")).unwrap();
-    assert!(persisted.contains("\"workspace_id\""));
 }
 
 #[test]

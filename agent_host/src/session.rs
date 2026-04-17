@@ -1,13 +1,19 @@
+use crate::channel::{ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate};
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
-use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
+use agent_frame::{
+    ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats, SessionEvent,
+    SessionExecutionControl, TokenUsage,
+};
 pub use agent_frame::{SessionErrno, SessionPhase};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -56,7 +62,7 @@ pub enum ModelCatalogChangeNotice {
 pub struct SessionCheckpointData {
     #[serde(default)]
     pub history: Vec<SessionMessage>,
-    #[serde(default, alias = "agent_messages")]
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub last_user_message_at: Option<DateTime<Utc>>,
@@ -94,6 +100,10 @@ pub struct SessionCheckpointData {
     pub system_prompt_component_hashes: BTreeMap<String, String>,
     #[serde(default)]
     pub pending_system_prompt_component_notices: BTreeSet<String>,
+    #[serde(default)]
+    pub actor_mailbox: Vec<DurableSessionActorMessage>,
+    #[serde(default)]
+    pub user_mailbox: Vec<DurableSessionUserMessage>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,10 +132,15 @@ pub struct DurableSessionState {
     pub errinfo: Option<String>,
     #[serde(default)]
     pub progress_message: Option<SessionProgressMessageState>,
+    #[serde(default)]
+    pub actor_mailbox: Vec<DurableSessionActorMessage>,
+    #[serde(default)]
+    pub user_mailbox: Vec<DurableSessionUserMessage>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
+    pub kind: SessionKind,
     pub id: Uuid,
     pub agent_id: Uuid,
     pub address: ChannelAddress,
@@ -156,6 +171,1397 @@ pub struct SystemPromptStateObservation {
     pub dynamic_notice_keys: BTreeSet<String>,
 }
 
+pub const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
+pub const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
+const COMPACTION_WAIT_NOTICE_TEXT: &str = "正在压缩上下文，可能要等待压缩完毕后才能回复。";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionActorOutbound {
+    UserVisibleText(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRuntimePhase {
+    Running,
+    Compacting,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionYieldDisposition {
+    interrupted: bool,
+    compaction_in_progress: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionUserMessageReceipt {
+    pub text: Option<String>,
+    pub interrupted: bool,
+    pub compaction_in_progress: bool,
+    pub outbound: Vec<SessionActorOutbound>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionActorMessage {
+    pub from_session_id: Uuid,
+    pub role: MessageRole,
+    pub text: Option<String>,
+    pub attachments: Vec<StoredAttachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionActorMessageReceipt {
+    pub message_id: Uuid,
+    pub applied_to_context: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionUserMessage {
+    pub pending_message: ChatMessage,
+    pub text: Option<String>,
+    pub attachments: Vec<StoredAttachment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DurableSessionActorMessage {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    pub from_session_id: Uuid,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "default_actor_message_role")]
+    pub role: MessageRole,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<StoredAttachment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DurableSessionUserMessage {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    pub pending_message: ChatMessage,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<StoredAttachment>,
+}
+
+fn default_actor_message_role() -> MessageRole {
+    MessageRole::Assistant
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionTurnTimeHintConfig {
+    pub emit_idle_time_gap_hint: bool,
+    pub emit_system_date_on_user_message: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionTurnTimeHints {
+    pub user_time_tip: Option<String>,
+    pub system_date: Option<String>,
+}
+
+pub struct SessionRuntimeTurnCommit {
+    pub messages: Vec<ChatMessage>,
+    pub consumed_pending_messages: Vec<ChatMessage>,
+    pub usage: TokenUsage,
+    pub compaction: SessionCompactionStats,
+    pub phase: SessionPhase,
+    pub system_prompt_static_hash_after_compaction: Option<String>,
+    pub system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
+    pub loaded_skills: Vec<String>,
+    pub user_history_text: Option<String>,
+    pub assistant_history_text: Option<String>,
+}
+
+pub struct SessionRuntimeTurnFailure {
+    pub resume_messages: Vec<ChatMessage>,
+    pub errno: SessionErrno,
+    pub errinfo: Option<String>,
+    pub compaction: SessionCompactionStats,
+    pub system_prompt_static_hash_after_compaction: Option<String>,
+    pub system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum SessionEffect {
+    UpdateProgress(ProgressFeedback),
+}
+
+#[derive(Default)]
+struct SessionRuntimeState {
+    active_control: Option<SessionExecutionControl>,
+    active_phase: Option<SessionRuntimePhase>,
+    pending_interrupt: bool,
+    turn_runner_claimed: bool,
+}
+
+type SessionActorCommandFn = Box<dyn FnOnce(&mut SessionActor) + Send + 'static>;
+
+enum SessionActorCommand {
+    Run(SessionActorCommandFn),
+    Shutdown(mpsc::Sender<()>),
+}
+
+struct SessionActorLifecycle {
+    closing: bool,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+struct SessionActorHandleInner {
+    sender: mpsc::Sender<SessionActorCommand>,
+    lifecycle: Mutex<SessionActorLifecycle>,
+}
+
+#[derive(Clone)]
+pub struct SessionActorRef {
+    inner: Arc<SessionActorHandleInner>,
+}
+
+impl SessionActorRef {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn snapshot(&self) -> Result<SessionSnapshot> {
+        self.read(|actor| Ok(actor.snapshot()))
+    }
+
+    pub(crate) fn workspace_id(&self) -> Result<String> {
+        self.read(|actor| Ok(actor.session.workspace_id.clone()))
+    }
+
+    pub(crate) fn export_checkpoint(&self) -> Result<SessionCheckpointData> {
+        self.read(|actor| Ok(actor.export_checkpoint()))
+    }
+
+    fn read<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&SessionActor) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        self.ask(|actor| f(actor))
+    }
+
+    fn update<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut SessionActor) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        self.ask(f)
+    }
+
+    fn ask<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut SessionActor) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        let (sender, receiver) = mpsc::channel();
+        {
+            let lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .map_err(|_| anyhow!("session actor lifecycle lock poisoned"))?;
+            if lifecycle.closing {
+                return Err(anyhow!("session actor is shutting down"));
+            }
+            self.inner
+                .sender
+                .send(SessionActorCommand::Run(Box::new(move |actor| {
+                    let _ = sender.send(f(actor));
+                })))
+                .map_err(|_| anyhow!("session actor mailbox closed"))?;
+        }
+        receiver
+            .recv()
+            .map_err(|_| anyhow!("session actor mailbox response dropped"))?
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        let worker = {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .map_err(|_| anyhow!("session actor lifecycle lock poisoned"))?;
+            if lifecycle.closing {
+                return Ok(());
+            }
+            lifecycle.closing = true;
+            let worker = lifecycle.worker.take();
+            if self
+                .inner
+                .sender
+                .send(SessionActorCommand::Shutdown(sender))
+                .is_err()
+            {
+                return join_session_actor_worker(worker);
+            }
+            worker
+        };
+        receiver
+            .recv()
+            .map_err(|_| anyhow!("session actor shutdown acknowledgement dropped"))?;
+        join_session_actor_worker(worker)
+    }
+
+    pub(crate) fn close_and_shutdown(&self) -> Result<()> {
+        self.update(|actor| actor.close())?;
+        self.shutdown()
+    }
+
+    pub fn tell_user_message(
+        &self,
+        message: SessionUserMessage,
+    ) -> Result<SessionUserMessageReceipt> {
+        self.update(move |actor| actor.tell_user_message(message))
+    }
+
+    pub fn tell_actor_message(
+        &self,
+        message: SessionActorMessage,
+    ) -> Result<SessionActorMessageReceipt> {
+        self.update(move |actor| actor.tell_actor_message(message))
+    }
+
+    pub(crate) fn register_control(&self, control: SessionExecutionControl) -> Result<()> {
+        self.update(|actor| {
+            actor.register_control(control);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn unregister_control(&self) -> Result<bool> {
+        self.update(|actor| actor.unregister_control())
+    }
+
+    pub(crate) fn request_cancel(&self) -> Result<bool> {
+        self.update(|actor| Ok(actor.request_cancel()))
+    }
+
+    pub(crate) fn clear_pending_interrupt(&self) -> Result<()> {
+        self.update(|actor| {
+            actor.clear_pending_interrupt();
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_set_runtime_phase(&self, phase: SessionRuntimePhase) -> Result<()> {
+        self.update(move |actor| {
+            actor.set_runtime_phase(phase);
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_receive_user_message(
+        &self,
+        text: Option<String>,
+    ) -> Result<SessionUserMessageReceipt> {
+        self.update(move |actor| Ok(actor.receive_user_message(text)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_is_running(&self) -> Result<bool> {
+        self.read(|actor| Ok(actor.is_running()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stage_user_turn(
+        &self,
+        pending_message: ChatMessage,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<SessionUserMessageReceipt> {
+        self.update(move |actor| actor.stage_user_turn(pending_message, text, attachments))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_append_visible_message(
+        &self,
+        role: MessageRole,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        self.update(move |actor| actor.append_visible_message(role, text, attachments))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_append_pending_request_message(&self, message: ChatMessage) -> Result<()> {
+        self.update(move |actor| actor.append_pending_request_message(message))
+    }
+
+    pub(crate) fn has_pending_interrupt(&self) -> Result<bool> {
+        self.read(|actor| Ok(actor.has_pending_interrupt()))
+    }
+
+    pub(crate) fn try_claim_turn_runner(&self) -> Result<bool> {
+        self.update(|actor| Ok(actor.try_claim_turn_runner()))
+    }
+
+    pub(crate) fn user_turn_time_hints(
+        &self,
+        config: SessionTurnTimeHintConfig,
+        now: DateTime<Utc>,
+    ) -> Result<SessionTurnTimeHints> {
+        self.read(move |actor| Ok(actor.user_turn_time_hints(config, now)))
+    }
+
+    pub(crate) fn receive_runtime_event_with_effects(
+        &self,
+        model_key: &str,
+        event: &SessionEvent,
+    ) -> Result<Vec<SessionEffect>> {
+        let model_key = model_key.to_string();
+        let event = event.clone();
+        self.update(move |actor| Ok(actor.receive_runtime_event_with_effects(&model_key, &event)))
+    }
+
+    pub(crate) fn receive_runtime_event(&self, event: &SessionEvent) -> Result<()> {
+        let event = event.clone();
+        self.update(move |actor| {
+            actor.receive_runtime_event(&event);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn receive_runtime_progress(
+        &self,
+        model_key: &str,
+        progress: &ExecutionProgress,
+    ) -> Result<Vec<SessionEffect>> {
+        let model_key = model_key.to_string();
+        let progress = progress.clone();
+        self.read(move |actor| Ok(actor.receive_runtime_progress(&model_key, &progress)))
+    }
+
+    pub(crate) fn receive_runtime_failure(
+        &self,
+        model_key: &str,
+        error: &anyhow::Error,
+    ) -> Result<Vec<SessionEffect>> {
+        let model_key = model_key.to_string();
+        let error_summary = format!("{error:#}");
+        self.read(
+            move |actor| Ok(actor.receive_runtime_failure_summary(&model_key, &error_summary)),
+        )
+    }
+
+    pub(crate) fn apply_progress_feedback_update(
+        &self,
+        update: ProgressFeedbackUpdate,
+    ) -> Result<()> {
+        self.update(|actor| actor.apply_progress_feedback_update(update))
+    }
+
+    pub(crate) fn mark_workspace_summary_state(
+        &self,
+        pending: bool,
+        close_after_summary: bool,
+    ) -> Result<()> {
+        self.update(move |actor| actor.mark_workspace_summary_state(pending, close_after_summary))
+    }
+
+    pub fn set_api_timeout_override(&self, timeout_seconds: Option<f64>) -> Result<()> {
+        self.update(move |actor| actor.set_api_timeout_override(timeout_seconds))
+    }
+
+    pub(crate) fn observe_skill_changes(
+        &self,
+        observed_skills: &[SessionSkillObservation],
+    ) -> Result<Vec<SkillChangeNotice>> {
+        let observed_skills = observed_skills.to_vec();
+        self.update(move |actor| actor.observe_skill_changes(&observed_skills))
+    }
+
+    pub(crate) fn observe_shared_profile_changes(
+        &self,
+        user_profile_version: String,
+        identity_profile_version: String,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        self.update(|actor| {
+            actor.observe_shared_profile_changes(user_profile_version, identity_profile_version)
+        })
+    }
+
+    pub(crate) fn observe_model_catalog_changes(
+        &self,
+        model_catalog_version: String,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        self.update(|actor| actor.observe_model_catalog_changes(model_catalog_version))
+    }
+
+    pub(crate) fn stage_shared_profile_change_notices(
+        &self,
+        notices: &[SharedProfileChangeNotice],
+    ) -> Result<()> {
+        let notices = notices.to_vec();
+        self.update(move |actor| actor.stage_shared_profile_change_notices(&notices))
+    }
+
+    pub(crate) fn take_shared_profile_change_notices(
+        &self,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        self.update(|actor| actor.take_shared_profile_change_notices())
+    }
+
+    pub(crate) fn take_model_catalog_change_notices(
+        &self,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        self.update(|actor| actor.take_model_catalog_change_notices())
+    }
+
+    pub(crate) fn observe_system_prompt_state(
+        &self,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<SystemPromptStateObservation> {
+        self.update(|actor| actor.observe_system_prompt_state(static_hash, component_hashes))
+    }
+
+    pub(crate) fn take_system_prompt_dynamic_notices(&self) -> Result<BTreeSet<String>> {
+        self.update(|actor| actor.take_system_prompt_dynamic_notices())
+    }
+
+    pub(crate) fn mark_system_prompt_state_current(
+        &self,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.update(|actor| actor.mark_system_prompt_state_current(static_hash, component_hashes))
+    }
+
+    pub fn commit_runtime_turn(&self, commit: SessionRuntimeTurnCommit) -> Result<()> {
+        self.update(|actor| actor.commit_runtime_turn(commit))
+    }
+
+    pub(crate) fn fail_runtime_turn(&self, failure: SessionRuntimeTurnFailure) -> Result<()> {
+        self.update(|actor| actor.fail_runtime_turn(failure))
+    }
+
+    pub fn record_idle_compaction(
+        &self,
+        messages: Vec<ChatMessage>,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let compaction = compaction.clone();
+        self.update(move |actor| actor.record_idle_compaction(messages, &compaction))
+    }
+
+    pub(crate) fn update_checkpoint(
+        &self,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let usage = usage.clone();
+        let compaction = compaction.clone();
+        self.update(move |actor| actor.update_checkpoint(messages, &usage, &compaction))
+    }
+
+    pub(crate) fn mark_idle_compaction_failed(&self, error_summary: String) -> Result<()> {
+        self.update(|actor| actor.mark_idle_compaction_failed(error_summary))
+    }
+
+    pub(crate) fn clear_idle_compaction_failure(&self) -> Result<()> {
+        self.update(|actor| actor.clear_idle_compaction_failure())
+    }
+
+    pub(crate) fn drain_mailboxes_if_idle(&self) -> Result<bool> {
+        self.update(|actor| actor.drain_mailboxes_if_idle())
+    }
+}
+
+struct SessionActor {
+    session: Session,
+    runtime: SessionRuntimeState,
+}
+
+impl SessionActor {
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            runtime: SessionRuntimeState::default(),
+        }
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        self.session.snapshot()
+    }
+
+    fn register_control(&mut self, control: SessionExecutionControl) {
+        if self.runtime.pending_interrupt {
+            control.request_yield();
+        }
+        self.runtime.turn_runner_claimed = true;
+        self.runtime.active_phase = Some(SessionRuntimePhase::Running);
+        self.runtime.active_control = Some(control);
+    }
+
+    fn unregister_control(&mut self) -> Result<bool> {
+        self.runtime.active_control = None;
+        self.runtime.active_phase = None;
+        self.runtime.turn_runner_claimed = false;
+        self.drain_mailboxes_if_idle()
+    }
+
+    fn receive_user_message(&mut self, text: Option<String>) -> SessionUserMessageReceipt {
+        let disposition = self.request_yield_for_user_message();
+        let mut outbound = Vec::new();
+        if disposition.compaction_in_progress {
+            outbound.push(SessionActorOutbound::UserVisibleText(
+                COMPACTION_WAIT_NOTICE_TEXT.to_string(),
+            ));
+        }
+        let text = if disposition.interrupted {
+            tag_interrupted_followup_text(text)
+        } else {
+            text
+        };
+        SessionUserMessageReceipt {
+            text,
+            interrupted: disposition.interrupted,
+            compaction_in_progress: disposition.compaction_in_progress,
+            outbound,
+        }
+    }
+
+    fn user_turn_time_hints(
+        &self,
+        config: SessionTurnTimeHintConfig,
+        now: DateTime<Utc>,
+    ) -> SessionTurnTimeHints {
+        SessionTurnTimeHints {
+            user_time_tip: config
+                .emit_idle_time_gap_hint
+                .then(|| render_last_user_message_time_tip(&self.session, now))
+                .flatten(),
+            system_date: config
+                .emit_system_date_on_user_message
+                .then(|| render_system_date_on_user_message(now)),
+        }
+    }
+
+    fn receive_runtime_event(&mut self, event: &SessionEvent) {
+        if let Some(phase) = session_runtime_phase_for_event(event)
+            && self.runtime.active_control.is_some()
+        {
+            self.runtime.active_phase = Some(phase);
+        }
+    }
+
+    fn receive_runtime_event_with_effects(
+        &mut self,
+        model_key: &str,
+        event: &SessionEvent,
+    ) -> Vec<SessionEffect> {
+        self.receive_runtime_event(event);
+        self.progress_feedback_for_event(model_key, event)
+            .map(SessionEffect::UpdateProgress)
+            .into_iter()
+            .collect()
+    }
+
+    fn receive_runtime_progress(
+        &self,
+        model_key: &str,
+        progress: &ExecutionProgress,
+    ) -> Vec<SessionEffect> {
+        vec![SessionEffect::UpdateProgress(ProgressFeedback {
+            turn_id: self.session.id.to_string(),
+            text: progress_text_for_execution(model_key, progress),
+            important: true,
+            final_state: None,
+            message_id: self
+                .session
+                .session_state
+                .progress_message
+                .as_ref()
+                .map(|state| state.message_id.clone()),
+        })]
+    }
+
+    fn receive_runtime_failure_summary(
+        &self,
+        model_key: &str,
+        error_summary: &str,
+    ) -> Vec<SessionEffect> {
+        vec![SessionEffect::UpdateProgress(ProgressFeedback {
+            turn_id: self.session.id.to_string(),
+            text: progress_text(
+                model_key,
+                &format!("失败：{}", truncate_single_line(error_summary, 160)),
+            ),
+            important: true,
+            final_state: Some(ProgressFeedbackFinalState::Failed),
+            message_id: self
+                .session
+                .session_state
+                .progress_message
+                .as_ref()
+                .map(|state| state.message_id.clone()),
+        })]
+    }
+
+    fn apply_progress_feedback_update(&mut self, update: ProgressFeedbackUpdate) -> Result<()> {
+        match update {
+            ProgressFeedbackUpdate::Unchanged => Ok(()),
+            ProgressFeedbackUpdate::StoreMessage { message_id } => {
+                self.set_progress_message(Some(SessionProgressMessageState {
+                    turn_id: self.session.id.to_string(),
+                    message_id,
+                }))
+            }
+            ProgressFeedbackUpdate::ClearMessage => self.set_progress_message(None),
+        }
+    }
+
+    fn progress_feedback_for_event(
+        &self,
+        model_key: &str,
+        event: &SessionEvent,
+    ) -> Option<ProgressFeedback> {
+        let (activity, important, final_state) = match event {
+            SessionEvent::CompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+            SessionEvent::SessionStarted { .. } | SessionEvent::CompactionCompleted { .. } => {
+                return None;
+            }
+            SessionEvent::RoundStarted { .. }
+            | SessionEvent::ModelCallStarted { .. }
+            | SessionEvent::ModelCallCompleted { .. } => return None,
+            SessionEvent::ToolWaitCompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+            SessionEvent::ToolWaitCompactionScheduled { .. }
+            | SessionEvent::ToolWaitCompactionCompleted { .. } => return None,
+            SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallCompleted { .. } => {
+                return None;
+            }
+            SessionEvent::SessionYielded { .. } | SessionEvent::PrefixRewriteApplied { .. } => {
+                return None;
+            }
+            SessionEvent::SessionCompleted { .. } => (
+                "完成".to_string(),
+                true,
+                Some(ProgressFeedbackFinalState::Done),
+            ),
+        };
+
+        Some(ProgressFeedback {
+            turn_id: self.session.id.to_string(),
+            text: progress_text(model_key, &activity),
+            important,
+            final_state,
+            message_id: self
+                .session
+                .session_state
+                .progress_message
+                .as_ref()
+                .map(|state| state.message_id.clone()),
+        })
+    }
+
+    fn request_yield_for_user_message(&mut self) -> SessionYieldDisposition {
+        let compaction_in_progress =
+            self.runtime.active_phase == Some(SessionRuntimePhase::Compacting);
+        if self.runtime.active_control.is_none() && !self.runtime.turn_runner_claimed {
+            return SessionYieldDisposition {
+                interrupted: false,
+                compaction_in_progress: false,
+            };
+        }
+        if let Some(control) = self.runtime.active_control.clone() {
+            control.request_yield();
+        }
+        self.runtime.pending_interrupt = true;
+        SessionYieldDisposition {
+            interrupted: true,
+            compaction_in_progress,
+        }
+    }
+
+    fn request_cancel(&mut self) -> bool {
+        let Some(control) = self.runtime.active_control.clone() else {
+            return false;
+        };
+        control.request_cancel();
+        true
+    }
+
+    #[cfg(test)]
+    fn set_runtime_phase(&mut self, phase: SessionRuntimePhase) {
+        if self.runtime.active_control.is_some() {
+            self.runtime.active_phase = Some(phase);
+        }
+    }
+
+    fn clear_pending_interrupt(&mut self) {
+        self.runtime.pending_interrupt = false;
+    }
+
+    fn has_pending_interrupt(&self) -> bool {
+        self.runtime.pending_interrupt
+    }
+
+    fn is_running(&self) -> bool {
+        self.runtime.active_control.is_some() || self.runtime.turn_runner_claimed
+    }
+
+    fn try_claim_turn_runner(&mut self) -> bool {
+        if self.runtime.active_control.is_some() || self.runtime.turn_runner_claimed {
+            return false;
+        }
+        self.runtime.turn_runner_claimed = true;
+        self.runtime.active_phase = Some(SessionRuntimePhase::Running);
+        true
+    }
+
+    fn set_progress_message(
+        &mut self,
+        progress_message: Option<SessionProgressMessageState>,
+    ) -> Result<()> {
+        self.session.session_state.progress_message = progress_message;
+        self.session.persist()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.session.closed_at = Some(Utc::now());
+        self.session.persist()
+    }
+
+    fn mark_workspace_summary_state(
+        &mut self,
+        pending: bool,
+        close_after_summary: bool,
+    ) -> Result<()> {
+        self.session.pending_workspace_summary = pending;
+        self.session.close_after_summary = close_after_summary;
+        self.session.persist()
+    }
+
+    fn set_api_timeout_override(&mut self, timeout_seconds: Option<f64>) -> Result<()> {
+        self.session.api_timeout_override_seconds = timeout_seconds;
+        self.session.persist()
+    }
+
+    #[cfg(test)]
+    fn append_pending_request_message(&mut self, message: ChatMessage) -> Result<()> {
+        self.session.session_state.pending_messages.push(message);
+        self.session.persist()
+    }
+
+    #[cfg(test)]
+    fn stage_user_turn(
+        &mut self,
+        pending_message: ChatMessage,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<SessionUserMessageReceipt> {
+        self.tell_user_message(SessionUserMessage {
+            pending_message,
+            text,
+            attachments,
+        })
+    }
+
+    fn set_failed_turn(
+        &mut self,
+        resume_messages: Vec<ChatMessage>,
+        errno: SessionErrno,
+        errinfo: Option<String>,
+    ) -> Result<()> {
+        let existing_pending_messages = self.session.session_state.pending_messages.clone();
+        self.session.session_state.messages = resume_messages;
+        self.session.session_state.pending_messages = if !existing_pending_messages.is_empty()
+            && !self
+                .session
+                .session_state
+                .messages
+                .ends_with(&existing_pending_messages)
+        {
+            existing_pending_messages
+        } else {
+            Vec::new()
+        };
+        self.session.session_state.phase = SessionPhase::Yielded;
+        self.session.session_state.errno = Some(errno);
+        self.session.session_state.errinfo = errinfo;
+        self.session.persist()
+    }
+
+    fn append_visible_message(
+        &mut self,
+        role: MessageRole,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        let attachment_count = attachments.len();
+        self.session.push_message(role.clone(), text, attachments);
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "message_appended",
+            role = ?role,
+            message_count = self.session.history.len() as u64,
+            attachment_count = attachment_count as u64,
+            "appended message to session history"
+        );
+        self.session.persist()
+    }
+
+    fn tell_actor_message(
+        &mut self,
+        message: SessionActorMessage,
+    ) -> Result<SessionActorMessageReceipt> {
+        let message = DurableSessionActorMessage {
+            id: Uuid::new_v4(),
+            from_session_id: message.from_session_id,
+            created_at: Utc::now(),
+            role: message.role,
+            text: message.text,
+            attachments: message.attachments,
+        };
+        let message_id = message.id;
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "actor_message_received",
+            from_session_id = %message.from_session_id,
+            "received actor message"
+        );
+        self.session.session_state.actor_mailbox.push(message);
+        self.session.persist()?;
+        let applied_to_context = self.drain_mailboxes_if_idle()?;
+        Ok(SessionActorMessageReceipt {
+            message_id,
+            applied_to_context,
+        })
+    }
+
+    fn tell_user_message(
+        &mut self,
+        mut message: SessionUserMessage,
+    ) -> Result<SessionUserMessageReceipt> {
+        let receipt = self.receive_user_message(message.text);
+        if receipt.interrupted {
+            tag_interrupted_user_chat_message(&mut message.pending_message);
+        }
+        let queued = DurableSessionUserMessage {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            pending_message: message.pending_message,
+            text: receipt.text.clone(),
+            attachments: message.attachments,
+        };
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "user_message_received",
+            interrupted = receipt.interrupted,
+            compaction_in_progress = receipt.compaction_in_progress,
+            "received user message into durable session mailbox"
+        );
+        self.session.session_state.user_mailbox.push(queued);
+        self.session.persist()?;
+        self.drain_mailboxes_if_idle()?;
+        Ok(receipt)
+    }
+
+    fn drain_mailboxes_if_idle(&mut self) -> Result<bool> {
+        if self.is_running() {
+            return Ok(false);
+        }
+        let actor_drained = self.drain_actor_mailbox_if_idle()?;
+        let user_drained = self.drain_user_mailbox_if_idle()?;
+        Ok(actor_drained || user_drained)
+    }
+
+    fn drain_actor_mailbox_if_idle(&mut self) -> Result<bool> {
+        if self.is_running() || self.session.session_state.actor_mailbox.is_empty() {
+            return Ok(false);
+        }
+        let messages = std::mem::take(&mut self.session.session_state.actor_mailbox);
+        let drained_count = messages.len();
+        for message in messages {
+            self.apply_actor_message(message);
+        }
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "actor_mailbox_drained",
+            drained_count = drained_count as u64,
+            message_count = self.session.history.len() as u64,
+            agent_message_count = self.session.session_state.messages.len() as u64,
+            "drained actor mailbox into session context"
+        );
+        self.session.persist()?;
+        Ok(true)
+    }
+
+    fn drain_user_mailbox_if_idle(&mut self) -> Result<bool> {
+        if self.is_running() || self.session.session_state.user_mailbox.is_empty() {
+            return Ok(false);
+        }
+        let messages = std::mem::take(&mut self.session.session_state.user_mailbox);
+        let drained_count = messages.len();
+        for message in messages {
+            self.apply_user_message(message);
+        }
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "user_mailbox_drained",
+            drained_count = drained_count as u64,
+            message_count = self.session.history.len() as u64,
+            pending_message_count = self.session.session_state.pending_messages.len() as u64,
+            "drained user mailbox into pending session context"
+        );
+        self.session.persist()?;
+        Ok(true)
+    }
+
+    fn apply_actor_message(&mut self, message: DurableSessionActorMessage) {
+        if let Some(stable_text) = message
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System => "system",
+            };
+            self.session
+                .session_state
+                .messages
+                .push(ChatMessage::text(role, stable_text));
+        }
+        self.session
+            .push_message(message.role, message.text, message.attachments);
+    }
+
+    fn apply_user_message(&mut self, message: DurableSessionUserMessage) {
+        let attachment_count = message.attachments.len();
+        self.session
+            .session_state
+            .pending_messages
+            .push(message.pending_message);
+        self.session
+            .push_message(MessageRole::User, message.text, message.attachments);
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "foreground_user_turn_staged",
+            message_count = self.session.history.len() as u64,
+            pending_message_count = self.session.session_state.pending_messages.len() as u64,
+            attachment_count = attachment_count as u64,
+            "staged user mailbox item into pending request queue and visible history"
+        );
+    }
+
+    fn observe_skill_changes(
+        &mut self,
+        observed_skills: &[SessionSkillObservation],
+    ) -> Result<Vec<SkillChangeNotice>> {
+        let mut notices = Vec::new();
+        let last_compacted_turn_count = self.session.last_compacted_turn_count;
+        for observed in observed_skills {
+            match self.session.skill_states.get_mut(&observed.name) {
+                Some(state) => {
+                    let description_changed = state.description != observed.description;
+                    let content_changed = state.content != observed.content;
+                    if description_changed {
+                        notices.push(SkillChangeNotice::DescriptionChanged {
+                            name: observed.name.clone(),
+                            description: observed.description.clone(),
+                        });
+                    }
+                    if content_changed
+                        && state
+                            .last_loaded_turn
+                            .is_some_and(|turn| turn > last_compacted_turn_count)
+                    {
+                        notices.push(SkillChangeNotice::ContentChanged {
+                            name: observed.name.clone(),
+                            description: observed.description.clone(),
+                            content: observed.content.clone(),
+                        });
+                    }
+                    state.description = observed.description.clone();
+                    state.content = observed.content.clone();
+                }
+                None => {
+                    self.session.skill_states.insert(
+                        observed.name.clone(),
+                        SessionSkillState {
+                            description: observed.description.clone(),
+                            content: observed.content.clone(),
+                            last_loaded_turn: None,
+                        },
+                    );
+                }
+            }
+        }
+        self.session.persist()?;
+        Ok(notices)
+    }
+
+    fn observe_shared_profile_changes(
+        &mut self,
+        user_profile_version: String,
+        identity_profile_version: String,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        let mut notices = Vec::new();
+
+        match self.session.seen_user_profile_version.as_deref() {
+            None => {
+                self.session.seen_user_profile_version = Some(user_profile_version);
+            }
+            Some(previous) if previous != user_profile_version => {
+                self.session.seen_user_profile_version = Some(user_profile_version);
+                self.session.pending_user_profile_notice = true;
+                notices.push(SharedProfileChangeNotice::UserUpdated);
+            }
+            Some(_) => {}
+        }
+
+        match self.session.seen_identity_profile_version.as_deref() {
+            None => {
+                self.session.seen_identity_profile_version = Some(identity_profile_version);
+            }
+            Some(previous) if previous != identity_profile_version => {
+                self.session.seen_identity_profile_version = Some(identity_profile_version);
+                self.session.pending_identity_profile_notice = true;
+                notices.push(SharedProfileChangeNotice::IdentityUpdated);
+            }
+            Some(_) => {}
+        }
+
+        self.session.persist()?;
+        Ok(notices)
+    }
+
+    fn observe_model_catalog_changes(
+        &mut self,
+        model_catalog_version: String,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        let mut notices = Vec::new();
+        match self.session.seen_model_catalog_version.as_deref() {
+            None => {
+                self.session.seen_model_catalog_version = Some(model_catalog_version);
+            }
+            Some(previous) if previous != model_catalog_version => {
+                self.session.seen_model_catalog_version = Some(model_catalog_version);
+                self.session.pending_model_catalog_notice = true;
+                notices.push(ModelCatalogChangeNotice::Updated);
+            }
+            Some(_) => {}
+        }
+        self.session.persist()?;
+        Ok(notices)
+    }
+
+    fn stage_shared_profile_change_notices(
+        &mut self,
+        notices: &[SharedProfileChangeNotice],
+    ) -> Result<()> {
+        if notices.is_empty() {
+            return Ok(());
+        }
+        for notice in notices {
+            match notice {
+                SharedProfileChangeNotice::UserUpdated => {
+                    self.session.pending_user_profile_notice = true;
+                }
+                SharedProfileChangeNotice::IdentityUpdated => {
+                    self.session.pending_identity_profile_notice = true;
+                }
+            }
+        }
+        self.session.persist()
+    }
+
+    fn take_shared_profile_change_notices(&mut self) -> Result<Vec<SharedProfileChangeNotice>> {
+        let mut notices = Vec::new();
+        if self.session.pending_user_profile_notice {
+            notices.push(SharedProfileChangeNotice::UserUpdated);
+            self.session.pending_user_profile_notice = false;
+        }
+        if self.session.pending_identity_profile_notice {
+            notices.push(SharedProfileChangeNotice::IdentityUpdated);
+            self.session.pending_identity_profile_notice = false;
+        }
+        self.session.persist()?;
+        Ok(notices)
+    }
+
+    fn take_model_catalog_change_notices(&mut self) -> Result<Vec<ModelCatalogChangeNotice>> {
+        let mut notices = Vec::new();
+        if self.session.pending_model_catalog_notice {
+            notices.push(ModelCatalogChangeNotice::Updated);
+            self.session.pending_model_catalog_notice = false;
+        }
+        self.session.persist()?;
+        Ok(notices)
+    }
+
+    fn observe_system_prompt_state(
+        &mut self,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<SystemPromptStateObservation> {
+        let mut static_changed = false;
+        match self
+            .session
+            .session_state
+            .system_prompt_static_hash
+            .as_deref()
+        {
+            None => {
+                self.session.session_state.system_prompt_static_hash = Some(static_hash);
+            }
+            Some(previous) if previous != static_hash => {
+                self.session.session_state.system_prompt_static_hash = Some(static_hash);
+                static_changed = true;
+            }
+            Some(_) => {}
+        }
+
+        for (key, hash) in &component_hashes {
+            match self
+                .session
+                .session_state
+                .system_prompt_component_hashes
+                .get(key)
+            {
+                None => {}
+                Some(previous) if previous != hash => {
+                    self.session
+                        .session_state
+                        .pending_system_prompt_component_notices
+                        .insert(key.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        let removed_keys = self
+            .session
+            .session_state
+            .system_prompt_component_hashes
+            .keys()
+            .filter(|key| !component_hashes.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in removed_keys {
+            self.session
+                .session_state
+                .pending_system_prompt_component_notices
+                .insert(key);
+        }
+        self.session.session_state.system_prompt_component_hashes = component_hashes;
+
+        let observation = SystemPromptStateObservation {
+            static_changed,
+            dynamic_notice_keys: self
+                .session
+                .session_state
+                .pending_system_prompt_component_notices
+                .clone(),
+        };
+        self.session.persist()?;
+        Ok(observation)
+    }
+
+    fn mark_system_prompt_state_current(
+        &mut self,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.session.session_state.system_prompt_static_hash = Some(static_hash);
+        self.session.session_state.system_prompt_component_hashes = component_hashes;
+        self.session
+            .session_state
+            .pending_system_prompt_component_notices
+            .clear();
+        self.session.persist()
+    }
+
+    fn take_system_prompt_dynamic_notices(&mut self) -> Result<BTreeSet<String>> {
+        let pending = std::mem::take(
+            &mut self
+                .session
+                .session_state
+                .pending_system_prompt_component_notices,
+        );
+        self.session.persist()?;
+        Ok(pending)
+    }
+
+    fn mark_skills_loaded_current_turn(&mut self, skill_names: &[String]) -> Result<()> {
+        if skill_names.is_empty() {
+            return Ok(());
+        }
+        for skill_name in skill_names {
+            self.session
+                .skill_states
+                .entry(skill_name.clone())
+                .or_insert_with(SessionSkillState::default)
+                .last_loaded_turn = Some(self.session.turn_count);
+        }
+        self.session.persist()
+    }
+
+    fn commit_runtime_turn(&mut self, commit: SessionRuntimeTurnCommit) -> Result<()> {
+        let consumed_pending_messages = match self.session.kind {
+            SessionKind::Foreground => commit.consumed_pending_messages.as_slice(),
+            SessionKind::Background => &[],
+        };
+        let log_kind = match commit.phase {
+            SessionPhase::Yielded => "agent_turn_yielded",
+            _ => "agent_turn_recorded",
+        };
+        record_turn(
+            &mut self.session,
+            commit.messages,
+            consumed_pending_messages,
+            &commit.usage,
+            &commit.compaction,
+            commit.phase,
+            log_kind,
+        )?;
+        self.mark_system_prompt_state_after_compaction(
+            &commit.compaction,
+            commit.system_prompt_static_hash_after_compaction,
+            commit.system_prompt_component_hashes_after_compaction,
+        )?;
+        self.mark_skills_loaded_current_turn(&commit.loaded_skills)?;
+        if let Some(text) = commit.user_history_text {
+            self.append_visible_message(MessageRole::User, Some(text), Vec::new())?;
+        }
+        if let Some(text) = commit.assistant_history_text {
+            self.append_visible_message(MessageRole::Assistant, Some(text), Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn fail_runtime_turn(&mut self, failure: SessionRuntimeTurnFailure) -> Result<()> {
+        self.set_failed_turn(failure.resume_messages, failure.errno, failure.errinfo)?;
+        self.mark_system_prompt_state_after_compaction(
+            &failure.compaction,
+            failure.system_prompt_static_hash_after_compaction,
+            failure.system_prompt_component_hashes_after_compaction,
+        )
+    }
+
+    fn mark_system_prompt_state_after_compaction(
+        &mut self,
+        compaction: &SessionCompactionStats,
+        static_hash: Option<String>,
+        component_hashes: Option<BTreeMap<String, String>>,
+    ) -> Result<()> {
+        if compaction.compacted_run_count == 0 {
+            return Ok(());
+        }
+        let Some(static_hash) = static_hash else {
+            return Ok(());
+        };
+        let component_hashes = component_hashes.unwrap_or_default();
+        self.mark_system_prompt_state_current(static_hash, component_hashes)
+    }
+
+    fn update_checkpoint(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        commit_stable_messages(&mut self.session, messages, Vec::new(), SessionPhase::End);
+        self.session.last_agent_returned_at = Some(Utc::now());
+        self.session.cumulative_usage.add_assign(usage);
+        accumulate_compaction_stats(&mut self.session, compaction);
+        self.session.persist()
+    }
+
+    fn record_idle_compaction(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let pending_messages = self.session.session_state.pending_messages.clone();
+        let phase = self.session.session_state.phase;
+        commit_stable_messages(&mut self.session, messages, pending_messages, phase);
+        self.session.last_compacted_at = Some(Utc::now());
+        self.session.last_compacted_turn_count = self.session.turn_count;
+        accumulate_compaction_stats(&mut self.session, compaction);
+        if self.session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
+            self.session.session_state.errno = None;
+            self.session.session_state.errinfo = None;
+        }
+        info!(
+            log_stream = "session",
+            log_key = %self.session.id,
+            kind = "idle_context_compacted",
+            agent_message_count = self.session.session_state.messages.len() as u64,
+            turn_count = self.session.turn_count,
+            "persisted idle context compaction"
+        );
+        self.session.persist()
+    }
+
+    fn mark_idle_compaction_failed(&mut self, error_summary: String) -> Result<()> {
+        self.session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
+        self.session.session_state.errinfo = Some(error_summary);
+        self.session.persist()
+    }
+
+    fn clear_idle_compaction_failure(&mut self) -> Result<()> {
+        if self.session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
+            self.session.session_state.errno = None;
+            self.session.session_state.errinfo = None;
+        }
+        self.session.persist()
+    }
+
+    fn export_checkpoint(&self) -> SessionCheckpointData {
+        SessionCheckpointData {
+            history: self.session.history.clone(),
+            messages: self.session.session_state.messages.clone(),
+            last_user_message_at: self.session.last_user_message_at,
+            last_agent_returned_at: self.session.last_agent_returned_at,
+            last_compacted_at: self.session.last_compacted_at,
+            turn_count: self.session.turn_count,
+            last_compacted_turn_count: self.session.last_compacted_turn_count,
+            cumulative_usage: self.session.cumulative_usage.clone(),
+            cumulative_compaction: self.session.cumulative_compaction.clone(),
+            api_timeout_override_seconds: self.session.api_timeout_override_seconds,
+            skill_states: self.session.skill_states.clone(),
+            seen_user_profile_version: self.session.seen_user_profile_version.clone(),
+            seen_identity_profile_version: self.session.seen_identity_profile_version.clone(),
+            pending_user_profile_notice: self.session.pending_user_profile_notice,
+            pending_identity_profile_notice: self.session.pending_identity_profile_notice,
+            seen_model_catalog_version: self.session.seen_model_catalog_version.clone(),
+            pending_model_catalog_notice: self.session.pending_model_catalog_notice,
+            system_prompt_static_hash: self.session.session_state.system_prompt_static_hash.clone(),
+            system_prompt_component_hashes: self
+                .session
+                .session_state
+                .system_prompt_component_hashes
+                .clone(),
+            pending_system_prompt_component_notices: self
+                .session
+                .session_state
+                .pending_system_prompt_component_notices
+                .clone(),
+            actor_mailbox: self.session.session_state.actor_mailbox.clone(),
+            user_mailbox: self.session.session_state.user_mailbox.clone(),
+        }
+    }
+}
+
 impl SessionSnapshot {
     pub fn stable_messages(&self) -> &[ChatMessage] {
         &self.session_state.messages
@@ -174,7 +1580,7 @@ impl SessionSnapshot {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum SessionKind {
+pub enum SessionKind {
     #[default]
     Foreground,
     Background,
@@ -219,6 +1625,7 @@ impl Session {
 
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
+            kind: self.kind,
             id: self.id,
             agent_id: self.agent_id,
             address: self.address.clone(),
@@ -268,7 +1675,6 @@ impl Session {
             address: self.address.clone(),
             workspace_id: Some(self.workspace_id.clone()),
             history: self.history.clone(),
-            legacy_agent_messages: Vec::new(),
             last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
@@ -284,7 +1690,7 @@ impl Session {
             pending_identity_profile_notice: self.pending_identity_profile_notice,
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             pending_model_catalog_notice: self.pending_model_catalog_notice,
-            session_state: Some(self.session_state.clone()),
+            session_state: self.session_state.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             closed_at: self.closed_at,
@@ -306,27 +1712,6 @@ impl Session {
         let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
-        let legacy_agent_messages =
-            sanitize_legacy_persisted_agent_messages(persisted.legacy_agent_messages);
-        let session_state = persisted
-            .session_state
-            .map(|mut state| {
-                state.messages = sanitize_legacy_persisted_agent_messages(state.messages);
-                state.pending_messages =
-                    sanitize_legacy_persisted_agent_messages(state.pending_messages);
-                state
-            })
-            .unwrap_or_else(|| DurableSessionState {
-                messages: legacy_agent_messages.clone(),
-                pending_messages: Vec::new(),
-                system_prompt_static_hash: None,
-                system_prompt_component_hashes: BTreeMap::new(),
-                pending_system_prompt_component_notices: BTreeSet::new(),
-                phase: SessionPhase::End,
-                errno: None,
-                errinfo: None,
-                progress_message: None,
-            });
         Ok(Self {
             kind: persisted.kind,
             id: persisted.id,
@@ -352,34 +1737,12 @@ impl Session {
             pending_user_profile_notice: persisted.pending_user_profile_notice,
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             pending_model_catalog_notice: persisted.pending_model_catalog_notice,
-            session_state,
+            session_state: persisted.session_state,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
         })
     }
-}
-
-fn sanitize_legacy_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut sanitized = Vec::new();
-    let mut seen_leading_system = false;
-    let mut leading = true;
-    for message in messages {
-        let is_system = message.role == "system";
-        if leading {
-            if is_system {
-                if seen_leading_system {
-                    continue;
-                }
-                seen_leading_system = true;
-                sanitized.push(message);
-                continue;
-            }
-            leading = false;
-        }
-        sanitized.push(message);
-    }
-    sanitized
 }
 
 fn record_turn(
@@ -467,10 +1830,6 @@ struct PersistedSession {
     #[serde(default)]
     history: Vec<SessionMessage>,
     #[serde(default)]
-    #[serde(skip_serializing)]
-    #[serde(rename = "agent_messages")]
-    legacy_agent_messages: Vec<ChatMessage>,
-    #[serde(default)]
     last_user_message_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_agent_returned_at: Option<DateTime<Utc>>,
@@ -500,8 +1859,7 @@ struct PersistedSession {
     pending_identity_profile_notice: bool,
     #[serde(default)]
     pending_model_catalog_notice: bool,
-    #[serde(default)]
-    session_state: Option<DurableSessionState>,
+    session_state: DurableSessionState,
     #[serde(default)]
     pending_workspace_summary: bool,
     #[serde(default)]
@@ -510,11 +1868,256 @@ struct PersistedSession {
     closed_at: Option<DateTime<Utc>>,
 }
 
+pub fn should_emit_runtime_change_prompt(text: Option<&str>) -> bool {
+    let trimmed = text.map(str::trim_start).unwrap_or("");
+    !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
+        && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
+}
+
+pub fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
+    match text {
+        Some(text) if !text.trim().is_empty() => {
+            Some(format!("{INTERRUPTED_FOLLOWUP_MARKER}\n{text}"))
+        }
+        _ => Some(INTERRUPTED_FOLLOWUP_MARKER.to_string()),
+    }
+}
+
+fn tag_interrupted_user_chat_message(message: &mut ChatMessage) {
+    match message.content.as_mut() {
+        Some(serde_json::Value::String(text)) => {
+            let tagged = tag_interrupted_followup_text(Some(std::mem::take(text)))
+                .unwrap_or_else(|| INTERRUPTED_FOLLOWUP_MARKER.to_string());
+            *text = tagged;
+        }
+        Some(serde_json::Value::Array(parts)) => {
+            let mut tagged_existing_text = false;
+            for part in parts.iter_mut() {
+                let Some(object) = part.as_object_mut() else {
+                    continue;
+                };
+                if object.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(serde_json::Value::String(text)) = object.get_mut("text") else {
+                    continue;
+                };
+                let tagged = tag_interrupted_followup_text(Some(std::mem::take(text)))
+                    .unwrap_or_else(|| INTERRUPTED_FOLLOWUP_MARKER.to_string());
+                *text = tagged;
+                tagged_existing_text = true;
+                break;
+            }
+            if !tagged_existing_text {
+                parts.insert(
+                    0,
+                    serde_json::json!({
+                        "type": "text",
+                        "text": INTERRUPTED_FOLLOWUP_MARKER,
+                    }),
+                );
+            }
+        }
+        _ => {
+            message.content = Some(serde_json::Value::String(
+                INTERRUPTED_FOLLOWUP_MARKER.to_string(),
+            ));
+        }
+    }
+}
+
+pub fn session_runtime_phase_for_event(event: &SessionEvent) -> Option<SessionRuntimePhase> {
+    match event {
+        SessionEvent::CompactionStarted { .. } | SessionEvent::ToolWaitCompactionStarted { .. } => {
+            Some(SessionRuntimePhase::Compacting)
+        }
+        SessionEvent::CompactionCompleted { .. }
+        | SessionEvent::ToolWaitCompactionCompleted { .. }
+        | SessionEvent::SessionStarted { .. }
+        | SessionEvent::RoundStarted { .. }
+        | SessionEvent::ModelCallStarted { .. }
+        | SessionEvent::ModelCallCompleted { .. }
+        | SessionEvent::ToolWaitCompactionScheduled { .. }
+        | SessionEvent::ToolCallStarted { .. }
+        | SessionEvent::ToolCallCompleted { .. }
+        | SessionEvent::SessionYielded { .. }
+        | SessionEvent::PrefixRewriteApplied { .. }
+        | SessionEvent::SessionCompleted { .. } => Some(SessionRuntimePhase::Running),
+    }
+}
+
+fn render_last_user_message_time_tip(session: &Session, now: DateTime<Utc>) -> Option<String> {
+    let last_user_message_at = session.last_user_message_at?;
+    let last_agent_returned_at = session.last_agent_returned_at?;
+    let idle_seconds = (now - last_agent_returned_at).num_seconds().max(0);
+    if idle_seconds < 5 * 60 {
+        return None;
+    }
+    let elapsed_seconds = (now - last_user_message_at).num_seconds().max(0);
+    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
+    Some(format!(
+        "[System Tip: {:.1} hours since the last user message.]",
+        elapsed_hours
+    ))
+}
+
+fn render_system_date_on_user_message(now: DateTime<Utc>) -> String {
+    let local_now = now.with_timezone(&chrono::Local);
+    format!(
+        "[System Date: {}]",
+        local_now.format("%Y-%m-%d %H:%M:%S %:z")
+    )
+}
+
+fn progress_text(model_key: &str, activity: &str) -> String {
+    format!(
+        "正在执行\n模型：{}\n阶段：{}\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
+        model_key, activity
+    )
+}
+
+fn progress_text_for_execution(model_key: &str, progress: &ExecutionProgress) -> String {
+    match progress.phase {
+        ExecutionProgressPhase::Thinking => format!(
+            "正在执行\n模型：{}\n状态：思考中...\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
+            model_key
+        ),
+        ExecutionProgressPhase::Tools => {
+            let mut lines = vec!["正在执行".to_string(), format!("模型：{model_key}")];
+            lines.push("状态：工具执行中".to_string());
+            for tool in &progress.tools {
+                lines.push(format!(
+                    "- {}：{}",
+                    tool.tool_name,
+                    render_tool_brief_arguments(&tool.tool_name, tool.arguments.as_deref())
+                ));
+            }
+            lines.push(String::new());
+            lines.push("发送新消息可打断；/continue 可继续最近中断的回合。".to_string());
+            lines.join("\n")
+        }
+    }
+}
+
+fn render_tool_brief_arguments(tool_name: &str, arguments: Option<&str>) -> String {
+    let args = arguments
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let object = args.as_object();
+    let detail = match tool_name {
+        "exec_start" | "exec_command" => first_string(object, &["cmd", "command"]),
+        "exec_wait" | "exec_write" | "exec_kill" => first_string(object, &["exec_id", "id"]),
+        "file_read" | "read_file" | "file_write" | "file_edit" | "ls" | "image_load"
+        | "pdf_read" | "audio_transcribe" => first_string(object, &["path", "file_path"]),
+        "glob" | "grep" | "web_search" => first_string(object, &["pattern", "query", "q"]),
+        "web_fetch" => first_string(object, &["url"]),
+        "image_generate" | "subagent_start" | "spawn_agent" => {
+            first_string(object, &["prompt", "message", "task"])
+        }
+        _ => object.and_then(|object| {
+            object
+                .values()
+                .find_map(|value| value.as_str().filter(|value| !value.trim().is_empty()))
+        }),
+    };
+    detail
+        .map(|value| truncate_single_line_strict(value, 20))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn first_string<'a>(
+    object: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    let object = object?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+}
+
+fn truncate_single_line(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out = compact.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn truncate_single_line_strict(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    if max_chars <= 3 {
+        return compact.chars().take(max_chars).collect();
+    }
+    let mut out = compact.chars().take(max_chars - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 pub struct SessionManager {
     sessions_root: PathBuf,
     workspace_manager: WorkspaceManager,
-    foreground_sessions: HashMap<String, Session>,
-    background_sessions: HashMap<Uuid, Session>,
+    foreground_actors: HashMap<String, SessionActorRef>,
+    background_actors: HashMap<Uuid, SessionActorRef>,
+}
+
+fn join_session_actor_worker(worker: Option<thread::JoinHandle<()>>) -> Result<()> {
+    if let Some(worker) = worker {
+        worker
+            .join()
+            .map_err(|_| anyhow!("session actor worker panicked"))?;
+    }
+    Ok(())
+}
+
+fn actor_ref(session: Session) -> SessionActorRef {
+    let session_id = session.id;
+    let actor = Arc::new(Mutex::new(SessionActor::new(session)));
+    let (sender, receiver) = mpsc::channel::<SessionActorCommand>();
+    let worker_actor = Arc::clone(&actor);
+    let worker = thread::Builder::new()
+        .name(format!("session-actor-{session_id}"))
+        .spawn(move || {
+            for command in receiver {
+                match command {
+                    SessionActorCommand::Run(command) => {
+                        let mut actor = worker_actor
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            command(&mut actor);
+                        }));
+                        if result.is_err() {
+                            warn!(
+                                log_stream = "session",
+                                log_key = %session_id,
+                                kind = "session_actor_command_panicked",
+                                "session actor command panicked and was dropped"
+                            );
+                        }
+                    }
+                    SessionActorCommand::Shutdown(done) => {
+                        let _ = done.send(());
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn session actor worker");
+
+    SessionActorRef {
+        inner: Arc::new(SessionActorHandleInner {
+            sender,
+            lifecycle: Mutex::new(SessionActorLifecycle {
+                closing: false,
+                worker: Some(worker),
+            }),
+        }),
+    }
 }
 
 impl SessionManager {
@@ -522,289 +2125,183 @@ impl SessionManager {
         let sessions_root = workdir.as_ref().join("sessions");
         fs::create_dir_all(&sessions_root)
             .with_context(|| format!("failed to create {}", sessions_root.display()))?;
-        let foreground_sessions = load_persisted_sessions(&sessions_root, &workspace_manager)?;
+        let foreground_actors = load_persisted_sessions(&sessions_root, &workspace_manager)?;
         Ok(Self {
             sessions_root,
             workspace_manager,
-            foreground_sessions,
-            background_sessions: HashMap::new(),
+            foreground_actors,
+            background_actors: HashMap::new(),
         })
     }
 
-    pub fn ensure_foreground(&mut self, address: &ChannelAddress) -> Result<SessionSnapshot> {
+    pub fn ensure_foreground_actor(&mut self, address: &ChannelAddress) -> Result<SessionActorRef> {
         let key = address.session_key();
-        if !self.foreground_sessions.contains_key(&key) {
-            let session = self.create_session(address)?;
-            info!(
-                log_stream = "session",
-                log_key = %session.id,
-                kind = "session_created",
-                channel_id = %address.channel_id,
-                conversation_id = %address.conversation_id,
-                root_dir = %session.root_dir.display(),
-                "created foreground session"
-            );
-            self.foreground_sessions.insert(key.clone(), session);
+        if !self.foreground_actors.contains_key(&key) {
+            let session = self.create_session_with_optional_workspace(address, None)?;
+            self.insert_foreground_actor(key.clone(), session);
         }
-        Ok(self
-            .foreground_sessions
-            .get(&key)
-            .expect("foreground session inserted")
-            .snapshot())
+        self.resolve_foreground(&key)
     }
 
-    pub fn reset_foreground_to_workspace(
+    pub fn ensure_foreground_in_workspace_actor(
         &mut self,
         address: &ChannelAddress,
         workspace_id: &str,
-    ) -> Result<SessionSnapshot> {
-        self.destroy_foreground(address)?;
-        self.ensure_foreground_in_workspace(address, workspace_id)
+    ) -> Result<SessionActorRef> {
+        let key = address.session_key();
+        if !self.foreground_actors.contains_key(&key) {
+            let session =
+                self.create_session_with_optional_workspace(address, Some(workspace_id))?;
+            self.insert_foreground_actor(key.clone(), session);
+        }
+        self.resolve_foreground(&key)
     }
 
-    pub fn ensure_foreground_in_workspace(
-        &mut self,
-        address: &ChannelAddress,
-        workspace_id: &str,
-    ) -> Result<SessionSnapshot> {
-        let key = address.session_key();
-        if !self.foreground_sessions.contains_key(&key) {
-            let session = self.create_session_with_workspace(address, workspace_id)?;
-            info!(
-                log_stream = "session",
-                log_key = %session.id,
-                kind = "session_created",
-                channel_id = %address.channel_id,
-                conversation_id = %address.conversation_id,
-                root_dir = %session.root_dir.display(),
-                workspace_id = %session.workspace_id,
-                "created foreground session in existing workspace"
-            );
-            self.foreground_sessions.insert(key.clone(), session);
-        }
-        Ok(self
-            .foreground_sessions
-            .get(&key)
-            .expect("foreground session inserted")
-            .snapshot())
+    fn insert_foreground_actor(&mut self, key: String, session: Session) {
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "session_created",
+            channel_id = %session.address.channel_id,
+            conversation_id = %session.address.conversation_id,
+            root_dir = %session.root_dir.display(),
+            workspace_id = %session.workspace_id,
+            "created foreground session"
+        );
+        self.foreground_actors.insert(key, actor_ref(session));
     }
 
     pub fn destroy_foreground(&mut self, address: &ChannelAddress) -> Result<()> {
         let key = address.session_key();
-        if let Some(mut session) = self.foreground_sessions.remove(&key) {
+        if let Some(actor) = self.foreground_actors.remove(&key) {
+            let snapshot = actor.snapshot()?;
             info!(
                 log_stream = "session",
-                log_key = %session.id,
+                log_key = %snapshot.id,
                 kind = "session_destroying",
-                root_dir = %session.root_dir.display(),
+                root_dir = %snapshot.root_dir.display(),
                 "destroying foreground session"
             );
-            session.closed_at = Some(Utc::now());
-            session.persist()?;
+            actor.close_and_shutdown()?;
             info!(
                 log_stream = "session",
-                log_key = %session.id,
+                log_key = %snapshot.id,
                 kind = "session_destroyed",
-                root_dir = %session.root_dir.display(),
-                "foreground session closed and retained on disk"
+                root_dir = %snapshot.root_dir.display(),
+                "foreground session closed and actor worker stopped"
             );
         }
         Ok(())
-    }
-
-    pub fn append_user_message(
-        &mut self,
-        address: &ChannelAddress,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        self.append_message(address, MessageRole::User, text, attachments)
-    }
-
-    pub fn append_assistant_message(
-        &mut self,
-        address: &ChannelAddress,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        self.append_message(address, MessageRole::Assistant, text, attachments)
-    }
-
-    pub fn append_background_result_to_foreground(
-        &mut self,
-        address: &ChannelAddress,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<SessionSnapshot> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let stable_text = text
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        if let Some(stable_text) = stable_text {
-            session
-                .session_state
-                .messages
-                .push(ChatMessage::text("assistant", stable_text));
-        }
-        let attachment_count = attachments.len();
-        session.push_message(MessageRole::Assistant, text, attachments);
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "background_result_inserted",
-            message_count = session.history.len() as u64,
-            agent_message_count = session.session_state.messages.len() as u64,
-            attachment_count = attachment_count as u64,
-            "inserted background result into foreground session"
-        );
-        session.persist()?;
-        Ok(session.snapshot())
     }
 
     pub fn get_snapshot(&self, address: &ChannelAddress) -> Option<SessionSnapshot> {
-        self.foreground_sessions
+        self.foreground_actors
             .get(&address.session_key())
-            .map(Session::snapshot)
+            .and_then(|actor| actor.snapshot().ok())
     }
 
-    pub fn set_progress_message(
-        &mut self,
+    pub fn resolve_foreground(&self, session_key: &str) -> Result<SessionActorRef> {
+        self.foreground_actors
+            .get(session_key)
+            .cloned()
+            .with_context(|| format!("no active session for {}", session_key))
+    }
+
+    pub fn resolve_foreground_by_address(
+        &self,
         address: &ChannelAddress,
-        progress_message: Option<SessionProgressMessageState>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.session_state.progress_message = progress_message;
-        session.persist()?;
-        Ok(())
+    ) -> Result<SessionActorRef> {
+        self.resolve_foreground(&address.session_key())
+    }
+
+    pub fn resolve_background(&self, session_id: Uuid) -> Result<SessionActorRef> {
+        self.background_actors
+            .get(&session_id)
+            .cloned()
+            .with_context(|| format!("no active background session for {}", session_id))
+    }
+
+    pub fn resolve_snapshot(&self, snapshot: &SessionSnapshot) -> Result<SessionActorRef> {
+        match snapshot.kind {
+            SessionKind::Foreground => self.resolve_foreground_by_address(&snapshot.address),
+            SessionKind::Background => self.resolve_background(snapshot.id),
+        }
     }
 
     pub fn list_foreground_snapshots(&self) -> Vec<SessionSnapshot> {
-        self.foreground_sessions
+        self.foreground_actors
             .values()
-            .map(Session::snapshot)
+            .filter_map(|actor| actor.snapshot().ok())
             .collect()
     }
 
     pub fn has_active_workspace(&self, workspace_id: &str) -> bool {
-        self.foreground_sessions
+        self.foreground_actors
             .values()
-            .chain(self.background_sessions.values())
-            .any(|session| session.workspace_id == workspace_id)
+            .chain(self.background_actors.values())
+            .any(|actor| actor.workspace_id().is_ok_and(|id| id == workspace_id))
     }
 
-    pub fn create_background(
+    pub fn create_background_actor(
         &mut self,
         address: &ChannelAddress,
         agent_id: Uuid,
-    ) -> Result<SessionSnapshot> {
-        let session =
-            self.create_session_with_kind(address, agent_id, None, SessionKind::Background)?;
-        let snapshot = session.snapshot();
-        self.background_sessions.insert(session.id, session);
-        Ok(snapshot)
+    ) -> Result<SessionActorRef> {
+        self.create_background_actor_with_optional_workspace(address, agent_id, None)
     }
 
-    pub fn create_background_in_workspace(
+    pub fn create_background_in_workspace_actor(
         &mut self,
         address: &ChannelAddress,
         agent_id: Uuid,
         workspace_id: &str,
-    ) -> Result<SessionSnapshot> {
+    ) -> Result<SessionActorRef> {
+        self.create_background_actor_with_optional_workspace(address, agent_id, Some(workspace_id))
+    }
+
+    fn create_background_actor_with_optional_workspace(
+        &mut self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+        workspace_id: Option<&str>,
+    ) -> Result<SessionActorRef> {
         let session = self.create_session_with_kind(
             address,
             agent_id,
-            Some(workspace_id),
+            workspace_id,
             SessionKind::Background,
         )?;
-        let snapshot = session.snapshot();
-        self.background_sessions.insert(session.id, session);
-        Ok(snapshot)
+        let session_id = session.id;
+        self.background_actors
+            .insert(session_id, actor_ref(session));
+        self.resolve_background(session_id)
     }
 
     pub fn background_snapshot(&self, session_id: Uuid) -> Result<SessionSnapshot> {
-        self.background_sessions
-            .get(&session_id)
-            .map(Session::snapshot)
-            .with_context(|| format!("no active background session for {}", session_id))
+        let actor = self.resolve_background(session_id)?;
+        actor.snapshot()
     }
 
     pub fn close_background(&mut self, session_id: Uuid) -> Result<()> {
-        if let Some(mut session) = self.background_sessions.remove(&session_id) {
-            session.closed_at = Some(Utc::now());
-            session.persist()?;
+        if let Some(actor) = self.background_actors.remove(&session_id) {
+            actor.close_and_shutdown()?;
         }
         Ok(())
     }
 
     pub fn pending_workspace_summary_snapshots(&self) -> Vec<SessionSnapshot> {
-        self.foreground_sessions
+        self.foreground_actors
             .values()
-            .filter(|session| session.pending_workspace_summary)
-            .map(Session::snapshot)
+            .filter_map(|actor| {
+                let snapshot = actor.snapshot().ok()?;
+                snapshot.pending_workspace_summary.then_some(snapshot)
+            })
             .collect()
     }
 
-    pub fn mark_workspace_summary_state(
-        &mut self,
-        address: &ChannelAddress,
-        pending: bool,
-        close_after_summary: bool,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.pending_workspace_summary = pending;
-        session.close_after_summary = close_after_summary;
-        session.persist()?;
-        Ok(())
-    }
-
     pub fn export_checkpoint(&self, address: &ChannelAddress) -> Result<SessionCheckpointData> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        Ok(SessionCheckpointData {
-            history: session.history.clone(),
-            messages: session.session_state.messages.clone(),
-            last_user_message_at: session.last_user_message_at,
-            last_agent_returned_at: session.last_agent_returned_at,
-            last_compacted_at: session.last_compacted_at,
-            turn_count: session.turn_count,
-            last_compacted_turn_count: session.last_compacted_turn_count,
-            cumulative_usage: session.cumulative_usage.clone(),
-            cumulative_compaction: session.cumulative_compaction.clone(),
-            api_timeout_override_seconds: session.api_timeout_override_seconds,
-            skill_states: session.skill_states.clone(),
-            seen_user_profile_version: session.seen_user_profile_version.clone(),
-            seen_identity_profile_version: session.seen_identity_profile_version.clone(),
-            pending_user_profile_notice: session.pending_user_profile_notice,
-            pending_identity_profile_notice: session.pending_identity_profile_notice,
-            seen_model_catalog_version: session.seen_model_catalog_version.clone(),
-            pending_model_catalog_notice: session.pending_model_catalog_notice,
-            system_prompt_static_hash: session.session_state.system_prompt_static_hash.clone(),
-            system_prompt_component_hashes: session
-                .session_state
-                .system_prompt_component_hashes
-                .clone(),
-            pending_system_prompt_component_notices: session
-                .session_state
-                .pending_system_prompt_component_notices
-                .clone(),
-        })
+        let actor = self.resolve_foreground_by_address(address)?;
+        actor.export_checkpoint()
     }
 
     pub fn restore_foreground_from_checkpoint(
@@ -860,6 +2357,8 @@ impl SessionManager {
                 errno: None,
                 errinfo: None,
                 progress_message: None,
+                actor_mailbox: checkpoint.actor_mailbox,
+                user_mailbox: checkpoint.user_mailbox,
             },
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -867,668 +2366,21 @@ impl SessionManager {
         };
         session.persist()?;
         let key = address.session_key();
-        self.foreground_sessions.insert(key.clone(), session);
-        Ok(self
-            .foreground_sessions
-            .get(&key)
-            .expect("foreground session inserted")
-            .snapshot())
+        self.foreground_actors
+            .insert(key.clone(), actor_ref(session));
+        let actor = self.resolve_foreground(&key)?;
+        actor.snapshot()
     }
 
-    pub fn set_api_timeout_override(
-        &mut self,
-        address: &ChannelAddress,
-        timeout_seconds: Option<f64>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.api_timeout_override_seconds = timeout_seconds;
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn append_pending_request_message(
-        &mut self,
-        address: &ChannelAddress,
-        message: ChatMessage,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.session_state.pending_messages.push(message);
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn stage_foreground_user_turn(
-        &mut self,
-        address: &ChannelAddress,
-        pending_message: ChatMessage,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let attachment_count = attachments.len();
-        session.session_state.pending_messages.push(pending_message);
-        session.push_message(MessageRole::User, text, attachments);
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "foreground_user_turn_staged",
-            message_count = session.history.len() as u64,
-            pending_message_count = session.session_state.pending_messages.len() as u64,
-            attachment_count = attachment_count as u64,
-            "staged foreground user turn into pending request queue and visible history"
-        );
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn set_failed_foreground_turn(
-        &mut self,
-        address: &ChannelAddress,
-        resume_messages: Vec<ChatMessage>,
-        errno: SessionErrno,
-        errinfo: Option<String>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let existing_pending_messages = session.session_state.pending_messages.clone();
-        session.session_state.messages = resume_messages;
-        session.session_state.pending_messages = if !existing_pending_messages.is_empty()
-            && !session
-                .session_state
-                .messages
-                .ends_with(&existing_pending_messages)
-        {
-            existing_pending_messages
-        } else {
-            Vec::new()
-        };
-        session.session_state.phase = SessionPhase::Yielded;
-        session.session_state.errno = Some(errno);
-        session.session_state.errinfo = errinfo;
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn observe_skill_changes(
-        &mut self,
-        address: &ChannelAddress,
-        observed_skills: &[SessionSkillObservation],
-    ) -> Result<Vec<SkillChangeNotice>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut notices = Vec::new();
-        for observed in observed_skills {
-            match session.skill_states.get_mut(&observed.name) {
-                Some(state) => {
-                    let description_changed = state.description != observed.description;
-                    let content_changed = state.content != observed.content;
-                    if description_changed {
-                        notices.push(SkillChangeNotice::DescriptionChanged {
-                            name: observed.name.clone(),
-                            description: observed.description.clone(),
-                        });
-                    }
-                    if content_changed
-                        && state
-                            .last_loaded_turn
-                            .is_some_and(|turn| turn > session.last_compacted_turn_count)
-                    {
-                        notices.push(SkillChangeNotice::ContentChanged {
-                            name: observed.name.clone(),
-                            description: observed.description.clone(),
-                            content: observed.content.clone(),
-                        });
-                    }
-                    state.description = observed.description.clone();
-                    state.content = observed.content.clone();
-                }
-                None => {
-                    session.skill_states.insert(
-                        observed.name.clone(),
-                        SessionSkillState {
-                            description: observed.description.clone(),
-                            content: observed.content.clone(),
-                            last_loaded_turn: None,
-                        },
-                    );
-                }
-            }
-        }
-        session.persist()?;
-        Ok(notices)
-    }
-
-    pub fn observe_shared_profile_changes(
-        &mut self,
-        address: &ChannelAddress,
-        user_profile_version: String,
-        identity_profile_version: String,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut notices = Vec::new();
-
-        match session.seen_user_profile_version.as_deref() {
-            None => {
-                session.seen_user_profile_version = Some(user_profile_version);
-            }
-            Some(previous) if previous != user_profile_version => {
-                session.seen_user_profile_version = Some(user_profile_version);
-                session.pending_user_profile_notice = true;
-                notices.push(SharedProfileChangeNotice::UserUpdated);
-            }
-            Some(_) => {}
-        }
-
-        match session.seen_identity_profile_version.as_deref() {
-            None => {
-                session.seen_identity_profile_version = Some(identity_profile_version);
-            }
-            Some(previous) if previous != identity_profile_version => {
-                session.seen_identity_profile_version = Some(identity_profile_version);
-                session.pending_identity_profile_notice = true;
-                notices.push(SharedProfileChangeNotice::IdentityUpdated);
-            }
-            Some(_) => {}
-        }
-
-        session.persist()?;
-        Ok(notices)
-    }
-
-    pub fn observe_model_catalog_changes(
-        &mut self,
-        address: &ChannelAddress,
-        model_catalog_version: String,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut notices = Vec::new();
-        match session.seen_model_catalog_version.as_deref() {
-            None => {
-                session.seen_model_catalog_version = Some(model_catalog_version);
-            }
-            Some(previous) if previous != model_catalog_version => {
-                session.seen_model_catalog_version = Some(model_catalog_version);
-                session.pending_model_catalog_notice = true;
-                notices.push(ModelCatalogChangeNotice::Updated);
-            }
-            Some(_) => {}
-        }
-        session.persist()?;
-        Ok(notices)
-    }
-
-    pub fn stage_shared_profile_change_notices(
-        &mut self,
-        address: &ChannelAddress,
-        notices: &[SharedProfileChangeNotice],
-    ) -> Result<()> {
-        if notices.is_empty() {
-            return Ok(());
-        }
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        for notice in notices {
-            match notice {
-                SharedProfileChangeNotice::UserUpdated => {
-                    session.pending_user_profile_notice = true;
-                }
-                SharedProfileChangeNotice::IdentityUpdated => {
-                    session.pending_identity_profile_notice = true;
-                }
-            }
-        }
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn take_shared_profile_change_notices(
-        &mut self,
-        address: &ChannelAddress,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut notices = Vec::new();
-        if session.pending_user_profile_notice {
-            notices.push(SharedProfileChangeNotice::UserUpdated);
-            session.pending_user_profile_notice = false;
-        }
-        if session.pending_identity_profile_notice {
-            notices.push(SharedProfileChangeNotice::IdentityUpdated);
-            session.pending_identity_profile_notice = false;
-        }
-        session.persist()?;
-        Ok(notices)
-    }
-
-    pub fn take_model_catalog_change_notices(
-        &mut self,
-        address: &ChannelAddress,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut notices = Vec::new();
-        if session.pending_model_catalog_notice {
-            notices.push(ModelCatalogChangeNotice::Updated);
-            session.pending_model_catalog_notice = false;
-        }
-        session.persist()?;
-        Ok(notices)
-    }
-
-    pub fn observe_system_prompt_state(
-        &mut self,
-        address: &ChannelAddress,
-        static_hash: String,
-        component_hashes: BTreeMap<String, String>,
-    ) -> Result<SystemPromptStateObservation> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let mut static_changed = false;
-        match session.session_state.system_prompt_static_hash.as_deref() {
-            None => {
-                session.session_state.system_prompt_static_hash = Some(static_hash);
-            }
-            Some(previous) if previous != static_hash => {
-                session.session_state.system_prompt_static_hash = Some(static_hash);
-                static_changed = true;
-            }
-            Some(_) => {}
-        }
-
-        for (key, hash) in &component_hashes {
-            match session
-                .session_state
-                .system_prompt_component_hashes
-                .get(key)
-            {
-                None => {}
-                Some(previous) if previous != hash => {
-                    session
-                        .session_state
-                        .pending_system_prompt_component_notices
-                        .insert(key.clone());
-                }
-                Some(_) => {}
-            }
-        }
-        let removed_keys = session
-            .session_state
-            .system_prompt_component_hashes
-            .keys()
-            .filter(|key| !component_hashes.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in removed_keys {
-            session
-                .session_state
-                .pending_system_prompt_component_notices
-                .insert(key);
-        }
-        session.session_state.system_prompt_component_hashes = component_hashes;
-
-        let observation = SystemPromptStateObservation {
-            static_changed,
-            dynamic_notice_keys: session
-                .session_state
-                .pending_system_prompt_component_notices
-                .clone(),
-        };
-        session.persist()?;
-        Ok(observation)
-    }
-
-    pub fn mark_system_prompt_state_current(
-        &mut self,
-        address: &ChannelAddress,
-        static_hash: String,
-        component_hashes: BTreeMap<String, String>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.session_state.system_prompt_static_hash = Some(static_hash);
-        session.session_state.system_prompt_component_hashes = component_hashes;
-        session
-            .session_state
-            .pending_system_prompt_component_notices
-            .clear();
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn take_system_prompt_dynamic_notices(
-        &mut self,
-        address: &ChannelAddress,
-    ) -> Result<BTreeSet<String>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let pending = std::mem::take(
-            &mut session
-                .session_state
-                .pending_system_prompt_component_notices,
-        );
-        session.persist()?;
-        Ok(pending)
-    }
-
-    pub fn mark_skills_loaded_current_turn(
-        &mut self,
-        address: &ChannelAddress,
-        skill_names: &[String],
-    ) -> Result<()> {
-        if skill_names.is_empty() {
-            return Ok(());
-        }
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        for skill_name in skill_names {
-            session
-                .skill_states
-                .entry(skill_name.clone())
-                .or_insert_with(SessionSkillState::default)
-                .last_loaded_turn = Some(session.turn_count);
-        }
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn record_agent_turn(
-        &mut self,
-        address: &ChannelAddress,
-        messages: Vec<ChatMessage>,
-        consumed_pending_messages: &[ChatMessage],
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        record_turn(
-            session,
-            messages,
-            consumed_pending_messages,
-            usage,
-            compaction,
-            SessionPhase::End,
-            "agent_turn_recorded",
-        )
-    }
-
-    pub fn record_yielded_turn(
-        &mut self,
-        address: &ChannelAddress,
-        messages: Vec<ChatMessage>,
-        consumed_pending_messages: &[ChatMessage],
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        record_turn(
-            session,
-            messages,
-            consumed_pending_messages,
-            usage,
-            compaction,
-            SessionPhase::Yielded,
-            "agent_turn_yielded",
-        )
-    }
-
-    pub fn record_background_turn(
-        &mut self,
-        session_id: Uuid,
-        messages: Vec<ChatMessage>,
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let session = self.background_session_mut(session_id)?;
-        record_turn(
-            session,
-            messages,
-            &[],
-            usage,
-            compaction,
-            SessionPhase::End,
-            "agent_turn_recorded",
-        )?;
-        Ok(())
-    }
-
-    pub fn record_background_yielded_turn(
-        &mut self,
-        session_id: Uuid,
-        messages: Vec<ChatMessage>,
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let session = self.background_session_mut(session_id)?;
-        record_turn(
-            session,
-            messages,
-            &[],
-            usage,
-            compaction,
-            SessionPhase::Yielded,
-            "agent_turn_yielded",
-        )?;
-        Ok(())
-    }
-
-    pub fn update_background_checkpoint(
-        &mut self,
-        session_id: Uuid,
-        messages: Vec<ChatMessage>,
-        usage: &TokenUsage,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let session = self.background_session_mut(session_id)?;
-        commit_stable_messages(session, messages, Vec::new(), SessionPhase::End);
-        session.last_agent_returned_at = Some(Utc::now());
-        session.cumulative_usage.add_assign(usage);
-        accumulate_compaction_stats(session, compaction);
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn record_idle_compaction(
-        &mut self,
-        address: &ChannelAddress,
-        messages: Vec<ChatMessage>,
-        compaction: &SessionCompactionStats,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        commit_stable_messages(
-            session,
-            messages,
-            session.session_state.pending_messages.clone(),
-            session.session_state.phase,
-        );
-        session.last_compacted_at = Some(Utc::now());
-        session.last_compacted_turn_count = session.turn_count;
-        accumulate_compaction_stats(session, compaction);
-        if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
-            session.session_state.errno = None;
-            session.session_state.errinfo = None;
-        }
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "idle_context_compacted",
-            agent_message_count = session.session_state.messages.len() as u64,
-            turn_count = session.turn_count,
-            "persisted idle context compaction"
-        );
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn mark_idle_compaction_failed(
-        &mut self,
-        address: &ChannelAddress,
-        error_summary: String,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
-        session.session_state.errinfo = Some(error_summary);
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn clear_idle_compaction_failure(&mut self, address: &ChannelAddress) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
-            session.session_state.errno = None;
-            session.session_state.errinfo = None;
-        }
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn append_background_user_message(
-        &mut self,
-        session_id: Uuid,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        self.append_background_message(session_id, MessageRole::User, text, attachments)
-    }
-
-    pub fn append_background_assistant_message(
-        &mut self,
-        session_id: Uuid,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        self.append_background_message(session_id, MessageRole::Assistant, text, attachments)
-    }
-
-    fn append_message(
-        &mut self,
-        address: &ChannelAddress,
-        role: MessageRole,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        let attachment_count = attachments.len();
-        session.push_message(role, text, attachments);
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "message_appended",
-            role = ?role,
-            message_count = session.history.len() as u64,
-            attachment_count = attachment_count as u64,
-            "appended message to session history"
-        );
-        session.persist()?;
-        Ok(())
-    }
-
-    fn append_background_message(
-        &mut self,
-        session_id: Uuid,
-        role: MessageRole,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        let session = self.background_session_mut(session_id)?;
-        let attachment_count = attachments.len();
-        session.push_message(role.clone(), text, attachments);
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "message_appended",
-            role = ?role,
-            message_count = session.history.len() as u64,
-            attachment_count = attachment_count as u64,
-            "appended message to session history"
-        );
-        session.persist()?;
-        Ok(())
-    }
-
-    fn create_session(&self, address: &ChannelAddress) -> Result<Session> {
-        self.create_session_with_kind(address, Uuid::new_v4(), None, SessionKind::Foreground)
-    }
-
-    fn create_session_with_workspace(
+    fn create_session_with_optional_workspace(
         &self,
         address: &ChannelAddress,
-        workspace_id: &str,
+        workspace_id: Option<&str>,
     ) -> Result<Session> {
         self.create_session_with_kind(
             address,
             Uuid::new_v4(),
-            Some(workspace_id),
+            workspace_id,
             SessionKind::Foreground,
         )
     }
@@ -1592,18 +2444,12 @@ impl SessionManager {
         session.persist()?;
         Ok(session)
     }
-
-    fn background_session_mut(&mut self, session_id: Uuid) -> Result<&mut Session> {
-        self.background_sessions
-            .get_mut(&session_id)
-            .with_context(|| format!("no active background session for {}", session_id))
-    }
 }
 
 fn load_persisted_sessions(
     sessions_root: &Path,
     workspace_manager: &WorkspaceManager,
-) -> Result<HashMap<String, Session>> {
+) -> Result<HashMap<String, SessionActorRef>> {
     let mut sessions = HashMap::new();
     for entry in fs::read_dir(sessions_root)
         .with_context(|| format!("failed to read {}", sessions_root.display()))?
@@ -1638,7 +2484,9 @@ fn load_persisted_sessions(
                     root_dir = %session.root_dir.display(),
                     "restored persisted foreground session"
                 );
-                sessions.insert(key, session);
+                let actor = actor_ref(session);
+                actor.drain_mailboxes_if_idle()?;
+                sessions.insert(key, actor);
             }
             Ok(None) => {
                 info!(
@@ -1665,14 +2513,20 @@ fn load_persisted_sessions(
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase,
-        SessionSkillObservation, SharedProfileChangeNotice, SkillChangeNotice,
-        sanitize_legacy_persisted_agent_messages,
+        ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
+        SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimePhase,
+        SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
+        SharedProfileChangeNotice, SkillChangeNotice, SystemPromptStateObservation,
     };
+    use crate::channel::ProgressFeedbackFinalState;
     use crate::domain::{ChannelAddress, MessageRole, StoredAttachment};
     use crate::workspace::WorkspaceManager;
-    use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
-    use std::collections::BTreeMap;
+    use agent_frame::{
+        ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats,
+        SessionEvent, SessionExecutionControl, TokenUsage,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1685,29 +2539,302 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sanitize_legacy_persisted_agent_messages_keeps_only_first_leading_system() {
-        let messages = vec![
-            ChatMessage::text("system", "system a"),
-            ChatMessage::text("system", "system b"),
-            ChatMessage::text("assistant", "summary"),
-            ChatMessage::text("system", "runtime state"),
-        ];
+    fn ensure_foreground_snapshot(
+        sessions: &mut SessionManager,
+        address: &ChannelAddress,
+    ) -> super::SessionSnapshot {
+        let actor = sessions.ensure_foreground_actor(address).unwrap();
+        actor.snapshot().unwrap()
+    }
 
-        let sanitized = sanitize_legacy_persisted_agent_messages(messages);
+    trait SessionManagerTestExt {
+        fn append_user_message(
+            &self,
+            address: &ChannelAddress,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<()>;
+        fn append_background_result_to_foreground(
+            &self,
+            address: &ChannelAddress,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<super::SessionSnapshot>;
+        fn append_pending_request_message(
+            &self,
+            address: &ChannelAddress,
+            message: ChatMessage,
+        ) -> anyhow::Result<()>;
+        fn stage_foreground_user_turn(
+            &self,
+            address: &ChannelAddress,
+            pending_message: ChatMessage,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<()>;
+        fn observe_skill_changes(
+            &self,
+            address: &ChannelAddress,
+            observed_skills: &[SessionSkillObservation],
+        ) -> anyhow::Result<Vec<SkillChangeNotice>>;
+        fn observe_shared_profile_changes(
+            &self,
+            address: &ChannelAddress,
+            user_profile_version: String,
+            identity_profile_version: String,
+        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>>;
+        fn observe_model_catalog_changes(
+            &self,
+            address: &ChannelAddress,
+            model_catalog_version: String,
+        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>>;
+        fn stage_shared_profile_change_notices(
+            &self,
+            address: &ChannelAddress,
+            notices: &[SharedProfileChangeNotice],
+        ) -> anyhow::Result<()>;
+        fn take_shared_profile_change_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>>;
+        fn take_model_catalog_change_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>>;
+        fn observe_system_prompt_state(
+            &self,
+            address: &ChannelAddress,
+            static_hash: String,
+            component_hashes: BTreeMap<String, String>,
+        ) -> anyhow::Result<SystemPromptStateObservation>;
+        fn take_system_prompt_dynamic_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<BTreeSet<String>>;
+        fn mark_idle_compaction_failed(
+            &self,
+            address: &ChannelAddress,
+            error_summary: String,
+        ) -> anyhow::Result<()>;
+        fn clear_idle_compaction_failure(&self, address: &ChannelAddress) -> anyhow::Result<()>;
+    }
 
-        assert_eq!(sanitized.len(), 3);
-        assert_eq!(sanitized[0].role, "system");
-        assert_eq!(
-            sanitized[0].content.as_ref().and_then(|v| v.as_str()),
-            Some("system a")
-        );
-        assert_eq!(sanitized[1].role, "assistant");
-        assert_eq!(sanitized[2].role, "system");
-        assert_eq!(
-            sanitized[2].content.as_ref().and_then(|v| v.as_str()),
-            Some("runtime state")
-        );
+    impl SessionManagerTestExt for SessionManager {
+        fn append_user_message(
+            &self,
+            address: &ChannelAddress,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.debug_append_visible_message(MessageRole::User, text, attachments)
+        }
+
+        fn append_background_result_to_foreground(
+            &self,
+            address: &ChannelAddress,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<super::SessionSnapshot> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.tell_actor_message(SessionActorMessage {
+                from_session_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                text,
+                attachments,
+            })?;
+            actor.snapshot()
+        }
+
+        fn append_pending_request_message(
+            &self,
+            address: &ChannelAddress,
+            message: ChatMessage,
+        ) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.debug_append_pending_request_message(message)
+        }
+
+        fn stage_foreground_user_turn(
+            &self,
+            address: &ChannelAddress,
+            pending_message: ChatMessage,
+            text: Option<String>,
+            attachments: Vec<StoredAttachment>,
+        ) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor
+                .tell_user_message(super::SessionUserMessage {
+                    pending_message,
+                    text,
+                    attachments,
+                })
+                .map(|_| ())
+        }
+
+        fn observe_skill_changes(
+            &self,
+            address: &ChannelAddress,
+            observed_skills: &[SessionSkillObservation],
+        ) -> anyhow::Result<Vec<SkillChangeNotice>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.observe_skill_changes(observed_skills)
+        }
+
+        fn observe_shared_profile_changes(
+            &self,
+            address: &ChannelAddress,
+            user_profile_version: String,
+            identity_profile_version: String,
+        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.observe_shared_profile_changes(user_profile_version, identity_profile_version)
+        }
+
+        fn observe_model_catalog_changes(
+            &self,
+            address: &ChannelAddress,
+            model_catalog_version: String,
+        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.observe_model_catalog_changes(model_catalog_version)
+        }
+
+        fn stage_shared_profile_change_notices(
+            &self,
+            address: &ChannelAddress,
+            notices: &[SharedProfileChangeNotice],
+        ) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.stage_shared_profile_change_notices(notices)
+        }
+
+        fn take_shared_profile_change_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.take_shared_profile_change_notices()
+        }
+
+        fn take_model_catalog_change_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.take_model_catalog_change_notices()
+        }
+
+        fn observe_system_prompt_state(
+            &self,
+            address: &ChannelAddress,
+            static_hash: String,
+            component_hashes: BTreeMap<String, String>,
+        ) -> anyhow::Result<SystemPromptStateObservation> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.observe_system_prompt_state(static_hash, component_hashes)
+        }
+
+        fn take_system_prompt_dynamic_notices(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<BTreeSet<String>> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.take_system_prompt_dynamic_notices()
+        }
+
+        fn mark_idle_compaction_failed(
+            &self,
+            address: &ChannelAddress,
+            error_summary: String,
+        ) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.mark_idle_compaction_failed(error_summary)
+        }
+
+        fn clear_idle_compaction_failure(&self, address: &ChannelAddress) -> anyhow::Result<()> {
+            let actor = self.resolve_foreground_by_address(address)?;
+            actor.clear_idle_compaction_failure()
+        }
+    }
+
+    fn commit_foreground_turn(
+        sessions: &SessionManager,
+        address: &ChannelAddress,
+        messages: Vec<ChatMessage>,
+        consumed_pending_messages: &[ChatMessage],
+        phase: SessionPhase,
+    ) -> anyhow::Result<()> {
+        commit_foreground_turn_with_loaded_skills(
+            sessions,
+            address,
+            messages,
+            consumed_pending_messages,
+            phase,
+            Vec::new(),
+        )
+    }
+
+    fn commit_foreground_turn_with_loaded_skills(
+        sessions: &SessionManager,
+        address: &ChannelAddress,
+        messages: Vec<ChatMessage>,
+        consumed_pending_messages: &[ChatMessage],
+        phase: SessionPhase,
+        loaded_skills: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let actor = sessions.resolve_foreground_by_address(address)?;
+        actor.commit_runtime_turn(SessionRuntimeTurnCommit {
+            messages,
+            consumed_pending_messages: consumed_pending_messages.to_vec(),
+            usage: TokenUsage::default(),
+            compaction: SessionCompactionStats::default(),
+            phase,
+            system_prompt_static_hash_after_compaction: None,
+            system_prompt_component_hashes_after_compaction: None,
+            loaded_skills,
+            user_history_text: None,
+            assistant_history_text: None,
+        })
+    }
+
+    fn commit_snapshot_turn(
+        sessions: &SessionManager,
+        snapshot: &super::SessionSnapshot,
+        messages: Vec<ChatMessage>,
+        phase: SessionPhase,
+    ) -> anyhow::Result<()> {
+        let actor = sessions.resolve_snapshot(snapshot)?;
+        actor.commit_runtime_turn(SessionRuntimeTurnCommit {
+            messages,
+            consumed_pending_messages: Vec::new(),
+            usage: TokenUsage::default(),
+            compaction: SessionCompactionStats::default(),
+            phase,
+            system_prompt_static_hash_after_compaction: None,
+            system_prompt_component_hashes_after_compaction: None,
+            loaded_skills: Vec::new(),
+            user_history_text: None,
+            assistant_history_text: None,
+        })
+    }
+
+    fn fail_foreground_turn(
+        sessions: &SessionManager,
+        address: &ChannelAddress,
+        resume_messages: Vec<ChatMessage>,
+        errno: SessionErrno,
+        errinfo: Option<String>,
+    ) -> anyhow::Result<()> {
+        let actor = sessions.resolve_foreground_by_address(address)?;
+        actor.fail_runtime_turn(SessionRuntimeTurnFailure {
+            resume_messages,
+            errno,
+            errinfo,
+            compaction: SessionCompactionStats::default(),
+            system_prompt_static_hash_after_compaction: None,
+            system_prompt_component_hashes_after_compaction: None,
+        })
     }
 
     #[test]
@@ -1716,7 +2843,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         let baseline = BTreeMap::from([
             ("identity".to_string(), "hash-a".to_string()),
@@ -1762,7 +2889,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        let session = sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .observe_skill_changes(
@@ -1775,18 +2902,15 @@ mod tests {
             )
             .unwrap();
 
-        sessions
-            .record_agent_turn(
-                &address,
-                session.stable_messages().to_vec(),
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
-        sessions
-            .mark_skills_loaded_current_turn(&address, &["skill-a".to_string()])
-            .unwrap();
+        commit_foreground_turn_with_loaded_skills(
+            &sessions,
+            &address,
+            Vec::new(),
+            &[],
+            SessionPhase::End,
+            vec!["skill-a".to_string()],
+        )
+        .unwrap();
 
         let notices = sessions
             .observe_skill_changes(
@@ -1822,7 +2946,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .observe_skill_changes(
@@ -1859,7 +2983,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        let session = sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .observe_skill_changes(
@@ -1872,18 +2996,15 @@ mod tests {
             )
             .unwrap();
 
-        sessions
-            .record_agent_turn(
-                &address,
-                session.stable_messages().to_vec(),
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
-        sessions
-            .mark_skills_loaded_current_turn(&address, &["skill-c".to_string()])
-            .unwrap();
+        commit_foreground_turn_with_loaded_skills(
+            &sessions,
+            &address,
+            Vec::new(),
+            &[],
+            SessionPhase::End,
+            vec!["skill-c".to_string()],
+        )
+        .unwrap();
 
         let notices = sessions
             .observe_skill_changes(
@@ -1919,7 +3040,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         let first = sessions
             .observe_shared_profile_changes(
@@ -1981,7 +3102,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         let first = sessions
             .observe_model_catalog_changes(&address, "models-v1".to_string())
@@ -2011,7 +3132,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .mark_idle_compaction_failed(&address, "idle compaction failed".to_string())
@@ -2038,7 +3159,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .stage_foreground_user_turn(
@@ -2066,16 +3187,16 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
-        sessions
-            .set_failed_foreground_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "preserved")],
-                SessionErrno::ApiFailure,
-                Some("upstream timed out".to_string()),
-            )
-            .unwrap();
+        fail_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "preserved")],
+            SessionErrno::ApiFailure,
+            Some("upstream timed out".to_string()),
+        )
+        .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert_eq!(snapshot.session_state.phase, SessionPhase::Yielded);
@@ -2096,16 +3217,15 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
-        sessions
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "tail")],
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "tail")],
+            &[],
+            SessionPhase::End,
+        )
+        .unwrap();
         sessions
             .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
             .unwrap();
@@ -2119,15 +3239,14 @@ mod tests {
             ]
         );
 
-        sessions
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "done")],
-                &[ChatMessage::text("user", "queued")],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "done")],
+            &[ChatMessage::text("user", "queued")],
+            SessionPhase::End,
+        )
+        .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert!(snapshot.session_state.pending_messages.is_empty());
@@ -2143,28 +3262,27 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
-        sessions
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "stable-tail")],
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "stable-tail")],
+            &[],
+            SessionPhase::End,
+        )
+        .unwrap();
         sessions
             .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
             .unwrap();
 
-        sessions
-            .set_failed_foreground_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "stable-tail")],
-                SessionErrno::ApiFailure,
-                Some("upstream timed out".to_string()),
-            )
-            .unwrap();
+        fail_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "stable-tail")],
+            SessionErrno::ApiFailure,
+            Some("upstream timed out".to_string()),
+        )
+        .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert_eq!(
@@ -2190,16 +3308,15 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
-        sessions
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "stable")],
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "stable")],
+            &[],
+            SessionPhase::End,
+        )
+        .unwrap();
         sessions
             .append_pending_request_message(&address, ChatMessage::text("user", "consumed"))
             .unwrap();
@@ -2207,19 +3324,18 @@ mod tests {
             .append_pending_request_message(&address, ChatMessage::text("user", "new-tail"))
             .unwrap();
 
-        sessions
-            .record_yielded_turn(
-                &address,
-                vec![
-                    ChatMessage::text("assistant", "stable"),
-                    ChatMessage::text("user", "consumed"),
-                    ChatMessage::text("assistant", "tool batch settled"),
-                ],
-                &[ChatMessage::text("user", "consumed")],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![
+                ChatMessage::text("assistant", "stable"),
+                ChatMessage::text("user", "consumed"),
+                ChatMessage::text("assistant", "tool batch settled"),
+            ],
+            &[ChatMessage::text("user", "consumed")],
+            SessionPhase::Yielded,
+        )
+        .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert_eq!(
@@ -2243,7 +3359,7 @@ mod tests {
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager.clone()).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         sessions
             .append_user_message(
@@ -2252,15 +3368,14 @@ mod tests {
                 Vec::<StoredAttachment>::new(),
             )
             .unwrap();
-        sessions
-            .record_agent_turn(
-                &address,
-                vec![ChatMessage::text("assistant", "hi")],
-                &[],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        commit_foreground_turn(
+            &sessions,
+            &address,
+            vec![ChatMessage::text("assistant", "hi")],
+            &[],
+            SessionPhase::End,
+        )
+        .unwrap();
 
         let checkpoint = sessions.export_checkpoint(&address).unwrap();
         let workspace = workspace_manager
@@ -2280,27 +3395,33 @@ mod tests {
     }
 
     #[test]
-    fn background_sessions_can_share_workspace_without_sharing_memory() {
+    fn background_actors_can_share_workspace_without_sharing_memory() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        let foreground = sessions.ensure_foreground(&address).unwrap();
-        let background = sessions
-            .create_background_in_workspace(&address, Uuid::new_v4(), &foreground.workspace_id)
+        let foreground = ensure_foreground_snapshot(&mut sessions, &address);
+        let background_actor = sessions
+            .create_background_in_workspace_actor(
+                &address,
+                Uuid::new_v4(),
+                &foreground.workspace_id,
+            )
             .unwrap();
+        let background = background_actor.snapshot().unwrap();
 
+        assert_eq!(foreground.kind, SessionKind::Foreground);
+        assert_eq!(background.kind, SessionKind::Background);
         assert_ne!(foreground.id, background.id);
         assert_eq!(foreground.workspace_id, background.workspace_id);
 
-        sessions
-            .record_background_turn(
-                background.id,
-                vec![ChatMessage::text("assistant", "background memory")],
-                &TokenUsage::default(),
-                &SessionCompactionStats::default(),
-            )
-            .unwrap();
+        commit_snapshot_turn(
+            &sessions,
+            &background,
+            vec![ChatMessage::text("assistant", "background memory")],
+            SessionPhase::End,
+        )
+        .unwrap();
 
         let foreground_after = sessions.get_snapshot(&address).unwrap();
         let background_after = sessions.background_snapshot(background.id).unwrap();
@@ -2315,12 +3436,520 @@ mod tests {
     }
 
     #[test]
+    fn idle_actor_tell_persists_and_drains_mailbox() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        let sender_id = Uuid::new_v4();
+
+        let receipt = actor
+            .tell_actor_message(SessionActorMessage {
+                from_session_id: sender_id,
+                role: MessageRole::Assistant,
+                text: Some("background finished".to_string()),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        let snapshot = actor.snapshot().unwrap();
+
+        assert_ne!(receipt.message_id, Uuid::nil());
+        assert!(receipt.applied_to_context);
+        assert!(snapshot.session_state.actor_mailbox.is_empty());
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "background finished")]
+        );
+        let checkpoint = actor.export_checkpoint().unwrap();
+        assert_eq!(checkpoint.history.len(), 1);
+        assert_eq!(checkpoint.history[0].role, MessageRole::Assistant);
+
+        let persisted: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(snapshot.root_dir.join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["session_state"]["actor_mailbox"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn running_actor_tell_persists_mailbox_and_unregister_drains() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        actor
+            .register_control(SessionExecutionControl::new())
+            .unwrap();
+        let sender_id = Uuid::new_v4();
+
+        let receipt = actor
+            .tell_actor_message(SessionActorMessage {
+                from_session_id: sender_id,
+                role: MessageRole::Assistant,
+                text: Some("queued actor message".to_string()),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        let queued = actor.snapshot().unwrap();
+
+        assert_ne!(receipt.message_id, Uuid::nil());
+        assert!(!receipt.applied_to_context);
+        assert_eq!(queued.session_state.actor_mailbox.len(), 1);
+        assert!(queued.stable_messages().is_empty());
+        let persisted_queued: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(queued.root_dir.join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted_queued["session_state"]["actor_mailbox"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let drained = actor.unregister_control().unwrap();
+        assert!(drained);
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.session_state.actor_mailbox.is_empty());
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "queued actor message")]
+        );
+    }
+
+    #[test]
+    fn background_actor_also_queues_actor_messages_while_running() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions
+            .create_background_actor(&address, Uuid::new_v4())
+            .unwrap();
+        actor
+            .register_control(SessionExecutionControl::new())
+            .unwrap();
+
+        let receipt = actor
+            .tell_actor_message(SessionActorMessage {
+                from_session_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                text: Some("background inbox".to_string()),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        let queued = actor.snapshot().unwrap();
+
+        assert_ne!(receipt.message_id, Uuid::nil());
+        assert!(!receipt.applied_to_context);
+        assert_eq!(queued.kind, SessionKind::Background);
+        assert_eq!(queued.session_state.actor_mailbox.len(), 1);
+        assert!(queued.stable_messages().is_empty());
+
+        assert!(actor.unregister_control().unwrap());
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.session_state.actor_mailbox.is_empty());
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "background inbox")]
+        );
+    }
+
+    #[test]
+    fn persisted_actor_mailbox_drains_after_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let workspace_id = {
+            let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+            let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+            let actor = sessions.ensure_foreground_actor(&address).unwrap();
+            actor
+                .register_control(SessionExecutionControl::new())
+                .unwrap();
+            actor
+                .tell_actor_message(SessionActorMessage {
+                    from_session_id: Uuid::new_v4(),
+                    role: MessageRole::Assistant,
+                    text: Some("survived restart".to_string()),
+                    attachments: Vec::new(),
+                })
+                .unwrap();
+            actor.snapshot().unwrap().workspace_id
+        };
+
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+
+        assert_eq!(snapshot.workspace_id, workspace_id);
+        assert!(snapshot.session_state.actor_mailbox.is_empty());
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "survived restart")]
+        );
+    }
+
+    #[test]
+    fn foreground_runtime_control_lives_inside_session_actor() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        assert!(!actor.debug_is_running().unwrap());
+        assert!(
+            !actor
+                .debug_receive_user_message(Some("hello".to_string()))
+                .unwrap()
+                .interrupted
+        );
+
+        let control = SessionExecutionControl::new();
+        actor.register_control(control.clone()).unwrap();
+        actor
+            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .unwrap();
+
+        let disposition = actor
+            .debug_receive_user_message(Some("进度如何？".to_string()))
+            .unwrap();
+        assert!(actor.debug_is_running().unwrap());
+        assert!(disposition.interrupted);
+        assert!(disposition.compaction_in_progress);
+        assert_eq!(
+            disposition.text.as_deref(),
+            Some("[Interrupted Follow-up]\n进度如何？")
+        );
+        assert_eq!(
+            disposition.outbound,
+            vec![SessionActorOutbound::UserVisibleText(
+                "正在压缩上下文，可能要等待压缩完毕后才能回复。".to_string()
+            )]
+        );
+        assert!(actor.has_pending_interrupt().unwrap());
+        assert!(control.take_yield_requested());
+
+        let next_control = SessionExecutionControl::new();
+        actor.register_control(next_control.clone()).unwrap();
+        assert!(next_control.take_yield_requested());
+
+        actor.clear_pending_interrupt().unwrap();
+        assert!(!actor.has_pending_interrupt().unwrap());
+        assert!(!next_control.take_yield_requested());
+        assert!(actor.request_cancel().unwrap());
+
+        actor.unregister_control().unwrap();
+        assert!(!actor.debug_is_running().unwrap());
+        assert!(!actor.request_cancel().unwrap());
+    }
+
+    #[test]
+    fn session_actor_claim_serializes_turn_runners_without_external_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        assert!(actor.try_claim_turn_runner().unwrap());
+        assert!(actor.debug_is_running().unwrap());
+        assert!(!actor.try_claim_turn_runner().unwrap());
+
+        let disposition = actor
+            .debug_receive_user_message(Some("next".to_string()))
+            .unwrap();
+        assert!(disposition.interrupted);
+        assert!(actor.has_pending_interrupt().unwrap());
+
+        actor.unregister_control().unwrap();
+        assert!(!actor.debug_is_running().unwrap());
+        assert!(actor.try_claim_turn_runner().unwrap());
+    }
+
+    #[test]
+    fn staging_user_turn_owns_interrupt_tagging_and_pending_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        let control = SessionExecutionControl::new();
+        actor.register_control(control.clone()).unwrap();
+        actor
+            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .unwrap();
+
+        let receipt = actor
+            .debug_stage_user_turn(
+                ChatMessage::text("user", "status?"),
+                Some("status?".to_string()),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert!(receipt.interrupted);
+        assert!(receipt.compaction_in_progress);
+        assert_eq!(
+            receipt.text.as_deref(),
+            Some("[Interrupted Follow-up]\nstatus?")
+        );
+        assert_eq!(
+            receipt.outbound,
+            vec![SessionActorOutbound::UserVisibleText(
+                "正在压缩上下文，可能要等待压缩完毕后才能回复。".to_string()
+            )]
+        );
+        assert!(control.take_yield_requested());
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.session_state.pending_messages.is_empty());
+        assert_eq!(snapshot.session_state.user_mailbox.len(), 1);
+        assert_eq!(
+            snapshot.session_state.user_mailbox[0]
+                .pending_message
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+            Some("[Interrupted Follow-up]\nstatus?")
+        );
+
+        actor.unregister_control().unwrap();
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.session_state.user_mailbox.is_empty());
+        assert_eq!(snapshot.session_state.pending_messages.len(), 1);
+        assert_eq!(
+            snapshot.session_state.pending_messages[0]
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+            Some("[Interrupted Follow-up]\nstatus?")
+        );
+    }
+
+    #[test]
+    fn persisted_user_mailbox_drains_after_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        {
+            let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+            let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+            let actor = sessions.ensure_foreground_actor(&address).unwrap();
+            actor
+                .register_control(SessionExecutionControl::new())
+                .unwrap();
+            actor
+                .debug_stage_user_turn(
+                    ChatMessage::text("user", "survived restart"),
+                    Some("survived restart".to_string()),
+                    Vec::new(),
+                )
+                .unwrap();
+
+            let snapshot = actor.snapshot().unwrap();
+            assert!(snapshot.session_state.pending_messages.is_empty());
+            assert_eq!(snapshot.session_state.user_mailbox.len(), 1);
+        }
+
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+
+        assert!(snapshot.session_state.user_mailbox.is_empty());
+        assert_eq!(snapshot.session_state.pending_messages.len(), 1);
+        assert_eq!(
+            snapshot.session_state.pending_messages[0],
+            ChatMessage::text("user", "[Interrupted Follow-up]\nsurvived restart")
+        );
+    }
+
+    #[test]
+    fn session_actor_ref_serializes_concurrent_user_messages() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        let handles = (0..8)
+            .map(|index| {
+                let actor = actor.clone();
+                std::thread::spawn(move || {
+                    let text = format!("mailbox message {index}");
+                    actor.tell_user_message(super::SessionUserMessage {
+                        pending_message: ChatMessage::text("user", text.clone()),
+                        text: Some(text),
+                        attachments: Vec::new(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.session_state.user_mailbox.is_empty());
+        assert_eq!(snapshot.session_state.pending_messages.len(), 8);
+        let checkpoint = sessions.export_checkpoint(&address).unwrap();
+        assert_eq!(checkpoint.history.len(), 8);
+    }
+
+    #[test]
+    fn destroying_foreground_session_shuts_down_actor_mailbox() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        sessions.destroy_foreground(&address).unwrap();
+
+        let error = actor.snapshot().unwrap_err().to_string();
+        assert!(
+            error.contains("shutting down") || error.contains("mailbox closed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_commit_updates_session_state_inside_actor() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        let compaction = SessionCompactionStats {
+            compacted_run_count: 1,
+            ..SessionCompactionStats::default()
+        };
+        let component_hashes = BTreeMap::from([("identity".to_string(), "hash-id".to_string())]);
+
+        actor
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: vec![ChatMessage::text("assistant", "stable reply")],
+                consumed_pending_messages: Vec::new(),
+                usage: TokenUsage::default(),
+                compaction,
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: Some("static-hash".to_string()),
+                system_prompt_component_hashes_after_compaction: Some(component_hashes.clone()),
+                loaded_skills: vec!["skill-a".to_string()],
+                user_history_text: Some("run background job".to_string()),
+                assistant_history_text: Some("done".to_string()),
+            })
+            .unwrap();
+
+        let snapshot = actor.snapshot().unwrap();
+        assert_eq!(snapshot.session_state.phase, SessionPhase::End);
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "stable reply")]
+        );
+        assert_eq!(
+            snapshot.session_state.system_prompt_static_hash.as_deref(),
+            Some("static-hash")
+        );
+        assert_eq!(
+            snapshot.session_state.system_prompt_component_hashes,
+            component_hashes
+        );
+        assert_eq!(
+            snapshot
+                .skill_states
+                .get("skill-a")
+                .and_then(|state| state.last_loaded_turn),
+            Some(1)
+        );
+        let checkpoint = actor.export_checkpoint().unwrap();
+        assert_eq!(checkpoint.history.len(), 2);
+        assert_eq!(checkpoint.history[0].role, MessageRole::User);
+        assert_eq!(
+            checkpoint.history[0].text.as_deref(),
+            Some("run background job")
+        );
+        assert_eq!(checkpoint.history[1].role, MessageRole::Assistant);
+        assert_eq!(checkpoint.history[1].text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn session_actor_renders_runtime_progress_effects() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        let effects = actor
+            .receive_runtime_progress(
+                "gpt54",
+                &ExecutionProgress {
+                    round_index: 0,
+                    phase: ExecutionProgressPhase::Tools,
+                    tools: vec![
+                        agent_frame::ToolExecutionProgress {
+                            tool_call_id: "call-1".to_string(),
+                            tool_name: "exec_start".to_string(),
+                            arguments: Some(
+                                r#"{"cmd":"cargo test --manifest-path agent_host/Cargo.toml"}"#
+                                    .to_string(),
+                            ),
+                            status: agent_frame::ToolExecutionStatus::Running,
+                        },
+                        agent_frame::ToolExecutionProgress {
+                            tool_call_id: "call-2".to_string(),
+                            tool_name: "file_read".to_string(),
+                            arguments: Some(r#"{"path":"src/main.rs"}"#.to_string()),
+                            status: agent_frame::ToolExecutionStatus::Completed,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        let SessionEffect::UpdateProgress(feedback) = &effects[0];
+        assert!(feedback.text.contains("状态：工具执行中"));
+        assert!(feedback.text.contains("- exec_start：cargo test --mani..."));
+        assert!(feedback.text.contains("- file_read：src/main.rs"));
+        assert!(!feedback.text.contains("已完成"));
+    }
+
+    #[test]
+    fn session_actor_marks_completed_progress_as_final() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        let effects = actor
+            .receive_runtime_event_with_effects(
+                "gpt54",
+                &SessionEvent::SessionCompleted {
+                    message_count: 3,
+                    total_tokens: 42,
+                },
+            )
+            .unwrap();
+
+        let SessionEffect::UpdateProgress(feedback) = &effects[0];
+        assert_eq!(feedback.final_state, Some(ProgressFeedbackFinalState::Done));
+    }
+
+    #[test]
     fn background_result_is_inserted_into_foreground_stable_context() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
+        sessions.ensure_foreground_actor(&address).unwrap();
 
         let snapshot = sessions
             .append_background_result_to_foreground(

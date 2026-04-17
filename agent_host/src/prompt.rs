@@ -240,7 +240,7 @@ fn build_static_intro_prompt_parts(
         "Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. The runtime notes may not include every deeper rule file. When you start working in a subdirectory, check whether that subtree has a more local AGENTS.md or similar instruction file before editing there; when rules conflict, follow the more local file.".to_string(),
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
-        "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
+        "Use the user_tell tool only for mid-task user-facing updates that must appear before the current turn is ready to finish. If you need to say something while you are still working, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Do not use user_tell as a substitute for the final answer; final answers should be returned normally.".to_string(),
         "A progress check is not a stop signal. Do not end an in-progress task early just because the user asks for status. Use user_tell for the status update, then keep going unless the user explicitly redirects or stops the work.".to_string(),
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as an active interruption signal. Before making any further tool calls or continuing substantial work, you MUST give immediate visible feedback to the user. If you are not ready to give the final answer right now, you MUST call user_tell first. Messages such as '在吗', '还在吗', '继续', '继续吗', '进度如何', '你知道怎么做吧', and similar status checks are not stop signals, but they still require immediate acknowledgement via user_tell before you continue. Only stop, replan, or answer directly when the user explicitly asks you to stop, change direction, or when the new message clearly makes the previous task no longer appropriate. Silent continuation after an interrupted follow-up is a failure.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat newer items as newer steering, but do not assume they cancel the current task unless they clearly do so. Before making any further tool calls or continuing substantial work, you MUST give immediate visible feedback to the user. If you are not ready to give the final answer right now, you MUST call user_tell first. If the newest update is only a progress check or lightweight coordination, acknowledge it with user_tell and continue working. Silent continuation after queued follow-up messages is a failure. Only convert the turn into a direct final reply when the user explicitly changes the objective or asks for an immediate answer instead of continued execution.".to_string(),
@@ -289,6 +289,7 @@ fn build_kind_static_prompt_parts(kind: AgentPromptKind) -> Vec<String> {
             parts.push("Choose between subagent and background agent based on who owns the final user-facing result. Use a subagent for internal support work that you still plan to review, integrate, or selectively adopt before replying yourself. Use a background agent only for truly independent asynchronous work that is allowed to finish later, report back to the user on its own, and become part of the main foreground context.".to_string());
             parts.push("Do not use a background agent as an internal helper for your current turn. If you expect to remain responsible for the final answer, use a subagent instead.".to_string());
             parts.push("If you started a background agent and later decide to take over the task yourself, cancel or suppress that background agent before sending your own final answer. Its final reply will be inserted into the main foreground context, so do not let both the current turn and the background agent produce separate user-facing completions for the same task unless the user explicitly asked for multiple independent outputs.".to_string());
+            parts.push("Your final response is automatically delivered to the owning foreground conversation and inserted into foreground context. For reminder, cron, scheduled notification, or 'send this message' tasks, put the requested user-facing message in your final answer. Do not call user_tell for that primary message, and do not add a separate confirmation such as 'sent' after the message unless the user explicitly asked for a receipt.".to_string());
             parts.push("If this background task should end silently without any user-facing reply or foreground-context insertion, call terminate and then stop.".to_string());
             parts.push("Positive examples: use a subagent to polish a draft that you will review before replying; use a subagent to gather facts from several files and then write the final answer yourself; use a background agent for a long benchmark that may finish later and independently report results to the user.".to_string());
             parts.push("Negative examples: do not start a background agent just to draft text that you will personally integrate; do not reply 'I already finished it' while an earlier background agent is still allowed to send its own completion later; do not use a background agent when you still need to inspect, filter, or merge its output before replying.".to_string());
@@ -485,6 +486,7 @@ mod tests {
             agents_markdown: String::new(),
         };
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             id: Uuid::nil(),
             agent_id: Uuid::nil(),
             address: ChannelAddress {
@@ -632,6 +634,23 @@ mod tests {
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));
 
+        let background_prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            "Current workspace summary.",
+            &[],
+            AgentPromptKind::MainBackground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+            &[],
+        );
+        assert!(background_prompt.contains("final response is automatically delivered"));
+        assert!(background_prompt.contains("For reminder, cron, scheduled notification"));
+        assert!(background_prompt.contains("Do not call user_tell for that primary message"));
+
         let prompt_state = build_agent_system_prompt_state(
             &workspace,
             &session,
@@ -688,6 +707,7 @@ mod tests {
             agents_markdown: "stale runtime notes".to_string(),
         };
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             id: Uuid::nil(),
             agent_id: Uuid::nil(),
             address: ChannelAddress {
@@ -826,6 +846,7 @@ mod tests {
             agents_markdown: String::new(),
         };
         let session = SessionSnapshot {
+            kind: crate::session::SessionKind::Foreground,
             id: Uuid::nil(),
             agent_id: Uuid::nil(),
             address: ChannelAddress {

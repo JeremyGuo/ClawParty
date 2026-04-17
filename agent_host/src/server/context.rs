@@ -1,14 +1,16 @@
 use super::{
-    ActiveForegroundAgentFrameRuntime, BackgroundJobRequest, ForegroundRuntimePhase,
-    HostedSubagent, SummaryTracker,
+    ActiveForegroundAgentFrameRuntime, BackgroundJobRequest, HostedSubagent, SummaryTracker,
 };
 use crate::agent_status::AgentRegistry;
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::Channel;
-use crate::config::{AgentConfig, BotCommandConfig, MainAgentConfig, ModelConfig, ToolingConfig};
+use crate::config::{
+    AgentConfig, BotCommandConfig, MainAgentConfig, ModelConfig, SandboxMode, ToolingConfig,
+};
 use crate::conversation::ConversationManager;
 use crate::cron::CronManager;
-use crate::session::SessionManager;
+use crate::domain::ChannelAddress;
+use crate::session::{SessionActorRef, SessionManager, SessionSnapshot};
 use crate::sink::SinkRouter;
 use crate::snapshot::SnapshotManager;
 use crate::workspace::WorkspaceManager;
@@ -42,7 +44,6 @@ pub struct RuntimeContext {
     pub(super) background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     pub(super) background_terminate_flags: Arc<Mutex<HashSet<Uuid>>>,
     pub(super) summary_tracker: Arc<SummaryTracker>,
-    pub(super) active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
     pub(super) active_foreground_agent_frame_runtimes:
         Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
     pub(super) subagents: Arc<Mutex<HashMap<Uuid, Arc<HostedSubagent>>>>,
@@ -73,6 +74,21 @@ impl RuntimeContext {
         f(&mut conversations)
     }
 
+    pub(super) fn with_conversations_and_sessions<T>(
+        &self,
+        f: impl FnOnce(&mut ConversationManager, &mut SessionManager) -> Result<T>,
+    ) -> Result<T> {
+        let mut conversations = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation manager lock poisoned"))?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session manager lock poisoned"))?;
+        f(&mut conversations, &mut sessions)
+    }
+
     pub(super) fn with_snapshots<T>(
         &self,
         f: impl FnOnce(&mut SnapshotManager) -> Result<T>,
@@ -84,6 +100,33 @@ impl RuntimeContext {
         f(&mut snapshots)
     }
 
+    pub(super) fn ensure_foreground_session(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<SessionSnapshot> {
+        self.with_conversations_and_sessions(|conversations, sessions| {
+            conversations.ensure_foreground_session(address, sessions)
+        })
+    }
+
+    pub(super) fn ensure_foreground_actor(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<SessionActorRef> {
+        self.with_conversations_and_sessions(|conversations, sessions| {
+            conversations.ensure_foreground_actor(address, sessions)
+        })
+    }
+
+    pub(super) fn resolve_foreground_actor(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<SessionActorRef>> {
+        self.with_conversations_and_sessions(|conversations, sessions| {
+            conversations.resolve_foreground_actor(address, sessions)
+        })
+    }
+
     pub(super) fn with_subagents<T>(
         &self,
         f: impl FnOnce(&mut HashMap<Uuid, Arc<HostedSubagent>>) -> Result<T>,
@@ -93,5 +136,28 @@ impl RuntimeContext {
             .lock()
             .map_err(|_| anyhow!("subagent manager lock poisoned"))?;
         f(&mut subagents)
+    }
+
+    pub(super) fn invalidate_foreground_agent_frame_runtime(
+        &self,
+        address: &crate::domain::ChannelAddress,
+    ) -> Result<()> {
+        let session_key = address.session_key();
+        let runtime = self
+            .active_foreground_agent_frame_runtimes
+            .lock()
+            .map_err(|_| anyhow!("active foreground runtimes lock poisoned"))?
+            .remove(&session_key);
+        if let Some(runtime) = runtime
+            && let Ok(mut runtime) = runtime.lock()
+        {
+            let _ = runtime.runtime.shutdown();
+            if runtime.sandbox_mode == SandboxMode::Bubblewrap {
+                let _ = self
+                    .workspace_manager
+                    .cleanup_transient_mounts(&runtime.workspace_id);
+            }
+        }
+        Ok(())
     }
 }

@@ -354,9 +354,17 @@ impl AgentRuntimeView {
 
             let runtime = self.clone();
             let tell_session = session.clone();
+            let user_tell_description = match kind {
+                AgentPromptKind::MainBackground => {
+                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish. Use this only for genuine mid-task progress updates while work is still ongoing. A main background agent's final answer is automatically delivered to the owning foreground conversation and inserted into foreground context, so do not use user_tell for the primary result of a reminder, cron, scheduled notification, or 'send this message' task. Put that primary user-facing message in your final answer instead, and do not add a separate 'sent' confirmation unless the user explicitly asked for a receipt. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+                }
+                AgentPromptKind::MainForeground | AgentPromptKind::SubAgent => {
+                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this only for genuine mid-task user-facing updates that should appear as their own chat bubbles while work is still ongoing. Do not use user_tell as a substitute for the final answer; return final answers normally. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+                }
+            };
             tools.push(Tool::new(
                 "user_tell",
-                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this for any mid-task user-facing update that should appear as its own chat bubble while work is still ongoing. If you want to answer the user, explain what you are doing, report progress, or give a transitional update before the turn is finished, use user_tell instead of only putting that text in an assistant message with tool_calls. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text.",
+                user_tell_description,
                 json!({
                     "type": "object",
                     "properties": {
@@ -554,13 +562,13 @@ impl AgentRuntimeView {
             let create_session = session.clone();
             tools.push(Tool::new(
                 "create_cron_task",
-                "Create a persisted cron task that later launches a main background agent. Use a 6-field cron expression with seconds first, e.g. '0 0 * * * *' for hourly at minute 0, or '0 * * * * *' for every minute. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
+                "Create a persisted cron task that later launches a main background agent. Use a cron expression with seconds first, interpreted in the server's local timezone, e.g. '0 0 * * * *' for hourly at minute 0, or '0 * * * * *' for every minute. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
                 json!({
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
                         "description": {"type": "string"},
-                        "schedule": {"type": "string", "description": "6-field cron expression with seconds first. Example: '0 0 * * * *' means hourly at minute 0; '0 * * * * *' means every minute."},
+                        "schedule": {"type": "string", "description": "Cron expression with seconds first, interpreted in the server's local timezone. Example: '0 0 * * * *' means hourly at minute 0; '0 * * * * *' means every minute."},
                         "task": {"type": "string"},
                         "enabled": {"type": "boolean"},
                         "checker_command": {"type": "string"},
@@ -599,7 +607,7 @@ impl AgentRuntimeView {
             let runtime = self.clone();
             tools.push(Tool::new(
                 "update_cron_task",
-                "Update a cron task. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
+                "Update a cron task. Cron schedules are interpreted in the server's local timezone. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
                 json!({
                     "type": "object",
                     "properties": {

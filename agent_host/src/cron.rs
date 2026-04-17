@@ -2,7 +2,7 @@ use crate::backend::AgentBackendKind;
 use crate::domain::ChannelAddress;
 use crate::sink::SinkTarget;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -280,15 +280,14 @@ impl CronManager {
             if !task.enabled {
                 continue;
             }
-            let schedule = Schedule::from_str(&task.schedule)
-                .with_context(|| format!("invalid cron schedule for task {}", task.id))?;
             let base = task
                 .last_scheduled_for
                 .unwrap_or_else(|| task.created_at - chrono::Duration::seconds(1));
-            let Some(next_run) = schedule.after(&base).next() else {
+            let Some(next_run) = next_run_after(&task.schedule, base)
+                .with_context(|| format!("invalid cron schedule for task {}", task.id))?
+            else {
                 continue;
             };
-            let next_run = Utc.from_utc_datetime(&next_run.naive_utc());
             if next_run <= now {
                 task.last_scheduled_for = Some(next_run);
                 task.updated_at = now;
@@ -372,15 +371,20 @@ fn task_view(task: &CronTaskRecord) -> Result<CronTaskView> {
 }
 
 fn next_run_at(task: &CronTaskRecord) -> Result<Option<DateTime<Utc>>> {
-    let schedule = Schedule::from_str(&task.schedule)
-        .with_context(|| format!("invalid cron schedule for task {}", task.id))?;
     let base = task
         .last_scheduled_for
         .unwrap_or_else(|| task.created_at - chrono::Duration::seconds(1));
+    next_run_after(&task.schedule, base)
+        .with_context(|| format!("invalid cron schedule for task {}", task.id))
+}
+
+fn next_run_after(schedule: &str, base: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+    let schedule = Schedule::from_str(schedule).context("invalid cron schedule")?;
+    let local_base = base.with_timezone(&Local);
     Ok(schedule
-        .after(&base)
+        .after(&local_base)
         .next()
-        .map(|value| Utc.from_utc_datetime(&value.naive_utc())))
+        .map(|value| value.with_timezone(&Utc)))
 }
 
 fn validate_task(task: &CronTaskRecord) -> Result<()> {
@@ -428,6 +432,7 @@ mod tests {
     use crate::backend::AgentBackendKind;
     use crate::domain::ChannelAddress;
     use crate::sink::SinkTarget;
+    use chrono::{Datelike, Local, TimeZone, Timelike};
     use tempfile::TempDir;
 
     #[test]
@@ -463,5 +468,69 @@ mod tests {
             .claim_due_tasks(task.created_at + chrono::Duration::seconds(5))
             .unwrap();
         assert_eq!(due.len(), 1);
+    }
+
+    #[test]
+    fn exact_time_cron_schedule_uses_local_timezone() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
+        let created_local = Local
+            .with_ymd_and_hms(2026, 4, 17, 13, 5, 35)
+            .single()
+            .expect("test local time should be valid");
+        let target_local = Local
+            .with_ymd_and_hms(2026, 4, 17, 13, 7, 0)
+            .single()
+            .expect("test local time should be valid");
+        let task = manager
+            .create(CronCreateRequest {
+                name: "local reminder".to_string(),
+                description: "send a local-time reminder".to_string(),
+                schedule: format!(
+                    "{} {} {} {} {} *",
+                    target_local.second(),
+                    target_local.minute(),
+                    target_local.hour(),
+                    target_local.day(),
+                    target_local.month()
+                ),
+                agent_backend: AgentBackendKind::AgentFrame,
+                model_key: "main".to_string(),
+                prompt: "ping".to_string(),
+                sink: SinkTarget::Direct(ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                }),
+                address: ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                },
+                enabled: true,
+                checker: None,
+            })
+            .unwrap();
+        let created_at = created_local.with_timezone(&chrono::Utc);
+        let target_at = target_local.with_timezone(&chrono::Utc);
+        {
+            let task = manager.tasks.get_mut(&task.id).unwrap();
+            task.created_at = created_at;
+            task.updated_at = created_at;
+            task.last_scheduled_for = None;
+        }
+
+        assert_eq!(manager.get(task.id).unwrap().next_run_at, Some(target_at));
+        assert!(
+            manager
+                .claim_due_tasks(target_at - chrono::Duration::seconds(1))
+                .unwrap()
+                .is_empty()
+        );
+        let due = manager.claim_due_tasks(target_at).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].scheduled_for, target_at);
     }
 }

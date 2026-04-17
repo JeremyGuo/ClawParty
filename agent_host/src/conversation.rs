@@ -1,6 +1,8 @@
 use crate::backend::AgentBackendKind;
+use crate::channel::PendingAttachment;
 use crate::config::SandboxMode;
-use crate::domain::ChannelAddress;
+use crate::domain::{ChannelAddress, StoredAttachment};
+use crate::session::{SessionActorRef, SessionManager, SessionSnapshot};
 use crate::workpath::{
     RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
     validate_remote_workpath_host,
@@ -67,12 +69,13 @@ struct PersistedConversation {
     pub settings: ConversationSettings,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ConversationState {
     id: Uuid,
     address: ChannelAddress,
     root_dir: PathBuf,
     settings: ConversationSettings,
+    foreground_actor: Option<SessionActorRef>,
 }
 
 impl ConversationState {
@@ -137,6 +140,7 @@ impl ConversationManager {
                 address: address.clone(),
                 root_dir,
                 settings: ConversationSettings::default(),
+                foreground_actor: None,
             };
             state.persist()?;
             self.conversations.insert(key.clone(), state);
@@ -152,6 +156,74 @@ impl ConversationManager {
         self.conversations
             .get(&address.session_key())
             .map(ConversationState::snapshot)
+    }
+
+    fn ensure_state_mut(&mut self, address: &ChannelAddress) -> Result<&mut ConversationState> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        self.conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))
+    }
+
+    pub fn ensure_foreground_actor(
+        &mut self,
+        address: &ChannelAddress,
+        sessions: &mut SessionManager,
+    ) -> Result<SessionActorRef> {
+        let state = self.ensure_state_mut(address)?;
+        if let Some(actor) = state.foreground_actor.clone() {
+            return Ok(actor);
+        }
+        let actor = match state.settings.workspace_id.as_deref() {
+            Some(workspace_id) => {
+                sessions.ensure_foreground_in_workspace_actor(address, workspace_id)?
+            }
+            None => sessions.ensure_foreground_actor(address)?,
+        };
+        let session = actor.snapshot()?;
+        if state.settings.workspace_id.as_deref() != Some(session.workspace_id.as_str()) {
+            state.settings.workspace_id = Some(session.workspace_id.clone());
+            state.persist()?;
+        }
+        state.foreground_actor = Some(actor.clone());
+        Ok(actor)
+    }
+
+    pub fn ensure_foreground_session(
+        &mut self,
+        address: &ChannelAddress,
+        sessions: &mut SessionManager,
+    ) -> Result<SessionSnapshot> {
+        let actor = self.ensure_foreground_actor(address, sessions)?;
+        actor.snapshot()
+    }
+
+    pub fn resolve_foreground_actor(
+        &mut self,
+        address: &ChannelAddress,
+        sessions: &mut SessionManager,
+    ) -> Result<Option<SessionActorRef>> {
+        let key = address.session_key();
+        let Some(state) = self.conversations.get_mut(&key) else {
+            return Ok(None);
+        };
+        if let Some(actor) = state.foreground_actor.clone() {
+            return Ok(Some(actor));
+        }
+        let Ok(actor) = sessions.resolve_foreground_by_address(address) else {
+            return Ok(None);
+        };
+        state.foreground_actor = Some(actor.clone());
+        Ok(Some(actor))
+    }
+
+    pub fn clear_foreground_actor(&mut self, address: &ChannelAddress) {
+        if let Some(state) = self.conversations.get_mut(&address.session_key()) {
+            state.foreground_actor = None;
+        }
     }
 
     pub fn remove_conversation(
@@ -174,14 +246,7 @@ impl ConversationManager {
         address: &ChannelAddress,
         model_key: Option<String>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.main_model = model_key;
         state.persist()?;
         Ok(state.snapshot())
@@ -193,14 +258,7 @@ impl ConversationManager {
         backend: Option<AgentBackendKind>,
         model_key: Option<String>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.agent_backend = backend;
         state.settings.main_model = model_key;
         state.persist()?;
@@ -212,14 +270,7 @@ impl ConversationManager {
         address: &ChannelAddress,
         sandbox_mode: Option<SandboxMode>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.sandbox_mode = sandbox_mode;
         state.persist()?;
         Ok(state.snapshot())
@@ -230,14 +281,7 @@ impl ConversationManager {
         address: &ChannelAddress,
         reasoning_effort: Option<String>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.reasoning_effort = reasoning_effort;
         state.persist()?;
         Ok(state.snapshot())
@@ -248,14 +292,7 @@ impl ConversationManager {
         address: &ChannelAddress,
         enabled: Option<bool>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.context_compaction_enabled = enabled;
         state.persist()?;
         Ok(state.snapshot())
@@ -266,14 +303,10 @@ impl ConversationManager {
         address: &ChannelAddress,
         workspace_id: Option<String>,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
+        let state = self.ensure_state_mut(address)?;
+        if state.settings.workspace_id != workspace_id {
+            state.foreground_actor = None;
         }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
         state.settings.workspace_id = workspace_id;
         state.persist()?;
         Ok(state.snapshot())
@@ -283,14 +316,7 @@ impl ConversationManager {
         &mut self,
         address: &ChannelAddress,
     ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
         Ok(state.snapshot())
@@ -304,14 +330,7 @@ impl ConversationManager {
         description: &str,
     ) -> Result<ConversationSnapshot> {
         let workpath = validate_remote_workpath(host, path, description)?;
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         let host_key = workpath.host.clone();
         state
             .settings
@@ -331,14 +350,7 @@ impl ConversationManager {
         description: &str,
     ) -> Result<ConversationSnapshot> {
         let host = validate_remote_workpath_host(host)?;
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         replace_workpath_description(&mut state.settings.remote_workpaths, &host, description)?;
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
@@ -352,14 +364,7 @@ impl ConversationManager {
         _path: &str,
     ) -> Result<ConversationSnapshot> {
         let host = validate_remote_workpath_host(host)?;
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        let state = self.ensure_state_mut(address)?;
         let before = state.settings.remote_workpaths.len();
         state
             .settings
@@ -398,10 +403,31 @@ fn load_persisted_conversations(root: &Path) -> Result<HashMap<String, Conversat
                 address: persisted.address,
                 root_dir: path,
                 settings: persisted.settings,
+                foreground_actor: None,
             },
         );
     }
     Ok(conversations)
+}
+
+pub async fn materialize_conversation_attachments(
+    attachments_dir: &Path,
+    attachments: Vec<PendingAttachment>,
+) -> Result<Vec<StoredAttachment>> {
+    let mut stored = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let item = attachment.materialize(attachments_dir).await?;
+        tracing::info!(
+            log_stream = "conversation",
+            kind = "attachment_materialized",
+            attachment_id = %item.id,
+            path = %item.path.display(),
+            size_bytes = item.size_bytes,
+            "attachment persisted to conversation session storage"
+        );
+        stored.push(item);
+    }
+    Ok(stored)
 }
 
 #[cfg(test)]
@@ -409,6 +435,8 @@ mod tests {
     use super::ConversationManager;
     use crate::config::SandboxMode;
     use crate::domain::ChannelAddress;
+    use crate::session::SessionManager;
+    use crate::workspace::WorkspaceManager;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -419,6 +447,37 @@ mod tests {
             user_id: Some("user-1".to_string()),
             display_name: Some("Test User".to_string()),
         }
+    }
+
+    #[test]
+    fn conversation_owns_foreground_actor_reference() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let mut conversations = ConversationManager::new(temp_dir.path()).unwrap();
+
+        let first = conversations
+            .ensure_foreground_actor(&address, &mut sessions)
+            .unwrap();
+        let first_snapshot = first.snapshot().unwrap();
+        let second = conversations
+            .ensure_foreground_actor(&address, &mut sessions)
+            .unwrap();
+        let conversation = conversations.get_snapshot(&address).unwrap();
+
+        assert!(first.ptr_eq(&second));
+        assert_eq!(
+            conversation.settings.workspace_id.as_deref(),
+            Some(first_snapshot.workspace_id.as_str())
+        );
+
+        conversations.clear_foreground_actor(&address);
+        let resolved = conversations
+            .resolve_foreground_actor(&address, &mut sessions)
+            .unwrap()
+            .expect("foreground actor should resolve from session registry");
+        assert!(first.ptr_eq(&resolved));
     }
 
     #[test]

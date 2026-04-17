@@ -8,7 +8,7 @@ pub(super) enum AgentCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IncomingCommandLane {
     Immediate,
-    ConversationWorker,
+    Conversation,
 }
 
 const IMMEDIATE_COMMANDS: &[&str] = &["/help", "/status"];
@@ -214,7 +214,7 @@ pub(super) fn incoming_command_lane(text: Option<&str>) -> Option<IncomingComman
         return Some(IncomingCommandLane::Immediate);
     }
     if KNOWN_COMMANDS.contains(&command_name.as_str()) {
-        return Some(IncomingCommandLane::ConversationWorker);
+        return Some(IncomingCommandLane::Conversation);
     }
     is_slash_command_name(&command_name).then_some(IncomingCommandLane::Immediate)
 }
