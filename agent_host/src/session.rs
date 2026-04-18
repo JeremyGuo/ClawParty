@@ -100,12 +100,38 @@ pub struct SessionCheckpointData {
     pub actor_mailbox: Vec<DurableSessionActorMessage>,
     #[serde(default)]
     pub user_mailbox: Vec<DurableSessionUserMessage>,
+    #[serde(default)]
+    pub current_plan: Option<SessionPlan>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProgressMessageState {
     pub turn_id: String,
     pub message_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPlanStep {
+    pub step: String,
+    pub status: SessionPlanStepStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPlan {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<SessionPlanStep>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -130,6 +156,8 @@ pub struct DurableSessionState {
     pub actor_mailbox: Vec<DurableSessionActorMessage>,
     #[serde(default)]
     pub user_mailbox: Vec<DurableSessionUserMessage>,
+    #[serde(default)]
+    pub current_plan: Option<SessionPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +536,10 @@ impl SessionActorRef {
         self.update(|actor| actor.apply_progress_feedback_update(update))
     }
 
+    pub(crate) fn update_plan(&self, plan: SessionPlan) -> Result<()> {
+        self.update(move |actor| actor.update_plan(plan))
+    }
+
     pub(crate) fn mark_workspace_summary_state(
         &self,
         pending: bool,
@@ -696,7 +728,11 @@ impl SessionActor {
     ) -> Vec<SessionEffect> {
         vec![SessionEffect::UpdateProgress(ProgressFeedback {
             turn_id: self.session.id.to_string(),
-            text: progress_text_for_execution(model_key, progress),
+            text: progress_text_for_execution(
+                model_key,
+                progress,
+                self.session.session_state.current_plan.as_ref(),
+            ),
             important: true,
             final_state: None,
             message_id: self
@@ -743,6 +779,11 @@ impl SessionActor {
         }
     }
 
+    fn update_plan(&mut self, plan: SessionPlan) -> Result<()> {
+        self.session.session_state.current_plan = Some(plan);
+        self.session.persist()
+    }
+
     fn progress_feedback_for_event(
         &self,
         model_key: &str,
@@ -760,6 +801,34 @@ impl SessionActor {
             SessionEvent::ToolWaitCompactionScheduled { .. }
             | SessionEvent::ToolWaitCompactionCompleted { .. } => return None,
             SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallCompleted { .. } => {
+                if let SessionEvent::ToolCallCompleted {
+                    tool_name, errored, ..
+                } = event
+                {
+                    let activity = if *errored {
+                        format!("工具失败：{tool_name}")
+                    } else if tool_name == "update_plan" {
+                        "计划已更新".to_string()
+                    } else {
+                        format!("工具完成：{tool_name}")
+                    };
+                    return Some(ProgressFeedback {
+                        turn_id: self.session.id.to_string(),
+                        text: progress_text_with_plan(
+                            model_key,
+                            &activity,
+                            self.session.session_state.current_plan.as_ref(),
+                        ),
+                        important: tool_name == "update_plan" || *errored,
+                        final_state: None,
+                        message_id: self
+                            .session
+                            .session_state
+                            .progress_message
+                            .as_ref()
+                            .map(|state| state.message_id.clone()),
+                    });
+                }
                 return None;
             }
             SessionEvent::SessionYielded { .. } | SessionEvent::PrefixRewriteApplied { .. } => {
@@ -1367,6 +1436,7 @@ impl SessionActor {
             prompt_components: self.session.session_state.prompt_components.clone(),
             actor_mailbox: self.session.session_state.actor_mailbox.clone(),
             user_mailbox: self.session.session_state.user_mailbox.clone(),
+            current_plan: self.session.session_state.current_plan.clone(),
         }
     }
 }
@@ -1747,14 +1817,27 @@ fn render_system_date_on_user_message(now: DateTime<Utc>) -> String {
 }
 
 fn progress_text(model_key: &str, activity: &str) -> String {
-    format!(
-        "正在执行\n模型：{}\n阶段：{}\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
-        model_key, activity
-    )
+    progress_text_with_plan(model_key, activity, None)
 }
 
-fn progress_text_for_execution(model_key: &str, progress: &ExecutionProgress) -> String {
-    match progress.phase {
+fn progress_text_with_plan(model_key: &str, activity: &str, plan: Option<&SessionPlan>) -> String {
+    let mut text = format!(
+        "正在执行\n模型：{}\n阶段：{}\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
+        model_key, activity
+    );
+    if let Some(plan_text) = render_plan_progress(plan) {
+        text.push_str("\n\n");
+        text.push_str(&plan_text);
+    }
+    text
+}
+
+fn progress_text_for_execution(
+    model_key: &str,
+    progress: &ExecutionProgress,
+    plan: Option<&SessionPlan>,
+) -> String {
+    let mut text = match progress.phase {
         ExecutionProgressPhase::Thinking => format!(
             "正在执行\n模型：{}\n状态：思考中...\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
             model_key
@@ -1773,7 +1856,45 @@ fn progress_text_for_execution(model_key: &str, progress: &ExecutionProgress) ->
             lines.push("发送新消息可打断；/continue 可继续最近中断的回合。".to_string());
             lines.join("\n")
         }
+    };
+    if let Some(plan_text) = render_plan_progress(plan) {
+        text.push_str("\n\n");
+        text.push_str(&plan_text);
     }
+    text
+}
+
+fn render_plan_progress(plan: Option<&SessionPlan>) -> Option<String> {
+    let plan = plan?;
+    if plan.steps.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(plan.steps.len() + 2);
+    lines.push("执行计划：".to_string());
+    if let Some(explanation) = plan
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "- 说明：{}",
+            truncate_single_line_strict(explanation, 60)
+        ));
+    }
+    for step in plan.steps.iter().take(7) {
+        let marker = match step.status {
+            SessionPlanStepStatus::Completed => "[x]",
+            SessionPlanStepStatus::InProgress => "[>]",
+            SessionPlanStepStatus::Pending => "[ ]",
+        };
+        lines.push(format!(
+            "- {} {}",
+            marker,
+            truncate_single_line_strict(&step.step, 50)
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn render_tool_brief_arguments(tool_name: &str, arguments: Option<&str>) -> String {
@@ -2121,6 +2242,7 @@ impl SessionManager {
                 progress_message: None,
                 actor_mailbox: checkpoint.actor_mailbox,
                 user_mailbox: checkpoint.user_mailbox,
+                current_plan: checkpoint.current_plan,
             },
             pending_workspace_summary: false,
             close_after_summary: false,

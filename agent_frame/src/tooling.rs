@@ -160,7 +160,53 @@ impl Tool {
     }
 }
 
-fn normalize_tool_result(result: Value) -> String {
+const MAX_ASSISTANT_TOOL_ERROR_CHARS: usize = 10_000;
+
+fn truncate_tool_error_text(text: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= MAX_ASSISTANT_TOOL_ERROR_CHARS {
+        return text.to_string();
+    }
+    let head_len = MAX_ASSISTANT_TOOL_ERROR_CHARS / 2;
+    let tail_len = MAX_ASSISTANT_TOOL_ERROR_CHARS.saturating_sub(head_len);
+    let head = text.chars().take(head_len).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{head}\n...[tool error truncated: original {char_count} chars, kept first {head_len} and last {tail_len}]...\n{tail}"
+    )
+}
+
+fn normalize_error_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                if key == "error"
+                    && let Value::String(text) = value
+                {
+                    *text = truncate_tool_error_text(text);
+                } else {
+                    normalize_error_fields(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_error_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tool_result(mut result: Value) -> String {
+    normalize_error_fields(&mut result);
     match result {
         Value::String(text) => text,
         other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| "{}".to_string()),
@@ -824,8 +870,8 @@ mod tests {
         BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
         ProcessMetadata, Tool, ToolExecutionMode, active_runtime_state_summary,
         build_tool_registry_with_cancel, execute_tool_call, execution_target_arg,
-        process_is_running, process_meta_path, remote_file_root, resolve_remote_cwd,
-        terminate_runtime_state_tasks, write_background_task_metadata,
+        normalize_tool_result, process_is_running, process_meta_path, remote_file_root,
+        resolve_remote_cwd, terminate_runtime_state_tasks, write_background_task_metadata,
     };
     use crate::config::{
         AuthCredentialsStoreMode, RemoteWorkpathConfig, UpstreamApiKind, UpstreamAuthKind,
@@ -880,6 +926,17 @@ mod tests {
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn normalize_tool_result_truncates_large_error_fields() {
+        let result = normalize_tool_result(json!({
+            "error": "x".repeat(12_000),
+            "stdout": "ok"
+        }));
+        assert!(result.contains("tool error truncated"));
+        assert!(result.contains("\"stdout\": \"ok\""));
+        assert!(result.len() < 11_000);
     }
 
     struct EnvVarGuard {
@@ -1222,7 +1279,7 @@ remote_command="$*"
         let ls_result = registry["ls"].invoke(json!({"path":"src"})).unwrap();
         let ls_result = ls_result.as_str().unwrap();
         assert!(ls_result.contains("num_entries: 2"));
-        assert!(ls_result.contains("truncated: false"));
+        assert!(!ls_result.contains("truncated: false"));
         assert!(ls_result.contains("- main.rs"));
         assert!(ls_result.contains("- lib.rs"));
         assert!(!ls_result.contains("\"entries\""));
@@ -1572,7 +1629,7 @@ remote_command="$*"
         let ls_result = ls_result.as_str().unwrap();
         assert!(ls_result.contains("remote: fake-host"));
         assert!(ls_result.contains("num_entries: 1"));
-        assert!(ls_result.contains("truncated: false"));
+        assert!(!ls_result.contains("truncated: false"));
         assert!(ls_result.contains("- remote.txt"));
 
         let remote_crowded_dir = workspace_root.join("crowded");

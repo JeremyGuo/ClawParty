@@ -32,9 +32,21 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
   - wait/observe/progress: check or wait for completion; waits must be interruptible and must not kill the underlying job merely because the user interrupted the agent turn.
   - kill/cancel: explicitly terminate the job/process/task.
 - `exec_start` follows the start shape while supporting default wait-until-complete; `exec_wait` is interruptible; `exec_kill` terminates explicitly.
+- Tool results should omit empty, null, or false diagnostic fields on ordinary success paths; absence means the normal/false case, while truncation, stderr, and errors remain explicit when present.
+- Tool errors are normalized at the global tool layer before they are returned to the model; oversized error strings are truncated with head/tail preservation rather than letting individual tools flood the assistant context.
+- Direct shell read/search commands such as `cat`, `grep`, `find`, `head`, `tail`, and `ls` are rejected by `exec_start` on the simple-command path. Agents should use the dedicated `file_read`, `grep`, `glob`, and `ls` tools, including their `remote` parameter for remote work.
+- Timeout observation compaction is controlled by the main agent global setting and is not gated on a particular model provider or per-model prompt-cache TTL.
 - Remote-capable tools should use `remote="<host>"` instead of shelling out to `ssh <host>` manually. If the tool has `cwd` and `cwd` is non-empty, that `cwd` controls the remote working directory. If `cwd` is omitted or empty, the remote root is the registered workpath, falling back to the remote user's home directory when no workpath is registered.
 - Download/image-style background jobs follow start + wait/progress + cancel where applicable.
 - Regression coverage should protect tool execution mode annotations and the start/wait/terminate schemas for long-running tool families.
+
+### Agent Plan Progress
+
+- Main agents can call `update_plan` to publish a short structured checklist for non-trivial, multi-step, ambiguous, or long-running work.
+- The current plan is owned and persisted by the receiving SessionActor as `session_state.current_plan`, so progress survives normal actor reloads and does not live in Conversation routing state.
+- Plan updates are rendered through the channel progress feedback path while the model only receives a compact tool result, avoiding repeated long plan text in the assistant context.
+- During long tool-driven turns, AgentFrame injects a transient reminder every 10 tool batches to update the plan when progress changed. The reminder is request-time only and must not be persisted into durable session messages.
+- Regression coverage should protect plan schema validation, at-most-one in-progress step, persisted current-plan upgrades, progress rendering, and transient reminder timing.
 
 ### System Prompt Refresh Semantics
 
@@ -49,10 +61,11 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ### API Request Observability
 
-- Every upstream HTTP model request should emit structured request lifecycle logs with a stable `api_request_id`, provider, API kind, model, URL, method, status, elapsed time, token usage, cache token breakdown, and redacted request/response headers.
+- Every upstream model API request, including HTTP and subscription WebSocket requests, should emit structured request lifecycle logs with a stable `api_request_id`, provider, API kind, model, URL/method where applicable, status, elapsed time, clear token accounting fields, cache token breakdown, and redacted request/response headers.
+- Token accounting logs should prefer unambiguous names such as `input_total_tokens`, `output_total_tokens`, `context_total_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cache_uncached_input_tokens`, and `normal_billed_input_tokens`; legacy provider-style names may remain only as compatibility aliases.
 - Request and response bodies are logged with secret-key redaction. By default, logs include bounded body previews for debugging; setting `AGENT_FRAME_LOG_API_BODIES=full` includes full redacted JSON bodies, and `off` disables body content while preserving sizes and metadata.
 - Agent runtime model-call events include the final `api_request_id` and cache token fields so session/agent logs can be joined to low-level API request logs without inferring from timestamps.
-- Regression coverage should protect header/body redaction and the model-call/API-request join fields.
+- Regression coverage should protect header/body redaction, clear token accounting names, and the model-call/API-request join fields.
 
 ### Background Agent Delivery
 
@@ -66,9 +79,9 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 ### Cron Scheduling
 
 - Cron task tools expose schedule timing through named fields such as `cron_second`, `cron_minute`, `cron_hour`, `cron_day_of_month`, `cron_month`, `cron_day_of_week`, and optional `cron_year`; models should not assemble positional cron strings themselves.
-- Internally, named cron fields are compiled to the persisted seconds-first cron expression and interpreted in the server's local timezone.
+- Internally, named cron fields are compiled to the persisted seconds-first cron expression and interpreted in the task's persisted IANA timezone, defaulting to `Asia/Shanghai` when omitted.
 - A cron task must not enqueue overlapping background jobs for the same task; if a previous trigger is still running, the due time is skipped rather than queued for catch-up.
-- Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, local-time exact schedules, and non-overlapping trigger behavior.
+- Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, task-timezone exact schedules, and non-overlapping trigger behavior.
 
 ### Channel Integrations
 

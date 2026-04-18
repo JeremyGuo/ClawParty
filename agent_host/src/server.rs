@@ -42,8 +42,9 @@ use crate::sandbox::{
 use crate::session::{
     IDENTITY_PROMPT_COMPONENT, PromptComponentChangeNotice, SessionActorMessage,
     SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager, SessionPhase,
-    SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot,
-    SessionTurnTimeHintConfig, SessionUserMessage, SkillChangeNotice, USER_META_PROMPT_COMPONENT,
+    SessionPlan, SessionPlanStep, SessionPlanStepStatus, SessionRuntimeTurnCommit,
+    SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot, SessionTurnTimeHintConfig,
+    SessionUserMessage, SkillChangeNotice, USER_META_PROMPT_COMPONENT,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -2325,13 +2326,20 @@ impl Server {
             estimated_tokens_before = report.estimated_tokens_before as u64,
             estimated_tokens_after = report.estimated_tokens_after as u64,
             llm_calls = report.usage.llm_calls,
-            prompt_tokens = report.usage.prompt_tokens,
-            completion_tokens = report.usage.completion_tokens,
-            total_tokens = report.usage.total_tokens,
-            cache_hit_tokens = report.usage.cache_hit_tokens,
-            cache_miss_tokens = report.usage.cache_miss_tokens,
-            cache_read_tokens = report.usage.cache_read_tokens,
-            cache_write_tokens = report.usage.cache_write_tokens,
+            input_total_tokens = report.usage.input_total_tokens(),
+            output_total_tokens = report.usage.output_total_tokens(),
+            context_total_tokens = report.usage.context_total_tokens(),
+            cache_read_input_tokens = report.usage.cache_read_input_tokens(),
+            cache_write_input_tokens = report.usage.cache_write_input_tokens(),
+            cache_uncached_input_tokens = report.usage.cache_uncached_input_tokens(),
+            normal_billed_input_tokens = report.usage.normal_billed_input_tokens(),
+            legacy_prompt_tokens = report.usage.prompt_tokens,
+            legacy_completion_tokens = report.usage.completion_tokens,
+            legacy_total_tokens = report.usage.total_tokens,
+            legacy_cache_hit_tokens = report.usage.cache_hit_tokens,
+            legacy_cache_miss_tokens = report.usage.cache_miss_tokens,
+            legacy_cache_read_tokens = report.usage.cache_read_tokens,
+            legacy_cache_write_tokens = report.usage.cache_write_tokens,
             rollout_id = rollout_id.as_deref(),
             "idle context compaction completed"
         );
@@ -4405,6 +4413,7 @@ mod tests {
         assert!(!create_cron_properties.contains_key("schedule"));
         assert!(create_cron_properties.contains_key("cron_second"));
         assert!(create_cron_properties.contains_key("cron_minute"));
+        assert!(create_cron_properties.contains_key("timezone"));
         let create_cron_required = create_cron
             .parameters
             .get("required")
@@ -5224,7 +5233,8 @@ mod tests {
         };
 
         let (formula, total_usd) = estimate_cost_usd(&model, &usage).unwrap();
-        assert!(formula.contains("cache_read_tokens"));
+        assert!(formula.contains("cache_read_input_tokens"));
+        assert!(formula.contains("normal_billed_input_tokens"));
         assert!(total_usd > 0.0);
     }
 

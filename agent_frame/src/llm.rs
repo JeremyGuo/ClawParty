@@ -65,6 +65,39 @@ impl TokenUsage {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
     }
+
+    pub fn input_total_tokens(&self) -> u64 {
+        self.prompt_tokens
+    }
+
+    pub fn output_total_tokens(&self) -> u64 {
+        self.completion_tokens
+    }
+
+    pub fn context_total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+
+    pub fn cache_hit_input_tokens(&self) -> u64 {
+        self.cache_hit_tokens
+    }
+
+    pub fn cache_read_input_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+
+    pub fn cache_write_input_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
+
+    pub fn cache_uncached_input_tokens(&self) -> u64 {
+        self.cache_miss_tokens
+    }
+
+    pub fn normal_billed_input_tokens(&self) -> u64 {
+        self.cache_miss_tokens
+            .saturating_sub(self.cache_write_tokens)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1161,13 +1194,20 @@ pub(super) fn log_upstream_api_request_completed(
         response_headers_json,
         response_id = response_id.unwrap_or(""),
         llm_calls = usage.llm_calls,
-        prompt_tokens = usage.prompt_tokens,
-        completion_tokens = usage.completion_tokens,
-        total_tokens = usage.total_tokens,
-        cache_hit_tokens = usage.cache_hit_tokens,
-        cache_miss_tokens = usage.cache_miss_tokens,
-        cache_read_tokens = usage.cache_read_tokens,
-        cache_write_tokens = usage.cache_write_tokens,
+        input_total_tokens = usage.input_total_tokens(),
+        output_total_tokens = usage.output_total_tokens(),
+        context_total_tokens = usage.context_total_tokens(),
+        cache_read_input_tokens = usage.cache_read_input_tokens(),
+        cache_write_input_tokens = usage.cache_write_input_tokens(),
+        cache_uncached_input_tokens = usage.cache_uncached_input_tokens(),
+        normal_billed_input_tokens = usage.normal_billed_input_tokens(),
+        legacy_prompt_tokens = usage.prompt_tokens,
+        legacy_completion_tokens = usage.completion_tokens,
+        legacy_total_tokens = usage.total_tokens,
+        legacy_cache_hit_tokens = usage.cache_hit_tokens,
+        legacy_cache_miss_tokens = usage.cache_miss_tokens,
+        legacy_cache_read_tokens = usage.cache_read_tokens,
+        legacy_cache_write_tokens = usage.cache_write_tokens,
         response_body_log_mode = body.mode,
         response_body_bytes = body.bytes,
         response_body_included = body.included,
@@ -1227,7 +1267,7 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
+        TokenUsage, UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
         chat_completions_messages_payload, normalize_inline_image_url,
         parse_streamed_responses_body, parse_usage, redact_sensitive_json,
         redacted_upstream_request_headers_json, responses_value_to_chat_message,
@@ -1260,6 +1300,29 @@ mod tests {
             .decode(encoded)
             .unwrap();
         image::load_from_memory(&bytes).unwrap().dimensions()
+    }
+
+    #[test]
+    fn token_usage_exposes_clear_accounting_names() {
+        let usage = TokenUsage {
+            llm_calls: 1,
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            cache_hit_tokens: 60,
+            cache_miss_tokens: 40,
+            cache_read_tokens: 60,
+            cache_write_tokens: 15,
+        };
+
+        assert_eq!(usage.input_total_tokens(), 100);
+        assert_eq!(usage.output_total_tokens(), 20);
+        assert_eq!(usage.context_total_tokens(), 120);
+        assert_eq!(usage.cache_hit_input_tokens(), 60);
+        assert_eq!(usage.cache_read_input_tokens(), 60);
+        assert_eq!(usage.cache_write_input_tokens(), 15);
+        assert_eq!(usage.cache_uncached_input_tokens(), 40);
+        assert_eq!(usage.normal_billed_input_tokens(), 25);
     }
 
     #[test]

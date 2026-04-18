@@ -15,7 +15,6 @@ use crate::tooling::{
 };
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -27,6 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const AGENT_FRAME_MARKER: &str = "[AgentFrame Runtime]";
+const TIMEOUT_OBSERVATION_IDLE_THRESHOLD: Duration = Duration::from_secs(270);
 const EMPTY_FINAL_ASSISTANT_RETRY_PROMPT: &str = "The previous upstream response was empty. Continue from the preserved context and tool results, and produce the final user-facing answer now.";
 
 fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> String {
@@ -963,7 +963,11 @@ fn run_session_state_controlled_internal(
                 tools: Vec::new(),
             });
         }
-        let request_messages = materialize_messages_for_upstream(&messages, &config)?;
+        let mut model_input_messages = messages.clone();
+        if let Some(plan_reminder) = transient_plan_update_reminder(&messages) {
+            model_input_messages.push(ChatMessage::text("system", plan_reminder));
+        }
+        let request_messages = materialize_messages_for_upstream(&model_input_messages, &config)?;
         let continuation_messages = runtime
             .continuation
             .as_ref()
@@ -1263,21 +1267,10 @@ fn start_pending_tool_wait_compaction(
     if control.is_none() || stable_prefix.is_empty() {
         return Ok(None);
     }
-    let Some(cache_control) = &config.upstream.cache_control else {
-        return Ok(None);
-    };
-    let Some(ttl) = cache_control.ttl.as_deref() else {
-        return Ok(None);
-    };
     let Some(last_model_response_at) = last_model_response_at else {
         return Ok(None);
     };
-    let ttl = parse_duration(ttl)
-        .map_err(|error| anyhow!("failed to parse cache ttl '{}': {}", ttl, error))?;
-    let Some(idle_threshold) = ttl.checked_sub(Duration::from_secs(30)) else {
-        return Ok(None);
-    };
-    let delay = idle_threshold.saturating_sub(last_model_response_at.elapsed());
+    let delay = TIMEOUT_OBSERVATION_IDLE_THRESHOLD.saturating_sub(last_model_response_at.elapsed());
     if let Some(control) = control {
         control.emit_event(SessionEvent::ToolWaitCompactionScheduled {
             tool_name: tool_name.to_string(),
@@ -1353,6 +1346,42 @@ fn apply_pending_prefix_rewrite(
     control.set_stable_prefix_messages(&rewrite.replacement_prefix);
 }
 
+fn transient_plan_update_reminder(messages: &[ChatMessage]) -> Option<String> {
+    let tool_batch_count = messages
+        .iter()
+        .filter(|message| {
+            message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|tool_calls| !tool_calls.is_empty())
+        })
+        .count();
+    if tool_batch_count == 0 || tool_batch_count % 10 != 0 {
+        return None;
+    }
+    let last_tool_batch_has_plan_update = messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|tool_calls| !tool_calls.is_empty())
+        })
+        .and_then(|message| message.tool_calls.as_ref())
+        .is_some_and(|tool_calls| {
+            tool_calls
+                .iter()
+                .any(|tool_call| tool_call.function.name == "update_plan")
+        });
+    if last_tool_batch_has_plan_update {
+        return None;
+    }
+    Some("[System Reminder: use tool to update plan progress.]".to_string())
+}
+
 fn tool_result_looks_like_error(result: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(result) else {
         return false;
@@ -1394,10 +1423,10 @@ mod tests {
         CompletedToolCall, ExecutionSignal, ResponseContinuation, SessionExecutionControl,
         compose_system_prompt, enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
         start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
-        tool_result_looks_like_error,
+        tool_result_looks_like_error, transient_plan_update_reminder,
     };
-    use crate::config::{AgentConfig, CacheControlConfig, MemorySystem, UpstreamConfig};
-    use crate::message::ChatMessage;
+    use crate::config::{AgentConfig, MemorySystem, UpstreamConfig};
+    use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use crate::skills::SkillMetadata;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1449,6 +1478,73 @@ mod tests {
             assert_eq!(value["tool"], "image_load");
             assert_eq!(value["max_per_tool_batch"], 3);
         }
+    }
+
+    #[test]
+    fn transient_plan_reminder_triggers_every_ten_tool_batches() {
+        let mut messages = Vec::new();
+        for index in 0..9 {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: format!("call_{index}"),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: "file_read".to_string(),
+                        arguments: None,
+                    },
+                }]),
+            });
+        }
+        assert!(transient_plan_update_reminder(&messages).is_none());
+
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_10".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "grep".to_string(),
+                    arguments: None,
+                },
+            }]),
+        });
+        assert_eq!(
+            transient_plan_update_reminder(&messages).as_deref(),
+            Some("[System Reminder: use tool to update plan progress.]")
+        );
+    }
+
+    #[test]
+    fn transient_plan_reminder_skips_when_last_batch_updated_plan() {
+        let mut messages = Vec::new();
+        for index in 0..10 {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: format!("call_{index}"),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: if index == 9 {
+                            "update_plan".to_string()
+                        } else {
+                            "file_read".to_string()
+                        },
+                        arguments: None,
+                    },
+                }]),
+            });
+        }
+        assert!(transient_plan_update_reminder(&messages).is_none());
     }
 
     #[test]
@@ -1536,10 +1632,7 @@ mod tests {
                 timeout_seconds: 30.0,
                 retry_mode: Default::default(),
                 context_window_tokens: 1000,
-                cache_control: Some(CacheControlConfig {
-                    cache_type: "ephemeral".to_string(),
-                    ttl: Some("31s".to_string()),
-                }),
+                cache_control: None,
                 prompt_cache_retention: None,
                 prompt_cache_key: None,
                 reasoning: None,
@@ -1596,7 +1689,7 @@ mod tests {
             &stable_prefix,
             Some(&control),
             "test_tool",
-            Some(Instant::now() - Duration::from_secs(2)),
+            Some(Instant::now() - Duration::from_secs(270)),
         )
         .unwrap();
 

@@ -35,6 +35,7 @@ fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
 
 const EXEC_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
 const EXEC_OUTPUT_MAX_CHARS: usize = 1000;
+const DIRECT_READ_COMMANDS: &[&str] = &["cat", "grep", "find", "head", "tail", "ls"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecTimeoutAction {
@@ -80,6 +81,39 @@ fn max_output_chars_arg(arguments: &Map<String, Value>) -> Result<usize> {
         ));
     }
     Ok(value)
+}
+
+fn shell_command_head(command: &str) -> Option<&str> {
+    command
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .map(|head| head.trim_matches(|ch| ch == '\'' || ch == '"'))
+}
+
+fn direct_read_command_guidance(command: &str) -> Option<&'static str> {
+    let head = shell_command_head(command)?;
+    let head = Path::new(head)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(head);
+    match head {
+        "cat" => {
+            Some("Use file_read with file_path and optional remote instead of exec_start cat.")
+        }
+        "grep" => {
+            Some("Use grep with pattern/path and optional remote instead of exec_start grep.")
+        }
+        "find" => Some("Use glob or ls with optional remote instead of exec_start find."),
+        "head" | "tail" => Some(
+            "Use file_read with offset/limit and optional remote instead of exec_start head/tail.",
+        ),
+        "ls" => Some("Use ls with path and optional remote instead of exec_start ls."),
+        _ if DIRECT_READ_COMMANDS.contains(&head) => Some(
+            "Use the dedicated filesystem/search tool with optional remote instead of exec_start.",
+        ),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Serialize, serde::Deserialize)]
@@ -293,19 +327,23 @@ fn insert_exec_output_fields(
         read_file_lines_window(stderr_path, start, limit)?;
     let (stdout, stdout_truncated) = truncate_exec_output(&stdout_window, max_output_chars);
     let (stderr, stderr_truncated) = truncate_exec_output(&stderr_window, max_output_chars);
+    let stdout_truncated = stdout_truncated || stdout_line_truncated;
+    let stderr_truncated = stderr_truncated || stderr_line_truncated;
 
     object.insert("stdout".to_string(), Value::String(stdout));
-    object.insert("stderr".to_string(), Value::String(stderr));
-    object.insert(
-        "stdout_truncated".to_string(),
-        Value::Bool(stdout_truncated || stdout_line_truncated),
-    );
-    object.insert(
-        "stderr_truncated".to_string(),
-        Value::Bool(stderr_truncated || stderr_line_truncated),
-    );
+    if stdout_truncated {
+        object.insert("stdout_truncated".to_string(), Value::Bool(true));
+    }
+    if stderr_truncated || !stderr.is_empty() {
+        object.insert("stderr".to_string(), Value::String(stderr));
+    }
+    if stderr_truncated {
+        object.insert("stderr_truncated".to_string(), Value::Bool(true));
+    }
     object.insert("stdout_chars".to_string(), Value::from(stdout_chars));
-    object.insert("stderr_chars".to_string(), Value::from(stderr_chars));
+    if stderr_chars > 0 || stderr_truncated {
+        object.insert("stderr_chars".to_string(), Value::from(stderr_chars));
+    }
     if let Some(path) = sync_workspace_output_file(workspace_root, metadata, stdout_path, "stdout")?
     {
         object.insert("stdout_path".to_string(), Value::String(path));
@@ -984,6 +1022,11 @@ pub(super) fn exec_start_tool(
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let target = execution_target_arg(arguments)?;
             let command = string_arg(arguments, "command")?;
+            if let Some(guidance) = direct_read_command_guidance(&command) {
+                return Err(anyhow!(
+                    "direct read/search shell command rejected by tool policy: {guidance}"
+                ));
+            }
             let include_stdout = arguments
                 .get("include_stdout")
                 .and_then(Value::as_bool)
@@ -1222,4 +1265,18 @@ pub(super) fn exec_kill_tool(
             }))
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::direct_read_command_guidance;
+
+    #[test]
+    fn direct_read_command_guard_catches_simple_shell_reads() {
+        assert!(direct_read_command_guidance("cat src/main.rs").is_some());
+        assert!(direct_read_command_guidance("/usr/bin/grep foo src/main.rs").is_some());
+        assert!(direct_read_command_guidance("find . -name '*.rs'").is_some());
+        assert!(direct_read_command_guidance("cargo test").is_none());
+        assert!(direct_read_command_guidance("git grep foo").is_none());
+    }
 }

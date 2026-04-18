@@ -513,10 +513,10 @@ pub(super) fn format_session_status(
 ) -> String {
     let usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
-    let cache_hit_rate = if usage.prompt_tokens == 0 {
+    let cache_read_rate = if usage.input_total_tokens() == 0 {
         0.0
     } else {
-        (usage.cache_hit_tokens as f64 / usage.prompt_tokens as f64) * 100.0
+        (usage.cache_read_input_tokens() as f64 / usage.input_total_tokens() as f64) * 100.0
     };
     let pricing = estimate_cost_usd(model, usage);
     let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
@@ -563,14 +563,26 @@ pub(super) fn format_session_status(
             String::new(),
             "Token 用量：".to_string(),
             format!("- llm_calls: {}", usage.llm_calls),
-            format!("- prompt_tokens: {}", usage.prompt_tokens),
-            format!("- completion_tokens: {}", usage.completion_tokens),
-            format!("- total_tokens: {}", usage.total_tokens),
-            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
-            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
-            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
-            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
-            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
+            format!("- input_total_tokens: {}", usage.input_total_tokens()),
+            format!("- output_total_tokens: {}", usage.output_total_tokens()),
+            format!("- context_total_tokens: {}", usage.context_total_tokens()),
+            format!(
+                "- cache_read_input_tokens: {}",
+                usage.cache_read_input_tokens()
+            ),
+            format!(
+                "- cache_write_input_tokens: {}",
+                usage.cache_write_input_tokens()
+            ),
+            format!(
+                "- cache_uncached_input_tokens: {}",
+                usage.cache_uncached_input_tokens()
+            ),
+            format!(
+                "- normal_billed_input_tokens: {}",
+                usage.normal_billed_input_tokens()
+            ),
+            format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
         if let Some((formula, total_usd)) = pricing {
             lines.push(String::new());
@@ -655,14 +667,26 @@ pub(super) fn format_session_status(
             String::new(),
             "Token usage:".to_string(),
             format!("- llm_calls: {}", usage.llm_calls),
-            format!("- prompt_tokens: {}", usage.prompt_tokens),
-            format!("- completion_tokens: {}", usage.completion_tokens),
-            format!("- total_tokens: {}", usage.total_tokens),
-            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
-            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
-            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
-            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
-            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
+            format!("- input_total_tokens: {}", usage.input_total_tokens()),
+            format!("- output_total_tokens: {}", usage.output_total_tokens()),
+            format!("- context_total_tokens: {}", usage.context_total_tokens()),
+            format!(
+                "- cache_read_input_tokens: {}",
+                usage.cache_read_input_tokens()
+            ),
+            format!(
+                "- cache_write_input_tokens: {}",
+                usage.cache_write_input_tokens()
+            ),
+            format!(
+                "- cache_uncached_input_tokens: {}",
+                usage.cache_uncached_input_tokens()
+            ),
+            format!(
+                "- normal_billed_input_tokens: {}",
+                usage.normal_billed_input_tokens()
+            ),
+            format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
         if let Some((formula, total_usd)) = pricing {
             lines.push(String::new());
@@ -852,15 +876,13 @@ pub(super) fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Opti
     let output_per_million = pricing.output_per_million;
     let cache_read_per_million = input_per_million * 0.1;
     let cache_write_per_million = input_per_million * 1.25;
-    let uncached_input_tokens = usage
-        .cache_miss_tokens
-        .saturating_sub(usage.cache_write_tokens);
-    let total_usd = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_per_million
-        + (usage.cache_write_tokens as f64 / 1_000_000.0) * cache_write_per_million
-        + (uncached_input_tokens as f64 / 1_000_000.0) * input_per_million
-        + (usage.completion_tokens as f64 / 1_000_000.0) * output_per_million;
+    let normal_billed_input_tokens = usage.normal_billed_input_tokens();
+    let total_usd = (usage.cache_read_input_tokens() as f64 / 1_000_000.0) * cache_read_per_million
+        + (usage.cache_write_input_tokens() as f64 / 1_000_000.0) * cache_write_per_million
+        + (normal_billed_input_tokens as f64 / 1_000_000.0) * input_per_million
+        + (usage.output_total_tokens() as f64 / 1_000_000.0) * output_per_million;
     let formula = format!(
-        "cache_read_tokens * ${cache_read_per_million:.6}/1M + cache_write_tokens * ${cache_write_per_million:.6}/1M + (cache_miss_tokens - cache_write_tokens) * ${input_per_million:.6}/1M + completion_tokens * ${output_per_million:.6}/1M"
+        "cache_read_input_tokens * ${cache_read_per_million:.6}/1M + cache_write_input_tokens * ${cache_write_per_million:.6}/1M + normal_billed_input_tokens * ${input_per_million:.6}/1M + output_total_tokens * ${output_per_million:.6}/1M"
     );
     Some((formula, total_usd))
 }
@@ -1039,13 +1061,20 @@ pub(super) fn log_turn_usage(
         initialization,
         parent_agent_id = parent_agent_id.map(|value| value.to_string()),
         llm_calls = usage.llm_calls,
-        prompt_tokens = usage.prompt_tokens,
-        completion_tokens = usage.completion_tokens,
-        total_tokens = usage.total_tokens,
-        cache_hit_tokens = usage.cache_hit_tokens,
-        cache_miss_tokens = usage.cache_miss_tokens,
-        cache_read_tokens = usage.cache_read_tokens,
-        cache_write_tokens = usage.cache_write_tokens,
+        input_total_tokens = usage.input_total_tokens(),
+        output_total_tokens = usage.output_total_tokens(),
+        context_total_tokens = usage.context_total_tokens(),
+        cache_read_input_tokens = usage.cache_read_input_tokens(),
+        cache_write_input_tokens = usage.cache_write_input_tokens(),
+        cache_uncached_input_tokens = usage.cache_uncached_input_tokens(),
+        normal_billed_input_tokens = usage.normal_billed_input_tokens(),
+        legacy_prompt_tokens = usage.prompt_tokens,
+        legacy_completion_tokens = usage.completion_tokens,
+        legacy_total_tokens = usage.total_tokens,
+        legacy_cache_hit_tokens = usage.cache_hit_tokens,
+        legacy_cache_miss_tokens = usage.cache_miss_tokens,
+        legacy_cache_read_tokens = usage.cache_read_tokens,
+        legacy_cache_write_tokens = usage.cache_write_tokens,
         "recorded turn token usage"
     );
 }
@@ -1177,13 +1206,20 @@ pub(super) fn log_agent_frame_event(
             round_index = *round_index as u64,
             tool_call_count = *tool_call_count as u64,
             api_request_id = api_request_id.as_deref().unwrap_or(""),
-            prompt_tokens = *prompt_tokens,
-            completion_tokens = *completion_tokens,
-            total_tokens = *total_tokens,
-            cache_hit_tokens = *cache_hit_tokens,
-            cache_miss_tokens = *cache_miss_tokens,
-            cache_read_tokens = *cache_read_tokens,
-            cache_write_tokens = *cache_write_tokens,
+            input_total_tokens = *prompt_tokens,
+            output_total_tokens = *completion_tokens,
+            context_total_tokens = *total_tokens,
+            cache_read_input_tokens = *cache_read_tokens,
+            cache_write_input_tokens = *cache_write_tokens,
+            cache_uncached_input_tokens = *cache_miss_tokens,
+            normal_billed_input_tokens = (*cache_miss_tokens).saturating_sub(*cache_write_tokens),
+            legacy_prompt_tokens = *prompt_tokens,
+            legacy_completion_tokens = *completion_tokens,
+            legacy_total_tokens = *total_tokens,
+            legacy_cache_hit_tokens = *cache_hit_tokens,
+            legacy_cache_miss_tokens = *cache_miss_tokens,
+            legacy_cache_read_tokens = *cache_read_tokens,
+            legacy_cache_write_tokens = *cache_write_tokens,
             "agent_frame model call completed"
         ),
         SessionEvent::ToolWaitCompactionScheduled {

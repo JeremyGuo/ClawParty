@@ -382,6 +382,45 @@ impl AgentRuntimeView {
             ));
 
             let runtime = self.clone();
+            let plan_session = session.clone();
+            tools.push(Tool::new(
+                "update_plan",
+                "Update the current task plan shown to the user. Use this for non-trivial, multi-step, or long-running work. Keep steps short and concrete. Status must be one of pending, in_progress, completed, and at most one step may be in_progress. Do not use this for simple one-step work.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "explanation": {"type": "string"},
+                        "plan": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {"type": "string"},
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"]
+                                    }
+                                },
+                                "required": ["step", "status"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["plan"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    let plan = parse_session_plan_tool_args(object)?;
+                    let actor = runtime.with_sessions(|sessions| sessions.resolve_snapshot(&plan_session))?;
+                    actor.update_plan(plan)?;
+                    Ok(json!({"updated": true}))
+                },
+            ));
+
+            let runtime = self.clone();
             let create_session = session.clone();
             tools.push(Tool::new(
                 "subagent_start",
@@ -562,7 +601,7 @@ impl AgentRuntimeView {
             let create_session = session.clone();
             tools.push(Tool::new(
                 "create_cron_task",
-                "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the server's local timezone. Example hourly at minute 0: cron_second='0', cron_minute='0', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Example every minute: cron_second='0', cron_minute='*', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Use cron_year for exact one-off calendar years when needed. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
+                "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. Use timezone as an IANA name such as 'Asia/Shanghai'; if omitted, Asia/Shanghai is used. Example hourly at minute 0: cron_second='0', cron_minute='0', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Example every minute: cron_second='0', cron_minute='*', cron_hour='*', cron_day_of_month='*', cron_month='*', cron_day_of_week='*'. Use cron_year for exact one-off calendar years when needed. The checker is optional: checker exit code 0 triggers the LLM, non-zero skips the run, and checker execution errors or timeouts still trigger the LLM.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -570,11 +609,12 @@ impl AgentRuntimeView {
                         "description": {"type": "string"},
                         "cron_second": {"type": "string", "description": "Seconds field. Examples: '0', '*/30', '*'."},
                         "cron_minute": {"type": "string", "description": "Minutes field. Examples: '0', '*/5', '*'."},
-                        "cron_hour": {"type": "string", "description": "Hours field in server local time. Examples: '13', '9-17', '*'."},
-                        "cron_day_of_month": {"type": "string", "description": "Day-of-month field in server local time. Examples: '17', '1,15', '*'."},
-                        "cron_month": {"type": "string", "description": "Month field in server local time. Examples: '4', '1-12', '*'."},
-                        "cron_day_of_week": {"type": "string", "description": "Day-of-week field in server local time. Examples: '*', 'Mon-Fri', '0'."},
-                        "cron_year": {"type": "string", "description": "Optional year field in server local time. Example: '2026'."},
+                        "cron_hour": {"type": "string", "description": "Hours field in the task timezone. Examples: '13', '9-17', '*'."},
+                        "cron_day_of_month": {"type": "string", "description": "Day-of-month field in the task timezone. Examples: '17', '1,15', '*'."},
+                        "cron_month": {"type": "string", "description": "Month field in the task timezone. Examples: '4', '1-12', '*'."},
+                        "cron_day_of_week": {"type": "string", "description": "Day-of-week field in the task timezone. Examples: '*', 'Mon-Fri', '0'."},
+                        "cron_year": {"type": "string", "description": "Optional year field in the task timezone. Example: '2026'."},
+                        "timezone": {"type": "string", "description": "IANA timezone for these cron fields, e.g. 'Asia/Shanghai'. Defaults to 'Asia/Shanghai'."},
                         "task": {"type": "string"},
                         "enabled": {"type": "boolean"},
                         "checker_command": {"type": "string"},
@@ -595,6 +635,8 @@ impl AgentRuntimeView {
                             name: string_arg_required(object, "name")?,
                             description: string_arg_required(object, "description")?,
                             schedule: cron_schedule_from_required_tool_args(object)?,
+                            timezone: optional_string_arg(object, "timezone")?
+                                .unwrap_or_else(crate::cron::default_cron_timezone),
                             agent_backend: runtime.effective_agent_backend()?,
                             model_key: runtime.effective_main_model_key()?,
                             prompt: string_arg_required(object, "task")?,
@@ -613,7 +655,7 @@ impl AgentRuntimeView {
             let runtime = self.clone();
             tools.push(Tool::new(
                 "update_cron_task",
-                "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Cron fields are interpreted in the server's local timezone. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
+                "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Cron fields are interpreted in the task timezone. Use timezone to change the IANA timezone, enabled to pause or resume it, and clear_checker=true to remove the checker.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -627,6 +669,7 @@ impl AgentRuntimeView {
                         "cron_month": {"type": "string"},
                         "cron_day_of_week": {"type": "string"},
                         "cron_year": {"type": "string"},
+                        "timezone": {"type": "string"},
                         "task": {"type": "string"},
                         "model": {"type": "string"},
                         "enabled": {"type": "boolean"},
@@ -663,6 +706,7 @@ impl AgentRuntimeView {
                             name: optional_string_arg(object, "name")?,
                             description: optional_string_arg(object, "description")?,
                             schedule: optional_cron_schedule_from_tool_args(object)?,
+                            timezone: optional_string_arg(object, "timezone")?,
                             agent_backend: None,
                             model_key: optional_string_arg(object, "model")?,
                             prompt: optional_string_arg(object, "task")?,
@@ -730,5 +774,106 @@ impl AgentRuntimeView {
         }
 
         tools
+    }
+}
+
+fn parse_session_plan_tool_args(object: &serde_json::Map<String, Value>) -> Result<SessionPlan> {
+    let explanation = optional_string_arg(object, "explanation")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.chars().count() > 240 {
+                value.chars().take(240).collect::<String>()
+            } else {
+                value
+            }
+        });
+    let raw_steps = object
+        .get("plan")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("plan must be an array"))?;
+    if raw_steps.len() > 7 {
+        return Err(anyhow!("plan must contain at most 7 steps"));
+    }
+
+    let mut in_progress_count = 0usize;
+    let mut steps = Vec::with_capacity(raw_steps.len());
+    for raw_step in raw_steps {
+        let step_object = raw_step
+            .as_object()
+            .ok_or_else(|| anyhow!("each plan item must be an object"))?;
+        let step = string_arg_required(step_object, "step")?.trim().to_string();
+        if step.is_empty() {
+            return Err(anyhow!("plan step must not be empty"));
+        }
+        let step = if step.chars().count() > 80 {
+            step.chars().take(80).collect::<String>()
+        } else {
+            step
+        };
+        let status = match string_arg_required(step_object, "status")?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pending" => SessionPlanStepStatus::Pending,
+            "in_progress" => {
+                in_progress_count += 1;
+                SessionPlanStepStatus::InProgress
+            }
+            "completed" => SessionPlanStepStatus::Completed,
+            other => {
+                return Err(anyhow!(
+                    "invalid plan status '{other}'; expected pending, in_progress, or completed"
+                ));
+            }
+        };
+        steps.push(SessionPlanStep { step, status });
+    }
+
+    if in_progress_count > 1 {
+        return Err(anyhow!("plan may contain at most one in_progress step"));
+    }
+
+    Ok(SessionPlan {
+        explanation,
+        steps,
+        updated_at: Utc::now(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_session_plan_tool_args;
+    use crate::session::SessionPlanStepStatus;
+    use serde_json::json;
+
+    #[test]
+    fn parses_valid_session_plan_tool_args() {
+        let value = json!({
+            "explanation": "normal progress update",
+            "plan": [
+                {"step": "Read context", "status": "completed"},
+                {"step": "Patch code", "status": "in_progress"},
+                {"step": "Run tests", "status": "pending"}
+            ]
+        });
+        let plan = parse_session_plan_tool_args(value.as_object().unwrap()).unwrap();
+
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[1].status, SessionPlanStepStatus::InProgress);
+    }
+
+    #[test]
+    fn rejects_multiple_in_progress_plan_steps() {
+        let value = json!({
+            "plan": [
+                {"step": "Patch code", "status": "in_progress"},
+                {"step": "Run tests", "status": "in_progress"}
+            ]
+        });
+        let error = parse_session_plan_tool_args(value.as_object().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("at most one in_progress"));
     }
 }

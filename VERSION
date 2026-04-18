@@ -1,5 +1,29 @@
-version: 0.20.2
+version: 0.20.4
 ---
+
+# 0.20.4
+
+- 新增 Agent Plan Progress：
+  主 Agent 可调用 `update_plan` 发布结构化执行计划；当前计划由 SessionActor 持久化到 `session_state.current_plan`，并通过现有 progress feedback 渲染给用户，模型侧只收到精简工具结果。
+- 强化长工具回合计划提醒：
+  AgentFrame 每 10 个 tool batch 注入一次仅请求期可见的 transient system reminder，提示模型在进度变化时调用 `update_plan`；该提醒不会写入 durable session messages。
+- 改进全局工具错误与 exec 策略：
+  工具层统一截断超长 `error` 字段，保留头尾上下文；`exec_start` 拒绝简单直接的 `cat`/`grep`/`find`/`head`/`tail`/`ls` 读搜命令，要求使用带 `remote` 参数的专用文件/搜索工具。
+- 升级 `workdir` 结构版本到 `0.30`：
+  `0.29 -> 0.30` upgrade step 会为旧 `sessions/*/session.json` 和 snapshot checkpoint 回填 `current_plan: null`。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.20.3` 提升到 `0.20.4`。
+
+# 0.20.3
+
+- 改进工具返回与 edit 安全性：
+  `edit` 在 `replace_all=false` 且 `old_text` 命中多处时会拒绝执行，要求模型补充上下文或显式 `replace_all=true`；`exec`、`file_read`、`glob`、`grep` 与 `ls` 不再在成功路径返回空 stderr、null include 或 false 截断字段，减少无意义 token。
+- Cron 任务新增显式时区：
+  `create_cron_task` / `update_cron_task` 支持 `timezone` IANA 名称，默认 `Asia/Shanghai`；命名 cron 字段按任务持久化时区解释，不再依赖服务器 local timezone。
+- 升级 `workdir` 结构版本到 `0.29`：
+  `0.28 -> 0.29` upgrade step 会为旧 `cron/tasks.json` 任务回填 `timezone: "Asia/Shanghai"`。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.20.2` 提升到 `0.20.3`。
 
 # 0.20.2
 

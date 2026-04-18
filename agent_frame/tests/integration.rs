@@ -479,8 +479,17 @@ fn builtin_tools_work() -> Result<()> {
     assert!(shell_json.get("exec_id").is_some());
     assert_eq!(shell_json["completed"], json!(true));
     assert_eq!(shell_json["stdout"], json!("123"));
-    assert_eq!(shell_json["stdout_truncated"], json!(false));
-    assert_eq!(shell_json["stderr_truncated"], json!(false));
+    assert!(shell_json.get("stdout_truncated").is_none());
+    assert!(shell_json.get("stderr").is_none());
+    assert!(shell_json.get("stderr_truncated").is_none());
+
+    let duplicate_edit = execute_tool_call(
+        &registry,
+        "edit",
+        Some(r#"{"path":"note.txt","old_text":"a","new_text":"z"}"#),
+    );
+    assert!(duplicate_edit.contains("matched"));
+    assert!(duplicate_edit.contains("include more surrounding context"));
 
     let timeout_process = execute_tool_call(
         &registry,
@@ -578,41 +587,44 @@ fn builtin_tools_work() -> Result<()> {
     assert!(process_result.contains("\"exec_id\""));
     assert!(process_result.contains("\"stdout\": \"bg\""));
 
-    let cat_process = execute_tool_call(
+    let stdin_process = execute_tool_call(
         &registry,
         "exec_start",
-        Some(r#"{"command":"cat","include_stdout":false,"return_immediate":true}"#),
+        Some(
+            r#"{"command":"python3 -c \"import sys; print(sys.stdin.readline(), end='')\"","include_stdout":false,"return_immediate":true}"#,
+        ),
     );
-    let cat_json: Value = serde_json::from_str(&cat_process)?;
-    let cat_wait = execute_tool_call(
+    let stdin_json: Value = serde_json::from_str(&stdin_process)?;
+    let stdin_wait = execute_tool_call(
         &registry,
         "exec_wait",
         Some(&format!(
             r#"{{"exec_id":"{}","wait_timeout_seconds":0.2,"input":"hello\n","start":0,"limit":10}}"#,
-            cat_json["exec_id"].as_str().unwrap()
+            stdin_json["exec_id"].as_str().unwrap()
         )),
     );
     assert!(
-        cat_wait.contains("\"wait_timed_out\": true") || cat_wait.contains("\"stdout\": \"hello\"")
+        stdin_wait.contains("\"wait_timed_out\": true")
+            || stdin_wait.contains("\"stdout\": \"hello\"")
     );
-    let cat_observe = execute_tool_call(
+    let stdin_observe = execute_tool_call(
         &registry,
         "exec_observe",
         Some(&format!(
             r#"{{"exec_id":"{}","start":0,"limit":10}}"#,
-            cat_json["exec_id"].as_str().unwrap()
+            stdin_json["exec_id"].as_str().unwrap()
         )),
     );
-    assert!(cat_observe.contains("hello"));
-    let cat_kill = execute_tool_call(
+    assert!(stdin_observe.contains("hello"));
+    let stdin_kill = execute_tool_call(
         &registry,
         "exec_kill",
         Some(&format!(
             r#"{{"exec_id":"{}"}}"#,
-            cat_json["exec_id"].as_str().unwrap()
+            stdin_json["exec_id"].as_str().unwrap()
         )),
     );
-    assert!(cat_kill.contains("\"killed\": true"));
+    assert!(stdin_kill.contains("\"killed\": true"));
 
     let patch_path = temp_dir.path().join("patch.txt");
     fs::write(&patch_path, "before\n")?;

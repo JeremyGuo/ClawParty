@@ -168,7 +168,6 @@ fn render_ls_tree(base_path: &Path, mut entries: Vec<LsEntry>, truncated: bool) 
         lines.push(String::new());
     } else {
         lines.push(format!("num_entries: {}", entries.len()));
-        lines.push("truncated: false".to_string());
         lines.push(String::new());
     }
     lines.push(format!("- {}", path_with_trailing_slash(base_path)));
@@ -275,17 +274,22 @@ def handle_file_read(args, workspace_root):
     else:
         end_line = start_line + selected_line_count - 1
     truncated_by_lines = line_offset + selected_line_count < len(lines)
-    return {
+    result = {
         "file_path": path,
         "start_line": start_line,
         "end_line": end_line,
         "total_lines": len(lines),
-        "truncated": truncated_by_lines or truncated_by_bytes or truncated_long_lines,
-        "truncated_by_lines": truncated_by_lines,
-        "truncated_by_bytes": truncated_by_bytes,
-        "truncated_long_lines": truncated_long_lines,
         "content": "\n".join(content),
     }
+    if truncated_by_lines or truncated_by_bytes or truncated_long_lines:
+        result["truncated"] = True
+    if truncated_by_lines:
+        result["truncated_by_lines"] = True
+    if truncated_by_bytes:
+        result["truncated_by_bytes"] = True
+    if truncated_long_lines:
+        result["truncated_long_lines"] = True
+    return result
 
 def handle_file_write(args, workspace_root):
     file_path = args.get("file_path", args.get("path"))
@@ -321,13 +325,15 @@ def handle_glob(args, workspace_root):
             matches.append({"path": path, "mtime_ms": file_mtime_ms(path)})
     matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
     total = len(matches)
-    return {
+    result = {
         "pattern": pattern,
         "path": base,
         "num_files": total,
-        "truncated": total > SEARCH_MAX_RESULTS,
         "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
     }
+    if total > SEARCH_MAX_RESULTS:
+        result["truncated"] = True
+    return result
 
 def handle_grep(args, workspace_root):
     pattern = args.get("pattern")
@@ -352,14 +358,17 @@ def handle_grep(args, workspace_root):
             matches.append({"path": path, "mtime_ms": file_mtime_ms(path)})
     matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
     total = len(matches)
-    return {
+    result = {
         "pattern": pattern,
         "path": base,
-        "include": include,
         "num_files": total,
-        "truncated": total > SEARCH_MAX_RESULTS,
         "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
     }
+    if include:
+        result["include"] = include
+    if total > SEARCH_MAX_RESULTS:
+        result["truncated"] = True
+    return result
 
 def should_skip_ls(root, name, is_dir, base):
     path = os.path.join(root, name)
@@ -409,7 +418,6 @@ def handle_ls(args, workspace_root):
         lines.append("")
     else:
         lines.append(f"num_entries: {len(entries)}")
-        lines.append("truncated: false")
         lines.append("")
     display_base = base.replace(os.sep, "/")
     if not display_base.endswith("/"):
@@ -452,6 +460,11 @@ def handle_edit(args, workspace_root):
     replacements = content.count(old_text)
     if replacements == 0:
         raise ValueError(f"old_text was not found in {path}")
+    if replacements > 1 and not replace_all:
+        raise ValueError(
+            f"old_text matched {replacements} locations in {path}; "
+            "include more surrounding context or set replace_all=true"
+        )
     updated = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(updated)
@@ -643,17 +656,28 @@ pub(super) fn file_read_tool(
             };
             let truncated_by_lines = line_offset.saturating_add(selected_line_count) < lines.len();
 
-            Ok(json!({
-                "file_path": path.display().to_string(),
-                "start_line": start_line,
-                "end_line": end_line,
-                "total_lines": lines.len(),
-                "truncated": truncated_by_lines || truncated_by_bytes || truncated_long_lines,
-                "truncated_by_lines": truncated_by_lines,
-                "truncated_by_bytes": truncated_by_bytes,
-                "truncated_long_lines": truncated_long_lines,
-                "content": content
-            }))
+            let mut result = Map::new();
+            result.insert(
+                "file_path".to_string(),
+                Value::String(path.display().to_string()),
+            );
+            result.insert("start_line".to_string(), Value::from(start_line));
+            result.insert("end_line".to_string(), Value::from(end_line));
+            result.insert("total_lines".to_string(), Value::from(lines.len()));
+            if truncated_by_lines || truncated_by_bytes || truncated_long_lines {
+                result.insert("truncated".to_string(), Value::Bool(true));
+            }
+            if truncated_by_lines {
+                result.insert("truncated_by_lines".to_string(), Value::Bool(true));
+            }
+            if truncated_by_bytes {
+                result.insert("truncated_by_bytes".to_string(), Value::Bool(true));
+            }
+            if truncated_long_lines {
+                result.insert("truncated_long_lines".to_string(), Value::Bool(true));
+            }
+            result.insert("content".to_string(), Value::String(content));
+            Ok(Value::Object(result))
         },
     )
 }
@@ -774,13 +798,18 @@ pub(super) fn glob_tool(
                 .take(SEARCH_MAX_RESULTS)
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>();
-            Ok(json!({
-                "pattern": pattern,
-                "path": base_path.display().to_string(),
-                "num_files": total_matches,
-                "truncated": truncated,
-                "filenames": filenames
-            }))
+            let mut result = Map::new();
+            result.insert("pattern".to_string(), Value::String(pattern));
+            result.insert(
+                "path".to_string(),
+                Value::String(base_path.display().to_string()),
+            );
+            result.insert("num_files".to_string(), Value::from(total_matches));
+            if truncated {
+                result.insert("truncated".to_string(), Value::Bool(true));
+            }
+            result.insert("filenames".to_string(), json!(filenames));
+            Ok(Value::Object(result))
         },
     )
 }
@@ -850,14 +879,21 @@ pub(super) fn grep_tool(
                 .take(SEARCH_MAX_RESULTS)
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>();
-            Ok(json!({
-                "pattern": pattern,
-                "path": base_path.display().to_string(),
-                "include": arguments.get("include").and_then(Value::as_str),
-                "num_files": total_matches,
-                "truncated": truncated,
-                "filenames": filenames
-            }))
+            let mut result = Map::new();
+            result.insert("pattern".to_string(), Value::String(pattern));
+            result.insert(
+                "path".to_string(),
+                Value::String(base_path.display().to_string()),
+            );
+            if let Some(include) = arguments.get("include").and_then(Value::as_str) {
+                result.insert("include".to_string(), Value::String(include.to_string()));
+            }
+            result.insert("num_files".to_string(), Value::from(total_matches));
+            if truncated {
+                result.insert("truncated".to_string(), Value::Bool(true));
+            }
+            result.insert("filenames".to_string(), json!(filenames));
+            Ok(Value::Object(result))
         },
     )
 }
@@ -916,7 +952,7 @@ pub(super) fn edit_tool(
 ) -> Tool {
     Tool::new(
         "edit",
-        "Edit a UTF-8 text file by replacing old_text with new_text. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local edits.",
+        "Edit a UTF-8 text file by replacing old_text with new_text. When replace_all=false, old_text must match exactly one location; if it matches multiple locations, include more surrounding context. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local edits.",
         json!({
             "type": "object",
             "properties": {
@@ -973,6 +1009,13 @@ pub(super) fn edit_tool(
             let replacements = content.matches(&old_text).count();
             if replacements == 0 {
                 return Err(anyhow!("old_text was not found in {}", path.display()));
+            }
+            if replacements > 1 && !replace_all {
+                return Err(anyhow!(
+                    "old_text matched {} locations in {}; include more surrounding context or set replace_all=true",
+                    replacements,
+                    path.display()
+                ));
             }
             let updated = if replace_all {
                 content.replace(&old_text, &new_text)

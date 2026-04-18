@@ -21,6 +21,8 @@ mod v0_25;
 mod v0_26;
 mod v0_27;
 mod v0_28;
+mod v0_29;
+mod v0_30;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -28,7 +30,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.28";
+pub const LATEST_WORKDIR_VERSION: &str = "0.30";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -44,7 +46,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 24] = [
+    let upgraders: [&dyn WorkdirUpgrader; 26] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -69,6 +71,8 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_26::Upgrade,
         &v0_27::Upgrade,
         &v0_28::Upgrade,
+        &v0_29::Upgrade,
+        &v0_30::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -121,6 +125,8 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.25" => Ok("0.25"),
         "0.26" => Ok("0.26"),
         "0.27" => Ok("0.27"),
+        "0.28" => Ok("0.28"),
+        "0.29" => Ok("0.29"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1272,5 +1278,113 @@ mod tests {
         assert!(snapshot["session"]["pending_model_catalog_notice"].is_null());
         assert!(snapshot["session"]["system_prompt_component_hashes"].is_null());
         assert!(snapshot["session"]["pending_system_prompt_component_notices"].is_null());
+    }
+
+    #[test]
+    fn v0_29_workdir_upgrade_backfills_cron_task_timezone() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.28\n").unwrap();
+
+        let cron_dir = temp_dir.path().join("cron");
+        fs::create_dir_all(&cron_dir).unwrap();
+        fs::write(
+            cron_dir.join("tasks.json"),
+            serde_json::to_string_pretty(&json!({
+                "tasks": [
+                    {
+                        "id": Uuid::new_v4(),
+                        "name": "reminder",
+                        "description": "send a reminder",
+                        "schedule": "0 7 13 * * *",
+                        "agent_backend": "agent_frame",
+                        "model_key": "main",
+                        "prompt": "ping",
+                        "sink": {
+                            "type": "direct",
+                            "address": {
+                                "channel_id": "telegram-main",
+                                "conversation_id": "123"
+                            }
+                        },
+                        "address": {
+                            "channel_id": "telegram-main",
+                            "conversation_id": "123"
+                        },
+                        "enabled": true,
+                        "created_at": "2026-04-18T00:00:00Z",
+                        "updated_at": "2026-04-18T00:00:00Z"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let store: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(cron_dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(store["tasks"][0]["timezone"], json!("Asia/Shanghai"));
+    }
+
+    #[test]
+    fn v0_30_workdir_upgrade_backfills_current_plan() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.29\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123"
+                },
+                "session_state": {
+                    "messages": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-19T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123"
+                },
+                "settings": {},
+                "session": {
+                    "messages": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert!(session["session_state"]["current_plan"].is_null());
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert!(snapshot["session"]["current_plan"].is_null());
     }
 }

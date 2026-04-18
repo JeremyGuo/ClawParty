@@ -2,7 +2,8 @@ use crate::backend::AgentBackendKind;
 use crate::domain::ChannelAddress;
 use crate::sink::SinkTarget;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,6 +26,8 @@ pub struct CronTaskRecord {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    #[serde(default = "default_cron_timezone")]
+    pub timezone: String,
     #[serde(default)]
     pub agent_backend: AgentBackendKind,
     pub model_key: String,
@@ -55,6 +58,7 @@ pub struct CronTaskView {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    pub timezone: String,
     #[serde(default)]
     pub agent_backend: AgentBackendKind,
     pub model_key: String,
@@ -82,6 +86,7 @@ pub struct CronCreateRequest {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    pub timezone: String,
     pub agent_backend: AgentBackendKind,
     pub model_key: String,
     pub prompt: String,
@@ -96,6 +101,7 @@ pub struct CronUpdateRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub schedule: Option<String>,
+    pub timezone: Option<String>,
     pub agent_backend: Option<AgentBackendKind>,
     pub model_key: Option<String>,
     pub prompt: Option<String>,
@@ -174,6 +180,7 @@ impl CronManager {
 
     pub fn create(&mut self, request: CronCreateRequest) -> Result<CronTaskView> {
         validate_schedule(&request.schedule)?;
+        let timezone = normalize_timezone(&request.timezone)?;
         validate_name(&request.name)?;
         validate_description(&request.description)?;
         if request.prompt.trim().is_empty() {
@@ -189,6 +196,7 @@ impl CronManager {
             name: request.name.trim().to_string(),
             description: request.description.trim().to_string(),
             schedule: request.schedule.trim().to_string(),
+            timezone,
             agent_backend: request.agent_backend,
             model_key: request.model_key,
             prompt: request.prompt,
@@ -227,6 +235,10 @@ impl CronManager {
         if let Some(schedule) = request.schedule {
             validate_schedule(&schedule)?;
             task.schedule = schedule.trim().to_string();
+            task.last_scheduled_for = None;
+        }
+        if let Some(timezone) = request.timezone {
+            task.timezone = normalize_timezone(&timezone)?;
             task.last_scheduled_for = None;
         }
         if let Some(agent_backend) = request.agent_backend {
@@ -295,7 +307,7 @@ impl CronManager {
             let base = task
                 .last_scheduled_for
                 .unwrap_or_else(|| task.created_at - chrono::Duration::seconds(1));
-            let Some(next_run) = next_run_after(&task.schedule, base)
+            let Some(next_run) = next_run_after(&task.schedule, &task.timezone, base)
                 .with_context(|| format!("invalid cron schedule for task {}", task.id))?
             else {
                 continue;
@@ -377,6 +389,7 @@ fn task_view(task: &CronTaskRecord) -> Result<CronTaskView> {
         name: task.name.clone(),
         description: task.description.clone(),
         schedule: task.schedule.clone(),
+        timezone: task.timezone.clone(),
         agent_backend: task.agent_backend,
         model_key: task.model_key.clone(),
         enabled: task.enabled,
@@ -400,13 +413,18 @@ fn next_run_at(task: &CronTaskRecord) -> Result<Option<DateTime<Utc>>> {
     let base = task
         .last_scheduled_for
         .unwrap_or_else(|| task.created_at - chrono::Duration::seconds(1));
-    next_run_after(&task.schedule, base)
+    next_run_after(&task.schedule, &task.timezone, base)
         .with_context(|| format!("invalid cron schedule for task {}", task.id))
 }
 
-fn next_run_after(schedule: &str, base: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+fn next_run_after(
+    schedule: &str,
+    timezone: &str,
+    base: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
     let schedule = Schedule::from_str(schedule).context("invalid cron schedule")?;
-    let local_base = base.with_timezone(&Local);
+    let timezone = parse_timezone(timezone)?;
+    let local_base = base.with_timezone(&timezone);
     Ok(schedule
         .after(&local_base)
         .next()
@@ -417,10 +435,31 @@ fn validate_task(task: &CronTaskRecord) -> Result<()> {
     validate_name(&task.name)?;
     validate_description(&task.description)?;
     validate_schedule(&task.schedule)?;
+    parse_timezone(&task.timezone)?;
     if let Some(checker) = &task.checker {
         validate_checker(checker)?;
     }
     Ok(())
+}
+
+pub fn default_cron_timezone() -> String {
+    "Asia/Shanghai".to_string()
+}
+
+fn normalize_timezone(timezone: &str) -> Result<String> {
+    let timezone = timezone.trim();
+    if timezone.is_empty() {
+        return Ok(default_cron_timezone());
+    }
+    parse_timezone(timezone)?;
+    Ok(timezone.to_string())
+}
+
+fn parse_timezone(timezone: &str) -> Result<Tz> {
+    timezone
+        .trim()
+        .parse::<Tz>()
+        .with_context(|| format!("invalid IANA timezone '{}'", timezone.trim()))
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -454,11 +493,12 @@ fn validate_checker(checker: &CronCheckerConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CronCreateRequest, CronManager, running_trigger_outcome};
+    use super::{CronCreateRequest, CronManager, default_cron_timezone, running_trigger_outcome};
     use crate::backend::AgentBackendKind;
     use crate::domain::ChannelAddress;
     use crate::sink::SinkTarget;
-    use chrono::{Datelike, Local, TimeZone, Timelike};
+    use chrono::{Datelike, TimeZone, Timelike};
+    use chrono_tz::Asia::Shanghai;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -471,6 +511,7 @@ mod tests {
                 name: "heartbeat".to_string(),
                 description: "send a heartbeat".to_string(),
                 schedule: "*/5 * * * * * *".to_string(),
+                timezone: default_cron_timezone(),
                 agent_backend: AgentBackendKind::AgentFrame,
                 model_key: "main".to_string(),
                 prompt: "ping".to_string(),
@@ -506,6 +547,7 @@ mod tests {
                 name: "progress".to_string(),
                 description: "send progress".to_string(),
                 schedule: "0 * * * * *".to_string(),
+                timezone: default_cron_timezone(),
                 agent_backend: AgentBackendKind::AgentFrame,
                 model_key: "main".to_string(),
                 prompt: "ping".to_string(),
@@ -568,6 +610,7 @@ mod tests {
                 name: "progress".to_string(),
                 description: "send progress".to_string(),
                 schedule: "0 * * * * *".to_string(),
+                timezone: default_cron_timezone(),
                 agent_backend: AgentBackendKind::AgentFrame,
                 model_key: "main".to_string(),
                 prompt: "ping".to_string(),
@@ -613,17 +656,17 @@ mod tests {
     }
 
     #[test]
-    fn exact_time_cron_schedule_uses_local_timezone() {
+    fn exact_time_cron_schedule_uses_task_timezone() {
         let temp_dir = TempDir::new().unwrap();
         let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
-        let created_local = Local
+        let created_local = Shanghai
             .with_ymd_and_hms(2026, 4, 17, 13, 5, 35)
             .single()
-            .expect("test local time should be valid");
-        let target_local = Local
+            .expect("test timezone should be valid");
+        let target_local = Shanghai
             .with_ymd_and_hms(2026, 4, 17, 13, 7, 0)
             .single()
-            .expect("test local time should be valid");
+            .expect("test timezone should be valid");
         let task = manager
             .create(CronCreateRequest {
                 name: "local reminder".to_string(),
@@ -636,6 +679,7 @@ mod tests {
                     target_local.day(),
                     target_local.month()
                 ),
+                timezone: default_cron_timezone(),
                 agent_backend: AgentBackendKind::AgentFrame,
                 model_key: "main".to_string(),
                 prompt: "ping".to_string(),
@@ -664,6 +708,7 @@ mod tests {
             task.last_scheduled_for = None;
         }
 
+        assert_eq!(manager.get(task.id).unwrap().timezone, "Asia/Shanghai");
         assert_eq!(manager.get(task.id).unwrap().next_run_at, Some(target_at));
         assert!(
             manager

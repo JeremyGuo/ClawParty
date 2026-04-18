@@ -497,6 +497,7 @@ impl AgentRuntimeView {
                 progress_message: None,
                 actor_mailbox: Vec::new(),
                 user_mailbox: Vec::new(),
+                current_plan: None,
             },
         };
         let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&model_key)?;
