@@ -457,9 +457,14 @@ pub enum SessionEvent {
     ModelCallCompleted {
         round_index: usize,
         tool_call_count: usize,
+        api_request_id: Option<String>,
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        cache_hit_tokens: u64,
+        cache_miss_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
     },
     ToolWaitCompactionScheduled {
         tool_name: String,
@@ -999,9 +1004,14 @@ fn run_session_state_controlled_internal(
             control.emit_event(SessionEvent::ModelCallCompleted {
                 round_index,
                 tool_call_count: tool_calls.len(),
+                api_request_id: outcome.api_request_id.clone(),
                 prompt_tokens: outcome.usage.prompt_tokens,
                 completion_tokens: outcome.usage.completion_tokens,
                 total_tokens: outcome.usage.total_tokens,
+                cache_hit_tokens: outcome.usage.cache_hit_tokens,
+                cache_miss_tokens: outcome.usage.cache_miss_tokens,
+                cache_read_tokens: outcome.usage.cache_read_tokens,
+                cache_write_tokens: outcome.usage.cache_write_tokens,
             });
         }
         if tool_calls.is_empty() && !assistant_message_has_content_or_tool_calls(&outcome.message) {

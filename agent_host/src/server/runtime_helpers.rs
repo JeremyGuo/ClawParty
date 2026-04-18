@@ -1158,9 +1158,14 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::ModelCallCompleted {
             round_index,
             tool_call_count,
+            api_request_id,
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_hit_tokens,
+            cache_miss_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,
@@ -1171,9 +1176,14 @@ pub(super) fn log_agent_frame_event(
             model = model_key,
             round_index = *round_index as u64,
             tool_call_count = *tool_call_count as u64,
+            api_request_id = api_request_id.as_deref().unwrap_or(""),
             prompt_tokens = *prompt_tokens,
             completion_tokens = *completion_tokens,
             total_tokens = *total_tokens,
+            cache_hit_tokens = *cache_hit_tokens,
+            cache_miss_tokens = *cache_miss_tokens,
+            cache_read_tokens = *cache_read_tokens,
+            cache_write_tokens = *cache_write_tokens,
             "agent_frame model call completed"
         ),
         SessionEvent::ToolWaitCompactionScheduled {

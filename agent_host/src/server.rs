@@ -3063,10 +3063,11 @@ mod tests {
         openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
         parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_system_date_on_user_message, rollout_read_file,
-        rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
+        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
+        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -4048,6 +4049,37 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_prefix_survives_normal_turns_and_updates_after_compaction() {
+        let prompt_v1 = "[AgentHost Main Foreground Agent]\nIdentity: v1";
+        let prompt_v2 = "[AgentHost Main Foreground Agent]\nIdentity: v2";
+        let stored_messages = vec![
+            ChatMessage::text("system", prompt_v1),
+            ChatMessage::text("user", "第一轮"),
+            ChatMessage::text("assistant", "收到"),
+        ];
+
+        let (turn_messages, active_prompt, rebuilt) =
+            prepare_system_prompt_for_turn(&stored_messages, prompt_v2, false);
+        assert!(!rebuilt);
+        assert_eq!(active_prompt, prompt_v1);
+        assert_eq!(turn_messages[0], ChatMessage::text("system", prompt_v1));
+
+        let persisted_without_compaction =
+            normalize_messages_for_persistence(turn_messages.clone(), &active_prompt, &[]);
+        assert_eq!(
+            persisted_without_compaction[0],
+            ChatMessage::text("system", prompt_v1)
+        );
+
+        let persisted_after_compaction =
+            normalize_messages_for_persistence(turn_messages, prompt_v2, &[]);
+        assert_eq!(
+            persisted_after_compaction[0],
+            ChatMessage::text("system", prompt_v2)
+        );
+    }
+
+    #[test]
     fn leading_system_prompt_ignores_agent_frame_rendered_prompt() {
         let messages = vec![ChatMessage::text(
             "system",
@@ -4783,6 +4815,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_agent_command(Some("/agent demo-model")),
+            Some(AgentCommand::SelectModel { model_key }) if model_key == "demo-model"
+        ));
+        assert!(matches!(
+            parse_agent_command(Some("/agent@party_claw_bot demo-model")),
             Some(AgentCommand::SelectModel { model_key }) if model_key == "demo-model"
         ));
         assert!(matches!(

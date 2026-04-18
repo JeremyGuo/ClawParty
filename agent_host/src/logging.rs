@@ -21,6 +21,8 @@ pub fn init_logging(workdir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", logs_root.join("sessions").display()))?;
     fs::create_dir_all(logs_root.join("agents"))
         .with_context(|| format!("failed to create {}", logs_root.join("agents").display()))?;
+    fs::create_dir_all(logs_root.join("api"))
+        .with_context(|| format!("failed to create {}", logs_root.join("api").display()))?;
 
     let routing_layer = JsonlRoutingLayer::new(logs_root);
     let fmt_layer = fmt::layer()
@@ -99,6 +101,12 @@ impl JsonlRoutingLayer {
                 self.state
                     .logs_root
                     .join("agents")
+                    .join(format!("{}.jsonl", sanitize_component(key))),
+            ),
+            (Some("api"), Some(key)) => Some(
+                self.state
+                    .logs_root
+                    .join("api")
                     .join(format!("{}.jsonl", sanitize_component(key))),
             ),
             _ => None,

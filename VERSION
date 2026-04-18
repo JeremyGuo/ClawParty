@@ -1,5 +1,18 @@
-version: 0.20.1
+version: 0.20.2
 ---
+
+# 0.20.2
+
+- 新增 upstream API request observability：
+  OpenRouter chat-completions / responses 请求会记录稳定 `api_request_id`、provider/API kind、模型、URL、状态码、耗时、token usage、cache token breakdown，以及脱敏后的请求/响应 headers 和可配置 body 日志。
+- AgentFrame model-call 事件现在携带 `api_request_id` 与 cache token 字段：
+  session/agent 日志可以和底层 `logs/api/*.jsonl` 请求日志直接 join，不再依赖时间戳推断用量来源。
+- 修复 Telegram 群聊命令解析：
+  `@party_claw_bot /agent ...` 与 `@party_claw_bot /model ...` 会在 channel 入站边界规范化为普通 slash command，避免被当作普通用户消息。
+- 补充 System Prompt 前缀稳定性回归测试：
+  覆盖普通 turn 不热替换 canonical system prompt、compaction 后才提升新 prompt snapshot 的行为。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增配置字段、config loader 或 workdir upgrade step；按普通 patch 将仓库版本从 `0.20.1` 提升到 `0.20.2`。
 
 # 0.20.1
 

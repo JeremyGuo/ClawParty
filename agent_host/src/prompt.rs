@@ -767,6 +767,47 @@ mod tests {
         assert!(snapshot_prompt.contains("name: Snapshot User"));
         assert!(!snapshot_prompt.contains("Fresh Identity"));
         assert!(!snapshot_prompt.contains("name: Fresh User"));
+
+        let snapshot_state = build_agent_system_prompt_state(
+            &workspace,
+            &component_session,
+            "",
+            &[],
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+        );
+        fs::write(&identity_md_path, "You are Newer Identity.\n").unwrap();
+        fs::write(&user_md_path, "---\nname: Newer User\n---\n").unwrap();
+        let snapshot_state_after_disk_change = build_agent_system_prompt_state(
+            &workspace,
+            &component_session,
+            "",
+            &[],
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+        );
+        assert_eq!(
+            snapshot_state.static_hash,
+            snapshot_state_after_disk_change.static_hash
+        );
+        assert!(
+            snapshot_state_after_disk_change
+                .system_prompt
+                .contains("Snapshot Identity")
+        );
+        assert!(
+            !snapshot_state_after_disk_change
+                .system_prompt
+                .contains("Newer Identity")
+        );
     }
 
     #[test]

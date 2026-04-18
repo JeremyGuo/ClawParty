@@ -46,6 +46,13 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - After context compaction, notified prompt component snapshots are promoted into canonical prompt snapshots.
 - Regression coverage should protect prompt recursion prevention, RuntimeContext removal, skill metadata snapshot/notified behavior, and user-boundary-only skill notifications.
 
+### API Request Observability
+
+- Every upstream HTTP model request should emit structured request lifecycle logs with a stable `api_request_id`, provider, API kind, model, URL, method, status, elapsed time, token usage, cache token breakdown, and redacted request/response headers.
+- Request and response bodies are logged with secret-key redaction. By default, logs include bounded body previews for debugging; setting `AGENT_FRAME_LOG_API_BODIES=full` includes full redacted JSON bodies, and `off` disables body content while preserving sizes and metadata.
+- Agent runtime model-call events include the final `api_request_id` and cache token fields so session/agent logs can be joined to low-level API request logs without inferring from timestamps.
+- Regression coverage should protect header/body redaction and the model-call/API-request join fields.
+
 ### Background Agent Delivery
 
 - A main background agent final user-facing reply is delivered to the same foreground conversation that started or owns it.

@@ -29,6 +29,7 @@ dependencies = [
  "serde_json",
  "tiktoken-rs",
  "tokenizers",
+ "tracing",
  "tungstenite",
  "url",
  "uuid",

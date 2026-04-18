@@ -2,14 +2,17 @@ use super::UpstreamProvider;
 use crate::config::{CacheControlConfig, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionResponse, ChatCompletionSession,
-    build_chat_completions_url, chat_completions_messages_payload, parse_usage,
-    should_bypass_proxy, upstream_error_from_value,
+    build_chat_completions_url, chat_completions_messages_payload,
+    log_upstream_api_request_completed, log_upstream_api_request_failed,
+    log_upstream_api_request_started, next_api_request_id, parse_usage,
+    redacted_response_headers_json, redacted_upstream_request_headers_json, should_bypass_proxy,
+    upstream_error_from_value,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) struct OpenRouterProvider;
 
@@ -65,15 +68,28 @@ impl UpstreamProvider for OpenRouterProvider {
             }
         }
 
-        let mut request = client
-            .post(chat_completions_url)
-            .json(&Value::Object(payload));
+        let payload = Value::Object(payload);
+        let api_request_id = next_api_request_id();
 
-        if let Some(api_key) = upstream
+        let api_key = upstream
             .api_key
             .clone()
-            .or_else(|| std::env::var(&upstream.api_key_env).ok())
-        {
+            .or_else(|| std::env::var(&upstream.api_key_env).ok());
+        let request_headers_json =
+            redacted_upstream_request_headers_json(upstream, api_key.is_some());
+        log_upstream_api_request_started(
+            &api_request_id,
+            upstream,
+            "openrouter_chat_completions",
+            "POST",
+            &chat_completions_url,
+            &request_headers_json,
+            &payload,
+        );
+
+        let mut request = client.post(&chat_completions_url).json(&payload);
+
+        if let Some(api_key) = api_key {
             request = request.bearer_auth(api_key);
         }
 
@@ -83,14 +99,54 @@ impl UpstreamProvider for OpenRouterProvider {
             }
         }
 
-        let response = request
-            .send()
-            .context("upstream chat completion request failed")?;
+        let started = Instant::now();
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                log_upstream_api_request_failed(
+                    &api_request_id,
+                    upstream,
+                    "openrouter_chat_completions",
+                    None,
+                    started.elapsed().as_millis() as u64,
+                    "{}",
+                    None,
+                    &format!("{error:#}"),
+                );
+                return Err(error).context("upstream chat completion request failed");
+            }
+        };
         let status = response.status();
-        let body = response
-            .text()
-            .context("failed to read upstream response body")?;
+        let response_headers_json = redacted_response_headers_json(response.headers());
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(error) => {
+                log_upstream_api_request_failed(
+                    &api_request_id,
+                    upstream,
+                    "openrouter_chat_completions",
+                    Some(status.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    &response_headers_json,
+                    None,
+                    &format!("{error:#}"),
+                );
+                return Err(error).context("failed to read upstream response body");
+            }
+        };
         if !status.is_success() {
+            let response_body = serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|_| Value::String(body.clone()));
+            log_upstream_api_request_failed(
+                &api_request_id,
+                upstream,
+                "openrouter_chat_completions",
+                Some(status.as_u16()),
+                started.elapsed().as_millis() as u64,
+                &response_headers_json,
+                Some(&response_body),
+                &format!("upstream chat completion failed with {}", status),
+            );
             return Err(anyhow!(
                 "upstream chat completion failed with {}: {}",
                 status,
@@ -98,15 +154,51 @@ impl UpstreamProvider for OpenRouterProvider {
             ));
         }
 
-        let value: Value =
-            serde_json::from_str(&body).context("failed to parse chat completion response")?;
+        let value: Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                let response_body = Value::String(body.clone());
+                log_upstream_api_request_failed(
+                    &api_request_id,
+                    upstream,
+                    "openrouter_chat_completions",
+                    Some(status.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    &response_headers_json,
+                    Some(&response_body),
+                    &format!("{error:#}"),
+                );
+                return Err(error).context("failed to parse chat completion response");
+            }
+        };
         if let Some(error_message) = upstream_error_from_value(&value) {
+            log_upstream_api_request_failed(
+                &api_request_id,
+                upstream,
+                "openrouter_chat_completions",
+                Some(status.as_u16()),
+                started.elapsed().as_millis() as u64,
+                &response_headers_json,
+                Some(&value),
+                &error_message,
+            );
             return Err(anyhow!(
                 "upstream chat completion returned an error payload: {}",
                 error_message
             ));
         }
         let usage = parse_usage(&value);
+        log_upstream_api_request_completed(
+            &api_request_id,
+            upstream,
+            "openrouter_chat_completions",
+            status.as_u16(),
+            started.elapsed().as_millis() as u64,
+            &response_headers_json,
+            &value,
+            &usage,
+            None,
+        );
         let parsed: ChatCompletionResponse =
             serde_json::from_value(value).context("failed to decode chat completion response")?;
         let message = parsed
@@ -121,6 +213,7 @@ impl UpstreamProvider for OpenRouterProvider {
             message,
             usage,
             response_id: None,
+            api_request_id: Some(api_request_id),
         })
     }
 }

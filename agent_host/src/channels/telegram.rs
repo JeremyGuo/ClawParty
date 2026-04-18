@@ -593,6 +593,9 @@ impl TelegramChannel {
             return false;
         };
         let bot_username = self.bot_username.lock().await.clone();
+        if text_targets_this_bot_command(text, bot_username.as_deref()) {
+            return true;
+        }
         let Some(bot_username) = bot_username else {
             return false;
         };
@@ -1207,6 +1210,11 @@ impl Channel for TelegramChannel {
                     );
                     continue;
                 }
+                let bot_username = self.bot_username.lock().await.clone();
+                let text = text.map(|value| {
+                    normalize_leading_bot_mention_command_text(&value, bot_username.as_deref())
+                        .unwrap_or(value)
+                });
                 let receive_lag_seconds = telegram_message_receive_lag_seconds(message.date);
                 info!(
                     log_stream = "channel",
@@ -1588,6 +1596,63 @@ fn build_edit_text_payload(
 fn poll_backoff_seconds(consecutive_failures: u32, cap_seconds: u64) -> u64 {
     let exponent = consecutive_failures.saturating_sub(1).min(5);
     2_u64.saturating_pow(exponent).min(cap_seconds).max(1)
+}
+
+fn text_targets_this_bot_command(text: &str, bot_username: Option<&str>) -> bool {
+    let Some(first_token) = text.split_whitespace().next() else {
+        return false;
+    };
+    let (command, target) = first_token
+        .split_once('@')
+        .map_or((first_token, None), |(command, target)| {
+            (command, Some(target))
+        });
+    if let Some(target) = target {
+        let Some(bot_username) = bot_username else {
+            return false;
+        };
+        if !target.eq_ignore_ascii_case(bot_username) {
+            return false;
+        }
+    }
+    let Some(name) = command.strip_prefix('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn normalize_leading_bot_mention_command_text(
+    text: &str,
+    bot_username: Option<&str>,
+) -> Option<String> {
+    let bot_username = bot_username?.trim();
+    if bot_username.is_empty() {
+        return None;
+    }
+    let trimmed = text.trim_start();
+    let mention = format!("@{}", bot_username);
+    let prefix = trimmed.get(..mention.len())?;
+    if !prefix.eq_ignore_ascii_case(&mention) {
+        return None;
+    }
+    let after_mention = &trimmed[mention.len()..];
+    if !after_mention.is_empty()
+        && !after_mention
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let rest = after_mention.trim_start();
+    if rest.is_empty() || !text_targets_this_bot_command(rest, Some(bot_username)) {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3337,9 +3402,10 @@ mod tests {
     use super::{
         RichBlock, RichInline, TelegramChannel, TelegramChat, TelegramMessage,
         TelegramMessageEntity, TelegramRenderedText, build_edit_text_payload,
-        build_send_text_payload, parse_markdown_to_rich_document, poll_backoff_seconds,
+        build_send_text_payload, normalize_leading_bot_mention_command_text,
+        parse_markdown_to_rich_document, poll_backoff_seconds,
         render_markdown_chunks_to_telegram_entities, render_rich_document_to_telegram_entities,
-        telegram_text_len, translate_markdown_to_telegram_html,
+        telegram_text_len, text_targets_this_bot_command, translate_markdown_to_telegram_html,
     };
     use crate::domain::ShowOptions;
     use anyhow::anyhow;
@@ -3919,7 +3985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ignores_group_messages_without_mention_even_if_command() {
+    async fn accepts_group_slash_commands_without_mention() {
         let channel = TelegramChannel {
             id: "telegram-main".to_string(),
             bot_token: "secret-token".to_string(),
@@ -3951,9 +4017,109 @@ mod tests {
             audio: None,
         };
         assert!(
+            channel
+                .should_accept_message(&message, message.text.as_deref(), 0)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_group_plain_messages_without_mention() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
+            pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            date: None,
+            chat: TelegramChat {
+                id: -1,
+                kind: "group".to_string(),
+            },
+            from: None,
+            left_chat_member: None,
+            text: Some("介绍一下你自己".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+            video: None,
+            audio: None,
+        };
+        assert!(
             !channel
                 .should_accept_message(&message, message.text.as_deref(), 0)
                 .await
+        );
+    }
+
+    #[test]
+    fn telegram_group_command_matching_ignores_other_bots_and_paths() {
+        assert!(text_targets_this_bot_command(
+            "/agent demo-model",
+            Some("party_claw_bot")
+        ));
+        assert!(text_targets_this_bot_command(
+            "/agent@party_claw_bot demo-model",
+            Some("party_claw_bot")
+        ));
+        assert!(!text_targets_this_bot_command(
+            "/agent@other_bot demo-model",
+            Some("party_claw_bot")
+        ));
+        assert!(!text_targets_this_bot_command(
+            "/home/jeremy/project",
+            Some("party_claw_bot")
+        ));
+    }
+
+    #[test]
+    fn telegram_normalizes_leading_bot_mention_commands() {
+        assert_eq!(
+            normalize_leading_bot_mention_command_text(
+                "@party_claw_bot /agent demo-model",
+                Some("party_claw_bot")
+            )
+            .as_deref(),
+            Some("/agent demo-model")
+        );
+        assert_eq!(
+            normalize_leading_bot_mention_command_text(
+                "  @Party_Claw_Bot   /model@party_claw_bot demo-model",
+                Some("party_claw_bot")
+            )
+            .as_deref(),
+            Some("/model@party_claw_bot demo-model")
+        );
+        assert_eq!(
+            normalize_leading_bot_mention_command_text(
+                "@party_claw_bot 你好",
+                Some("party_claw_bot")
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_leading_bot_mention_command_text(
+                "@party_claw_bot /home/jeremy/project",
+                Some("party_claw_bot")
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_leading_bot_mention_command_text(
+                "@other_bot /agent demo-model",
+                Some("party_claw_bot")
+            ),
+            None
         );
     }
 

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 static RETRY_RANDOM_SEED: AtomicU64 = AtomicU64::new(0);
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 2000;
@@ -71,6 +72,7 @@ pub struct ChatCompletionOutcome {
     pub message: ChatMessage,
     pub usage: TokenUsage,
     pub response_id: Option<String>,
+    pub api_request_id: Option<String>,
 }
 
 pub(crate) enum ChatCompletionSession {
@@ -924,6 +926,292 @@ pub(super) fn parse_usage(response: &Value) -> TokenUsage {
     }
 }
 
+pub(super) fn next_api_request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+#[derive(Clone, Copy)]
+enum ApiBodyLogMode {
+    Off,
+    Preview,
+    Full,
+}
+
+impl ApiBodyLogMode {
+    fn current() -> Self {
+        match std::env::var("AGENT_FRAME_LOG_API_BODIES")
+            .unwrap_or_else(|_| "preview".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "0" | "false" | "off" | "none" => Self::Off,
+            "1" | "true" | "full" => Self::Full,
+            _ => Self::Preview,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Preview => "preview",
+            Self::Full => "full",
+        }
+    }
+}
+
+struct ApiBodyLogFields {
+    mode: &'static str,
+    bytes: u64,
+    preview: String,
+    full_json: String,
+    truncated: bool,
+    included: bool,
+}
+
+const API_BODY_PREVIEW_CHARS: usize = 12_000;
+
+fn api_body_log_fields(value: &Value) -> ApiBodyLogFields {
+    let mode = ApiBodyLogMode::current();
+    let redacted = redact_sensitive_json(value);
+    let json = serde_json::to_string(&redacted).unwrap_or_else(|_| "<unserializable>".to_string());
+    let bytes = json.len() as u64;
+    match mode {
+        ApiBodyLogMode::Off => ApiBodyLogFields {
+            mode: mode.label(),
+            bytes,
+            preview: String::new(),
+            full_json: String::new(),
+            truncated: false,
+            included: false,
+        },
+        ApiBodyLogMode::Preview => {
+            let (preview, truncated) = preview_chars(&json, API_BODY_PREVIEW_CHARS);
+            ApiBodyLogFields {
+                mode: mode.label(),
+                bytes,
+                preview,
+                full_json: String::new(),
+                truncated,
+                included: true,
+            }
+        }
+        ApiBodyLogMode::Full => ApiBodyLogFields {
+            mode: mode.label(),
+            bytes,
+            preview: String::new(),
+            full_json: json,
+            truncated: false,
+            included: true,
+        },
+    }
+}
+
+fn preview_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let mut count = 0usize;
+    for (idx, _) in value.char_indices() {
+        if count == max_chars {
+            return (value[..idx].to_string(), true);
+        }
+        count += 1;
+    }
+    (value.to_string(), false)
+}
+
+fn redact_sensitive_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if is_sensitive_name(key) {
+                        (key.clone(), Value::String("[REDACTED]".to_string()))
+                    } else {
+                        (key.clone(), redact_sensitive_json(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_sensitive_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("authorization")
+        || lower.contains("api-key")
+        || lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("cookie")
+        || lower.contains("credential")
+}
+
+pub(super) fn redacted_upstream_request_headers_json(
+    upstream: &UpstreamConfig,
+    has_authorization: bool,
+) -> String {
+    let mut object = Map::new();
+    object.insert(
+        "content-type".to_string(),
+        Value::String("application/json".to_string()),
+    );
+    if has_authorization {
+        object.insert(
+            "authorization".to_string(),
+            Value::String("Bearer [REDACTED]".to_string()),
+        );
+    }
+    for (key, value) in &upstream.headers {
+        let rendered = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        object.insert(
+            key.clone(),
+            if is_sensitive_name(key) {
+                Value::String("[REDACTED]".to_string())
+            } else {
+                Value::String(rendered)
+            },
+        );
+    }
+    serde_json::to_string(&Value::Object(object)).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub(super) fn redacted_response_headers_json(headers: &reqwest::header::HeaderMap) -> String {
+    let mut object = Map::new();
+    for (key, value) in headers {
+        let key = key.as_str().to_string();
+        let rendered = value
+            .to_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|_| "<non-utf8>".to_string());
+        object.insert(
+            key.clone(),
+            if is_sensitive_name(&key) {
+                Value::String("[REDACTED]".to_string())
+            } else {
+                Value::String(rendered)
+            },
+        );
+    }
+    serde_json::to_string(&Value::Object(object)).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub(super) fn log_upstream_api_request_started(
+    api_request_id: &str,
+    upstream: &UpstreamConfig,
+    provider: &str,
+    method: &str,
+    url: &str,
+    request_headers_json: &str,
+    request_body: &Value,
+) {
+    let body = api_body_log_fields(request_body);
+    tracing::info!(
+        log_stream = "api",
+        log_key = %upstream.model,
+        kind = "upstream_api_request_started",
+        api_request_id,
+        provider,
+        api_kind = ?upstream.api_kind,
+        auth_kind = ?upstream.auth_kind,
+        model = %upstream.model,
+        method,
+        url,
+        timeout_seconds = upstream.timeout_seconds,
+        request_headers_json,
+        request_body_log_mode = body.mode,
+        request_body_bytes = body.bytes,
+        request_body_included = body.included,
+        request_body_truncated = body.truncated,
+        request_body_preview = %body.preview,
+        request_body_json = %body.full_json,
+        "upstream API request started"
+    );
+}
+
+pub(super) fn log_upstream_api_request_completed(
+    api_request_id: &str,
+    upstream: &UpstreamConfig,
+    provider: &str,
+    status_code: u16,
+    elapsed_ms: u64,
+    response_headers_json: &str,
+    response_body: &Value,
+    usage: &TokenUsage,
+    response_id: Option<&str>,
+) {
+    let body = api_body_log_fields(response_body);
+    tracing::info!(
+        log_stream = "api",
+        log_key = %upstream.model,
+        kind = "upstream_api_request_completed",
+        api_request_id,
+        provider,
+        api_kind = ?upstream.api_kind,
+        auth_kind = ?upstream.auth_kind,
+        model = %upstream.model,
+        status_code,
+        elapsed_ms,
+        response_headers_json,
+        response_id = response_id.unwrap_or(""),
+        llm_calls = usage.llm_calls,
+        prompt_tokens = usage.prompt_tokens,
+        completion_tokens = usage.completion_tokens,
+        total_tokens = usage.total_tokens,
+        cache_hit_tokens = usage.cache_hit_tokens,
+        cache_miss_tokens = usage.cache_miss_tokens,
+        cache_read_tokens = usage.cache_read_tokens,
+        cache_write_tokens = usage.cache_write_tokens,
+        response_body_log_mode = body.mode,
+        response_body_bytes = body.bytes,
+        response_body_included = body.included,
+        response_body_truncated = body.truncated,
+        response_body_preview = %body.preview,
+        response_body_json = %body.full_json,
+        "upstream API request completed"
+    );
+}
+
+pub(super) fn log_upstream_api_request_failed(
+    api_request_id: &str,
+    upstream: &UpstreamConfig,
+    provider: &str,
+    status_code: Option<u16>,
+    elapsed_ms: u64,
+    response_headers_json: &str,
+    response_body: Option<&Value>,
+    error: &str,
+) {
+    let body = response_body.map(api_body_log_fields);
+    tracing::warn!(
+        log_stream = "api",
+        log_key = %upstream.model,
+        kind = "upstream_api_request_failed",
+        api_request_id,
+        provider,
+        api_kind = ?upstream.api_kind,
+        auth_kind = ?upstream.auth_kind,
+        model = %upstream.model,
+        status_code = status_code.unwrap_or(0),
+        elapsed_ms,
+        response_headers_json,
+        response_body_log_mode = body.as_ref().map(|body| body.mode).unwrap_or("none"),
+        response_body_bytes = body.as_ref().map(|body| body.bytes).unwrap_or(0),
+        response_body_included = body.as_ref().map(|body| body.included).unwrap_or(false),
+        response_body_truncated = body.as_ref().map(|body| body.truncated).unwrap_or(false),
+        response_body_preview = %body.as_ref().map(|body| body.preview.as_str()).unwrap_or(""),
+        response_body_json = %body.as_ref().map(|body| body.full_json.as_str()).unwrap_or(""),
+        error,
+        "upstream API request failed"
+    );
+}
+
 fn first_u64(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<u64> {
     paths.iter().find_map(|path| nested_u64(object, path))
 }
@@ -941,7 +1229,8 @@ mod tests {
     use super::{
         UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
         chat_completions_messages_payload, normalize_inline_image_url,
-        parse_streamed_responses_body, parse_usage, responses_value_to_chat_message,
+        parse_streamed_responses_body, parse_usage, redact_sensitive_json,
+        redacted_upstream_request_headers_json, responses_value_to_chat_message,
         upstream_error_from_value,
     };
     use crate::config::{
@@ -971,6 +1260,45 @@ mod tests {
             .decode(encoded)
             .unwrap();
         image::load_from_memory(&bytes).unwrap().dimensions()
+    }
+
+    #[test]
+    fn api_log_redacts_sensitive_headers() {
+        let mut upstream = test_upstream_config();
+        upstream.base_url = "https://example.test".to_string();
+        upstream.model = "demo-model".to_string();
+        upstream
+            .headers
+            .insert("X-Api-Key".to_string(), json!("secret-value"));
+        upstream
+            .headers
+            .insert("X-Trace".to_string(), json!("trace-value"));
+
+        let headers = redacted_upstream_request_headers_json(&upstream, true);
+        let value: serde_json::Value = serde_json::from_str(&headers).unwrap();
+        assert_eq!(value["authorization"], "Bearer [REDACTED]");
+        assert_eq!(value["X-Api-Key"], "[REDACTED]");
+        assert_eq!(value["X-Trace"], "trace-value");
+        assert!(!headers.contains("secret-value"));
+    }
+
+    #[test]
+    fn api_log_redacts_sensitive_json_keys() {
+        let value = json!({
+            "model": "demo",
+            "messages": [{"role": "user", "content": "keep this visible"}],
+            "metadata": {
+                "api_key": "secret",
+                "nested_token": "secret-token",
+                "ordinary": "value"
+            }
+        });
+
+        let redacted = redact_sensitive_json(&value);
+        assert_eq!(redacted["metadata"]["api_key"], "[REDACTED]");
+        assert_eq!(redacted["metadata"]["nested_token"], "[REDACTED]");
+        assert_eq!(redacted["metadata"]["ordinary"], "value");
+        assert_eq!(redacted["messages"][0]["content"], "keep this visible");
     }
 
     #[test]

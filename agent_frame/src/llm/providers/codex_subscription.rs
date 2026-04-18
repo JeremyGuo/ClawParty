@@ -3,7 +3,9 @@ use crate::config::{ReasoningConfig, UpstreamApiKind, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionSession, account_id_from_access_token,
     build_chat_completions_url, build_responses_input, build_responses_tools_payload,
-    load_codex_auth, refresh_codex_auth, response_id_from_value, responses_value_to_chat_message,
+    load_codex_auth, log_upstream_api_request_completed, log_upstream_api_request_failed,
+    log_upstream_api_request_started, next_api_request_id, refresh_codex_auth,
+    response_id_from_value, responses_value_to_chat_message,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -11,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
 use std::net::TcpStream;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::WebSocket;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::{HeaderName, HeaderValue};
@@ -64,29 +66,32 @@ impl UpstreamProvider for CodexSubscriptionProvider {
         let payload =
             build_responses_request_payload(upstream, messages, tools, extra_payload, true)?;
 
-        let response = match session {
+        let (response, api_request_id) = match session {
             Some(ChatCompletionSession::CodexSubscription(session)) => {
-                match send_response_create(&mut session.socket, payload.clone()) {
+                match send_response_create(upstream, &mut session.socket, payload.clone()) {
                     Ok(response) => response,
                     Err(error) if should_recover_codex_websocket_error(&error) => {
-                        let (response, socket) = send_responses_websocket_request_with_retries(
-                            upstream, payload,
-                        )
-                        .map_err(|recovery_error| {
-                            if let Ok(socket) = establish_codex_websocket(upstream) {
-                                session.socket = socket;
-                            }
-                            recovery_error.context(format!(
+                        let (response, api_request_id, socket) =
+                            send_responses_websocket_request_with_retries(upstream, payload)
+                                .map_err(|recovery_error| {
+                                    if let Ok(socket) = establish_codex_websocket(upstream) {
+                                        session.socket = socket;
+                                    }
+                                    recovery_error.context(format!(
                                 "existing codex websocket session failed and recovery request also failed; original stale-session error: {error:#}"
                             ))
-                        })?;
+                                })?;
                         session.socket = socket;
-                        response
+                        (response, api_request_id)
                     }
                     Err(error) => return Err(error),
                 }
             }
-            None => send_responses_websocket_request_with_retries(upstream, payload)?.0,
+            None => {
+                let (response, api_request_id, _) =
+                    send_responses_websocket_request_with_retries(upstream, payload)?;
+                (response, api_request_id)
+            }
         };
 
         let usage = crate::llm::parse_usage(&response);
@@ -95,6 +100,7 @@ impl UpstreamProvider for CodexSubscriptionProvider {
             message,
             usage,
             response_id: response_id_from_value(&response),
+            api_request_id: Some(api_request_id),
         })
     }
 }
