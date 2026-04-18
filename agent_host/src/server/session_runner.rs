@@ -7,7 +7,6 @@ struct TurnSystemPromptState {
     active: String,
     full: String,
     static_hash: String,
-    component_hashes: BTreeMap<String, String>,
 }
 
 impl TurnSystemPromptState {
@@ -92,27 +91,10 @@ impl<'a> TurnCoordinator<'a> {
             .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
             .expect("session should exist after initialization");
 
+        server.sync_runtime_profile_files(&session)?;
         let stored_attachments = incoming.stored_attachments.clone();
+        let prompt_updates_prefix = server.observe_runtime_prompt_component_changes(&session)?;
         let skill_updates_prefix = server.observe_runtime_skill_changes(&session)?;
-        let workspace_profile_notices = server.sync_runtime_profile_files(&session)?;
-        server.observe_runtime_profile_changes(&session)?;
-        server.observe_runtime_model_catalog_changes(&session)?;
-        server.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
-        let should_emit_runtime_change_notice =
-            should_emit_runtime_change_prompt(incoming.text.as_deref());
-        let mut profile_change_notices = if should_emit_runtime_change_notice {
-            server.take_runtime_profile_change_notices(&session)?
-        } else {
-            Vec::new()
-        };
-        let mut model_catalog_change_notice = if should_emit_runtime_change_notice {
-            render_model_catalog_change_notice(
-                &server.take_runtime_model_catalog_change_notices(&session)?,
-                &server.current_runtime_model_catalog(),
-            )
-        } else {
-            None
-        };
         let session_actor = server.ensure_foreground_actor(&incoming.address)?;
         let time_hints = session_actor.user_turn_time_hints(
             SessionTurnTimeHintConfig {
@@ -157,43 +139,13 @@ impl<'a> TurnCoordinator<'a> {
             }
             let prompt_state =
                 server.build_foreground_prompt_state(&session, &effective_model_key)?;
-            let prompt_observation = session_actor.observe_system_prompt_state(
-                prompt_state.static_hash.clone(),
-                prompt_state.dynamic_hashes.clone(),
-            )?;
-            let dynamic_notice_keys = if should_emit_runtime_change_notice
-                && !prompt_observation.static_changed
-                && !prompt_observation.dynamic_notice_keys.is_empty()
-            {
-                session_actor.take_system_prompt_dynamic_notices()?
-            } else {
-                Default::default()
-            };
-            let dynamic_system_prompt_notices = dynamic_notice_keys
-                .iter()
-                .filter_map(|key| prompt_state.dynamic_notices.get(key))
-                .cloned()
-                .collect::<Vec<_>>();
-            if dynamic_notice_keys.contains("identity") {
-                profile_change_notices
-                    .retain(|notice| !matches!(notice, SharedProfileChangeNotice::IdentityUpdated));
-            }
-            if dynamic_notice_keys.contains("user_meta") {
-                profile_change_notices
-                    .retain(|notice| !matches!(notice, SharedProfileChangeNotice::UserUpdated));
-            }
-            if dynamic_notice_keys.contains("available_models")
-                || dynamic_notice_keys.contains("current_model_profile")
-            {
-                model_catalog_change_notice = None;
-            }
+            let prompt_observation =
+                session_actor.observe_system_prompt_state(prompt_state.static_hash.clone())?;
             let synthetic_system_messages = build_synthetic_system_messages(
                 server.take_process_restart_notice(&incoming.address),
                 time_hints.user_time_tip.as_deref(),
-                &dynamic_system_prompt_notices,
-                model_catalog_change_notice.as_deref(),
+                prompt_updates_prefix.as_deref(),
                 skill_updates_prefix.as_deref(),
-                &profile_change_notices,
             );
             let base_messages = session.request_messages();
             let (mut previous_messages, active_system_prompt, rebuilt_system_prompt) =
@@ -205,16 +157,12 @@ impl<'a> TurnCoordinator<'a> {
             previous_messages.extend(synthetic_system_messages.iter().cloned());
             if rebuilt_system_prompt {
                 server.mark_conversation_context_changed(&incoming.address)?;
-                session_actor.mark_system_prompt_state_current(
-                    prompt_state.static_hash.clone(),
-                    prompt_state.dynamic_hashes.clone(),
-                )?;
+                session_actor.mark_system_prompt_state_current(prompt_state.static_hash.clone())?;
             }
             let turn_system_prompt = TurnSystemPromptState {
                 active: active_system_prompt,
                 full: prompt_state.system_prompt.clone(),
                 static_hash: prompt_state.static_hash.clone(),
-                component_hashes: prompt_state.dynamic_hashes.clone(),
             };
             let mut active_session = session;
             let mut next_previous_messages = previous_messages;
@@ -359,6 +307,26 @@ impl Server {
         }
     }
 
+    fn initialize_session_prompt_components_if_missing(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<()> {
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        actor.initialize_prompt_component_if_missing(
+            IDENTITY_PROMPT_COMPONENT,
+            current_identity_prompt_for_workspace(&self.agent_workspace),
+        )?;
+        actor.initialize_prompt_component_if_missing(
+            USER_META_PROMPT_COMPONENT,
+            current_user_meta_prompt_for_workspace(&self.agent_workspace),
+        )?;
+        let discovered = discover_skills(std::slice::from_ref(&self.agent_workspace.skills_dir))?;
+        actor.initialize_prompt_component_if_missing(
+            crate::session::SKILLS_METADATA_PROMPT_COMPONENT,
+            build_skills_meta_prompt(&discovered),
+        )
+    }
+
     fn take_process_restart_notice(&self, address: &ChannelAddress) -> Option<&'static str> {
         let session_key = address.session_key();
         let mut pending = self.pending_process_restart_notices.lock().ok()?;
@@ -423,10 +391,8 @@ impl Server {
             let persistence_system_prompt =
                 self.build_foreground_prompt_state(&session, &continue_model_key)?;
             let actor = self.ensure_foreground_actor(&incoming.address)?;
-            let prompt_observation = actor.observe_system_prompt_state(
-                persistence_system_prompt.static_hash.clone(),
-                persistence_system_prompt.dynamic_hashes.clone(),
-            )?;
+            let prompt_observation =
+                actor.observe_system_prompt_state(persistence_system_prompt.static_hash.clone())?;
             self.log_current_tools_for_user_message(
                 &session,
                 &continue_model_key,
@@ -446,7 +412,6 @@ impl Server {
                     let actor = self.ensure_foreground_actor(&incoming.address)?;
                     actor.mark_system_prompt_state_current(
                         persistence_system_prompt.static_hash.clone(),
-                        persistence_system_prompt.dynamic_hashes.clone(),
                     )?;
                 }
                 (resume_messages, active_system_prompt)
@@ -455,15 +420,12 @@ impl Server {
                 active: active_system_prompt,
                 full: persistence_system_prompt.system_prompt.clone(),
                 static_hash: persistence_system_prompt.static_hash.clone(),
-                component_hashes: persistence_system_prompt.dynamic_hashes.clone(),
             };
             let synthetic_system_messages = build_synthetic_system_messages(
                 self.take_process_restart_notice(&incoming.address),
                 None,
-                &[],
                 None,
                 None,
-                &[],
             );
             next_previous_messages.extend(synthetic_system_messages.iter().cloned());
             let mut ephemeral_system_messages = synthetic_system_messages.clone();
@@ -587,9 +549,6 @@ impl Server {
             errinfo: Some(format!("{error:#}")),
             compaction: compaction.clone(),
             system_prompt_static_hash_after_compaction: Some(system_prompt.static_hash.clone()),
-            system_prompt_component_hashes_after_compaction: Some(
-                system_prompt.component_hashes.clone(),
-            ),
         })?;
         self.rotate_chat_version_if_compacted(address, compaction)?;
         Ok(user_facing_continue_error_text(
@@ -625,9 +584,6 @@ impl Server {
             compaction: compaction.clone(),
             phase: SessionPhase::End,
             system_prompt_static_hash_after_compaction: Some(system_prompt.static_hash.clone()),
-            system_prompt_component_hashes_after_compaction: Some(
-                system_prompt.component_hashes.clone(),
-            ),
             loaded_skills,
             user_history_text: None,
             assistant_history_text: append_assistant_history
@@ -799,9 +755,6 @@ impl Server {
             compaction: compaction.clone(),
             phase: SessionPhase::Yielded,
             system_prompt_static_hash_after_compaction: Some(system_prompt.static_hash.clone()),
-            system_prompt_component_hashes_after_compaction: Some(
-                system_prompt.component_hashes.clone(),
-            ),
             loaded_skills,
             user_history_text: None,
             assistant_history_text: None,
@@ -931,21 +884,18 @@ impl Server {
                     &active_session.workspace_root,
                 )?;
             }
+            self.initialize_session_prompt_components_if_missing(&active_session)?;
             let greeting =
                 ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
             let effective_model_key = self.effective_main_model_key(&session.address)?;
             let prompt_state =
                 self.build_foreground_prompt_state(&active_session, &effective_model_key)?;
             let actor = self.ensure_foreground_actor(&session.address)?;
-            actor.mark_system_prompt_state_current(
-                prompt_state.static_hash.clone(),
-                prompt_state.dynamic_hashes.clone(),
-            )?;
+            actor.mark_system_prompt_state_current(prompt_state.static_hash.clone())?;
             let turn_system_prompt = TurnSystemPromptState {
                 active: prompt_state.system_prompt.clone(),
                 full: prompt_state.system_prompt.clone(),
                 static_hash: prompt_state.static_hash.clone(),
-                component_hashes: prompt_state.dynamic_hashes.clone(),
             };
             let mut next_previous_messages = {
                 let mut messages = active_session.request_messages();
@@ -1169,15 +1119,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dynamic_prompt_components_persist_only_after_compaction() {
+    fn active_prompt_persists_until_compaction() {
         let state = TurnSystemPromptState {
             active: "static prompt plus dynamic change notifications".to_string(),
             full: "static prompt plus latest dynamic components".to_string(),
             static_hash: "static-hash".to_string(),
-            component_hashes: BTreeMap::from([(
-                "agent_frame_dynamic_prompt".to_string(),
-                "dynamic-hash".to_string(),
-            )]),
         };
 
         assert_eq!(
@@ -1222,6 +1168,7 @@ impl AgentRuntimeView {
         self.ensure_model_available_for_backend(agent_backend, &model_key)?;
         let background_session =
             self.create_background_session_for_conversation(&session.address, background_agent_id)?;
+        self.initialize_session_prompt_components_if_missing(&background_session)?;
         self.register_managed_agent(
             background_agent_id,
             ManagedAgentKind::Background,
@@ -1302,19 +1249,46 @@ impl AgentRuntimeView {
         .await
     }
 
+    fn normalize_background_messages_for_persistence(
+        &self,
+        session: &SessionSnapshot,
+        messages: &[ChatMessage],
+        model_key: &str,
+    ) -> Result<Vec<ChatMessage>> {
+        let config = self.build_agent_frame_config(
+            session,
+            &session.workspace_root,
+            AgentPromptKind::MainBackground,
+            model_key,
+            None,
+        )?;
+        Ok(normalize_messages_for_persistence(
+            messages.to_vec(),
+            &config.system_prompt,
+            &[],
+        ))
+    }
+
     fn persist_background_report(
         &self,
         session: &SessionSnapshot,
         report: &SessionState,
+        model_key: &str,
     ) -> Result<()> {
         let actor = self.with_sessions(|sessions| sessions.resolve_snapshot(session))?;
-        actor.update_checkpoint(report.messages.clone(), &report.usage, &report.compaction)
+        let messages = self.normalize_background_messages_for_persistence(
+            session,
+            &report.messages,
+            model_key,
+        )?;
+        actor.update_checkpoint(messages, &report.usage, &report.compaction)
     }
 
     fn persist_background_visible_turn(
         &self,
         session: &SessionSnapshot,
         report: &SessionState,
+        model_key: &str,
         prompt_for_history: String,
         phase: SessionPhase,
     ) -> Result<OutgoingMessage> {
@@ -1322,14 +1296,18 @@ impl AgentRuntimeView {
         let assistant_text = extract_assistant_text(&report.messages);
         let outgoing =
             build_outgoing_message_for_session(session, &assistant_text, &session.workspace_root)?;
+        let messages = self.normalize_background_messages_for_persistence(
+            session,
+            &report.messages,
+            model_key,
+        )?;
         actor.commit_runtime_turn(SessionRuntimeTurnCommit {
-            messages: report.messages.clone(),
+            messages,
             consumed_pending_messages: Vec::new(),
             usage: report.usage.clone(),
             compaction: report.compaction.clone(),
             phase,
             system_prompt_static_hash_after_compaction: None,
-            system_prompt_component_hashes_after_compaction: None,
             loaded_skills: Vec::new(),
             user_history_text: Some(prompt_for_history),
             assistant_history_text: outgoing.text.clone(),
@@ -1341,16 +1319,21 @@ impl AgentRuntimeView {
         &self,
         session: &SessionSnapshot,
         report: &SessionState,
+        model_key: &str,
     ) -> Result<()> {
         let actor = self.with_sessions(|sessions| sessions.resolve_snapshot(session))?;
+        let messages = self.normalize_background_messages_for_persistence(
+            session,
+            &report.messages,
+            model_key,
+        )?;
         actor.commit_runtime_turn(SessionRuntimeTurnCommit {
-            messages: report.messages.clone(),
+            messages,
             consumed_pending_messages: Vec::new(),
             usage: report.usage.clone(),
             compaction: report.compaction.clone(),
             phase: SessionPhase::Yielded,
             system_prompt_static_hash_after_compaction: None,
-            system_prompt_component_hashes_after_compaction: None,
             loaded_skills: Vec::new(),
             user_history_text: None,
             assistant_history_text: None,
@@ -1360,17 +1343,18 @@ impl AgentRuntimeView {
     fn persist_background_report_after_silent_terminate(
         &self,
         session: &SessionSnapshot,
+        model_key: &str,
         run_result: &Result<TimedRunOutcome>,
         accumulated_usage: &mut TokenUsage,
     ) -> Result<()> {
         match run_result {
             Ok(TimedRunOutcome::Completed(report)) | Ok(TimedRunOutcome::Yielded(report)) => {
-                self.persist_background_report(session, report)?;
+                self.persist_background_report(session, report, model_key)?;
                 accumulated_usage.add_assign(&report.usage);
             }
             Ok(TimedRunOutcome::TimedOut { state, .. }) => {
                 if let Some(state) = state {
-                    self.persist_background_report(session, state)?;
+                    self.persist_background_report(session, state, model_key)?;
                     accumulated_usage.add_assign(&state.usage);
                 }
             }
@@ -1388,6 +1372,7 @@ impl AgentRuntimeView {
         let outgoing = self.persist_background_visible_turn(
             session,
             report,
+            &job.model_key,
             job.prompt.clone(),
             SessionPhase::End,
         )?;
@@ -1477,11 +1462,6 @@ impl AgentRuntimeView {
         model_key: &str,
     ) -> Result<AgentSystemPromptState> {
         let model = self.model_config(model_key)?;
-        let commands = self
-            .command_catalog
-            .get(&session.address.channel_id)
-            .cloned()
-            .unwrap_or_else(default_bot_commands);
         let workspace_summary = self
             .workspace_manager
             .ensure_workspace_exists(&session.workspace_id)
@@ -1504,7 +1484,6 @@ impl AgentRuntimeView {
             &self.models,
             &self.available_agent_models(AgentBackendKind::AgentFrame),
             &self.main_agent,
-            &commands,
         ))
     }
 
@@ -1576,10 +1555,7 @@ impl AgentRuntimeView {
         let prompt_state =
             runtime.build_foreground_prompt_state_for_runtime(session, &model_key)?;
         let actor = self.ensure_foreground_actor(&session.address)?;
-        actor.mark_system_prompt_state_current(
-            prompt_state.static_hash,
-            prompt_state.dynamic_hashes,
-        )?;
+        actor.mark_system_prompt_state_current(prompt_state.static_hash)?;
         self.with_conversations(|conversations| {
             conversations
                 .rotate_chat_version_id(&session.address)
@@ -1701,6 +1677,7 @@ impl AgentRuntimeView {
             if self.take_background_terminate_requested(job.agent_id) {
                 self.persist_background_report_after_silent_terminate(
                     &session,
+                    &job.model_key,
                     &run_result,
                     &mut accumulated_usage,
                 )?;
@@ -1741,7 +1718,7 @@ impl AgentRuntimeView {
                 Ok(TimedRunOutcome::Yielded(report)) => {
                     accumulated_usage.add_assign(&report.usage);
                     if report.errno.is_some() {
-                        self.persist_background_report(&session, &report)?;
+                        self.persist_background_report(&session, &report, &job.model_key)?;
                         self.unregister_session_actor_runtime_control(&session)?;
                         let error = Self::background_yield_error(&report);
                         self.mark_managed_agent_failed(job.agent_id, &accumulated_usage, &error);
@@ -1750,14 +1727,14 @@ impl AgentRuntimeView {
                             .handle_background_job_failure(&job, &session, &error)
                             .await;
                     }
-                    self.persist_background_yielded_turn(&session, &report)?;
+                    self.persist_background_yielded_turn(&session, &report, &job.model_key)?;
                     self.unregister_session_actor_runtime_control(&session)?;
                     self.log_background_auto_resuming_yield(&job, &session, &report);
                     session = self.background_session_snapshot(session.id)?;
                 }
                 Ok(TimedRunOutcome::TimedOut { state, error }) => {
                     if let Some(state) = &state {
-                        self.persist_background_report(&session, state)?;
+                        self.persist_background_report(&session, state, &job.model_key)?;
                         accumulated_usage.add_assign(&state.usage);
                     }
                     self.unregister_session_actor_runtime_control(&session)?;
@@ -1871,6 +1848,7 @@ impl AgentRuntimeView {
                 let outgoing = self.persist_background_visible_turn(
                     &session,
                     &report,
+                    &job.model_key,
                     recovery_prompt_for_history.clone(),
                     SessionPhase::End,
                 )?;
@@ -1892,6 +1870,7 @@ impl AgentRuntimeView {
                 let outgoing = self.persist_background_visible_turn(
                     &session,
                     &report,
+                    &job.model_key,
                     recovery_prompt_for_history.clone(),
                     SessionPhase::Yielded,
                 )?;
@@ -1907,7 +1886,7 @@ impl AgentRuntimeView {
                 error: recovery_error,
             }) => {
                 if let Some(state) = &state {
-                    self.persist_background_report(&session, state)?;
+                    self.persist_background_report(&session, state, &job.model_key)?;
                 }
                 self.unregister_session_actor_runtime_control(&session)?;
                 let usage = state

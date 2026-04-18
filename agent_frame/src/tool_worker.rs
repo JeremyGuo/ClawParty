@@ -1056,7 +1056,7 @@ fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) 
         shell_quote(command),
         remote_cd_prefix(&cwd.display().to_string())
     );
-    let remote_command = format!("sh -lc {}", shell_quote(&remote_script));
+    let remote_command = format!("sh -c {}", shell_quote(&remote_script));
     let mut command_builder = Command::new(resolve_ssh_executable());
     command_builder
         .arg("-o")

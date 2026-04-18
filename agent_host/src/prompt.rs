@@ -1,6 +1,6 @@
 use crate::bootstrap::AgentWorkspace;
-use crate::config::{BotCommandConfig, MainAgentConfig, ModelConfig};
-use crate::session::SessionSnapshot;
+use crate::config::{MainAgentConfig, ModelConfig};
+use crate::session::{IDENTITY_PROMPT_COMPONENT, SessionSnapshot, USER_META_PROMPT_COMPONENT};
 use crate::workpath::{RemoteWorkpath, render_remote_workpaths_for_prompt};
 use agent_frame::config::MemorySystem;
 use std::collections::BTreeMap;
@@ -18,8 +18,6 @@ pub enum AgentPromptKind {
 pub struct AgentSystemPromptState {
     pub system_prompt: String,
     pub static_hash: String,
-    pub dynamic_hashes: BTreeMap<String, String>,
-    pub dynamic_notices: BTreeMap<String, String>,
 }
 
 pub fn render_available_models_catalog(
@@ -52,7 +50,6 @@ pub fn build_agent_system_prompt_state(
     models: &BTreeMap<String, ModelConfig>,
     chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
-    commands: &[BotCommandConfig],
 ) -> AgentSystemPromptState {
     let system_prompt = build_agent_system_prompt(
         workspace,
@@ -65,36 +62,18 @@ pub fn build_agent_system_prompt_state(
         models,
         chat_model_keys,
         main_agent,
-        commands,
     );
-    let dynamic_components = build_dynamic_system_context_components(
-        workspace,
-        session,
-        workspace_summary,
+    let rebuild_trigger = build_system_prompt_rebuild_trigger(
         kind,
         model_name,
         model,
         models,
         chat_model_keys,
+        main_agent,
     );
-    let dynamic_hashes = dynamic_components
-        .iter()
-        .map(|(key, value)| (key.clone(), stable_prompt_hash(value)))
-        .collect::<BTreeMap<_, _>>();
-    let dynamic_notices = dynamic_components
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                render_dynamic_context_notice(key, value.as_str()),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     AgentSystemPromptState {
         system_prompt,
-        static_hash: stable_prompt_hash(&build_static_system_prompt(kind, main_agent)),
-        dynamic_hashes,
-        dynamic_notices,
+        static_hash: stable_prompt_hash(&rebuild_trigger),
     }
 }
 
@@ -104,97 +83,47 @@ fn stable_prompt_hash(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn render_dynamic_context_notice(key: &str, value: &str) -> String {
-    let title = match key {
-        "available_models" => "Available models",
-        "current_model_profile" => "Current model profile",
-        "identity" => "Identity",
-        "memory_mode" => "Memory mode",
-        "runtime_context" => "Runtime context",
-        "runtime_notes" => "Runtime notes",
-        "user_meta" => "User meta",
-        "workspace_summary" => "Current workspace summary",
-        _ => "Runtime context",
-    };
-    if value.trim().is_empty() {
-        format!("[System Message: {title} was removed from the dynamic runtime context.]")
-    } else {
-        format!(
-            "[System Message: {title} changed in the dynamic runtime context. Treat this as authoritative for this turn.\n{}]",
-            value.trim()
-        )
-    }
-}
-
-fn build_dynamic_system_context_components(
-    workspace: &AgentWorkspace,
-    session: &SessionSnapshot,
-    workspace_summary: &str,
-    _kind: AgentPromptKind,
+fn build_system_prompt_rebuild_trigger(
+    kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
     models: &BTreeMap<String, ModelConfig>,
     chat_model_keys: &[String],
-) -> BTreeMap<String, String> {
-    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
+    main_agent: &MainAgentConfig,
+) -> String {
+    let mut trigger = build_static_system_prompt(kind, main_agent);
+    trigger.push('\n');
+    trigger.push_str(&format!(
+        "Current model profile: {} - {}",
+        model_name,
+        if model.description.trim().is_empty() {
+            "No description provided."
+        } else {
+            model.description.trim()
+        }
+    ));
+    let model_catalog = render_available_models_catalog(models, chat_model_keys);
+    trigger.push('\n');
+    trigger.push_str(&model_catalog);
+    trigger
+}
+
+pub fn current_identity_prompt_for_workspace(workspace: &AgentWorkspace) -> String {
+    fs::read_to_string(&workspace.identity_md_path)
         .ok()
         .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| workspace.identity_prompt.clone());
+        .unwrap_or_else(|| workspace.identity_prompt.clone())
+}
+
+pub fn current_user_meta_prompt_for_workspace(workspace: &AgentWorkspace) -> String {
     let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
         .ok()
         .unwrap_or_else(|| workspace.user_profile_markdown.clone());
-    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
-        .ok()
-        .unwrap_or_else(|| workspace.agents_markdown.clone());
-
-    let mut components = BTreeMap::new();
-    components.insert(
-        "current_model_profile".to_string(),
-        format!(
-            "Current model profile: {} - {}",
-            model_name,
-            if model.description.trim().is_empty() {
-                "No description provided."
-            } else {
-                model.description.trim()
-            }
-        ),
-    );
-
-    let model_catalog = render_available_models_catalog(models, chat_model_keys);
-    components.insert("available_models".to_string(), model_catalog);
-
-    let identity = current_identity_prompt.trim();
-    components.insert("identity".to_string(), identity.to_string());
-
-    components.insert(
-        "user_meta".to_string(),
-        extract_frontmatter(&current_user_profile_markdown)
-            .map(|value| value.trim().to_string())
-            .unwrap_or_default(),
-    );
-
-    let workspace_summary = workspace_summary.trim();
-    components.insert(
-        "workspace_summary".to_string(),
-        workspace_summary.to_string(),
-    );
-
-    components.insert(
-        "runtime_notes".to_string(),
-        current_agents_markdown.trim().to_string(),
-    );
-
-    components.insert(
-        "runtime_context".to_string(),
-        format!(
-            "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}",
-            session.address.channel_id, session.id, session.agent_id, session.workspace_id,
-        ),
-    );
-
-    components
+    extract_frontmatter(&current_user_profile_markdown)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn build_static_system_prompt(kind: AgentPromptKind, main_agent: &MainAgentConfig) -> String {
@@ -330,16 +259,7 @@ pub fn build_agent_system_prompt(
     models: &BTreeMap<String, ModelConfig>,
     chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
-    commands: &[BotCommandConfig],
 ) -> String {
-    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
-        .ok()
-        .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| workspace.identity_prompt.clone());
-    let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
-        .ok()
-        .unwrap_or_else(|| workspace.user_profile_markdown.clone());
     let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
         .ok()
         .unwrap_or_else(|| workspace.agents_markdown.clone());
@@ -370,13 +290,21 @@ pub fn build_agent_system_prompt(
 
     parts.extend(build_kind_static_prompt_parts(kind));
 
-    let identity = current_identity_prompt.trim();
+    let identity_prompt = session
+        .prompt_component_system_value(IDENTITY_PROMPT_COMPONENT)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| current_identity_prompt_for_workspace(workspace));
+    let identity = identity_prompt.trim();
     if !identity.is_empty() {
         parts.push("Identity:".to_string());
         parts.push(identity.to_string());
     }
 
-    if let Some(user_meta) = extract_frontmatter(&current_user_profile_markdown) {
+    let user_meta = session
+        .prompt_component_system_value(USER_META_PROMPT_COMPONENT)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| current_user_meta_prompt_for_workspace(workspace));
+    if !user_meta.trim().is_empty() {
         parts.push("User meta:".to_string());
         parts.push(user_meta.trim().to_string());
     }
@@ -403,13 +331,6 @@ pub fn build_agent_system_prompt(
         parts.push("PARTCLAW.md:".to_string());
         parts.push(current_partclaw_markdown.trim().to_string());
     }
-
-    let _ = commands;
-
-    parts.push(format!(
-        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}",
-        session.address.channel_id, session.id, session.agent_id, session.workspace_id,
-    ));
 
     parts.join("\n")
 }
@@ -452,7 +373,7 @@ fn extract_frontmatter(markdown: &str) -> Option<String> {
 mod tests {
     use super::{
         AgentPromptKind, build_agent_system_prompt, build_agent_system_prompt_state,
-        build_static_system_prompt, stable_prompt_hash,
+        build_system_prompt_rebuild_trigger, stable_prompt_hash,
     };
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
@@ -461,7 +382,10 @@ mod tests {
         TimeAwarenessConfig, TimeoutObservationCompactionConfig, TokenEstimationCacheConfig,
     };
     use crate::domain::ChannelAddress;
-    use crate::session::SessionSnapshot;
+    use crate::session::{
+        DurableSessionState, IDENTITY_PROMPT_COMPONENT, SessionPromptComponentState,
+        SessionSnapshot, USER_META_PROMPT_COMPONENT,
+    };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::PathBuf;
@@ -508,9 +432,6 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -581,13 +502,12 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
-            &[],
         );
 
         assert!(prompt.contains("append one or more tags in your final reply"));
         assert!(prompt.contains("Some system-wide software packages are installed under /opt."));
         assert!(prompt.contains("Current workspace summary."));
-        assert!(prompt.contains("workspace_id=workspace-1"));
+        assert!(!prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
         assert!(prompt.contains("do not issue more than 3 image_load calls"));
         assert!(
@@ -645,7 +565,6 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
-            &[],
         );
         assert!(background_prompt.contains("final response is automatically delivered"));
         assert!(background_prompt.contains("For reminder, cron, scheduled notification"));
@@ -662,14 +581,18 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
-            &[],
+        );
+        let rebuild_trigger = build_system_prompt_rebuild_trigger(
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
         );
         assert_eq!(
             prompt_state.static_hash,
-            stable_prompt_hash(&build_static_system_prompt(
-                AgentPromptKind::MainForeground,
-                &main_agent
-            ))
+            stable_prompt_hash(&rebuild_trigger)
         );
         assert_ne!(
             prompt_state.static_hash,
@@ -729,9 +652,6 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -799,7 +719,6 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
-            &[],
         );
 
         assert!(prompt.contains("Fresh Identity"));
@@ -807,6 +726,47 @@ mod tests {
         assert!(prompt.contains("runtime notes"));
         assert!(!prompt.contains("Stale Identity"));
         assert!(!prompt.contains("name: Stale User"));
+
+        let mut component_session = session.clone();
+        component_session.session_state = DurableSessionState {
+            prompt_components: BTreeMap::from([
+                (
+                    IDENTITY_PROMPT_COMPONENT.to_string(),
+                    SessionPromptComponentState {
+                        system_prompt_value: "Snapshot Identity".to_string(),
+                        system_prompt_hash: "identity-hash".to_string(),
+                        notified_value: "Fresh Identity".to_string(),
+                        notified_hash: "fresh-identity-hash".to_string(),
+                    },
+                ),
+                (
+                    USER_META_PROMPT_COMPONENT.to_string(),
+                    SessionPromptComponentState {
+                        system_prompt_value: "name: Snapshot User".to_string(),
+                        system_prompt_hash: "user-meta-hash".to_string(),
+                        notified_value: "name: Fresh User".to_string(),
+                        notified_hash: "fresh-user-meta-hash".to_string(),
+                    },
+                ),
+            ]),
+            ..DurableSessionState::default()
+        };
+        let snapshot_prompt = build_agent_system_prompt(
+            &workspace,
+            &component_session,
+            "",
+            &[],
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+        );
+        assert!(snapshot_prompt.contains("Snapshot Identity"));
+        assert!(snapshot_prompt.contains("name: Snapshot User"));
+        assert!(!snapshot_prompt.contains("Fresh Identity"));
+        assert!(!snapshot_prompt.contains("name: Fresh User"));
     }
 
     #[test]
@@ -868,9 +828,6 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -938,7 +895,6 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
-            &[],
         );
 
         assert!(prompt.contains("Memory mode: claude_code."));

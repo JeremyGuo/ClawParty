@@ -327,6 +327,7 @@ mod tests {
             audio_tool_upstream: None,
             image_generation_tool_upstream: None,
             skills_dirs: Vec::new(),
+            skills_metadata_prompt: None,
             system_prompt: String::new(),
             remote_workpaths: Vec::new(),
             max_tool_roundtrips: 4,

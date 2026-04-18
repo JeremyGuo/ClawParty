@@ -32,18 +32,18 @@ use crate::domain::{
 };
 use crate::prompt::{
     AgentPromptKind, AgentSystemPromptState, build_agent_system_prompt_state,
-    greeting_for_language, render_available_models_catalog,
+    current_identity_prompt_for_workspace, current_user_meta_prompt_for_workspace,
+    greeting_for_language,
 };
 use crate::sandbox::{
     PersistentChildRuntime, bubblewrap_is_available, is_child_run_turn_request_send_error,
     is_child_transport_error, run_one_shot_child_turn,
 };
 use crate::session::{
-    ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
-    SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimeTurnCommit,
-    SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot, SessionTurnTimeHintConfig,
-    SessionUserMessage, SharedProfileChangeNotice, SkillChangeNotice,
-    should_emit_runtime_change_prompt,
+    IDENTITY_PROMPT_COMPONENT, PromptComponentChangeNotice, SessionActorMessage,
+    SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager, SessionPhase,
+    SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot,
+    SessionTurnTimeHintConfig, SessionUserMessage, SkillChangeNotice, USER_META_PROMPT_COMPONENT,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -56,7 +56,7 @@ use agent_frame::config::{
     NativeWebSearchConfig, ReasoningConfig, TokenEstimationSource, TokenEstimationTemplateConfig,
     TokenEstimationTokenizerConfig, UpstreamApiKind, UpstreamConfig, load_codex_auth_tokens,
 };
-use agent_frame::skills::discover_skills;
+use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
     ChatMessage, ContextCompactionReport, ExecutionProgress, SessionCompactionStats, SessionEvent,
@@ -72,7 +72,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -244,10 +243,54 @@ fn leading_system_prompt(messages: &[ChatMessage]) -> Option<String> {
     if first.role != "system" {
         return None;
     }
-    first.content.as_ref()?.as_str().map(ToOwned::to_owned)
+    let prompt = first.content.as_ref()?.as_str()?;
+    if prompt.starts_with("[AgentFrame Runtime]") {
+        return None;
+    }
+    Some(prompt.to_owned())
 }
 
 impl AgentRuntimeView {
+    fn current_runtime_skills_metadata_prompt(&self) -> Result<String> {
+        let discovered = discover_skills(std::slice::from_ref(&self.agent_workspace.skills_dir))?;
+        Ok(build_skills_meta_prompt(&discovered))
+    }
+
+    fn initialize_skills_metadata_prompt_if_missing(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<()> {
+        let metadata_prompt = self.current_runtime_skills_metadata_prompt()?;
+        let actor = self.with_sessions(|sessions| sessions.resolve_snapshot(session))?;
+        actor.initialize_prompt_component_if_missing(
+            crate::session::SKILLS_METADATA_PROMPT_COMPONENT,
+            metadata_prompt,
+        )
+    }
+
+    fn initialize_host_prompt_components_if_missing(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<()> {
+        let actor = self.with_sessions(|sessions| sessions.resolve_snapshot(session))?;
+        actor.initialize_prompt_component_if_missing(
+            IDENTITY_PROMPT_COMPONENT,
+            current_identity_prompt_for_workspace(&self.agent_workspace),
+        )?;
+        actor.initialize_prompt_component_if_missing(
+            USER_META_PROMPT_COMPONENT,
+            current_user_meta_prompt_for_workspace(&self.agent_workspace),
+        )
+    }
+
+    fn initialize_session_prompt_components_if_missing(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<()> {
+        self.initialize_host_prompt_components_if_missing(session)?;
+        self.initialize_skills_metadata_prompt_if_missing(session)
+    }
+
     fn available_agent_models(&self, backend: AgentBackendKind) -> Vec<String> {
         self.agent
             .available_models(backend)
@@ -1606,6 +1649,7 @@ impl AgentRuntimeView {
         let background_agent_id = uuid::Uuid::new_v4();
         let session =
             self.create_background_session_for_conversation(&task.address, background_agent_id)?;
+        self.initialize_session_prompt_components_if_missing(&session)?;
         self.register_managed_agent(
             background_agent_id,
             ManagedAgentKind::Background,
@@ -2254,10 +2298,7 @@ impl Server {
             .record_idle_compaction(normalized_messages, &compaction_stats)
             .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
         let prompt_state = self.build_foreground_prompt_state(session, &model_key)?;
-        actor.mark_system_prompt_state_current(
-            prompt_state.static_hash,
-            prompt_state.dynamic_hashes,
-        )?;
+        actor.mark_system_prompt_state_current(prompt_state.static_hash)?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
         info!(
             log_stream = "session",
@@ -2615,10 +2656,7 @@ impl Server {
         let actor = self.ensure_foreground_actor(&session.address)?;
         actor.record_idle_compaction(normalized_messages, &compaction_stats)?;
         let prompt_state = self.build_foreground_prompt_state(session, model_key)?;
-        actor.mark_system_prompt_state_current(
-            prompt_state.static_hash,
-            prompt_state.dynamic_hashes,
-        )?;
+        actor.mark_system_prompt_state_current(prompt_state.static_hash)?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
         Ok(true)
     }
@@ -2859,11 +2897,6 @@ impl Server {
         model_key: &str,
     ) -> Result<AgentSystemPromptState> {
         let model = self.model_config_or_main(model_key)?;
-        let commands = self
-            .command_catalog
-            .get(&session.address.channel_id)
-            .cloned()
-            .unwrap_or_else(default_bot_commands);
         let workspace_summary = self
             .workspace_manager
             .ensure_workspace_exists(&session.workspace_id)
@@ -2886,7 +2919,6 @@ impl Server {
             &self.models,
             &self.chat_model_keys,
             &self.main_agent,
-            &commands,
         ))
     }
 
@@ -2909,83 +2941,49 @@ impl Server {
 
     fn observe_runtime_skill_changes(&self, session: &SessionSnapshot) -> Result<Option<String>> {
         let observed = self.current_runtime_skill_observations()?;
+        let metadata = observed
+            .iter()
+            .map(|skill| agent_frame::skills::SkillMetadata {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path: PathBuf::new(),
+            })
+            .collect::<Vec<_>>();
+        let metadata_prompt = build_skills_meta_prompt(&metadata);
         let actor = self.ensure_foreground_actor(&session.address)?;
-        let notices = actor.observe_skill_changes(&observed)?;
+        let notices = actor.observe_skill_changes(&observed, metadata_prompt)?;
         let rendered = render_skill_change_notices(&notices);
         Ok((!rendered.is_empty()).then_some(rendered))
     }
 
-    fn sync_runtime_profile_files(
+    fn observe_runtime_prompt_component_changes(
         &self,
         session: &SessionSnapshot,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
+    ) -> Result<Option<String>> {
+        let actor = self.ensure_foreground_actor(&session.address)?;
+        let mut notices = Vec::new();
+        if let Some(notice) = actor.observe_prompt_component_change(
+            IDENTITY_PROMPT_COMPONENT,
+            current_identity_prompt_for_workspace(&self.agent_workspace),
+        )? {
+            notices.push(notice);
+        }
+        if let Some(notice) = actor.observe_prompt_component_change(
+            USER_META_PROMPT_COMPONENT,
+            current_user_meta_prompt_for_workspace(&self.agent_workspace),
+        )? {
+            notices.push(notice);
+        }
+        let rendered = render_prompt_component_change_notices(&notices);
+        Ok((!rendered.is_empty()).then_some(rendered))
+    }
+
+    fn sync_runtime_profile_files(&self, session: &SessionSnapshot) -> Result<()> {
         if self.main_agent.memory_system == agent_frame::config::MemorySystem::ClaudeCode {
             ensure_workspace_partclaw_file(&self.agent_workspace, &session.workspace_root)?;
         }
-        sync_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)
-    }
-
-    fn observe_runtime_profile_changes(&self, session: &SessionSnapshot) -> Result<()> {
-        let user_markdown =
-            fs::read_to_string(&self.agent_workspace.user_md_path).with_context(|| {
-                format!(
-                    "failed to read {}",
-                    self.agent_workspace.user_md_path.display()
-                )
-            })?;
-        let identity_markdown = fs::read_to_string(&self.agent_workspace.identity_md_path)
-            .with_context(|| {
-                format!(
-                    "failed to read {}",
-                    self.agent_workspace.identity_md_path.display()
-                )
-            })?;
-        let user_profile_version = stable_content_version(&user_markdown);
-        let identity_profile_version = stable_content_version(&identity_markdown);
-        let actor = self.ensure_foreground_actor(&session.address)?;
-        actor
-            .observe_shared_profile_changes(user_profile_version, identity_profile_version)
-            .map(|_| ())?;
+        sync_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)?;
         Ok(())
-    }
-
-    fn current_runtime_model_catalog(&self) -> String {
-        render_available_models_catalog(&self.models, &self.chat_model_keys)
-    }
-
-    fn observe_runtime_model_catalog_changes(
-        &self,
-        session: &SessionSnapshot,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let catalog = self.current_runtime_model_catalog();
-        let version = stable_content_version(&catalog);
-        let actor = self.ensure_foreground_actor(&session.address)?;
-        actor.observe_model_catalog_changes(version)
-    }
-
-    fn take_runtime_model_catalog_change_notices(
-        &self,
-        session: &SessionSnapshot,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let actor = self.ensure_foreground_actor(&session.address)?;
-        actor.take_model_catalog_change_notices()
-    }
-
-    fn stage_runtime_profile_change_notices(
-        &self,
-        session: &SessionSnapshot,
-        notices: &[SharedProfileChangeNotice],
-    ) -> Result<()> {
-        let actor = self.ensure_foreground_actor(&session.address)?;
-        actor.stage_shared_profile_change_notices(notices)
-    }
-
-    fn take_runtime_profile_change_notices(
-        &self,
-        session: &SessionSnapshot,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        let actor = self.ensure_foreground_actor(&session.address)?;
-        actor.take_shared_profile_change_notices()
     }
 
     fn log_turn_usage(&self, session: &SessionSnapshot, usage: &TokenUsage, initialization: bool) {
@@ -3061,19 +3059,17 @@ mod tests {
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
         fast_path_agent_selection_message, format_session_status, incoming_command_lane,
         infer_single_agent_backend, is_command_like_text, is_out_of_band_command, is_timeout_like,
-        memory_search_files, normalize_messages_for_persistence,
+        leading_system_prompt, memory_search_files, normalize_messages_for_persistence,
         openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
         parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_model_catalog_change_notice,
-        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
-        should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
-        summarize_resume_progress, sync_workspace_shared_profile_files,
-        upload_workspace_shared_profile_files, user_facing_continue_error_text,
-        workspace_visible_in_list,
+        render_last_user_message_time_tip, render_system_date_on_user_message, rollout_read_file,
+        rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        should_attempt_idle_context_compaction, summarize_resume_progress,
+        sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
+        user_facing_continue_error_text, workspace_visible_in_list,
     };
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
@@ -3092,9 +3088,7 @@ mod tests {
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::tag_interrupted_followup_text;
-    use crate::session::{
-        ModelCatalogChangeNotice, SessionErrno, SessionSnapshot, SessionUserMessage,
-    };
+    use crate::session::{SessionErrno, SessionSnapshot, SessionUserMessage};
     use crate::session::{SessionManager, SessionPhase, SessionRuntimeTurnCommit};
     use crate::sink::SinkRouter;
     use crate::snapshot::SnapshotManager;
@@ -3152,9 +3146,6 @@ mod tests {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -3939,10 +3930,8 @@ mod tests {
         let injected = build_synthetic_system_messages(
             None,
             None,
-            &[],
             None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
-            &[],
         );
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0].role, "system");
@@ -3964,10 +3953,8 @@ mod tests {
         let injected = build_synthetic_system_messages(
             Some(SYSTEM_RESTART_NOTICE),
             Some("[System Tip: 2.0 hours since the last user message.]"),
-            &[],
             None,
             None,
-            &[],
         );
 
         assert_eq!(injected.len(), 2);
@@ -4004,10 +3991,8 @@ mod tests {
         let injected = build_synthetic_system_messages(
             None,
             None,
-            &[],
-            Some("[System Message: models changed]"),
             None,
-            &[],
+            Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
         );
         let (mut previous, rebuilt) = rebuild_canonical_system_prompt(
             &[
@@ -4033,34 +4018,8 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_model_catalog_updates_are_system_messages() {
-        let notice = render_model_catalog_change_notice(
-            &[ModelCatalogChangeNotice::Updated],
-            "- gpt54: primary\n- opus-4.6: large-context",
-        )
-        .unwrap();
-        let injected = build_synthetic_system_messages(None, None, &[], Some(&notice), None, &[]);
-        assert_eq!(injected.len(), 1);
-        assert_eq!(injected[0].role, "system");
-        assert!(
-            injected[0]
-                .content
-                .as_ref()
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("Available models changed"))
-        );
-        assert!(
-            injected[0]
-                .content
-                .as_ref()
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("- opus-4.6: large-context"))
-        );
-    }
-
-    #[test]
     fn normalize_messages_for_persistence_keeps_one_canonical_system_and_drops_ephemeral_systems() {
-        let canonical = "[AgentFrame Runtime]\ncanonical prompt";
+        let canonical = "[AgentHost Main Foreground Agent]\ncanonical prompt";
         let ephemeral = vec![ChatMessage::text(
             "system",
             "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use file_read on ./USER.md.]",
@@ -4086,6 +4045,16 @@ mod tests {
         );
         assert_eq!(normalized[3], ChatMessage::text("user", "继续"));
         assert_eq!(normalized.len(), 4);
+    }
+
+    #[test]
+    fn leading_system_prompt_ignores_agent_frame_rendered_prompt() {
+        let messages = vec![ChatMessage::text(
+            "system",
+            "[AgentFrame Runtime]\n\n[AgentHost Main Background Agent]\nold prompt",
+        )];
+
+        assert!(leading_system_prompt(&messages).is_none());
     }
 
     #[test]
@@ -4132,17 +4101,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_change_prompts_are_suppressed_for_interrupted_messages() {
-        assert!(!should_emit_runtime_change_prompt(Some(
-            "[Interrupted Follow-up]\n进度如何？"
-        )));
-        assert!(!should_emit_runtime_change_prompt(Some(
-            "[Queued User Updates]\nFollow-up 1:\n继续"
-        )));
-        assert!(should_emit_runtime_change_prompt(Some("正常对话")));
-    }
-
-    #[test]
     fn shared_profile_sync_copies_missing_workspace_files_and_upload_only_reports_real_changes() {
         let temp_dir = TempDir::new().unwrap();
         let workdir = temp_dir.path();
@@ -4173,15 +4131,10 @@ mod tests {
             agents_markdown: String::new(),
         };
 
-        let notices =
+        let synced =
             sync_workspace_shared_profile_files(&agent_workspace, &workspace_root).unwrap();
-        assert_eq!(
-            notices,
-            vec![
-                crate::session::SharedProfileChangeNotice::UserUpdated,
-                crate::session::SharedProfileChangeNotice::IdentityUpdated
-            ]
-        );
+        assert!(synced.user_changed);
+        assert!(synced.identity_changed);
         assert_eq!(
             fs::read_to_string(workspace_root.join("USER.md")).unwrap(),
             "shared user v1"
@@ -4480,9 +4433,6 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -4601,7 +4551,6 @@ mod tests {
                 compaction: SessionCompactionStats::default(),
                 phase: SessionPhase::End,
                 system_prompt_static_hash_after_compaction: None,
-                system_prompt_component_hashes_after_compaction: None,
                 loaded_skills: Vec::new(),
                 user_history_text: None,
                 assistant_history_text: Some("done".to_string()),

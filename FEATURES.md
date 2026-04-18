@@ -37,11 +37,14 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ### System Prompt Refresh Semantics
 
-- Fixed/static system prompt content is checked on every new turn and must be rewritten immediately when it changes.
-- Dynamic system prompt components from both agent host and agent frame must not rewrite the canonical system prompt immediately during normal turns.
-- When dynamic components change, the user-facing turn receives system notifications that describe the change instead of invalidating the existing canonical prompt prefix.
-- After context compaction, the full current system prompt is rebuilt and persisted, including the latest dynamic components.
-- Regression coverage should protect static prompt immediate rewrite, dynamic component notifications, and compaction-only persistence of dynamic prompt content.
+- Rendered upstream system prompts are request-time products and must not be treated as durable session truth. In particular, persisted session messages must not recursively accumulate AgentFrame-rendered `[AgentFrame Runtime]` prompts.
+- AgentHost always assembles latest static/role/memory/current-model/model-catalog prompt parts for rebuild-triggering prompt content; RuntimeContext ids such as channel/session/agent/workspace ids stay in structured session state instead of the model prompt.
+- Identity and User meta are tracked as session prompt components with separate canonical and notified snapshots, so profile edits are announced once at the next user-message boundary and become canonical prompt content after compaction.
+- Workspace summary, remote workpaths, runtime notes, and PARTCLAW.md are snapshot-style context: they become canonical prompt content at compaction/rebuild boundaries rather than generating normal-turn change notifications.
+- AgentFrame always assembles latest runtime/tool guidance and tool schemas at request time, while skills metadata is tracked as a session prompt component with separate canonical and notified snapshots.
+- Profile and skill metadata change notifications are emitted only on user-message turn boundaries. Assistant resume, background auto-resume, and tool-progress loops must not advance prompt notification state.
+- After context compaction, notified prompt component snapshots are promoted into canonical prompt snapshots.
+- Regression coverage should protect prompt recursion prevention, RuntimeContext removal, skill metadata snapshot/notified behavior, and user-boundary-only skill notifications.
 
 ### Background Agent Delivery
 
@@ -121,4 +124,4 @@ flowchart TD
 - DSL code must also reject imports, functions, classes, lambdas, private `_` names/attributes, recursive DSL tool calls, and other constructs that make execution unbounded, unsafe, or hard to reason about.
 - DSL runtime enforces hard limits for runtime duration, LLM calls, tool calls, emitted messages, code size, and output size.
 - DSL tool calls must use the single-dict `tool({"name": ..., "args": {...}})` shape and must go through the normal tool registry, preserving existing permissions, sandboxing, remote/workpath behavior, lifecycle semantics, and output limits.
-- DSL cannot directly mutate canonical system prompts; dynamic prompt changes still use system notifications and compaction-time prompt rebuild.
+- DSL cannot directly mutate canonical system prompts; request-time prompt state is owned by AgentHost/AgentFrame, with skills metadata changes flowing through Session prompt component snapshots.

@@ -30,12 +30,15 @@ const AGENT_FRAME_MARKER: &str = "[AgentFrame Runtime]";
 const EMPTY_FINAL_ASSISTANT_RETRY_PROMPT: &str = "The previous upstream response was empty. Continue from the preserved context and tool results, and produce the final user-facing answer now.";
 
 fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> String {
-    let skills_prompt = build_skills_meta_prompt(skills);
+    let skills_prompt = config
+        .skills_metadata_prompt
+        .clone()
+        .unwrap_or_else(|| build_skills_meta_prompt(skills));
     let mut parts = vec![
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
         "When a supported tool has remote=\"<host>|local\" and the task is on an SSH host, you MUST set remote to the actual SSH alias instead of manually running ssh <host> inside a shell command; this avoids brittle quoting and escaping retries. Omit remote for local work. Remote path resolution is unified: if a tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise the registered workpath is used as the root, falling back to the remote user's home directory when no workpath is registered.".to_string(),
-        "DSL tool guidance: use dsl_start/dsl_wait/dsl_kill only for finite multi-step orchestration that reduces multiple dependent LLM/tool rounds. DSL code runs in a restricted CPython worker, so normal Python expressions, assignments, if statements, f-strings, list/dict operations, slices, string methods, and type() work. Available globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape; do not call tool(\"tool_name\", arg=value). DSL LLM calls always use the same model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). LLM is only a callable handle factory; do not call LLM.llm(), LLM.tool(), LLM.gen(), LLM.json(), or LLM.select(). Use emit(text) for DSL output; emitted text is joined into the default result, while quit(value) returns an explicit result. Assign tool(...) results to variables and access returned JSON with normal Python dict/list syntax. DSL jobs are exec-like long-running jobs: interrupting dsl_start or dsl_wait only interrupts the outer wait, while the DSL job continues in the background regardless of what it is doing internally. User interrupts do not cancel DSL code, DSL LLM calls, DSL tool calls, or child long-running tools; use dsl_kill to stop the DSL job and kill child tools explicitly when needed. DSL code must not use loops, comprehensions, generators, imports, functions, classes, lambdas, private '_' names/attributes, or recursive DSL calls. DSL cannot directly mutate canonical system prompts; dynamic prompt changes still arrive through system notifications and are folded into the canonical system prompt after compaction.".to_string(),
+        "DSL tool guidance: use dsl_start/dsl_wait/dsl_kill only for finite multi-step orchestration that reduces multiple dependent LLM/tool rounds. DSL code runs in a restricted CPython worker, so normal Python expressions, assignments, if statements, f-strings, list/dict operations, slices, string methods, and type() work. Available globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape; do not call tool(\"tool_name\", arg=value). DSL LLM calls always use the same model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). LLM is only a callable handle factory; do not call LLM.llm(), LLM.tool(), LLM.gen(), LLM.json(), or LLM.select(). Use emit(text) for DSL output; emitted text is joined into the default result, while quit(value) returns an explicit result. Assign tool(...) results to variables and access returned JSON with normal Python dict/list syntax. DSL jobs are exec-like long-running jobs: interrupting dsl_start or dsl_wait only interrupts the outer wait, while the DSL job continues in the background regardless of what it is doing internally. User interrupts do not cancel DSL code, DSL LLM calls, DSL tool calls, or child long-running tools; use dsl_kill to stop the DSL job and kill child tools explicitly when needed. DSL code must not use loops, comprehensions, generators, imports, functions, classes, lambdas, private '_' names/attributes, or recursive DSL calls. DSL cannot directly mutate canonical system prompts or Session prompt components; request-time prompt state is owned by AgentHost/AgentFrame, and skills metadata changes flow through Session prompt component snapshots at user-message turn boundaries.".to_string(),
     ];
     if config
         .upstream
@@ -1379,12 +1382,13 @@ fn synthesize_tool_timeout_observation(
 mod tests {
     use super::{
         CompletedToolCall, ExecutionSignal, ResponseContinuation, SessionExecutionControl,
-        enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
+        compose_system_prompt, enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
         start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
         tool_result_looks_like_error,
     };
     use crate::config::{AgentConfig, CacheControlConfig, MemorySystem, UpstreamConfig};
     use crate::message::ChatMessage;
+    use crate::skills::SkillMetadata;
     use serde_json::Value;
     use std::path::PathBuf;
     use std::thread;
@@ -1438,6 +1442,70 @@ mod tests {
     }
 
     #[test]
+    fn compose_system_prompt_uses_configured_skills_metadata_snapshot() {
+        let config = AgentConfig {
+            enabled_tools: Vec::new(),
+            upstream: UpstreamConfig {
+                base_url: "http://127.0.0.1:1".to_string(),
+                model: "fake-model".to_string(),
+                api_kind: crate::config::UpstreamApiKind::ChatCompletions,
+                auth_kind: crate::config::UpstreamAuthKind::ApiKey,
+                supports_vision_input: false,
+                supports_pdf_input: false,
+                supports_audio_input: false,
+                api_key: None,
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                chat_completions_path: "/chat/completions".to_string(),
+                codex_home: None,
+                codex_auth: None,
+                auth_credentials_store_mode: crate::config::AuthCredentialsStoreMode::Auto,
+                timeout_seconds: 30.0,
+                retry_mode: Default::default(),
+                context_window_tokens: 1000,
+                cache_control: None,
+                prompt_cache_retention: None,
+                prompt_cache_key: None,
+                reasoning: None,
+                headers: serde_json::Map::new(),
+                native_web_search: None,
+                external_web_search: None,
+                native_image_input: false,
+                native_pdf_input: false,
+                native_audio_input: false,
+                native_image_generation: false,
+                token_estimation: None,
+            },
+            available_upstreams: Default::default(),
+            image_tool_upstream: None,
+            pdf_tool_upstream: None,
+            audio_tool_upstream: None,
+            image_generation_tool_upstream: None,
+            skills_dirs: Vec::new(),
+            skills_metadata_prompt: Some("[AgentFrame Skills]\nsnapshot".to_string()),
+            system_prompt: "host prompt".to_string(),
+            remote_workpaths: Vec::new(),
+            max_tool_roundtrips: 4,
+            workspace_root: PathBuf::from("."),
+            runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
+            enable_context_compression: true,
+            context_compaction: crate::config::ContextCompactionConfig::default(),
+            timeout_observation_compaction:
+                crate::config::TimeoutObservationCompactionConfig::default(),
+            memory_system: MemorySystem::Layered,
+        };
+        let latest = vec![SkillMetadata {
+            name: "new-skill".to_string(),
+            description: "latest metadata".to_string(),
+            path: PathBuf::from("."),
+        }];
+
+        let prompt = compose_system_prompt(&config, &latest);
+
+        assert!(prompt.contains("[AgentFrame Skills]\nsnapshot"));
+        assert!(!prompt.contains("new-skill"));
+    }
+
+    #[test]
     fn pending_tool_wait_compaction_requests_timeout_observation_after_deadline() {
         let config = AgentConfig {
             enabled_tools: Vec::new(),
@@ -1480,6 +1548,7 @@ mod tests {
             audio_tool_upstream: None,
             image_generation_tool_upstream: None,
             skills_dirs: Vec::new(),
+            skills_metadata_prompt: None,
             system_prompt: "Test system prompt.".to_string(),
             remote_workpaths: Vec::new(),
             max_tool_roundtrips: 4,

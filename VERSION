@@ -1,5 +1,16 @@
-version: 0.20.0
+version: 0.20.1
 ---
+
+# 0.20.1
+
+- 修复 AgentFrame rendered system prompt 被 background session 持久化后反复套娃的问题：
+  background 完成、yield、timeout 与 silent terminate 路径都会先把 Frame runtime wrapper 归一化为 Host canonical prompt，再写回 session。
+- 重构 System Prompt 动态状态边界：
+  `RuntimeContext` 不再进入 Host prompt；channel/session/agent/workspace id 继续保存在 `session.json` 的结构化字段中。Identity、User meta 与 skills metadata 新增 canonical/notified prompt component 状态，只在用户消息 turn 边界发一次变更通知，并在 compaction 后提升为 canonical snapshot。
+- 升级 `workdir` 结构版本到 `0.28`：
+  `0.27 -> 0.28` upgrade step 会为 `sessions/*/session.json` 的 `session_state` 以及 snapshot 的 `session` checkpoint 回填 `prompt_components: {}`，并清除旧的 profile/model 通知字段与 Host dynamic prompt hash 字段。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.20.0` 提升到 `0.20.1`。
 
 # 0.20.0
 

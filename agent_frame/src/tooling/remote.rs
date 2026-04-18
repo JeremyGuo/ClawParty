@@ -214,7 +214,7 @@ pub(super) fn run_remote_command(
         script.push_str(&shell_quote(arg));
     }
     let mut command = ssh_command(host, false);
-    let remote_command = format!("sh -lc {}", shell_quote(&script));
+    let remote_command = format!("sh -c {}", shell_quote(&script));
     command
         .arg(remote_command)
         .stdin(if stdin.is_some() {

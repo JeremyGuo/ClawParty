@@ -494,7 +494,7 @@ fn run_remote_file_tool(
         &remote_cwd,
         &[
             "sh".to_string(),
-            "-lc".to_string(),
+            "-c".to_string(),
             remote_python_command(REMOTE_FILE_TOOL_PY),
         ],
         Some(&stdin),

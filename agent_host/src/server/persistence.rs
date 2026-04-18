@@ -239,19 +239,13 @@ fn lower_contains(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
-pub(super) fn stable_content_version(content: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct SharedProfileUploadReport {
+pub(super) struct SharedProfileFileChangeReport {
     pub(super) user_changed: bool,
     pub(super) identity_changed: bool,
 }
 
-impl SharedProfileUploadReport {
+impl SharedProfileFileChangeReport {
     pub(super) fn changed_any(self) -> bool {
         self.user_changed || self.identity_changed
     }
@@ -260,21 +254,17 @@ impl SharedProfileUploadReport {
 pub(super) fn sync_workspace_shared_profile_files(
     agent_workspace: &AgentWorkspace,
     workspace_root: &Path,
-) -> Result<Vec<SharedProfileChangeNotice>> {
-    let mut notices = Vec::new();
-    if sync_shared_profile_file(
-        &agent_workspace.user_md_path,
-        &workspace_root.join("USER.md"),
-    )? {
-        notices.push(SharedProfileChangeNotice::UserUpdated);
-    }
-    if sync_shared_profile_file(
-        &agent_workspace.identity_md_path,
-        &workspace_root.join("IDENTITY.md"),
-    )? {
-        notices.push(SharedProfileChangeNotice::IdentityUpdated);
-    }
-    Ok(notices)
+) -> Result<SharedProfileFileChangeReport> {
+    Ok(SharedProfileFileChangeReport {
+        user_changed: sync_shared_profile_file(
+            &agent_workspace.user_md_path,
+            &workspace_root.join("USER.md"),
+        )?,
+        identity_changed: sync_shared_profile_file(
+            &agent_workspace.identity_md_path,
+            &workspace_root.join("IDENTITY.md"),
+        )?,
+    })
 }
 
 pub(super) fn ensure_workspace_partclaw_file(
@@ -304,8 +294,8 @@ pub(super) fn ensure_workspace_partclaw_file(
 pub(super) fn upload_workspace_shared_profile_files(
     agent_workspace: &AgentWorkspace,
     workspace_root: &Path,
-) -> Result<SharedProfileUploadReport> {
-    Ok(SharedProfileUploadReport {
+) -> Result<SharedProfileFileChangeReport> {
+    Ok(SharedProfileFileChangeReport {
         user_changed: sync_shared_profile_file(
             &workspace_root.join("USER.md"),
             &agent_workspace.user_md_path,

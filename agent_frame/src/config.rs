@@ -333,6 +333,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub skills_dirs: Vec<PathBuf>,
     #[serde(default)]
+    pub skills_metadata_prompt: Option<String>,
+    #[serde(default)]
     pub system_prompt: String,
     #[serde(default)]
     pub remote_workpaths: Vec<RemoteWorkpathConfig>,
@@ -367,6 +369,8 @@ struct AgentConfigRaw {
     image_generation_tool_upstream: Option<UpstreamConfigRaw>,
     #[serde(default)]
     skills_dirs: Vec<String>,
+    #[serde(default)]
+    skills_metadata_prompt: Option<String>,
     #[serde(default)]
     system_prompt: String,
     #[serde(default)]
@@ -721,6 +725,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             .iter()
             .map(|path| resolve_path(path, base_dir))
             .collect(),
+        skills_metadata_prompt: raw.skills_metadata_prompt,
         system_prompt: raw.system_prompt,
         remote_workpaths: raw.remote_workpaths,
         max_tool_roundtrips: raw.max_tool_roundtrips,

@@ -9,7 +9,7 @@ pub use agent_frame::{SessionErrno, SessionPhase};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -34,8 +34,23 @@ pub(crate) struct SessionSkillObservation {
     pub(crate) content: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPromptComponentState {
+    #[serde(default)]
+    pub system_prompt_value: String,
+    #[serde(default)]
+    pub system_prompt_hash: String,
+    #[serde(default)]
+    pub notified_value: String,
+    #[serde(default)]
+    pub notified_hash: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum SkillChangeNotice {
+    MetadataChanged {
+        metadata_prompt: String,
+    },
     DescriptionChanged {
         name: String,
         description: String,
@@ -48,14 +63,9 @@ pub(crate) enum SkillChangeNotice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SharedProfileChangeNotice {
-    UserUpdated,
-    IdentityUpdated,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ModelCatalogChangeNotice {
-    Updated,
+pub(crate) struct PromptComponentChangeNotice {
+    pub(crate) key: String,
+    pub(crate) value: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -83,23 +93,9 @@ pub struct SessionCheckpointData {
     #[serde(default)]
     pub skill_states: HashMap<String, SessionSkillState>,
     #[serde(default)]
-    pub seen_user_profile_version: Option<String>,
-    #[serde(default)]
-    pub seen_identity_profile_version: Option<String>,
-    #[serde(default)]
-    pub pending_user_profile_notice: bool,
-    #[serde(default)]
-    pub pending_identity_profile_notice: bool,
-    #[serde(default)]
-    pub seen_model_catalog_version: Option<String>,
-    #[serde(default)]
-    pub pending_model_catalog_notice: bool,
-    #[serde(default)]
     pub system_prompt_static_hash: Option<String>,
     #[serde(default)]
-    pub system_prompt_component_hashes: BTreeMap<String, String>,
-    #[serde(default)]
-    pub pending_system_prompt_component_notices: BTreeSet<String>,
+    pub prompt_components: BTreeMap<String, SessionPromptComponentState>,
     #[serde(default)]
     pub actor_mailbox: Vec<DurableSessionActorMessage>,
     #[serde(default)]
@@ -121,9 +117,7 @@ pub struct DurableSessionState {
     #[serde(default)]
     pub system_prompt_static_hash: Option<String>,
     #[serde(default)]
-    pub system_prompt_component_hashes: BTreeMap<String, String>,
-    #[serde(default)]
-    pub pending_system_prompt_component_notices: BTreeSet<String>,
+    pub prompt_components: BTreeMap<String, SessionPromptComponentState>,
     #[serde(default)]
     pub phase: SessionPhase,
     #[serde(default)]
@@ -157,9 +151,6 @@ pub struct SessionSnapshot {
     pub cumulative_compaction: SessionCompactionStats,
     pub api_timeout_override_seconds: Option<f64>,
     pub skill_states: HashMap<String, SessionSkillState>,
-    pub seen_user_profile_version: Option<String>,
-    pub seen_identity_profile_version: Option<String>,
-    pub seen_model_catalog_version: Option<String>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
     pub session_state: DurableSessionState,
@@ -168,12 +159,22 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SystemPromptStateObservation {
     pub(crate) static_changed: bool,
-    pub(crate) dynamic_notice_keys: BTreeSet<String>,
 }
 
 pub const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
 pub const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const COMPACTION_WAIT_NOTICE_TEXT: &str = "正在压缩上下文，可能要等待压缩完毕后才能回复。";
+pub(crate) const IDENTITY_PROMPT_COMPONENT: &str = "identity";
+pub(crate) const SKILLS_METADATA_PROMPT_COMPONENT: &str = "skills_metadata";
+pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
+
+fn prompt_component_hash(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionActorOutbound {
@@ -272,7 +273,6 @@ pub struct SessionRuntimeTurnCommit {
     pub compaction: SessionCompactionStats,
     pub phase: SessionPhase,
     pub system_prompt_static_hash_after_compaction: Option<String>,
-    pub system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
     pub loaded_skills: Vec<String>,
     pub user_history_text: Option<String>,
     pub assistant_history_text: Option<String>,
@@ -284,7 +284,6 @@ pub(crate) struct SessionRuntimeTurnFailure {
     pub(crate) errinfo: Option<String>,
     pub(crate) compaction: SessionCompactionStats,
     pub(crate) system_prompt_static_hash_after_compaction: Option<String>,
-    pub(crate) system_prompt_component_hashes_after_compaction: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -524,66 +523,39 @@ impl SessionActorRef {
     pub(crate) fn observe_skill_changes(
         &self,
         observed_skills: &[SessionSkillObservation],
+        metadata_prompt: String,
     ) -> Result<Vec<SkillChangeNotice>> {
         let observed_skills = observed_skills.to_vec();
-        self.update(move |actor| actor.observe_skill_changes(&observed_skills))
+        self.update(move |actor| actor.observe_skill_changes(&observed_skills, metadata_prompt))
     }
 
-    pub(crate) fn observe_shared_profile_changes(
+    pub(crate) fn observe_prompt_component_change(
         &self,
-        user_profile_version: String,
-        identity_profile_version: String,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        self.update(|actor| {
-            actor.observe_shared_profile_changes(user_profile_version, identity_profile_version)
-        })
+        key: &str,
+        value: String,
+    ) -> Result<Option<PromptComponentChangeNotice>> {
+        let key = key.to_string();
+        self.update(move |actor| actor.observe_prompt_component_change(key, value))
     }
 
-    pub(crate) fn observe_model_catalog_changes(
+    pub(crate) fn initialize_prompt_component_if_missing(
         &self,
-        model_catalog_version: String,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        self.update(|actor| actor.observe_model_catalog_changes(model_catalog_version))
-    }
-
-    pub(crate) fn stage_shared_profile_change_notices(
-        &self,
-        notices: &[SharedProfileChangeNotice],
+        key: &str,
+        value: String,
     ) -> Result<()> {
-        let notices = notices.to_vec();
-        self.update(move |actor| actor.stage_shared_profile_change_notices(&notices))
-    }
-
-    pub(crate) fn take_shared_profile_change_notices(
-        &self,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        self.update(|actor| actor.take_shared_profile_change_notices())
-    }
-
-    pub(crate) fn take_model_catalog_change_notices(
-        &self,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        self.update(|actor| actor.take_model_catalog_change_notices())
+        let key = key.to_string();
+        self.update(move |actor| actor.initialize_prompt_component_if_missing(key, value))
     }
 
     pub(crate) fn observe_system_prompt_state(
         &self,
         static_hash: String,
-        component_hashes: BTreeMap<String, String>,
     ) -> Result<SystemPromptStateObservation> {
-        self.update(|actor| actor.observe_system_prompt_state(static_hash, component_hashes))
+        self.update(|actor| actor.observe_system_prompt_state(static_hash))
     }
 
-    pub(crate) fn take_system_prompt_dynamic_notices(&self) -> Result<BTreeSet<String>> {
-        self.update(|actor| actor.take_system_prompt_dynamic_notices())
-    }
-
-    pub(crate) fn mark_system_prompt_state_current(
-        &self,
-        static_hash: String,
-        component_hashes: BTreeMap<String, String>,
-    ) -> Result<()> {
-        self.update(|actor| actor.mark_system_prompt_state_current(static_hash, component_hashes))
+    pub(crate) fn mark_system_prompt_state_current(&self, static_hash: String) -> Result<()> {
+        self.update(|actor| actor.mark_system_prompt_state_current(static_hash))
     }
 
     pub fn commit_runtime_turn(&self, commit: SessionRuntimeTurnCommit) -> Result<()> {
@@ -1090,8 +1062,33 @@ impl SessionActor {
     fn observe_skill_changes(
         &mut self,
         observed_skills: &[SessionSkillObservation],
+        metadata_prompt: String,
     ) -> Result<Vec<SkillChangeNotice>> {
         let mut notices = Vec::new();
+        let metadata_hash = prompt_component_hash(&metadata_prompt);
+        let metadata_state = self
+            .session
+            .session_state
+            .prompt_components
+            .entry(SKILLS_METADATA_PROMPT_COMPONENT.to_string())
+            .or_default();
+        if metadata_state.system_prompt_hash.is_empty()
+            && metadata_state.system_prompt_value.is_empty()
+            && metadata_state.notified_hash.is_empty()
+            && metadata_state.notified_value.is_empty()
+        {
+            metadata_state.system_prompt_value = metadata_prompt.clone();
+            metadata_state.system_prompt_hash = metadata_hash.clone();
+            metadata_state.notified_value = metadata_prompt.clone();
+            metadata_state.notified_hash = metadata_hash.clone();
+        } else if metadata_state.notified_hash != metadata_hash {
+            notices.push(SkillChangeNotice::MetadataChanged {
+                metadata_prompt: metadata_prompt.clone(),
+            });
+            metadata_state.notified_value = metadata_prompt.clone();
+            metadata_state.notified_hash = metadata_hash.clone();
+        }
+
         let last_compacted_turn_count = self.session.last_compacted_turn_count;
         for observed in observed_skills {
             match self.session.skill_states.get_mut(&observed.name) {
@@ -1134,109 +1131,64 @@ impl SessionActor {
         Ok(notices)
     }
 
-    fn observe_shared_profile_changes(
+    fn observe_prompt_component_change(
         &mut self,
-        user_profile_version: String,
-        identity_profile_version: String,
-    ) -> Result<Vec<SharedProfileChangeNotice>> {
-        let mut notices = Vec::new();
-
-        match self.session.seen_user_profile_version.as_deref() {
-            None => {
-                self.session.seen_user_profile_version = Some(user_profile_version);
-            }
-            Some(previous) if previous != user_profile_version => {
-                self.session.seen_user_profile_version = Some(user_profile_version);
-                self.session.pending_user_profile_notice = true;
-                notices.push(SharedProfileChangeNotice::UserUpdated);
-            }
-            Some(_) => {}
-        }
-
-        match self.session.seen_identity_profile_version.as_deref() {
-            None => {
-                self.session.seen_identity_profile_version = Some(identity_profile_version);
-            }
-            Some(previous) if previous != identity_profile_version => {
-                self.session.seen_identity_profile_version = Some(identity_profile_version);
-                self.session.pending_identity_profile_notice = true;
-                notices.push(SharedProfileChangeNotice::IdentityUpdated);
-            }
-            Some(_) => {}
-        }
-
+        key: String,
+        value: String,
+    ) -> Result<Option<PromptComponentChangeNotice>> {
+        let hash = prompt_component_hash(&value);
+        let state = self
+            .session
+            .session_state
+            .prompt_components
+            .entry(key.clone())
+            .or_default();
+        let notice = if state.system_prompt_hash.is_empty()
+            && state.system_prompt_value.is_empty()
+            && state.notified_hash.is_empty()
+            && state.notified_value.is_empty()
+        {
+            state.system_prompt_value = value.clone();
+            state.system_prompt_hash = hash.clone();
+            state.notified_value = value;
+            state.notified_hash = hash;
+            None
+        } else if state.notified_hash != hash {
+            state.notified_value = value.clone();
+            state.notified_hash = hash;
+            Some(PromptComponentChangeNotice { key, value })
+        } else {
+            None
+        };
         self.session.persist()?;
-        Ok(notices)
+        Ok(notice)
     }
 
-    fn observe_model_catalog_changes(
-        &mut self,
-        model_catalog_version: String,
-    ) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let mut notices = Vec::new();
-        match self.session.seen_model_catalog_version.as_deref() {
-            None => {
-                self.session.seen_model_catalog_version = Some(model_catalog_version);
-            }
-            Some(previous) if previous != model_catalog_version => {
-                self.session.seen_model_catalog_version = Some(model_catalog_version);
-                self.session.pending_model_catalog_notice = true;
-                notices.push(ModelCatalogChangeNotice::Updated);
-            }
-            Some(_) => {}
+    fn initialize_prompt_component_if_missing(&mut self, key: String, value: String) -> Result<()> {
+        let state = self
+            .session
+            .session_state
+            .prompt_components
+            .entry(key)
+            .or_default();
+        if state.system_prompt_hash.is_empty()
+            && state.system_prompt_value.is_empty()
+            && state.notified_hash.is_empty()
+            && state.notified_value.is_empty()
+        {
+            let hash = prompt_component_hash(&value);
+            state.system_prompt_value = value.clone();
+            state.system_prompt_hash = hash.clone();
+            state.notified_value = value;
+            state.notified_hash = hash;
+            self.session.persist()?;
         }
-        self.session.persist()?;
-        Ok(notices)
-    }
-
-    fn stage_shared_profile_change_notices(
-        &mut self,
-        notices: &[SharedProfileChangeNotice],
-    ) -> Result<()> {
-        if notices.is_empty() {
-            return Ok(());
-        }
-        for notice in notices {
-            match notice {
-                SharedProfileChangeNotice::UserUpdated => {
-                    self.session.pending_user_profile_notice = true;
-                }
-                SharedProfileChangeNotice::IdentityUpdated => {
-                    self.session.pending_identity_profile_notice = true;
-                }
-            }
-        }
-        self.session.persist()
-    }
-
-    fn take_shared_profile_change_notices(&mut self) -> Result<Vec<SharedProfileChangeNotice>> {
-        let mut notices = Vec::new();
-        if self.session.pending_user_profile_notice {
-            notices.push(SharedProfileChangeNotice::UserUpdated);
-            self.session.pending_user_profile_notice = false;
-        }
-        if self.session.pending_identity_profile_notice {
-            notices.push(SharedProfileChangeNotice::IdentityUpdated);
-            self.session.pending_identity_profile_notice = false;
-        }
-        self.session.persist()?;
-        Ok(notices)
-    }
-
-    fn take_model_catalog_change_notices(&mut self) -> Result<Vec<ModelCatalogChangeNotice>> {
-        let mut notices = Vec::new();
-        if self.session.pending_model_catalog_notice {
-            notices.push(ModelCatalogChangeNotice::Updated);
-            self.session.pending_model_catalog_notice = false;
-        }
-        self.session.persist()?;
-        Ok(notices)
+        Ok(())
     }
 
     fn observe_system_prompt_state(
         &mut self,
         static_hash: String,
-        component_hashes: BTreeMap<String, String>,
     ) -> Result<SystemPromptStateObservation> {
         let mut static_changed = false;
         match self
@@ -1255,74 +1207,14 @@ impl SessionActor {
             Some(_) => {}
         }
 
-        for (key, hash) in &component_hashes {
-            match self
-                .session
-                .session_state
-                .system_prompt_component_hashes
-                .get(key)
-            {
-                None => {}
-                Some(previous) if previous != hash => {
-                    self.session
-                        .session_state
-                        .pending_system_prompt_component_notices
-                        .insert(key.clone());
-                }
-                Some(_) => {}
-            }
-        }
-        let removed_keys = self
-            .session
-            .session_state
-            .system_prompt_component_hashes
-            .keys()
-            .filter(|key| !component_hashes.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in removed_keys {
-            self.session
-                .session_state
-                .pending_system_prompt_component_notices
-                .insert(key);
-        }
-        self.session.session_state.system_prompt_component_hashes = component_hashes;
-
-        let observation = SystemPromptStateObservation {
-            static_changed,
-            dynamic_notice_keys: self
-                .session
-                .session_state
-                .pending_system_prompt_component_notices
-                .clone(),
-        };
+        let observation = SystemPromptStateObservation { static_changed };
         self.session.persist()?;
         Ok(observation)
     }
 
-    fn mark_system_prompt_state_current(
-        &mut self,
-        static_hash: String,
-        component_hashes: BTreeMap<String, String>,
-    ) -> Result<()> {
+    fn mark_system_prompt_state_current(&mut self, static_hash: String) -> Result<()> {
         self.session.session_state.system_prompt_static_hash = Some(static_hash);
-        self.session.session_state.system_prompt_component_hashes = component_hashes;
-        self.session
-            .session_state
-            .pending_system_prompt_component_notices
-            .clear();
         self.session.persist()
-    }
-
-    fn take_system_prompt_dynamic_notices(&mut self) -> Result<BTreeSet<String>> {
-        let pending = std::mem::take(
-            &mut self
-                .session
-                .session_state
-                .pending_system_prompt_component_notices,
-        );
-        self.session.persist()?;
-        Ok(pending)
     }
 
     fn mark_skills_loaded_current_turn(&mut self, skill_names: &[String]) -> Result<()> {
@@ -1360,7 +1252,6 @@ impl SessionActor {
         self.mark_system_prompt_state_after_compaction(
             &commit.compaction,
             commit.system_prompt_static_hash_after_compaction,
-            commit.system_prompt_component_hashes_after_compaction,
         )?;
         self.mark_skills_loaded_current_turn(&commit.loaded_skills)?;
         if let Some(text) = commit.user_history_text {
@@ -1377,7 +1268,6 @@ impl SessionActor {
         self.mark_system_prompt_state_after_compaction(
             &failure.compaction,
             failure.system_prompt_static_hash_after_compaction,
-            failure.system_prompt_component_hashes_after_compaction,
         )
     }
 
@@ -1385,7 +1275,6 @@ impl SessionActor {
         &mut self,
         compaction: &SessionCompactionStats,
         static_hash: Option<String>,
-        component_hashes: Option<BTreeMap<String, String>>,
     ) -> Result<()> {
         if compaction.compacted_run_count == 0 {
             return Ok(());
@@ -1393,8 +1282,18 @@ impl SessionActor {
         let Some(static_hash) = static_hash else {
             return Ok(());
         };
-        let component_hashes = component_hashes.unwrap_or_default();
-        self.mark_system_prompt_state_current(static_hash, component_hashes)
+        self.promote_notified_prompt_components_after_compaction();
+        self.mark_system_prompt_state_current(static_hash)
+    }
+
+    fn promote_notified_prompt_components_after_compaction(&mut self) {
+        for state in self.session.session_state.prompt_components.values_mut() {
+            if state.notified_hash.is_empty() && state.notified_value.is_empty() {
+                continue;
+            }
+            state.system_prompt_value = state.notified_value.clone();
+            state.system_prompt_hash = state.notified_hash.clone();
+        }
     }
 
     fn update_checkpoint(
@@ -1420,6 +1319,7 @@ impl SessionActor {
         commit_stable_messages(&mut self.session, messages, pending_messages, phase);
         self.session.last_compacted_at = Some(Utc::now());
         self.session.last_compacted_turn_count = self.session.turn_count;
+        self.promote_notified_prompt_components_after_compaction();
         accumulate_compaction_stats(&mut self.session, compaction);
         if self.session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
             self.session.session_state.errno = None;
@@ -1463,23 +1363,8 @@ impl SessionActor {
             cumulative_compaction: self.session.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.session.api_timeout_override_seconds,
             skill_states: self.session.skill_states.clone(),
-            seen_user_profile_version: self.session.seen_user_profile_version.clone(),
-            seen_identity_profile_version: self.session.seen_identity_profile_version.clone(),
-            pending_user_profile_notice: self.session.pending_user_profile_notice,
-            pending_identity_profile_notice: self.session.pending_identity_profile_notice,
-            seen_model_catalog_version: self.session.seen_model_catalog_version.clone(),
-            pending_model_catalog_notice: self.session.pending_model_catalog_notice,
             system_prompt_static_hash: self.session.session_state.system_prompt_static_hash.clone(),
-            system_prompt_component_hashes: self
-                .session
-                .session_state
-                .system_prompt_component_hashes
-                .clone(),
-            pending_system_prompt_component_notices: self
-                .session
-                .session_state
-                .pending_system_prompt_component_notices
-                .clone(),
+            prompt_components: self.session.session_state.prompt_components.clone(),
             actor_mailbox: self.session.session_state.actor_mailbox.clone(),
             user_mailbox: self.session.session_state.user_mailbox.clone(),
         }
@@ -1493,6 +1378,13 @@ impl SessionSnapshot {
 
     pub fn stable_message_count(&self) -> usize {
         self.stable_messages().len()
+    }
+
+    pub(crate) fn prompt_component_system_value(&self, key: &str) -> Option<&str> {
+        self.session_state
+            .prompt_components
+            .get(key)
+            .map(|state| state.system_prompt_value.as_str())
     }
 
     pub fn request_messages(&self) -> Vec<ChatMessage> {
@@ -1530,12 +1422,6 @@ struct Session {
     cumulative_compaction: SessionCompactionStats,
     api_timeout_override_seconds: Option<f64>,
     skill_states: HashMap<String, SessionSkillState>,
-    seen_user_profile_version: Option<String>,
-    seen_identity_profile_version: Option<String>,
-    seen_model_catalog_version: Option<String>,
-    pending_user_profile_notice: bool,
-    pending_identity_profile_notice: bool,
-    pending_model_catalog_notice: bool,
     session_state: DurableSessionState,
     pending_workspace_summary: bool,
     close_after_summary: bool,
@@ -1566,9 +1452,6 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
-            seen_user_profile_version: self.seen_user_profile_version.clone(),
-            seen_identity_profile_version: self.seen_identity_profile_version.clone(),
-            seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             session_state: self.session_state.clone(),
@@ -1608,12 +1491,6 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
-            seen_user_profile_version: self.seen_user_profile_version.clone(),
-            seen_identity_profile_version: self.seen_identity_profile_version.clone(),
-            pending_user_profile_notice: self.pending_user_profile_notice,
-            pending_identity_profile_notice: self.pending_identity_profile_notice,
-            seen_model_catalog_version: self.seen_model_catalog_version.clone(),
-            pending_model_catalog_notice: self.pending_model_catalog_notice,
             session_state: self.session_state.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -1655,12 +1532,6 @@ impl Session {
             cumulative_compaction: persisted.cumulative_compaction,
             api_timeout_override_seconds: persisted.api_timeout_override_seconds,
             skill_states: persisted.skill_states,
-            seen_user_profile_version: persisted.seen_user_profile_version,
-            seen_identity_profile_version: persisted.seen_identity_profile_version,
-            seen_model_catalog_version: persisted.seen_model_catalog_version,
-            pending_user_profile_notice: persisted.pending_user_profile_notice,
-            pending_identity_profile_notice: persisted.pending_identity_profile_notice,
-            pending_model_catalog_notice: persisted.pending_model_catalog_notice,
             session_state: persisted.session_state,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
@@ -1771,18 +1642,6 @@ struct PersistedSession {
     api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
     skill_states: HashMap<String, SessionSkillState>,
-    #[serde(default)]
-    seen_user_profile_version: Option<String>,
-    #[serde(default)]
-    seen_identity_profile_version: Option<String>,
-    #[serde(default)]
-    seen_model_catalog_version: Option<String>,
-    #[serde(default)]
-    pending_user_profile_notice: bool,
-    #[serde(default)]
-    pending_identity_profile_notice: bool,
-    #[serde(default)]
-    pending_model_catalog_notice: bool,
     session_state: DurableSessionState,
     #[serde(default)]
     pending_workspace_summary: bool,
@@ -1790,12 +1649,6 @@ struct PersistedSession {
     close_after_summary: bool,
     #[serde(default)]
     closed_at: Option<DateTime<Utc>>,
-}
-
-pub fn should_emit_runtime_change_prompt(text: Option<&str>) -> bool {
-    let trimmed = text.map(str::trim_start).unwrap_or("");
-    !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
-        && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
 }
 
 pub fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
@@ -2257,19 +2110,11 @@ impl SessionManager {
             cumulative_compaction: checkpoint.cumulative_compaction,
             api_timeout_override_seconds: checkpoint.api_timeout_override_seconds,
             skill_states: checkpoint.skill_states,
-            seen_user_profile_version: checkpoint.seen_user_profile_version,
-            seen_identity_profile_version: checkpoint.seen_identity_profile_version,
-            pending_user_profile_notice: checkpoint.pending_user_profile_notice,
-            pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
-            seen_model_catalog_version: checkpoint.seen_model_catalog_version,
-            pending_model_catalog_notice: checkpoint.pending_model_catalog_notice,
             session_state: DurableSessionState {
                 messages: checkpoint_messages,
                 pending_messages: Vec::new(),
                 system_prompt_static_hash: checkpoint.system_prompt_static_hash,
-                system_prompt_component_hashes: checkpoint.system_prompt_component_hashes,
-                pending_system_prompt_component_notices: checkpoint
-                    .pending_system_prompt_component_notices,
+                prompt_components: checkpoint.prompt_components,
                 phase: SessionPhase::End,
                 errno: None,
                 errinfo: None,
@@ -2347,12 +2192,6 @@ impl SessionManager {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            seen_model_catalog_version: None,
-            pending_user_profile_notice: false,
-            pending_identity_profile_notice: false,
-            pending_model_catalog_notice: false,
             session_state: DurableSessionState::default(),
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -2430,9 +2269,9 @@ fn load_persisted_sessions(
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
-        SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimeTurnCommit,
-        SessionRuntimeTurnFailure, SessionSkillObservation, SharedProfileChangeNotice,
+        IDENTITY_PROMPT_COMPONENT, SKILLS_METADATA_PROMPT_COMPONENT, SessionActorMessage,
+        SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager,
+        SessionPhase, SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
         SkillChangeNotice,
     };
     use crate::channel::ProgressFeedbackFinalState;
@@ -2442,7 +2281,6 @@ mod tests {
         ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats,
         SessionEvent, SessionExecutionControl, TokenUsage,
     };
-    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -2512,7 +2350,6 @@ mod tests {
             compaction: SessionCompactionStats::default(),
             phase,
             system_prompt_static_hash_after_compaction: None,
-            system_prompt_component_hashes_after_compaction: None,
             loaded_skills,
             user_history_text: None,
             assistant_history_text: None,
@@ -2533,7 +2370,6 @@ mod tests {
             compaction: SessionCompactionStats::default(),
             phase,
             system_prompt_static_hash_after_compaction: None,
-            system_prompt_component_hashes_after_compaction: None,
             loaded_skills: Vec::new(),
             user_history_text: None,
             assistant_history_text: None,
@@ -2554,12 +2390,11 @@ mod tests {
             errinfo,
             compaction: SessionCompactionStats::default(),
             system_prompt_static_hash_after_compaction: None,
-            system_prompt_component_hashes_after_compaction: None,
         })
     }
 
     #[test]
-    fn system_prompt_state_tracks_changed_components_independently() {
+    fn system_prompt_state_tracks_static_prompt_rebuilds() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
@@ -2567,42 +2402,15 @@ mod tests {
         sessions.ensure_foreground_actor(&address).unwrap();
         let actor = foreground_actor(&sessions, &address);
 
-        let baseline = BTreeMap::from([
-            ("identity".to_string(), "hash-a".to_string()),
-            ("runtime_notes".to_string(), "hash-b".to_string()),
-        ]);
         let observed = actor
-            .observe_system_prompt_state("static-a".to_string(), baseline)
+            .observe_system_prompt_state("static-a".to_string())
             .unwrap();
         assert!(!observed.static_changed);
-        assert!(observed.dynamic_notice_keys.is_empty());
 
-        let changed = BTreeMap::from([
-            ("identity".to_string(), "hash-a2".to_string()),
-            ("runtime_notes".to_string(), "hash-b".to_string()),
-        ]);
         let observed = actor
-            .observe_system_prompt_state("static-a".to_string(), changed)
+            .observe_system_prompt_state("static-b".to_string())
             .unwrap();
-        assert!(!observed.static_changed);
-        assert_eq!(
-            observed.dynamic_notice_keys.into_iter().collect::<Vec<_>>(),
-            vec!["identity".to_string()]
-        );
-        assert_eq!(
-            actor
-                .take_system_prompt_dynamic_notices()
-                .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec!["identity".to_string()]
-        );
-        assert!(
-            actor
-                .take_system_prompt_dynamic_notices()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(observed.static_changed);
     }
 
     #[test]
@@ -2615,11 +2423,14 @@ mod tests {
         let actor = foreground_actor(&sessions, &address);
 
         actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-a".to_string(),
-                description: "old desc".to_string(),
-                content: "old content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-a".to_string(),
+                    description: "old desc".to_string(),
+                    content: "old content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         commit_foreground_turn_with_loaded_skills(
@@ -2633,11 +2444,14 @@ mod tests {
         .unwrap();
 
         let notices = actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-a".to_string(),
-                description: "new desc".to_string(),
-                content: "new content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-a".to_string(),
+                    description: "new desc".to_string(),
+                    content: "new content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         assert!(matches!(
@@ -2667,19 +2481,25 @@ mod tests {
         let actor = foreground_actor(&sessions, &address);
 
         actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-b".to_string(),
-                description: "old desc".to_string(),
-                content: "same content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-b".to_string(),
+                    description: "old desc".to_string(),
+                    content: "same content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         let notices = actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-b".to_string(),
-                description: "new desc".to_string(),
-                content: "same content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-b".to_string(),
+                    description: "new desc".to_string(),
+                    content: "same content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         assert!(matches!(
@@ -2699,11 +2519,14 @@ mod tests {
         let actor = foreground_actor(&sessions, &address);
 
         actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-c".to_string(),
-                description: "old desc".to_string(),
-                content: "old content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-c".to_string(),
+                    description: "old desc".to_string(),
+                    content: "old content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         commit_foreground_turn_with_loaded_skills(
@@ -2717,11 +2540,14 @@ mod tests {
         .unwrap();
 
         let notices = actor
-            .observe_skill_changes(&[SessionSkillObservation {
-                name: "skill-c".to_string(),
-                description: "new desc".to_string(),
-                content: "new content".to_string(),
-            }])
+            .observe_skill_changes(
+                &[SessionSkillObservation {
+                    name: "skill-c".to_string(),
+                    description: "new desc".to_string(),
+                    content: "new content".to_string(),
+                }],
+                "skills metadata".to_string(),
+            )
             .unwrap();
 
         assert!(matches!(
@@ -2742,51 +2568,71 @@ mod tests {
     }
 
     #[test]
-    fn shared_profile_changes_queue_until_taken() {
+    fn skill_metadata_prompt_tracks_notified_and_compaction_snapshots() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
         let actor = foreground_actor(&sessions, &address);
+        let observed = [SessionSkillObservation {
+            name: "skill-d".to_string(),
+            description: "desc".to_string(),
+            content: "content".to_string(),
+        }];
 
         let first = actor
-            .observe_shared_profile_changes("user-v1".to_string(), "identity-v1".to_string())
+            .observe_skill_changes(&observed, "metadata v1".to_string())
             .unwrap();
         assert!(first.is_empty());
 
         let second = actor
-            .observe_shared_profile_changes("user-v2".to_string(), "identity-v1".to_string())
+            .observe_skill_changes(&observed, "metadata v2".to_string())
             .unwrap();
-        assert_eq!(second, vec![SharedProfileChangeNotice::UserUpdated]);
-        let queued = actor.take_shared_profile_change_notices().unwrap();
-        assert_eq!(queued, vec![SharedProfileChangeNotice::UserUpdated]);
-        assert!(
-            actor
-                .take_shared_profile_change_notices()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(matches!(
+            second.as_slice(),
+            [SkillChangeNotice::MetadataChanged { metadata_prompt }]
+                if metadata_prompt == "metadata v2"
+        ));
 
-        let third = actor
-            .observe_shared_profile_changes("user-v2".to_string(), "identity-v2".to_string())
+        let snapshot = actor.snapshot().unwrap();
+        let state = snapshot
+            .session_state
+            .prompt_components
+            .get(SKILLS_METADATA_PROMPT_COMPONENT)
             .unwrap();
-        assert_eq!(third, vec![SharedProfileChangeNotice::IdentityUpdated]);
+        assert_eq!(state.system_prompt_value, "metadata v1");
+        assert_eq!(state.notified_value, "metadata v2");
+
         actor
-            .stage_shared_profile_change_notices(&[SharedProfileChangeNotice::UserUpdated])
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: vec![ChatMessage::text("assistant", "compacted")],
+                consumed_pending_messages: Vec::new(),
+                usage: TokenUsage::default(),
+                compaction: SessionCompactionStats {
+                    compacted_run_count: 1,
+                    ..SessionCompactionStats::default()
+                },
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: Some("static".to_string()),
+                loaded_skills: Vec::new(),
+                user_history_text: None,
+                assistant_history_text: None,
+            })
             .unwrap();
-        let delivered = actor.take_shared_profile_change_notices().unwrap();
-        assert_eq!(
-            delivered,
-            vec![
-                SharedProfileChangeNotice::UserUpdated,
-                SharedProfileChangeNotice::IdentityUpdated
-            ]
-        );
+
+        let snapshot = actor.snapshot().unwrap();
+        let state = snapshot
+            .session_state
+            .prompt_components
+            .get(SKILLS_METADATA_PROMPT_COMPONENT)
+            .unwrap();
+        assert_eq!(state.system_prompt_value, "metadata v2");
+        assert_eq!(state.notified_value, "metadata v2");
     }
 
     #[test]
-    fn model_catalog_changes_queue_until_taken() {
+    fn prompt_component_change_tracks_notified_until_compaction() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
@@ -2795,23 +2641,51 @@ mod tests {
         let actor = foreground_actor(&sessions, &address);
 
         let first = actor
-            .observe_model_catalog_changes("models-v1".to_string())
+            .observe_prompt_component_change(IDENTITY_PROMPT_COMPONENT, "identity v1".to_string())
             .unwrap();
-        assert!(first.is_empty());
+        assert!(first.is_none());
 
         let second = actor
-            .observe_model_catalog_changes("models-v2".to_string())
-            .unwrap();
-        assert_eq!(second, vec![ModelCatalogChangeNotice::Updated]);
+            .observe_prompt_component_change(IDENTITY_PROMPT_COMPONENT, "identity v2".to_string())
+            .unwrap()
+            .expect("changed identity should emit a notice");
+        assert_eq!(second.key, IDENTITY_PROMPT_COMPONENT);
+        assert_eq!(second.value, "identity v2");
 
-        let queued = actor.take_model_catalog_change_notices().unwrap();
-        assert_eq!(queued, vec![ModelCatalogChangeNotice::Updated]);
-        assert!(
-            actor
-                .take_model_catalog_change_notices()
-                .unwrap()
-                .is_empty()
-        );
+        let snapshot = actor.snapshot().unwrap();
+        let state = snapshot
+            .session_state
+            .prompt_components
+            .get(IDENTITY_PROMPT_COMPONENT)
+            .unwrap();
+        assert_eq!(state.system_prompt_value, "identity v1");
+        assert_eq!(state.notified_value, "identity v2");
+
+        actor
+            .commit_runtime_turn(SessionRuntimeTurnCommit {
+                messages: vec![ChatMessage::text("assistant", "compacted")],
+                consumed_pending_messages: Vec::new(),
+                usage: TokenUsage::default(),
+                compaction: SessionCompactionStats {
+                    compacted_run_count: 1,
+                    ..SessionCompactionStats::default()
+                },
+                phase: SessionPhase::End,
+                system_prompt_static_hash_after_compaction: Some("static".to_string()),
+                loaded_skills: Vec::new(),
+                user_history_text: None,
+                assistant_history_text: None,
+            })
+            .unwrap();
+
+        let snapshot = actor.snapshot().unwrap();
+        let state = snapshot
+            .session_state
+            .prompt_components
+            .get(IDENTITY_PROMPT_COMPONENT)
+            .unwrap();
+        assert_eq!(state.system_prompt_value, "identity v2");
+        assert_eq!(state.notified_value, "identity v2");
     }
 
     #[test]
@@ -3502,8 +3376,6 @@ mod tests {
             compacted_run_count: 1,
             ..SessionCompactionStats::default()
         };
-        let component_hashes = BTreeMap::from([("identity".to_string(), "hash-id".to_string())]);
-
         actor
             .commit_runtime_turn(SessionRuntimeTurnCommit {
                 messages: vec![ChatMessage::text("assistant", "stable reply")],
@@ -3512,7 +3384,6 @@ mod tests {
                 compaction,
                 phase: SessionPhase::End,
                 system_prompt_static_hash_after_compaction: Some("static-hash".to_string()),
-                system_prompt_component_hashes_after_compaction: Some(component_hashes.clone()),
                 loaded_skills: vec!["skill-a".to_string()],
                 user_history_text: Some("run background job".to_string()),
                 assistant_history_text: Some("done".to_string()),
@@ -3528,10 +3399,6 @@ mod tests {
         assert_eq!(
             snapshot.session_state.system_prompt_static_hash.as_deref(),
             Some("static-hash")
-        );
-        assert_eq!(
-            snapshot.session_state.system_prompt_component_hashes,
-            component_hashes
         );
         assert_eq!(
             snapshot

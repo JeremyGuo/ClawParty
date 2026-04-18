@@ -364,11 +364,6 @@ impl AgentRuntimeView {
             self.resolve_native_or_tool_upstream(ToolingFamily::Pdf, model_key, model);
         let (native_audio_input, audio_tool_upstream) =
             self.resolve_native_or_tool_upstream(ToolingFamily::AudioInput, model_key, model);
-        let commands = self
-            .command_catalog
-            .get(&session.address.channel_id)
-            .cloned()
-            .unwrap_or_else(default_bot_commands);
         let workspace_summary = self
             .workspace_manager
             .ensure_workspace_exists(&session.workspace_id)
@@ -462,6 +457,9 @@ impl AgentRuntimeView {
             } else {
                 vec![self.agent_workspace.skills_dir.clone()]
             },
+            skills_metadata_prompt: session
+                .prompt_component_system_value(crate::session::SKILLS_METADATA_PROMPT_COMPONENT)
+                .map(ToOwned::to_owned),
             system_prompt: build_agent_system_prompt_state(
                 &self.agent_workspace,
                 session,
@@ -473,7 +471,6 @@ impl AgentRuntimeView {
                 &self.models,
                 &prompt_available_models,
                 &self.main_agent,
-                &commands,
             )
             .system_prompt,
             remote_workpaths: remote_workpaths

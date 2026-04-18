@@ -286,10 +286,8 @@ pub(super) fn build_user_turn_message(
 pub(super) fn build_synthetic_system_messages(
     process_restart_notice: Option<&str>,
     user_time_tip: Option<&str>,
-    dynamic_system_prompt_notices: &[String],
-    model_catalog_change_notice: Option<&str>,
+    prompt_updates_prefix: Option<&str>,
     skill_updates_prefix: Option<&str>,
-    profile_change_notices: &[SharedProfileChangeNotice],
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(process_restart_notice) = process_restart_notice
@@ -304,30 +302,11 @@ pub(super) fn build_synthetic_system_messages(
     {
         messages.push(ChatMessage::text("system", user_time_tip));
     }
-    for notice in dynamic_system_prompt_notices
-        .iter()
-        .map(String::as_str)
+    if let Some(prompt_updates_prefix) = prompt_updates_prefix
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        messages.push(ChatMessage::text("system", notice));
-    }
-    for notice in profile_change_notices {
-        let text = match notice {
-            SharedProfileChangeNotice::UserUpdated => {
-                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use file_read on ./USER.md.]"
-            }
-            SharedProfileChangeNotice::IdentityUpdated => {
-                "[System Message: IDENTITY.md changed. It defines your persona. Use file_read on ./IDENTITY.md now so your current behavior follows the updated persona.]"
-            }
-        };
-        messages.push(ChatMessage::text("system", text));
-    }
-    if let Some(model_catalog_change_notice) = model_catalog_change_notice
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        messages.push(ChatMessage::text("system", model_catalog_change_notice));
+        messages.push(ChatMessage::text("system", prompt_updates_prefix));
     }
     if let Some(skill_updates_prefix) = skill_updates_prefix
         .map(str::trim)
@@ -364,26 +343,6 @@ pub(super) fn render_system_date_on_user_message(now: chrono::DateTime<chrono::U
         "[System Date: {}]",
         local_now.format("%Y-%m-%d %H:%M:%S %:z")
     )
-}
-
-pub(super) fn render_model_catalog_change_notice(
-    notices: &[ModelCatalogChangeNotice],
-    model_catalog: &str,
-) -> Option<String> {
-    if notices.is_empty() {
-        return None;
-    }
-    let model_catalog = model_catalog.trim();
-    if model_catalog.is_empty() {
-        return Some(
-            "[System Message: Available models changed since earlier in this session. Treat the current system prompt as authoritative for the latest model list.]"
-                .to_string(),
-        );
-    }
-    Some(format!(
-        "[System Message: Available models changed since earlier in this session. The current model catalog for this run is authoritative.\nAvailable models:\n{}]",
-        model_catalog
-    ))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -605,6 +564,12 @@ pub(super) fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> Stri
     ];
     for notice in notices {
         match notice {
+            SkillChangeNotice::MetadataChanged { metadata_prompt } => {
+                sections.push(format!(
+                    "The available skill metadata changed. Treat this refreshed metadata as authoritative for this turn:\n{}",
+                    metadata_prompt.trim()
+                ));
+            }
             SkillChangeNotice::DescriptionChanged { name, description } => {
                 sections.push(format!(
                     "Skill \"{name}\" has an updated description:\n{description}"
@@ -617,6 +582,55 @@ pub(super) fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> Stri
             } => {
                 sections.push(format!(
                     "Skill \"{name}\" changed after it was loaded earlier in this session and before that load was compacted away. Use the refreshed skill immediately.\nUpdated description: {description}\nRefreshed SKILL.md content:\n{content}"
+                ));
+            }
+        }
+    }
+    sections.join("\n\n")
+}
+
+pub(super) fn render_prompt_component_change_notices(
+    notices: &[PromptComponentChangeNotice],
+) -> String {
+    if notices.is_empty() {
+        return String::new();
+    }
+    let mut sections = vec![
+        "[Runtime Prompt Updates]".to_string(),
+        "Some durable profile context changed since the current canonical system prompt snapshot. Apply these updates for this user turn; they will be folded into the canonical system prompt after compaction.".to_string(),
+    ];
+    for notice in notices {
+        match notice.key.as_str() {
+            IDENTITY_PROMPT_COMPONENT => {
+                if notice.value.trim().is_empty() {
+                    sections.push(
+                        "Identity is now empty. Ignore earlier Identity prompt content."
+                            .to_string(),
+                    );
+                } else {
+                    sections.push(format!(
+                        "Identity changed. Treat this refreshed identity as authoritative for this turn:\n{}",
+                        notice.value.trim()
+                    ));
+                }
+            }
+            USER_META_PROMPT_COMPONENT => {
+                if notice.value.trim().is_empty() {
+                    sections.push(
+                        "User meta is now empty. Ignore earlier User meta prompt content."
+                            .to_string(),
+                    );
+                } else {
+                    sections.push(format!(
+                        "User meta changed. Treat this refreshed user metadata as authoritative for this turn:\n{}",
+                        notice.value.trim()
+                    ));
+                }
+            }
+            key => {
+                sections.push(format!(
+                    "Prompt component `{key}` changed. Treat this refreshed value as authoritative for this turn:\n{}",
+                    notice.value.trim()
                 ));
             }
         }

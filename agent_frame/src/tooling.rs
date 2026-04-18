@@ -1599,6 +1599,60 @@ remote_command="$*"
 
     #[cfg(unix)]
     #[test]
+    fn remote_file_tools_avoid_login_shell_banner_pollution() {
+        let _env_guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = TempDir::new().unwrap();
+        let fake_ssh = write_fake_ssh_with_path(
+            &temp_dir,
+            r#"case "$remote_command" in
+  *-lc*) printf 'REMOTE LOGIN BANNER\n' ;;
+esac
+exec sh -c "$remote_command""#,
+        );
+        let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(workspace_root.join("src/remote.txt"), "clean\n").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            &remote_workpaths,
+            None,
+        )
+        .unwrap();
+
+        let read_result = registry["file_read"]
+            .invoke(json!({
+                "file_path": "src/remote.txt",
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        assert_eq!(read_result["remote"].as_str(), Some("fake-host"));
+        assert_eq!(read_result["content"].as_str(), Some("1: clean"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_file_tools_fall_back_to_python_when_python3_is_missing() {
         let _env_guard = env_test_lock()
             .lock()
