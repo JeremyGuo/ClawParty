@@ -510,15 +510,22 @@ pub(super) fn format_session_status(
     current_context_limit: usize,
     current_reasoning_effort: Option<&str>,
     context_compaction_enabled: bool,
+    conversation_usage_24h: &ConversationUsageWindow,
 ) -> String {
-    let usage = &session.cumulative_usage;
+    let usage = &conversation_usage_24h.usage;
+    let legacy_usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
     let cache_read_rate = if usage.input_total_tokens() == 0 {
         0.0
     } else {
         (usage.cache_read_input_tokens() as f64 / usage.input_total_tokens() as f64) * 100.0
     };
-    let pricing = estimate_cost_usd(model, usage);
+    let legacy_cache_read_rate = if legacy_usage.input_total_tokens() == 0 {
+        0.0
+    } else {
+        (legacy_usage.cache_read_input_tokens() as f64 / legacy_usage.input_total_tokens() as f64)
+            * 100.0
+    };
     let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
     let context_percent = if current_context_limit == 0 {
         0.0
@@ -561,7 +568,10 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            "Token 用量：".to_string(),
+            "最近 24 小时 Conversation 总用量（所有 Agent）：".to_string(),
+            "- source: agent turn usage logs; legacy session cumulative_usage is not used for this 24h total".to_string(),
+            format!("- sessions: {}", conversation_usage_24h.session_count),
+            format!("- usage_events: {}", conversation_usage_24h.event_count),
             format!("- llm_calls: {}", usage.llm_calls),
             format!("- input_total_tokens: {}", usage.input_total_tokens()),
             format!("- output_total_tokens: {}", usage.output_total_tokens()),
@@ -584,15 +594,43 @@ pub(super) fn format_session_status(
             ),
             format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
-        if let Some((formula, total_usd)) = pricing {
-            lines.push(String::new());
-            lines.push("价格估算：".to_string());
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
-        } else {
-            lines.push(String::new());
-            lines.push("价格估算：当前模型没有内置价格表，无法直接估算。".to_string());
+        if conversation_usage_24h.missing_cache_breakdown_events > 0 {
+            lines.push(format!(
+                "- cache_breakdown_note: {} old events did not include cache fields, so token totals are correct but billed-cache split is best-effort.",
+                conversation_usage_24h.missing_cache_breakdown_events
+            ));
         }
+        lines.push(String::new());
+        lines.push("Legacy session cumulative usage（历史累计，仅供排查）：".to_string());
+        lines.push("- note: this field may contain older accounting bugs and is no longer used as the /status primary usage total.".to_string());
+        lines.push(format!("- llm_calls: {}", legacy_usage.llm_calls));
+        lines.push(format!(
+            "- input_total_tokens: {}",
+            legacy_usage.input_total_tokens()
+        ));
+        lines.push(format!(
+            "- output_total_tokens: {}",
+            legacy_usage.output_total_tokens()
+        ));
+        lines.push(format!(
+            "- context_total_tokens: {}",
+            legacy_usage.context_total_tokens()
+        ));
+        lines.push(format!(
+            "- cache_read_input_tokens: {}",
+            legacy_usage.cache_read_input_tokens()
+        ));
+        lines.push(format!(
+            "- cache_write_input_tokens: {}",
+            legacy_usage.cache_write_input_tokens()
+        ));
+        lines.push(format!(
+            "- normal_billed_input_tokens: {}",
+            legacy_usage.normal_billed_input_tokens()
+        ));
+        lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
+        lines.push(String::new());
+        lines.push("价格估算：最近 24 小时 Conversation 总用量目前按日志 token 精确统计，但不再用当前模型价格粗估总价；历史多模型、多 Agent 和旧日志 cache 字段缺失会让这种粗估误导。".to_string());
         lines.push(String::new());
         lines.push("累计上下文压缩统计：".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -665,7 +703,10 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            "Token usage:".to_string(),
+            "Last 24h conversation usage (all agents):".to_string(),
+            "- source: agent turn usage logs; legacy session cumulative_usage is not used for this 24h total".to_string(),
+            format!("- sessions: {}", conversation_usage_24h.session_count),
+            format!("- usage_events: {}", conversation_usage_24h.event_count),
             format!("- llm_calls: {}", usage.llm_calls),
             format!("- input_total_tokens: {}", usage.input_total_tokens()),
             format!("- output_total_tokens: {}", usage.output_total_tokens()),
@@ -688,17 +729,43 @@ pub(super) fn format_session_status(
             ),
             format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
-        if let Some((formula, total_usd)) = pricing {
-            lines.push(String::new());
-            lines.push("Estimated cost:".to_string());
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
-        } else {
-            lines.push(String::new());
-            lines.push(
-                "Estimated cost: unavailable for the current model pricing table.".to_string(),
-            );
+        if conversation_usage_24h.missing_cache_breakdown_events > 0 {
+            lines.push(format!(
+                "- cache_breakdown_note: {} old events did not include cache fields, so token totals are correct but billed-cache split is best-effort.",
+                conversation_usage_24h.missing_cache_breakdown_events
+            ));
         }
+        lines.push(String::new());
+        lines.push("Legacy session cumulative usage (debug only):".to_string());
+        lines.push("- note: this field may contain older accounting bugs and is no longer used as the /status primary usage total.".to_string());
+        lines.push(format!("- llm_calls: {}", legacy_usage.llm_calls));
+        lines.push(format!(
+            "- input_total_tokens: {}",
+            legacy_usage.input_total_tokens()
+        ));
+        lines.push(format!(
+            "- output_total_tokens: {}",
+            legacy_usage.output_total_tokens()
+        ));
+        lines.push(format!(
+            "- context_total_tokens: {}",
+            legacy_usage.context_total_tokens()
+        ));
+        lines.push(format!(
+            "- cache_read_input_tokens: {}",
+            legacy_usage.cache_read_input_tokens()
+        ));
+        lines.push(format!(
+            "- cache_write_input_tokens: {}",
+            legacy_usage.cache_write_input_tokens()
+        ));
+        lines.push(format!(
+            "- normal_billed_input_tokens: {}",
+            legacy_usage.normal_billed_input_tokens()
+        ));
+        lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
+        lines.push(String::new());
+        lines.push("Estimated cost: disabled for the 24h conversation total because using the current model price for mixed historical models, subagents, and old cache logs would be misleading.".to_string());
         lines.push(String::new());
         lines.push("Cumulative context compaction stats:".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -737,6 +804,199 @@ pub(super) fn format_session_status(
             );
         }
         lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConversationUsageWindow {
+    pub usage: TokenUsage,
+    pub event_count: u64,
+    pub session_count: usize,
+    pub missing_cache_breakdown_events: u64,
+}
+
+pub(super) fn collect_conversation_usage_window(
+    workdir: &Path,
+    address: &ChannelAddress,
+    now: chrono::DateTime<Utc>,
+    window: chrono::Duration,
+) -> ConversationUsageWindow {
+    let session_ids = conversation_session_ids_from_workdir(workdir, address);
+    let mut usage = ConversationUsageWindow {
+        session_count: session_ids.len(),
+        ..ConversationUsageWindow::default()
+    };
+    if session_ids.is_empty() {
+        return usage;
+    }
+    let cutoff_ms = now
+        .checked_sub_signed(window)
+        .unwrap_or(now)
+        .timestamp_millis();
+    let logs_dir = workdir.join("logs").join("agents");
+    let Ok(entries) = fs::read_dir(&logs_dir) else {
+        return usage;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in std::io::BufRead::lines(reader).map_while(std::result::Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("kind").and_then(Value::as_str) != Some("turn_token_usage") {
+                continue;
+            }
+            if event_timestamp_ms(&value).is_none_or(|ts| ts < cutoff_ms) {
+                continue;
+            }
+            if value.get("channel_id").and_then(Value::as_str) != Some(address.channel_id.as_str())
+            {
+                continue;
+            }
+            let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !session_ids.contains(session_id) {
+                continue;
+            }
+            if !event_has_cache_breakdown(&value) {
+                usage.missing_cache_breakdown_events =
+                    usage.missing_cache_breakdown_events.saturating_add(1);
+            }
+            usage.usage.add_assign(&token_usage_from_log_event(&value));
+            usage.event_count = usage.event_count.saturating_add(1);
+        }
+    }
+    usage
+}
+
+fn conversation_session_ids_from_workdir(
+    workdir: &Path,
+    address: &ChannelAddress,
+) -> HashSet<String> {
+    let sessions_dir = workdir.join("sessions");
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return HashSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("session.json");
+            let raw = fs::read_to_string(path).ok()?;
+            let value = serde_json::from_str::<Value>(&raw).ok()?;
+            let object_address = value.get("address")?.as_object()?;
+            let channel_id = object_address.get("channel_id")?.as_str()?;
+            let conversation_id = object_address.get("conversation_id")?.as_str()?;
+            if channel_id != address.channel_id || conversation_id != address.conversation_id {
+                return None;
+            }
+            value.get("id")?.as_str().map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn event_timestamp_ms(value: &Value) -> Option<i64> {
+    let ts = value.get("ts")?.as_i64()?;
+    if ts > 10_000_000_000 {
+        Some(ts)
+    } else {
+        Some(ts.saturating_mul(1000))
+    }
+}
+
+fn event_has_cache_breakdown(value: &Value) -> bool {
+    [
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "cache_uncached_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_miss_tokens",
+        "legacy_cache_read_tokens",
+        "legacy_cache_write_tokens",
+        "legacy_cache_miss_tokens",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some())
+}
+
+fn first_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| value.get(*key)?.as_u64())
+}
+
+fn token_usage_from_log_event(value: &Value) -> TokenUsage {
+    let prompt_tokens = first_u64_field(
+        value,
+        &[
+            "input_total_tokens",
+            "prompt_tokens",
+            "legacy_prompt_tokens",
+        ],
+    )
+    .unwrap_or(0);
+    let completion_tokens = first_u64_field(
+        value,
+        &[
+            "output_total_tokens",
+            "completion_tokens",
+            "legacy_completion_tokens",
+        ],
+    )
+    .unwrap_or(0);
+    let total_tokens = first_u64_field(
+        value,
+        &[
+            "context_total_tokens",
+            "total_tokens",
+            "legacy_total_tokens",
+        ],
+    )
+    .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    let cache_read_tokens = first_u64_field(
+        value,
+        &[
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+            "legacy_cache_read_tokens",
+        ],
+    )
+    .unwrap_or(0);
+    let cache_write_tokens = first_u64_field(
+        value,
+        &[
+            "cache_write_input_tokens",
+            "cache_write_tokens",
+            "legacy_cache_write_tokens",
+        ],
+    )
+    .unwrap_or(0);
+    let cache_miss_tokens = first_u64_field(
+        value,
+        &[
+            "cache_uncached_input_tokens",
+            "cache_miss_tokens",
+            "legacy_cache_miss_tokens",
+        ],
+    )
+    .unwrap_or_else(|| prompt_tokens.saturating_sub(cache_read_tokens));
+    let cache_hit_tokens = first_u64_field(value, &["cache_hit_tokens", "legacy_cache_hit_tokens"])
+        .unwrap_or(cache_read_tokens);
+    TokenUsage {
+        llm_calls: first_u64_field(value, &["llm_calls"]).unwrap_or(1),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cache_hit_tokens,
+        cache_miss_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
     }
 }
 

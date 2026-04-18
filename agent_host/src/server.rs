@@ -2576,6 +2576,12 @@ impl Server {
             });
         let context_compaction_enabled =
             self.effective_context_compaction_enabled(&session.address)?;
+        let conversation_usage_24h = collect_conversation_usage_window(
+            &self.workdir,
+            &session.address,
+            Utc::now(),
+            chrono::Duration::hours(24),
+        );
         Ok(format_session_status(
             &self.main_agent.language,
             model_key,
@@ -2587,6 +2593,7 @@ impl Server {
             current_context_limit,
             current_reasoning_effort.as_deref(),
             context_compaction_enabled,
+            &conversation_usage_24h,
         ))
     }
 
@@ -3069,20 +3076,20 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, AgentPromptKind, ImageGenerationRouting, IncomingCommandLane, RuntimeContext,
-        SYSTEM_RESTART_NOTICE, Server, SummaryTracker, TokenUsage,
-        background_timeout_with_active_children_text, build_synthetic_system_messages,
+        AgentCommand, AgentPromptKind, ConversationUsageWindow, ImageGenerationRouting,
+        IncomingCommandLane, RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SummaryTracker,
+        TokenUsage, background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
-        coalesce_buffered_conversation_messages, conversation_memory_root,
-        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
-        fast_path_agent_selection_message, format_session_status, idle_compaction_token_limit,
-        incoming_command_lane, infer_single_agent_backend, is_command_like_text,
-        is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
-        normalize_messages_for_persistence, openrouter_automatic_cache_control,
-        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
-        parse_sandbox_command, parse_set_api_timeout_command, parse_snap_list_command,
-        parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, prepare_system_prompt_for_turn,
+        coalesce_buffered_conversation_messages, collect_conversation_usage_window,
+        conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
+        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
+        idle_compaction_token_limit, incoming_command_lane, infer_single_agent_backend,
+        is_command_like_text, is_out_of_band_command, is_timeout_like, leading_system_prompt,
+        memory_search_files, normalize_messages_for_persistence,
+        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
+        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
+        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
         rebuild_canonical_system_prompt, render_last_user_message_time_tip,
         render_system_date_on_user_message, rollout_read_file, rollout_search_files,
         sanitize_messages_for_model_capabilities, select_image_generation_routing,
@@ -4734,6 +4741,7 @@ mod tests {
             115_200,
             None,
             true,
+            &ConversationUsageWindow::default(),
         );
 
         assert!(
@@ -4742,6 +4750,124 @@ mod tests {
             )
         );
         assert!(text.contains("upstream timeout while compacting older messages"));
+    }
+
+    #[test]
+    fn conversation_usage_window_sums_last_24h_turn_logs_for_same_conversation() {
+        let temp_dir = TempDir::new().unwrap();
+        let workdir = temp_dir.path();
+        let sessions_dir = workdir.join("sessions");
+        let logs_dir = workdir.join("logs").join("agents");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&logs_dir).unwrap();
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "-100".to_string(),
+            user_id: Some("user-a".to_string()),
+            display_name: None,
+        };
+        let foreground_session_id = Uuid::new_v4();
+        let background_session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+        for (session_id, conversation_id) in [
+            (foreground_session_id, "-100"),
+            (background_session_id, "-100"),
+            (other_session_id, "-200"),
+        ] {
+            let root = sessions_dir.join(session_id.to_string());
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("session.json"),
+                serde_json::to_vec(&json!({
+                    "id": session_id,
+                    "address": {
+                        "channel_id": "telegram-main",
+                        "conversation_id": conversation_id,
+                        "user_id": "user-a",
+                        "display_name": null
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let now = Utc::now();
+        let recent = now.timestamp_millis();
+        let old = (now - ChronoDuration::hours(25)).timestamp_millis();
+        let log_path = logs_dir.join("agent.jsonl");
+        let lines = [
+            json!({
+                "kind": "turn_token_usage",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": foreground_session_id,
+                "agent_kind": "main_foreground",
+                "llm_calls": 1,
+                "input_total_tokens": 100,
+                "output_total_tokens": 10,
+                "context_total_tokens": 110,
+                "cache_read_input_tokens": 40,
+                "cache_write_input_tokens": 5,
+                "cache_uncached_input_tokens": 60
+            }),
+            json!({
+                "kind": "turn_token_usage",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": background_session_id,
+                "agent_kind": "main_background",
+                "llm_calls": 2,
+                "prompt_tokens": 200,
+                "completion_tokens": 20,
+                "total_tokens": 220
+            }),
+            json!({
+                "kind": "turn_token_usage",
+                "ts": old,
+                "channel_id": "telegram-main",
+                "session_id": foreground_session_id,
+                "llm_calls": 99,
+                "input_total_tokens": 999,
+                "output_total_tokens": 999,
+                "context_total_tokens": 1998
+            }),
+            json!({
+                "kind": "turn_token_usage",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": other_session_id,
+                "llm_calls": 99,
+                "input_total_tokens": 999,
+                "output_total_tokens": 999,
+                "context_total_tokens": 1998
+            }),
+            json!({
+                "kind": "agent_frame_model_call_completed",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": foreground_session_id,
+                "input_total_tokens": 999
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(log_path, lines).unwrap();
+
+        let usage =
+            collect_conversation_usage_window(workdir, &address, now, ChronoDuration::hours(24));
+        assert_eq!(usage.session_count, 2);
+        assert_eq!(usage.event_count, 2);
+        assert_eq!(usage.missing_cache_breakdown_events, 1);
+        assert_eq!(usage.usage.llm_calls, 3);
+        assert_eq!(usage.usage.input_total_tokens(), 300);
+        assert_eq!(usage.usage.output_total_tokens(), 30);
+        assert_eq!(usage.usage.context_total_tokens(), 330);
+        assert_eq!(usage.usage.cache_read_input_tokens(), 40);
+        assert_eq!(usage.usage.cache_write_input_tokens(), 5);
+        assert_eq!(usage.usage.normal_billed_input_tokens(), 255);
     }
 
     #[tokio::test]

@@ -65,6 +65,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Token accounting logs should prefer unambiguous names such as `input_total_tokens`, `output_total_tokens`, `context_total_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cache_uncached_input_tokens`, and `normal_billed_input_tokens`; legacy provider-style names may remain only as compatibility aliases.
 - Request and response bodies are logged with secret-key redaction. By default, logs include bounded body previews for debugging; setting `AGENT_FRAME_LOG_API_BODIES=full` includes full redacted JSON bodies, and `off` disables body content while preserving sizes and metadata.
 - Agent runtime model-call events include the final `api_request_id` and cache token fields so session/agent logs can be joined to low-level API request logs without inferring from timestamps.
+- `/status` should show the last 24 hours of total usage for the current conversation across foreground, background, and subagents by aggregating per-turn agent usage logs for sessions with the same channel/conversation address. It must not use legacy `session.cumulative_usage` as the primary status total because older session state may contain polluted cumulative accounting.
 - Regression coverage should protect header/body redaction, clear token accounting names, and the model-call/API-request join fields.
 
 ### Background Agent Delivery
