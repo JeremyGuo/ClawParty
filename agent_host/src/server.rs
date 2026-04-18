@@ -1694,6 +1694,12 @@ impl AgentRuntimeView {
     }
 }
 
+fn idle_compaction_token_limit(existing_override: Option<usize>, idle_min_tokens: usize) -> usize {
+    existing_override
+        .map(|limit| limit.min(idle_min_tokens))
+        .unwrap_or(idle_min_tokens)
+}
+
 pub struct Server {
     context: Arc<RuntimeContext>,
     telegram_channel_ids: Arc<HashSet<String>>,
@@ -2220,7 +2226,7 @@ impl Server {
         if source_messages.is_empty() {
             return Ok(false);
         }
-        let config = runtime.build_agent_frame_config(
+        let mut config = runtime.build_agent_frame_config(
             session,
             &session.workspace_root,
             AgentPromptKind::MainForeground,
@@ -2241,6 +2247,10 @@ impl Server {
         if estimated_tokens < idle_min_tokens {
             return Ok(false);
         }
+        config.context_compaction.token_limit_override = Some(idle_compaction_token_limit(
+            config.context_compaction.token_limit_override,
+            idle_min_tokens,
+        ));
 
         if !force_retry {
             let lead_time = Duration::from_secs(30);
@@ -3057,13 +3067,14 @@ mod tests {
         build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
-        fast_path_agent_selection_message, format_session_status, incoming_command_lane,
-        infer_single_agent_backend, is_command_like_text, is_out_of_band_command, is_timeout_like,
-        leading_system_prompt, memory_search_files, normalize_messages_for_persistence,
-        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
-        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
+        fast_path_agent_selection_message, format_session_status, idle_compaction_token_limit,
+        incoming_command_lane, infer_single_agent_backend, is_command_like_text,
+        is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
+        normalize_messages_for_persistence, openrouter_automatic_cache_control,
+        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
+        parse_sandbox_command, parse_set_api_timeout_command, parse_snap_list_command,
+        parse_snap_load_command, parse_snap_save_command, parse_think_command,
+        persist_compaction_artifacts, prepare_system_prompt_for_turn,
         rebuild_canonical_system_prompt, render_last_user_message_time_tip,
         render_system_date_on_user_message, rollout_read_file, rollout_search_files,
         sanitize_messages_for_model_capabilities, select_image_generation_routing,
@@ -4528,6 +4539,13 @@ mod tests {
             200,
             400,
         ));
+    }
+
+    #[test]
+    fn idle_compaction_min_ratio_sets_precompression_token_limit() {
+        assert_eq!(idle_compaction_token_limit(None, 64_000), 64_000);
+        assert_eq!(idle_compaction_token_limit(Some(48_000), 64_000), 48_000);
+        assert_eq!(idle_compaction_token_limit(Some(96_000), 64_000), 64_000);
     }
 
     #[test]

@@ -19,7 +19,8 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Incoming dispatch and Conversation routing must not maintain long-running per-conversation queues; they may prepare and route messages, but durable ordering and waiting belong to the receiving SessionActor.
 - Session actors own the per-session run claim, interrupt, yield, compaction-phase, and pending-interrupt state so independent sessions can progress concurrently.
 - Server maintenance work such as idle context compaction must not run inline on the incoming-message dispatch loop in a way that globally pauses new conversation dispatch.
-- Regression coverage should protect per-session interrupt scoping and non-leaking conversation queues/control messages.
+- Idle context compaction uses `idle_compaction.min_ratio` as the precompression token limit, so an idle session over that ratio can be compacted before it reaches the normal foreground threshold.
+- Regression coverage should protect per-session interrupt scoping, non-leaking conversation queues/control messages, and idle compaction min-ratio precompression.
 
 ### Tool Execution Lifecycle
 
