@@ -4538,7 +4538,7 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
         ChannelFormField::AuthTokenEnv => (
             "The environment variable that holds the Web channel bearer token.",
             "CLAWPARTY_WEB_AUTH_TOKEN",
-            "When neither auth_token nor this env var is set, the Web channel is open.",
+            "When neither auth_token nor this env var is set, the Web channel is disabled for safety.",
         ),
         ChannelFormField::ApiBaseUrl => (
             "The DingTalk API base URL.",
@@ -4940,7 +4940,7 @@ fn channel_summary_text(channel: &ChannelSummary) -> String {
             api_base_url
         ),
         "web" => format!(
-            "当前频道: {}\n类型: web\nlisten_addr: {}\nauth_token_env: {}\n提供内嵌浏览器界面、HTTP 发送接口、WebSocket 实时推送和 transcript 查询接口。",
+            "当前频道: {}\n类型: web\nlisten_addr: {}\nauth_token_env: {}\n提供内嵌浏览器界面、HTTP 发送接口、WebSocket 实时推送和 transcript 查询接口；未配置 token 时会安全禁用。",
             channel.id, listen_addr, auth_token_env
         ),
         "command_line" => format!(

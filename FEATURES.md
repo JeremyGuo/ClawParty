@@ -95,11 +95,13 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - DingTalk robot channels can receive HTTP callback messages when `DINGTALK_ROBOT_APP_SECRET` is configured; callbacks must validate DingTalk `timestamp`/`sign` headers with HMAC-SHA256 and reject stale or invalid requests before parsing message bodies.
 - DingTalk robot channels materialize inbound non-text messages as conversation attachments when `DINGTALK_ROBOT_APP_KEY` and `DINGTALK_ROBOT_APP_SECRET` are configured; `downloadCode` is exchanged for a temporary file URL and persisted through the same `PendingAttachment` path used by Telegram.
 - Without an AppSecret, DingTalk robot channels must remain send-only and must not pretend to receive user messages.
-- Web channels serve the embedded browser client over HTTP, accept user messages through `/api/send`, push live outgoing/progress/session events through `/ws`, and support optional bearer-token authentication from `auth_token` or `auth_token_env`.
+- Web channels serve the embedded browser client over HTTP, accept user messages through `/api/send`, push live outgoing/progress/session events through `/ws`, and require bearer-token authentication from `auth_token` or `auth_token_env`.
+- Web channels without a configured token must log a warning and stay disabled rather than exposing an unauthenticated browser/API surface.
 - Web browser clients expose a left-side conversation list and authenticated create/delete controls for Web conversations.
-- Web browser clients render assistant messages with safe local Markdown support for headings, lists, blockquotes, code blocks, inline code, emphasis, and links.
+- Web browser clients render assistant messages with safe local Markdown support for headings, lists, tables, horizontal rules, blockquotes, code blocks, inline code, emphasis, and links.
 - Web browser clients render assistant `<attachment>...</attachment>` references and outgoing Web attachments through an authenticated attachment endpoint so images and files remain visible after refresh.
 - Web browser clients render `ShowOptions` response prompts as clickable buttons and send the selected option value back through the normal `/api/send` path.
+- Web browser clients must not submit while an input method editor is composing text, and sent user messages should be rendered from transcript append/history rather than an extra optimistic local bubble.
 - Web channel transcript APIs expose newest-first session transcript skeletons and bounded detail ranges through the Host bridge so browser clients can recover reliable history after refresh without depending only on live WebSocket events.
 - Web browser clients load transcript skeletons by page, render API calls and tool responses as clickable summary rows, and request full transcript details over WebSocket only when a user expands an entry.
 - Web browser clients scroll to the newest history on initial load and automatically request the previous transcript page when the user scrolls to the top, preserving the viewport while older entries are inserted.

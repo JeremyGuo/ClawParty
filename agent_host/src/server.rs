@@ -2102,6 +2102,16 @@ impl Server {
                 }
                 ChannelConfig::Web(web) => {
                     let id = web.id.clone();
+                    if WebChannel::resolve_auth_token(&web).is_none() {
+                        warn!(
+                            log_stream = "channel",
+                            log_key = %id,
+                            kind = "web_channel_disabled_missing_auth",
+                            auth_token_env = %web.auth_token_env,
+                            "web channel disabled because no auth token is configured; set auth_token or auth_token_env before enabling the Web channel"
+                        );
+                        continue;
+                    }
                     command_catalog.insert(id.clone(), default_bot_commands());
                     let channel = Arc::new(WebChannel::from_config(web, &workdir)?);
                     web_channels.insert(id.clone(), Arc::clone(&channel));

@@ -110,6 +110,9 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); }
   margin: 0.45rem 0; padding-left: 0.65rem; border-left: 3px solid var(--surface2);
   color: var(--text-muted);
 }
+.markdown hr {
+  border: 0; border-top: 1px solid var(--surface2); margin: 0.65rem 0;
+}
 .markdown pre {
   margin: 0.45rem 0; padding: 0.55rem; overflow: auto; max-width: 100%;
   background: var(--bg); border: 1px solid var(--surface2); border-radius: 4px; white-space: pre;
@@ -120,6 +123,22 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); }
 }
 .markdown pre code { border: none; padding: 0; background: transparent; }
 .markdown a { color: #8bd3ff; text-decoration: underline; }
+.markdown-table-wrap {
+  max-width: 100%; overflow-x: auto; margin: 0.45rem 0;
+}
+.markdown table {
+  border-collapse: collapse; min-width: 100%; width: max-content; max-width: none;
+}
+.markdown th, .markdown td {
+  border: 1px solid var(--surface2); padding: 0.35rem 0.5rem; vertical-align: top;
+  white-space: normal;
+}
+.markdown th {
+  background: var(--surface2); font-weight: 650;
+}
+.markdown tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.025);
+}
 .attachments { display: flex; flex-direction: column; gap: 0.45rem; margin-top: 0.55rem; }
 .attachment { margin: 0; }
 .attachment img {

@@ -28,6 +28,7 @@
   let loadingOlder = false;
   let conversationCache = [];
   let autoStickToBottom = true;
+  let composingInput = false;
   const renderedSeqs = new Set();
 
   function ensureToken(force) {
@@ -360,6 +361,19 @@
         continue;
       }
 
+      if (isMarkdownHorizontalRule(line)) {
+        parent.appendChild(document.createElement('hr'));
+        index += 1;
+        continue;
+      }
+
+      if (isMarkdownTableStart(lines, index)) {
+        const rendered = renderMarkdownTable(lines, index);
+        parent.appendChild(rendered.node);
+        index = rendered.nextIndex;
+        continue;
+      }
+
       if (/^>\s?/.test(line)) {
         const quote = document.createElement('blockquote');
         while (index < lines.length && /^>\s?/.test(lines[index])) {
@@ -389,7 +403,7 @@
       }
 
       const paragraphLines = [];
-      while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      while (index < lines.length && lines[index].trim() && !isMarkdownBlockStartAt(lines, index)) {
         paragraphLines.push(lines[index]);
         index += 1;
       }
@@ -399,11 +413,128 @@
     }
   }
 
-  function isMarkdownBlockStart(line) {
+  function isMarkdownBlockStartAt(lines, index) {
+    const line = lines[index];
     return /^```/.test(line) ||
       /^(#{1,6})\s+/.test(line) ||
+      isMarkdownHorizontalRule(line) ||
+      isMarkdownTableStart(lines, index) ||
       /^>\s?/.test(line) ||
       /^(\s*)([-*+]|\d+\.)\s+/.test(line);
+  }
+
+  function isMarkdownHorizontalRule(line) {
+    return /^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+  }
+
+  function renderMarkdownTable(lines, startIndex) {
+    const headerCells = splitMarkdownTableRow(lines[startIndex]);
+    const delimiterCells = splitMarkdownTableRow(lines[startIndex + 1]);
+    const alignments = delimiterCells.map(tableAlignment);
+    const rows = [];
+    let index = startIndex + 2;
+    while (index < lines.length && lines[index].trim() && hasUnescapedPipe(lines[index])) {
+      if (isMarkdownTableDelimiter(lines[index])) break;
+      rows.push(splitMarkdownTableRow(lines[index]));
+      index += 1;
+    }
+
+    const width = Math.max(
+      headerCells.length,
+      delimiterCells.length,
+      rows.reduce(function (max, row) { return Math.max(max, row.length); }, 0)
+    );
+    const wrap = document.createElement('div');
+    wrap.className = 'markdown-table-wrap';
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (let col = 0; col < width; col += 1) {
+      const th = document.createElement('th');
+      applyTableAlignment(th, alignments[col]);
+      renderInlineMarkdown(th, headerCells[col] || '');
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    rows.forEach(function (row) {
+      const tr = document.createElement('tr');
+      for (let col = 0; col < width; col += 1) {
+        const td = document.createElement('td');
+        applyTableAlignment(td, alignments[col]);
+        renderInlineMarkdown(td, row[col] || '');
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return { node: wrap, nextIndex: index };
+  }
+
+  function isMarkdownTableStart(lines, index) {
+    if (index + 1 >= lines.length) return false;
+    if (!hasUnescapedPipe(lines[index])) return false;
+    if (!isMarkdownTableDelimiter(lines[index + 1])) return false;
+    return splitMarkdownTableRow(lines[index]).length >= 2;
+  }
+
+  function isMarkdownTableDelimiter(line) {
+    if (!hasUnescapedPipe(line)) return false;
+    const cells = splitMarkdownTableRow(line);
+    if (cells.length < 2) return false;
+    return cells.every(function (cell) {
+      return /^:?-{3,}:?$/.test(cell.trim());
+    });
+  }
+
+  function splitMarkdownTableRow(line) {
+    const cells = [];
+    let current = '';
+    const source = String(line || '').trim();
+    for (let i = 0; i < source.length; i += 1) {
+      const ch = source[i];
+      if (ch === '\\' && i + 1 < source.length) {
+        current += source[i + 1];
+        i += 1;
+      } else if (ch === '|') {
+        cells.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current.trim());
+    if (source.startsWith('|') && cells[0] === '') cells.shift();
+    if (source.endsWith('|') && cells[cells.length - 1] === '') cells.pop();
+    return cells;
+  }
+
+  function hasUnescapedPipe(line) {
+    const source = String(line || '');
+    for (let i = 0; i < source.length; i += 1) {
+      if (source[i] === '\\') {
+        i += 1;
+      } else if (source[i] === '|') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function tableAlignment(cell) {
+    const value = String(cell || '').trim();
+    const left = value.startsWith(':');
+    const right = value.endsWith(':');
+    if (left && right) return 'center';
+    if (right) return 'right';
+    return null;
+  }
+
+  function applyTableAlignment(node, alignment) {
+    if (alignment) node.style.textAlign = alignment;
   }
 
   function renderInlineMarkdown(parent, text) {
@@ -543,7 +674,6 @@
   }
 
   async function sendMessage(text) {
-    appendMessage('user', text);
     try {
       const resp = await apiPost('/api/send', {
         text: text,
@@ -553,6 +683,9 @@
         appendEvent('Send failed: ' + resp.status + ' ' + (await resp.text()));
       } else {
         loadConversations();
+        setTimeout(function () {
+          loadTranscriptPage('latest');
+        }, 250);
       }
     } catch (e) {
       appendEvent('Network error: ' + e.message);
@@ -971,10 +1104,19 @@
   });
 
   inputEl.addEventListener('keydown', function (e) {
+    if (e.isComposing || composingInput || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       formEl.dispatchEvent(new Event('submit'));
     }
+  });
+
+  inputEl.addEventListener('compositionstart', function () {
+    composingInput = true;
+  });
+
+  inputEl.addEventListener('compositionend', function () {
+    composingInput = false;
   });
 
   if (newConversationBtn) {

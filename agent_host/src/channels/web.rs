@@ -27,6 +27,7 @@ struct WebChannelInner {
     id: String,
     listen_addr: String,
     auth_token: Option<String>,
+    auth_token_env: String,
     workdir: PathBuf,
     host: StdRwLock<Option<Arc<dyn WebChannelHost>>>,
     incoming_sender: RwLock<Option<mpsc::Sender<IncomingMessage>>>,
@@ -61,21 +62,34 @@ pub trait WebChannelHost: Send + Sync {
 }
 
 impl WebChannel {
-    pub fn from_config(config: WebChannelConfig, workdir: impl Into<PathBuf>) -> Result<Self> {
-        let auth_token = config
+    pub(crate) fn resolve_auth_token(config: &WebChannelConfig) -> Option<String> {
+        config
             .auth_token
-            .filter(|token| !token.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToOwned::to_owned)
             .or_else(|| {
-                std::env::var(&config.auth_token_env)
+                let env_name = config.auth_token_env.trim();
+                if env_name.is_empty() {
+                    return None;
+                }
+                std::env::var(env_name)
                     .ok()
-                    .filter(|token| !token.trim().is_empty())
-            });
+                    .map(|token| token.trim().to_string())
+                    .filter(|token| !token.is_empty())
+            })
+    }
+
+    pub fn from_config(config: WebChannelConfig, workdir: impl Into<PathBuf>) -> Result<Self> {
+        let auth_token = Self::resolve_auth_token(&config);
         let (event_bus, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(WebChannelInner {
                 id: config.id,
                 listen_addr: config.listen_addr,
                 auth_token,
+                auth_token_env: config.auth_token_env,
                 workdir: workdir.into(),
                 host: StdRwLock::new(None),
                 incoming_sender: RwLock::new(None),
@@ -113,6 +127,17 @@ impl Channel for WebChannel {
     }
 
     async fn run(self: Arc<Self>, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
+        if self.inner.auth_token.is_none() {
+            tracing::warn!(
+                log_stream = "channel",
+                log_key = %self.inner.id,
+                kind = "web_channel_disabled_missing_auth",
+                auth_token_env = %self.inner.auth_token_env,
+                "web channel disabled because no auth token is configured; set auth_token or auth_token_env before enabling the Web channel"
+            );
+            std::future::pending::<()>().await;
+        }
+
         {
             let mut incoming_sender = self.inner.incoming_sender.write().await;
             *incoming_sender = Some(sender);
@@ -308,16 +333,15 @@ fn check_auth(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<(), StatusCode> {
-    let Some(expected_token) = &state.auth_token else {
-        return Ok(());
+    let Some(expected_token) = state.auth_token.as_deref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
 
     let bearer_token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if bearer_token == Some(expected_token.as_str()) || query_token == Some(expected_token.as_str())
-    {
+    if bearer_token == Some(expected_token) || query_token == Some(expected_token) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -511,10 +535,7 @@ async fn ws_handler(
             true
         }
         Some(_) => false,
-        None => {
-            check_auth(&state, &headers, None)?;
-            true
-        }
+        None => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     Ok(ws.on_upgrade(move |socket| handle_ws(socket, state, pre_authenticated)))
 }
@@ -524,7 +545,12 @@ async fn handle_ws(
     state: Arc<WebChannelInner>,
     pre_authenticated: bool,
 ) {
-    if !pre_authenticated && let Some(expected_token) = state.auth_token.as_deref() {
+    let Some(expected_token) = state.auth_token.as_deref() else {
+        let _ = socket.close().await;
+        return;
+    };
+
+    if !pre_authenticated {
         let authed = match socket.recv().await {
             Some(Ok(ws::Message::Text(payload))) => {
                 serde_json::from_str::<Value>(&payload)
@@ -1029,6 +1055,7 @@ mod tests {
             id: "web".to_string(),
             listen_addr: "127.0.0.1:0".to_string(),
             auth_token: token.map(ToOwned::to_owned),
+            auth_token_env: "CLAWPARTY_WEB_AUTH_TOKEN".to_string(),
             workdir,
             host: StdRwLock::new(None),
             incoming_sender: RwLock::new(None),
@@ -1037,9 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn auth_allows_open_channel() {
+    fn auth_rejects_missing_token_configuration() {
         let headers = HeaderMap::new();
-        assert!(check_auth(&state_with_token(None), &headers, None).is_ok());
+        assert_eq!(
+            check_auth(&state_with_token(None), &headers, None).unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -1055,6 +1085,28 @@ mod tests {
             check_auth(&state, &headers, Some("wrong")).unwrap_err(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn web_channel_resolves_literal_auth_and_ignores_blank_values() {
+        let config = WebChannelConfig {
+            id: "web".to_string(),
+            listen_addr: "127.0.0.1:0".to_string(),
+            auth_token: Some("  secret  ".to_string()),
+            auth_token_env: String::new(),
+        };
+        assert_eq!(
+            WebChannel::resolve_auth_token(&config).as_deref(),
+            Some("secret")
+        );
+
+        let config = WebChannelConfig {
+            id: "web".to_string(),
+            listen_addr: "127.0.0.1:0".to_string(),
+            auth_token: Some("   ".to_string()),
+            auth_token_env: String::new(),
+        };
+        assert!(WebChannel::resolve_auth_token(&config).is_none());
     }
 
     #[test]
@@ -1093,6 +1145,31 @@ mod tests {
         );
         assert_eq!(payload["options"]["options"][0]["label"], "opus-4.6");
         assert_eq!(payload["options"]["options"][0]["value"], "/agent opus-4.6");
+    }
+
+    #[test]
+    fn bundled_web_client_supports_markdown_tables() {
+        assert!(APP_JS.contains("function renderMarkdownTable"));
+        assert!(APP_JS.contains("function isMarkdownTableStart"));
+        assert!(APP_JS.contains("markdown-table-wrap"));
+        assert!(STYLE_CSS.contains(".markdown table"));
+        assert!(STYLE_CSS.contains(".markdown th, .markdown td"));
+    }
+
+    #[test]
+    fn bundled_web_client_supports_markdown_horizontal_rules() {
+        assert!(APP_JS.contains("function isMarkdownHorizontalRule"));
+        assert!(APP_JS.contains("document.createElement('hr')"));
+        assert!(STYLE_CSS.contains(".markdown hr"));
+    }
+
+    #[test]
+    fn bundled_web_client_handles_ime_and_authoritative_user_echo() {
+        assert!(APP_JS.contains("compositionstart"));
+        assert!(APP_JS.contains("compositionend"));
+        assert!(APP_JS.contains("e.isComposing || composingInput || e.keyCode === 229"));
+        assert!(!APP_JS.contains("appendMessage('user', text);"));
+        assert!(APP_JS.contains("loadTranscriptPage('latest');"));
     }
 
     #[test]
