@@ -38,6 +38,7 @@ pub struct TelegramChannel {
     chat_member_counts: Mutex<HashMap<i64, (u64, Instant)>>,
     pending_outbound: Mutex<VecDeque<PendingOutbound>>,
     progress_messages: Mutex<HashMap<String, TelegramProgressMessage>>,
+    pending_media_groups: Mutex<HashMap<String, PendingTelegramMediaGroup>>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +52,14 @@ struct TelegramProgressMessage {
     message_id: i64,
     last_text: String,
     last_update: Instant,
+}
+
+struct PendingTelegramMediaGroup {
+    address: ChannelAddress,
+    remote_message_ids: Vec<String>,
+    text_chunks: Vec<String>,
+    attachments: Vec<PendingAttachment>,
+    accepted: bool,
 }
 
 impl TelegramChannel {
@@ -88,6 +97,7 @@ impl TelegramChannel {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         })
     }
 
@@ -264,7 +274,8 @@ impl TelegramChannel {
 
     fn max_send_attempts(&self, method: &str) -> u32 {
         match method {
-            "sendMessage" | "sendPhoto" | "sendDocument" | "sendMediaGroup" | "sendChatAction" => {
+            "sendMessage" | "sendPhoto" | "sendDocument" | "sendAudio" | "sendVoice"
+            | "sendVideo" | "sendAnimation" | "sendMediaGroup" | "sendChatAction" => {
                 Self::MAX_SEND_RETRIES
             }
             _ => 1,
@@ -323,6 +334,87 @@ impl TelegramChannel {
 
     fn progress_message_key(address: &ChannelAddress, turn_id: &str) -> String {
         format!("{}:{}", address.session_key(), turn_id)
+    }
+
+    fn media_group_key(chat_id: i64, media_group_id: &str) -> String {
+        format!("{chat_id}:{media_group_id}")
+    }
+
+    async fn enqueue_media_group_message(
+        self: &Arc<Self>,
+        key: String,
+        incoming: IncomingMessage,
+        accepted: bool,
+        sender: mpsc::Sender<IncomingMessage>,
+    ) {
+        let mut groups = self.pending_media_groups.lock().await;
+        let is_new = !groups.contains_key(&key);
+        let group = groups
+            .entry(key.clone())
+            .or_insert_with(|| PendingTelegramMediaGroup {
+                address: incoming.address.clone(),
+                remote_message_ids: Vec::new(),
+                text_chunks: Vec::new(),
+                attachments: Vec::new(),
+                accepted: false,
+            });
+        group.remote_message_ids.push(incoming.remote_message_id);
+        if let Some(text) = incoming
+            .text
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            group.text_chunks.push(text);
+        }
+        group.attachments.extend(incoming.attachments);
+        group.accepted |= accepted;
+        drop(groups);
+
+        if is_new {
+            let channel = Arc::clone(self);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                channel.flush_media_group(key, sender).await;
+            });
+        }
+    }
+
+    async fn flush_media_group(
+        self: Arc<Self>,
+        key: String,
+        sender: mpsc::Sender<IncomingMessage>,
+    ) {
+        let Some(group) = self.pending_media_groups.lock().await.remove(&key) else {
+            return;
+        };
+        if !group.accepted {
+            info!(
+                log_stream = "channel",
+                log_key = %self.id,
+                kind = "telegram_ignored_media_group",
+                conversation_id = %group.address.conversation_id,
+                remote_message_ids = ?group.remote_message_ids,
+                attachment_count = group.attachments.len() as u64,
+                "ignoring telegram media group without bot mention or command"
+            );
+            return;
+        }
+        let incoming = IncomingMessage {
+            remote_message_id: format!("media_group:{}", group.remote_message_ids.join(",")),
+            address: group.address,
+            text: (!group.text_chunks.is_empty()).then(|| group.text_chunks.join("\n\n")),
+            attachments: group.attachments,
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        if sender.send(incoming).await.is_err() {
+            warn!(
+                log_stream = "channel",
+                log_key = %self.id,
+                kind = "telegram_receiver_closed",
+                "telegram receiver closed while flushing media group"
+            );
+        }
     }
 
     async fn flush_pending_outbound_queue(&self, trigger: &str) {
@@ -518,17 +610,11 @@ impl TelegramChannel {
 
         if let Some(document) = message.document.as_ref() {
             attachments.push(PendingAttachment::new(
-                if document
-                    .mime_type
-                    .as_deref()
-                    .unwrap_or_default()
-                    .starts_with("image/")
-                {
-                    AttachmentKind::Image
-                } else {
-                    AttachmentKind::File
-                },
-                document.file_name.clone(),
+                attachment_kind_from_telegram_media(document),
+                document
+                    .file_name
+                    .clone()
+                    .or_else(|| telegram_default_media_name(document, "document")),
                 document.mime_type.clone(),
                 document.file_size,
                 Arc::new(TelegramAttachmentSource::new(
@@ -542,12 +628,15 @@ impl TelegramChannel {
 
         if let Some(video) = message.video.as_ref() {
             attachments.push(PendingAttachment::new(
-                AttachmentKind::File,
+                AttachmentKind::Video,
                 video
                     .file_name
                     .clone()
-                    .or_else(|| Some(format!("video_{}.bin", video.file_unique_id))),
-                video.mime_type.clone(),
+                    .or_else(|| telegram_default_media_name(video, "video")),
+                video
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("video/mp4".to_string())),
                 video.file_size,
                 Arc::new(TelegramAttachmentSource::new(
                     self.client.clone(),
@@ -560,11 +649,11 @@ impl TelegramChannel {
 
         if let Some(audio) = message.audio.as_ref() {
             attachments.push(PendingAttachment::new(
-                AttachmentKind::File,
+                AttachmentKind::Audio,
                 audio
                     .file_name
                     .clone()
-                    .or_else(|| Some(format!("audio_{}.bin", audio.file_unique_id))),
+                    .or_else(|| telegram_default_media_name(audio, "audio")),
                 audio.mime_type.clone(),
                 audio.file_size,
                 Arc::new(TelegramAttachmentSource::new(
@@ -572,6 +661,75 @@ impl TelegramChannel {
                     self.api_base_url.clone(),
                     self.bot_token.clone(),
                     audio.file_id.clone(),
+                )),
+            ));
+        }
+
+        if let Some(voice) = message.voice.as_ref() {
+            attachments.push(PendingAttachment::new(
+                AttachmentKind::Voice,
+                telegram_default_media_name(voice, "voice"),
+                voice
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("audio/ogg".to_string())),
+                voice.file_size,
+                Arc::new(TelegramAttachmentSource::new(
+                    self.client.clone(),
+                    self.api_base_url.clone(),
+                    self.bot_token.clone(),
+                    voice.file_id.clone(),
+                )),
+            ));
+        }
+
+        if let Some(video_note) = message.video_note.as_ref() {
+            attachments.push(PendingAttachment::new(
+                AttachmentKind::Video,
+                Some(format!("video_note_{}.mp4", video_note.file_unique_id)),
+                Some("video/mp4".to_string()),
+                video_note.file_size,
+                Arc::new(TelegramAttachmentSource::new(
+                    self.client.clone(),
+                    self.api_base_url.clone(),
+                    self.bot_token.clone(),
+                    video_note.file_id.clone(),
+                )),
+            ));
+        }
+
+        if let Some(animation) = message.animation.as_ref() {
+            attachments.push(PendingAttachment::new(
+                AttachmentKind::Animation,
+                animation
+                    .file_name
+                    .clone()
+                    .or_else(|| telegram_default_media_name(animation, "animation")),
+                animation
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("video/mp4".to_string())),
+                animation.file_size,
+                Arc::new(TelegramAttachmentSource::new(
+                    self.client.clone(),
+                    self.api_base_url.clone(),
+                    self.bot_token.clone(),
+                    animation.file_id.clone(),
+                )),
+            ));
+        }
+
+        if let Some(sticker) = message.sticker.as_ref() {
+            attachments.push(PendingAttachment::new(
+                AttachmentKind::Sticker,
+                Some(sticker.file_name()),
+                sticker.media_type(),
+                sticker.file_size,
+                Arc::new(TelegramAttachmentSource::new(
+                    self.client.clone(),
+                    self.api_base_url.clone(),
+                    self.bot_token.clone(),
+                    sticker.file_id.clone(),
                 )),
             ));
         }
@@ -745,19 +903,27 @@ impl TelegramChannel {
         Ok(())
     }
 
-    async fn send_document(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+    async fn send_binary_attachment(
+        &self,
+        chat_id: &str,
+        attachment: OutgoingAttachment,
+        method: &str,
+        field_name: &str,
+        fallback_name: &str,
+    ) -> Result<()> {
         let file_name = attachment
             .path
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment.bin".to_string());
+            .unwrap_or_else(|| fallback_name.to_string());
         let bytes = fs::read(&attachment.path)
             .await
             .with_context(|| format!("failed to read attachment {}", attachment.path.display()))?;
         let mut trailing_text_chunks = Vec::new();
-        let form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", Part::bytes(bytes).file_name(file_name));
+        let form = Form::new().text("chat_id", chat_id.to_string()).part(
+            field_name.to_string(),
+            Part::bytes(bytes).file_name(file_name),
+        );
         let form = if let Some(caption) = attachment.caption {
             let mut iter =
                 render_markdown_chunks_to_telegram_entities(&caption, Self::MAX_CAPTION_CHARS)
@@ -780,11 +946,48 @@ impl TelegramChannel {
         } else {
             form
         };
-        self.call_multipart("sendDocument", form).await?;
+        self.call_multipart(method, form).await?;
         for chunk in trailing_text_chunks {
             self.send_rendered_text_chunk(chat_id, chunk, None).await?;
         }
         Ok(())
+    }
+
+    async fn send_document(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+        self.send_binary_attachment(
+            chat_id,
+            attachment,
+            "sendDocument",
+            "document",
+            "attachment.bin",
+        )
+        .await
+    }
+
+    async fn send_audio(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+        self.send_binary_attachment(chat_id, attachment, "sendAudio", "audio", "audio.bin")
+            .await
+    }
+
+    async fn send_voice(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+        self.send_binary_attachment(chat_id, attachment, "sendVoice", "voice", "voice.ogg")
+            .await
+    }
+
+    async fn send_video(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+        self.send_binary_attachment(chat_id, attachment, "sendVideo", "video", "video.bin")
+            .await
+    }
+
+    async fn send_animation(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
+        self.send_binary_attachment(
+            chat_id,
+            attachment,
+            "sendAnimation",
+            "animation",
+            "animation.bin",
+        )
+        .await
     }
 
     async fn render_usage_chart_image(&self, chart: &UsageChart) -> Result<PathBuf> {
@@ -1172,8 +1375,32 @@ fig.savefig(output_path, format="png")
             }
         }
         for attachment in attachments {
-            self.send_document(&address.conversation_id, attachment)
-                .await?;
+            match attachment.kind {
+                AttachmentKind::Audio => {
+                    self.send_audio(&address.conversation_id, attachment)
+                        .await?
+                }
+                AttachmentKind::Voice => {
+                    self.send_voice(&address.conversation_id, attachment)
+                        .await?
+                }
+                AttachmentKind::Video => {
+                    self.send_video(&address.conversation_id, attachment)
+                        .await?
+                }
+                AttachmentKind::Animation => {
+                    self.send_animation(&address.conversation_id, attachment)
+                        .await?
+                }
+                AttachmentKind::Image => {
+                    self.send_photo(&address.conversation_id, attachment)
+                        .await?
+                }
+                AttachmentKind::Pdf | AttachmentKind::Sticker | AttachmentKind::File => {
+                    self.send_document(&address.conversation_id, attachment)
+                        .await?
+                }
+            }
         }
         if let Some(path) = generated_chart_path
             && let Err(error) = fs::remove_file(&path).await
@@ -1355,10 +1582,29 @@ impl Channel for TelegramChannel {
                     );
                     continue;
                 }
-                if !self
+                let accepted = self
                     .should_accept_message(&message, text.as_deref(), attachments.len())
-                    .await
-                {
+                    .await;
+                let bot_username = self.bot_username.lock().await.clone();
+                let text = text.map(|value| {
+                    normalize_leading_bot_mention_command_text(&value, bot_username.as_deref())
+                        .unwrap_or(value)
+                });
+                if let Some(media_group_id) = message.media_group_id.as_deref() {
+                    let key = Self::media_group_key(message.chat.id, media_group_id);
+                    let incoming = IncomingMessage {
+                        remote_message_id: message.message_id.to_string(),
+                        address: self.build_address(&message),
+                        text,
+                        attachments,
+                        stored_attachments: Vec::new(),
+                        control: None,
+                    };
+                    self.enqueue_media_group_message(key, incoming, accepted, sender.clone())
+                        .await;
+                    continue;
+                }
+                if !accepted {
                     info!(
                         log_stream = "channel",
                         log_key = %self.id,
@@ -1370,11 +1616,6 @@ impl Channel for TelegramChannel {
                     );
                     continue;
                 }
-                let bot_username = self.bot_username.lock().await.clone();
-                let text = text.map(|value| {
-                    normalize_leading_bot_mention_command_text(&value, bot_username.as_deref())
-                        .unwrap_or(value)
-                });
                 let receive_lag_seconds = telegram_message_receive_lag_seconds(message.date);
                 info!(
                     log_stream = "channel",
@@ -1675,6 +1916,53 @@ fn telegram_message_receive_lag_seconds(message_date: Option<i64>) -> Option<i64
         .try_into()
         .ok()?;
     Some(now - sent_at)
+}
+
+fn attachment_kind_from_telegram_media(media: &TelegramMedia) -> AttachmentKind {
+    let mime = media.mime_type.as_deref().unwrap_or_default();
+    if mime.starts_with("image/") {
+        AttachmentKind::Image
+    } else if mime.eq_ignore_ascii_case("application/pdf")
+        || media
+            .file_name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".pdf"))
+    {
+        AttachmentKind::Pdf
+    } else if mime.starts_with("audio/") {
+        AttachmentKind::Audio
+    } else if mime.starts_with("video/") {
+        AttachmentKind::Video
+    } else {
+        AttachmentKind::File
+    }
+}
+
+fn telegram_default_media_name(media: &TelegramMedia, prefix: &str) -> Option<String> {
+    let extension = media
+        .mime_type
+        .as_deref()
+        .and_then(extension_from_media_type)
+        .unwrap_or("bin");
+    Some(format!("{}_{}.{}", prefix, media.file_unique_id, extension))
+}
+
+fn extension_from_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type.to_ascii_lowercase().as_str() {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "application/pdf" => Some("pdf"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/ogg" | "audio/opus" => Some("ogg"),
+        "audio/wav" | "audio/wave" | "audio/x-wav" => Some("wav"),
+        "audio/mp4" | "audio/aac" | "audio/m4a" => Some("m4a"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "application/x-tgsticker" => Some("tgs"),
+        _ => None,
+    }
 }
 
 fn build_inline_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
@@ -3563,19 +3851,22 @@ fn prefer_split_boundary(chars: &[char], minimum_index: usize) -> Option<usize> 
 #[cfg(test)]
 mod tests {
     use super::{
-        RichBlock, RichInline, TelegramChannel, TelegramChat, TelegramMessage,
-        TelegramMessageEntity, TelegramRenderedText, build_edit_text_payload,
-        build_send_text_payload, normalize_leading_bot_mention_command_text,
-        parse_markdown_to_rich_document, poll_backoff_seconds,
-        render_markdown_chunks_to_telegram_entities, render_rich_document_to_telegram_entities,
-        telegram_text_len, text_targets_this_bot_command, translate_markdown_to_telegram_html,
+        RichBlock, RichInline, TelegramAttachmentSource, TelegramChannel, TelegramChat,
+        TelegramMedia, TelegramMessage, TelegramMessageEntity, TelegramRenderedText,
+        build_edit_text_payload, build_send_text_payload,
+        normalize_leading_bot_mention_command_text, parse_markdown_to_rich_document,
+        poll_backoff_seconds, render_markdown_chunks_to_telegram_entities,
+        render_rich_document_to_telegram_entities, telegram_text_len,
+        text_targets_this_bot_command, translate_markdown_to_telegram_html,
     };
-    use crate::domain::ShowOptions;
+    use crate::channel::{IncomingMessage, PendingAttachment};
+    use crate::domain::{AttachmentKind, ChannelAddress, ShowOptions};
     use anyhow::anyhow;
     use reqwest::Client;
     use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc};
 
     #[test]
     fn translates_basic_markdown_to_telegram_html() {
@@ -3995,6 +4286,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
 
         let redacted = channel
@@ -4018,6 +4310,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
 
         assert_eq!(
@@ -4049,6 +4342,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
 
         let error = anyhow!("telegram API sendMessage failed: Too Many Requests");
@@ -4070,6 +4364,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
 
         let error = anyhow!("telegram API sendMessage failed: Bad Request: chat not found");
@@ -4091,6 +4386,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
 
         assert!(channel.is_terminal_chat_error(&anyhow!(
@@ -4123,6 +4419,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -4135,10 +4432,15 @@ mod tests {
             left_chat_member: None,
             text: Some("介绍一下你自己".to_string()),
             caption: None,
+            media_group_id: None,
             photo: None,
             document: None,
             video: None,
             audio: None,
+            voice: None,
+            video_note: None,
+            animation: None,
+            sticker: None,
         };
         assert!(
             channel
@@ -4162,6 +4464,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -4174,10 +4477,15 @@ mod tests {
             left_chat_member: None,
             text: Some("/status".to_string()),
             caption: None,
+            media_group_id: None,
             photo: None,
             document: None,
             video: None,
             audio: None,
+            voice: None,
+            video_note: None,
+            animation: None,
+            sticker: None,
         };
         assert!(
             channel
@@ -4201,6 +4509,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -4213,10 +4522,15 @@ mod tests {
             left_chat_member: None,
             text: Some("介绍一下你自己".to_string()),
             caption: None,
+            media_group_id: None,
             photo: None,
             document: None,
             video: None,
             audio: None,
+            voice: None,
+            video_note: None,
+            animation: None,
+            sticker: None,
         };
         assert!(
             !channel
@@ -4301,6 +4615,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -4313,10 +4628,15 @@ mod tests {
             left_chat_member: None,
             text: Some("@party_claw_bot 你好".to_string()),
             caption: None,
+            media_group_id: None,
             photo: None,
             document: None,
             video: None,
             audio: None,
+            voice: None,
+            video_note: None,
+            animation: None,
+            sticker: None,
         };
         assert!(
             channel
@@ -4340,6 +4660,7 @@ mod tests {
             chat_member_counts: Mutex::new(HashMap::from([(-5158767783, (2, Instant::now()))])),
             pending_outbound: Mutex::new(VecDeque::new()),
             progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -4352,16 +4673,177 @@ mod tests {
             left_chat_member: None,
             text: Some("在吗".to_string()),
             caption: None,
+            media_group_id: None,
             photo: None,
             document: None,
             video: None,
             audio: None,
+            voice: None,
+            video_note: None,
+            animation: None,
+            sticker: None,
         };
         assert!(
             channel
                 .should_accept_message(&message, message.text.as_deref(), 0)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn coalesces_accepted_telegram_media_groups() {
+        let channel = Arc::new(TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
+            pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
+        });
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "123".to_string(),
+            user_id: Some("7".to_string()),
+            display_name: Some("tester".to_string()),
+        };
+        let key = TelegramChannel::media_group_key(123, "album-1");
+        let (sender, mut receiver) = mpsc::channel(2);
+
+        channel
+            .enqueue_media_group_message(
+                key.clone(),
+                IncomingMessage {
+                    remote_message_id: "10".to_string(),
+                    address: address.clone(),
+                    text: Some("first".to_string()),
+                    attachments: vec![PendingAttachment::new(
+                        AttachmentKind::Image,
+                        Some("one.jpg".to_string()),
+                        Some("image/jpeg".to_string()),
+                        Some(10),
+                        Arc::new(TelegramAttachmentSource::new(
+                            Client::new(),
+                            "https://api.telegram.org".to_string(),
+                            "secret-token".to_string(),
+                            "file-one".to_string(),
+                        )),
+                    )],
+                    stored_attachments: Vec::new(),
+                    control: None,
+                },
+                true,
+                sender.clone(),
+            )
+            .await;
+        channel
+            .enqueue_media_group_message(
+                key.clone(),
+                IncomingMessage {
+                    remote_message_id: "11".to_string(),
+                    address,
+                    text: Some("second".to_string()),
+                    attachments: vec![PendingAttachment::new(
+                        AttachmentKind::Pdf,
+                        Some("two.pdf".to_string()),
+                        Some("application/pdf".to_string()),
+                        Some(20),
+                        Arc::new(TelegramAttachmentSource::new(
+                            Client::new(),
+                            "https://api.telegram.org".to_string(),
+                            "secret-token".to_string(),
+                            "file-two".to_string(),
+                        )),
+                    )],
+                    stored_attachments: Vec::new(),
+                    control: None,
+                },
+                false,
+                sender.clone(),
+            )
+            .await;
+
+        Arc::clone(&channel).flush_media_group(key, sender).await;
+
+        let incoming = receiver
+            .recv()
+            .await
+            .expect("expected coalesced media group");
+        assert_eq!(incoming.remote_message_id, "media_group:10,11");
+        assert_eq!(incoming.text.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(incoming.attachments.len(), 2);
+        assert_eq!(incoming.attachments[0].kind, AttachmentKind::Image);
+        assert_eq!(incoming.attachments[1].kind, AttachmentKind::Pdf);
+    }
+
+    #[test]
+    fn classifies_rich_telegram_media_attachments() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            bot_user_id: Mutex::new(Some(42)),
+            chat_member_counts: Mutex::new(HashMap::new()),
+            pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
+            pending_media_groups: Mutex::new(HashMap::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            date: None,
+            chat: TelegramChat {
+                id: 1,
+                kind: "private".to_string(),
+            },
+            from: None,
+            left_chat_member: None,
+            text: None,
+            caption: Some("see attached".to_string()),
+            media_group_id: None,
+            photo: None,
+            document: Some(TelegramMedia {
+                file_id: "pdf-file-id".to_string(),
+                file_unique_id: "pdf-unique".to_string(),
+                file_name: Some("brief.pdf".to_string()),
+                mime_type: Some("application/pdf".to_string()),
+                file_size: Some(123),
+            }),
+            video: Some(TelegramMedia {
+                file_id: "video-file-id".to_string(),
+                file_unique_id: "video-unique".to_string(),
+                file_name: None,
+                mime_type: Some("video/mp4".to_string()),
+                file_size: Some(456),
+            }),
+            audio: None,
+            voice: Some(TelegramMedia {
+                file_id: "voice-file-id".to_string(),
+                file_unique_id: "voice-unique".to_string(),
+                file_name: None,
+                mime_type: Some("audio/ogg".to_string()),
+                file_size: Some(789),
+            }),
+            video_note: None,
+            animation: None,
+            sticker: None,
+        };
+
+        let attachments = channel.collect_attachments(&message);
+        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments[0].kind, AttachmentKind::Pdf);
+        assert_eq!(attachments[1].kind, AttachmentKind::Video);
+        assert_eq!(attachments[2].kind, AttachmentKind::Voice);
     }
 }
 
@@ -4463,10 +4945,15 @@ struct TelegramMessage {
     left_chat_member: Option<TelegramUser>,
     text: Option<String>,
     caption: Option<String>,
+    media_group_id: Option<String>,
     photo: Option<Vec<TelegramPhotoSize>>,
     document: Option<TelegramMedia>,
     video: Option<TelegramMedia>,
     audio: Option<TelegramMedia>,
+    voice: Option<TelegramMedia>,
+    video_note: Option<TelegramVideoNote>,
+    animation: Option<TelegramMedia>,
+    sticker: Option<TelegramSticker>,
 }
 
 #[derive(Deserialize)]
@@ -4498,6 +4985,54 @@ struct TelegramMedia {
     file_name: Option<String>,
     mime_type: Option<String>,
     file_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TelegramVideoNote {
+    file_id: String,
+    file_unique_id: String,
+    file_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TelegramSticker {
+    file_id: String,
+    file_unique_id: String,
+    #[serde(default)]
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    kind: Option<String>,
+    #[serde(default)]
+    is_animated: bool,
+    #[serde(default)]
+    is_video: bool,
+    file_size: Option<u64>,
+}
+
+impl TelegramSticker {
+    fn file_name(&self) -> String {
+        let extension = if self.is_video {
+            "webm"
+        } else if self.is_animated {
+            "tgs"
+        } else {
+            "webp"
+        };
+        format!("sticker_{}.{}", self.file_unique_id, extension)
+    }
+
+    fn media_type(&self) -> Option<String> {
+        Some(
+            if self.is_video {
+                "video/webm"
+            } else if self.is_animated {
+                "application/x-tgsticker"
+            } else {
+                "image/webp"
+            }
+            .to_string(),
+        )
+    }
 }
 
 #[derive(Deserialize)]

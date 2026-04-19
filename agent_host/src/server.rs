@@ -2143,6 +2143,23 @@ impl Server {
                 }
             });
         }
+        {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                if let Err(error) = server
+                    .recover_pending_foreground_turns_after_startup()
+                    .await
+                {
+                    error!(
+                        log_stream = "server",
+                        kind = "pending_foreground_turn_recovery_failed",
+                        error = %format!("{error:#}"),
+                        "failed to recover pending foreground turns after startup"
+                    );
+                }
+            });
+        }
 
         let mut idle_compaction_ticker = interval(Duration::from_secs(
             server.main_agent.idle_compaction.poll_interval_seconds,
@@ -3701,7 +3718,7 @@ mod tests {
         let text = items[0]["text"].as_str().unwrap();
         assert!(text.contains("[System Date: 2026-04-10 01:23:45 +08:00]"));
         assert!(text.contains("already directly visible in this request"));
-        assert!(text.contains("instead of calling the image tool again"));
+        assert!(text.contains("instead of calling load/query tools"));
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));

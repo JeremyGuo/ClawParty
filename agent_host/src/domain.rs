@@ -22,7 +22,31 @@ impl ChannelAddress {
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Image,
+    Pdf,
+    Audio,
+    Voice,
+    Video,
+    Animation,
+    Sticker,
     File,
+}
+
+impl AttachmentKind {
+    pub fn is_image(self) -> bool {
+        matches!(self, Self::Image)
+    }
+
+    pub fn is_pdf(self) -> bool {
+        matches!(self, Self::Pdf)
+    }
+
+    pub fn is_audio(self) -> bool {
+        matches!(self, Self::Audio | Self::Voice)
+    }
+
+    pub fn is_video(self) -> bool {
+        matches!(self, Self::Video | Self::Animation)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

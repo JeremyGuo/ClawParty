@@ -205,14 +205,25 @@ pub(super) fn build_user_turn_message(
     backend_supports_native_multimodal: bool,
     system_date: Option<&str>,
 ) -> Result<ChatMessage> {
+    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
+    let allow_pdfs =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
+    let allow_audio =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
     let image_attachments = attachments
         .iter()
-        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .filter(|attachment| attachment.kind.is_image() && allow_images)
         .collect::<Vec<_>>();
-    if !backend_supports_native_multimodal
-        || !model.supports_image_input()
-        || image_attachments.is_empty()
-    {
+    let pdf_attachments = attachments
+        .iter()
+        .filter(|attachment| attachment.kind.is_pdf() && allow_pdfs)
+        .collect::<Vec<_>>();
+    let audio_attachments = attachments
+        .iter()
+        .filter(|attachment| attachment.kind.is_audio() && allow_audio)
+        .filter(|attachment| infer_audio_format_for_attachment(attachment).is_some())
+        .collect::<Vec<_>>();
+    if image_attachments.is_empty() && pdf_attachments.is_empty() && audio_attachments.is_empty() {
         return Ok(ChatMessage::text(
             "user",
             prepend_system_date_section(vec![compose_user_prompt(text, attachments)], system_date)
@@ -227,11 +238,21 @@ pub(super) fn build_user_turn_message(
 
     let file_attachments = attachments
         .iter()
-        .filter(|attachment| attachment.kind != AttachmentKind::Image)
+        .filter(|attachment| {
+            !image_attachments
+                .iter()
+                .any(|direct| direct.id == attachment.id)
+                && !pdf_attachments
+                    .iter()
+                    .any(|direct| direct.id == attachment.id)
+                && !audio_attachments
+                    .iter()
+                    .any(|direct| direct.id == attachment.id)
+        })
         .collect::<Vec<_>>();
     if !file_attachments.is_empty() {
         let mut attachment_lines =
-            vec!["Non-image attachments available for this turn:".to_string()];
+            vec!["Additional attachments available for this turn:".to_string()];
         for attachment in file_attachments {
             attachment_lines.push(format!(
                 "- kind={:?}, path={}, original_name={}, media_type={}",
@@ -242,21 +263,26 @@ pub(super) fn build_user_turn_message(
             ));
         }
         attachment_lines.push(
-            "Use tools if you need to inspect any non-image attachment or related files."
+            "Use tools if you need to inspect any attachment that is not already directly visible in this request."
                 .to_string(),
         );
         text_sections.push(attachment_lines.join("\n"));
     }
 
     if text_sections.is_empty() {
-        text_sections.push(format!(
-            "The user attached {} image(s). Inspect the images directly.",
-            image_attachments.len()
+        text_sections.push(direct_multimodal_summary(
+            image_attachments.len(),
+            pdf_attachments.len(),
+            audio_attachments.len(),
         ));
     } else {
         text_sections.push(format!(
-            "The user attached {} image(s), and those images are already directly visible in this request. Inspect them directly here instead of calling the image tool again for the same current-turn attachments.",
-            image_attachments.len()
+            "{} Inspect directly visible current-turn attachments here instead of calling load/query tools for the same files.",
+            direct_multimodal_summary(
+                image_attachments.len(),
+                pdf_attachments.len(),
+                audio_attachments.len()
+            )
         ));
     }
     let text_sections = prepend_system_date_section(text_sections, system_date);
@@ -272,6 +298,12 @@ pub(super) fn build_user_turn_message(
                 "url": build_image_data_url(image)?,
             }
         }));
+    }
+    for pdf in pdf_attachments {
+        content.push(build_pdf_content_item(pdf)?);
+    }
+    for audio in audio_attachments {
+        content.push(build_audio_content_item(audio)?);
     }
 
     Ok(ChatMessage {
@@ -686,6 +718,102 @@ fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
     Ok(format!("data:{};base64,{}", mime_type, encoded))
 }
 
+fn direct_multimodal_summary(image_count: usize, pdf_count: usize, audio_count: usize) -> String {
+    let mut parts = Vec::new();
+    if image_count > 0 {
+        parts.push(format!("{image_count} image(s)"));
+    }
+    if pdf_count > 0 {
+        parts.push(format!("{pdf_count} PDF document(s)"));
+    }
+    if audio_count > 0 {
+        parts.push(format!("{audio_count} audio clip(s)"));
+    }
+    format!(
+        "The user attached {}, and they are already directly visible in this request.",
+        parts.join(", ")
+    )
+}
+
+fn build_pdf_content_item(attachment: &StoredAttachment) -> Result<Value> {
+    let encoded = file_to_base64(attachment)?;
+    Ok(json!({
+        "type": "file",
+        "file": {
+            "file_data": encoded,
+            "filename": attachment_filename(attachment, "document.pdf"),
+        }
+    }))
+}
+
+fn build_audio_content_item(attachment: &StoredAttachment) -> Result<Value> {
+    let encoded = file_to_base64(attachment)?;
+    let format = infer_audio_format_for_attachment(attachment).ok_or_else(|| {
+        anyhow!(
+            "unsupported audio attachment format for {}",
+            attachment.path.display()
+        )
+    })?;
+    Ok(json!({
+        "type": "input_audio",
+        "input_audio": {
+            "data": encoded,
+            "format": format,
+        }
+    }))
+}
+
+fn file_to_base64(attachment: &StoredAttachment) -> Result<String> {
+    let bytes = std::fs::read(&attachment.path)
+        .with_context(|| format!("failed to read attachment {}", attachment.path.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn attachment_filename(attachment: &StoredAttachment, fallback: &str) -> String {
+    attachment
+        .original_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            attachment
+                .path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn infer_audio_format_for_attachment(attachment: &StoredAttachment) -> Option<&'static str> {
+    if let Some(media_type) = attachment.media_type.as_deref() {
+        match media_type.to_ascii_lowercase().as_str() {
+            "audio/wav" | "audio/wave" | "audio/x-wav" => return Some("wav"),
+            "audio/mpeg" | "audio/mp3" | "audio/mpga" => return Some("mp3"),
+            "audio/ogg" | "audio/opus" => return Some("ogg"),
+            "audio/webm" => return Some("webm"),
+            "audio/mp4" | "audio/aac" | "audio/m4a" => return Some("m4a"),
+            "audio/flac" => return Some("flac"),
+            _ => {}
+        }
+    }
+    match attachment
+        .path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wav" => Some("wav"),
+        "mp3" | "mpeg" | "mpga" => Some("mp3"),
+        "ogg" | "opus" => Some("ogg"),
+        "webm" => Some("webm"),
+        "m4a" | "mp4" | "aac" => Some("m4a"),
+        "flac" => Some("flac"),
+        _ => None,
+    }
+}
+
 fn infer_image_media_type(path: &Path) -> String {
     match path
         .extension()
@@ -800,6 +928,12 @@ fn resolve_outgoing_attachment(
         .to_ascii_lowercase();
     let kind = match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => AttachmentKind::Image,
+        "pdf" => AttachmentKind::Pdf,
+        "wav" | "mp3" | "mpeg" | "mpga" | "ogg" | "opus" | "m4a" | "aac" | "flac" => {
+            AttachmentKind::Audio
+        }
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => AttachmentKind::Video,
+        "tgs" => AttachmentKind::Sticker,
         _ => AttachmentKind::File,
     };
 
@@ -831,7 +965,13 @@ pub(super) fn build_outgoing_message_for_session(
         let attachment = persist_outgoing_attachment(session, attachment)?;
         match attachment.kind {
             AttachmentKind::Image => outgoing.images.push(attachment),
-            AttachmentKind::File => outgoing.attachments.push(attachment),
+            AttachmentKind::Pdf
+            | AttachmentKind::Audio
+            | AttachmentKind::Voice
+            | AttachmentKind::Video
+            | AttachmentKind::Animation
+            | AttachmentKind::Sticker
+            | AttachmentKind::File => outgoing.attachments.push(attachment),
         }
     }
     Ok(outgoing)

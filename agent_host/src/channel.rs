@@ -192,6 +192,12 @@ pub trait Channel: Send + Sync {
 fn default_attachment_name(kind: AttachmentKind, id: Uuid) -> String {
     let suffix = match kind {
         AttachmentKind::Image => "image.bin",
+        AttachmentKind::Pdf => "document.pdf",
+        AttachmentKind::Audio => "audio.bin",
+        AttachmentKind::Voice => "voice.ogg",
+        AttachmentKind::Video => "video.bin",
+        AttachmentKind::Animation => "animation.bin",
+        AttachmentKind::Sticker => "sticker.bin",
         AttachmentKind::File => "file.bin",
     };
     format!("{}-{}", id.simple(), suffix)

@@ -368,7 +368,7 @@ impl DingtalkRobotChannel {
             "audio" => {
                 if let Some(download_code) = non_empty(content.download_code.as_deref()) {
                     attachments.push(self.pending_download_attachment(
-                        AttachmentKind::File,
+                        AttachmentKind::Audio,
                         Some("dingtalk-audio.bin".to_string()),
                         None,
                         download_code,
@@ -387,7 +387,7 @@ impl DingtalkRobotChannel {
                         .filter(|value| !value.is_empty())
                         .unwrap_or("bin");
                     attachments.push(self.pending_download_attachment(
-                        AttachmentKind::File,
+                        AttachmentKind::Video,
                         Some(format!("dingtalk-video.{extension}")),
                         None,
                         download_code,
@@ -426,7 +426,7 @@ impl DingtalkRobotChannel {
                     };
                     let name = match kind {
                         AttachmentKind::Image => format!("dingtalk-richtext-image-{index}.bin"),
-                        AttachmentKind::File => format!("dingtalk-richtext-file-{index}.bin"),
+                        _ => format!("dingtalk-richtext-file-{index}.bin"),
                     };
                     attachments.push(self.pending_download_attachment(
                         kind,

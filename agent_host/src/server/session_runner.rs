@@ -246,6 +246,204 @@ impl<'a> TurnCoordinator<'a> {
 }
 
 impl Server {
+    pub(super) async fn recover_pending_foreground_turns_after_startup(
+        self: Arc<Self>,
+    ) -> Result<()> {
+        let sessions = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
+        let pending_sessions = sessions
+            .into_iter()
+            .filter(|session| !session.session_state.pending_messages.is_empty())
+            .collect::<Vec<_>>();
+        if pending_sessions.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            log_stream = "server",
+            kind = "pending_foreground_turn_recovery_started",
+            session_count = pending_sessions.len() as u64,
+            "recovering foreground turns that were pending at startup"
+        );
+
+        for session in pending_sessions {
+            let Some(channel) = self.channels.get(&session.address.channel_id).cloned() else {
+                warn!(
+                    log_stream = "session",
+                    log_key = %session.id,
+                    kind = "pending_foreground_turn_recovery_skipped",
+                    channel_id = %session.address.channel_id,
+                    conversation_id = %session.address.conversation_id,
+                    pending_message_count = session.session_state.pending_messages.len() as u64,
+                    "cannot recover pending foreground turn because its channel is not configured"
+                );
+                continue;
+            };
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = server
+                    .recover_pending_foreground_turn_for_channel(&channel, session)
+                    .await
+                {
+                    error!(
+                        log_stream = "session",
+                        kind = "pending_foreground_turn_recovery_failed",
+                        error = %format!("{error:#}"),
+                        "failed to recover one pending foreground turn"
+                    );
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn recover_pending_foreground_turn_for_channel(
+        &self,
+        channel: &Arc<dyn Channel>,
+        original_session: SessionSnapshot,
+    ) -> Result<()> {
+        let address = original_session.address.clone();
+        if !self.has_complete_agent_selection(&address)? {
+            self.send_channel_message(
+                channel,
+                &address,
+                self.agent_selection_message(
+                    &address,
+                    "A pending message survived a service restart. Choose a model for this conversation to resume it.",
+                )?,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut active_session = self
+            .claim_foreground_turn_runner_when_ready(&address)
+            .await?;
+        let recovery_result = async {
+            if active_session.session_state.pending_messages.is_empty() {
+                self.unregister_session_runtime_control(&address)?;
+                return Ok(());
+            }
+
+            self.sync_runtime_profile_files(&active_session)?;
+            let prompt_updates_prefix =
+                self.observe_runtime_prompt_component_changes(&active_session)?;
+            let skill_updates_prefix = self.observe_runtime_skill_changes(&active_session)?;
+            let model_key = self.effective_main_model_key(&address)?;
+            self.log_current_tools_for_user_message(
+                &active_session,
+                &model_key,
+                "startup-recovery",
+                "startup_pending_message_recovery",
+            );
+
+            let prompt_state = self.build_foreground_prompt_state(&active_session, &model_key)?;
+            let actor = self.ensure_foreground_actor(&address)?;
+            let prompt_observation =
+                actor.observe_system_prompt_state(prompt_state.static_hash.clone())?;
+            let synthetic_system_messages = build_synthetic_system_messages(
+                self.take_process_restart_notice(&address),
+                None,
+                prompt_updates_prefix.as_deref(),
+                skill_updates_prefix.as_deref(),
+            );
+            let base_messages = active_session.request_messages();
+            let (mut next_previous_messages, active_system_prompt, rebuilt_system_prompt) =
+                prepare_system_prompt_for_turn(
+                    &base_messages,
+                    &prompt_state.system_prompt,
+                    prompt_observation.static_changed,
+                );
+            next_previous_messages.extend(synthetic_system_messages.iter().cloned());
+            if rebuilt_system_prompt {
+                self.mark_conversation_context_changed(&address)?;
+                actor.mark_system_prompt_state_current(prompt_state.static_hash.clone())?;
+            }
+            let turn_system_prompt = TurnSystemPromptState {
+                active: active_system_prompt,
+                full: prompt_state.system_prompt.clone(),
+                static_hash: prompt_state.static_hash.clone(),
+            };
+            let mut ephemeral_system_messages = synthetic_system_messages.clone();
+
+            channel
+                .set_processing(&address, ProcessingState::Typing)
+                .await
+                .ok();
+            let typing_guard =
+                spawn_processing_keepalive(channel.clone(), address.clone(), ProcessingState::Typing);
+            let outcome = self
+                .run_main_session_turn_until_settled(
+                    &mut active_session,
+                    &model_key,
+                    &mut next_previous_messages,
+                    &turn_system_prompt,
+                    &mut ephemeral_system_messages,
+                    "failed to recover pending foreground turn after restart",
+                )
+                .await;
+            let actor = self.ensure_foreground_actor(&address)?;
+            actor.clear_pending_interrupt()?;
+            if let Some(stop_sender) = typing_guard {
+                let _ = stop_sender.send(());
+            }
+            if let Err(error) = &outcome {
+                channel
+                    .set_processing(&address, ProcessingState::Idle)
+                    .await
+                    .ok();
+                self.send_user_error_message(channel, &address, error).await;
+            }
+
+            match outcome? {
+                MainSessionTurnOutcome::Replied { state, outgoing } => {
+                    self.finish_replied_foreground_turn_for_channel(
+                        channel,
+                        &active_session,
+                        &address,
+                        &model_key,
+                        state,
+                        outgoing,
+                        &turn_system_prompt,
+                        &synthetic_system_messages,
+                        "startup pending message recovery",
+                        "failed to persist recovered pending foreground turn",
+                    )
+                    .await?;
+                }
+                outcome => {
+                    let _ = self
+                        .finish_non_reply_foreground_outcome_for_channel(
+                            channel,
+                            &address,
+                            &active_session,
+                            outcome,
+                            &turn_system_prompt,
+                            &synthetic_system_messages,
+                        )
+                        .await?;
+                }
+            }
+
+            info!(
+                log_stream = "session",
+                log_key = %original_session.id,
+                kind = "pending_foreground_turn_recovered",
+                channel_id = %address.channel_id,
+                conversation_id = %address.conversation_id,
+                pending_message_count = original_session.session_state.pending_messages.len() as u64,
+                "recovered pending foreground turn after startup"
+            );
+            Ok(())
+        }
+        .await;
+
+        if recovery_result.is_err() {
+            let _ = self.unregister_session_runtime_control(&address);
+        }
+        recovery_result
+    }
+
     pub(super) async fn prepare_regular_conversation_message(
         &self,
         mut incoming: IncomingMessage,
