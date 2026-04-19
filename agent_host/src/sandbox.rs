@@ -663,6 +663,15 @@ fn build_bubblewrap_command(
     if Path::new("/run").exists() {
         command.args(["--ro-bind", "/run", "/run"]);
     }
+    // Expose Docker socket into sandbox if available on the host.
+    // This must come after the /run ro-bind so it takes precedence.
+    // We use --bind (read-write) because connect() on a Unix socket
+    // may require write permission even though the socket itself is
+    // not modified.
+    let docker_socket = Path::new("/run/docker.sock");
+    if docker_socket.exists() {
+        command.args(["--bind", "/run/docker.sock", "/run/docker.sock"]);
+    }
     command.args(["--dev", "/dev"]);
     command.args(["--proc", "/proc"]);
     command.args(["--tmpfs", "/tmp"]);

@@ -82,20 +82,18 @@ struct VersionedModelConfigRaw {
     pub native_web_search: Option<NativeWebSearchConfig>,
 }
 
-const V0_14_VERSION: &str = "0.14";
-
 impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        V0_14_VERSION
+        LATEST_CONFIG_VERSION
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
-            serde_json::from_value(value).context("failed to parse v0.14 server config")?;
-        if raw.version != V0_14_VERSION {
+            serde_json::from_value(value).context("failed to parse latest server config")?;
+        if raw.version != LATEST_CONFIG_VERSION {
             return Err(anyhow!(
-                "v0.14 config loader expected version '{}' but received '{}'",
-                V0_14_VERSION,
+                "latest config loader expected version '{}' but received '{}'",
+                LATEST_CONFIG_VERSION,
                 raw.version
             ));
         }

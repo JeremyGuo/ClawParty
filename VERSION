@@ -1,5 +1,22 @@
-version: 0.14.3
+version: 0.15.0
 ---
+
+# 0.15.0
+
+- 新增 **Web Channel**：支持通过浏览器访问 ClawParty 的 web 界面。
+  - 配置项 `ChannelConfig::Web`：`id`、`listen_addr`（默认 `0.0.0.0:8080`）、`auth_token` / `auth_token_env`（Bearer token 认证）。
+  - axum HTTP/WS 后端：`/api/send`（发送消息）、`/ws`（实时 WebSocket 推送）、`/`（内嵌 SPA）。
+  - TUI config editor 完整支持 Web channel 的增删改。
+- 新增 **Session Transcript** 系统：
+  - 每个 session 自动生成 `transcript.jsonl`，记录用户消息、模型调用（含完整 assistant message）、工具调用结果、compaction 事件。
+  - `SessionManager` 新增 `record_transcript_event`、`list_transcript`（反序分页）、`get_transcript_detail` 等 API。
+  - 事件通过 `Channel::on_session_event()` trait 方法实时推送到 Web channel WS 客户端。
+- `agent_frame::SessionEvent` 扩展：
+  - `ModelCallCompleted` 新增 `assistant_message` 字段，携带完整助手回复。
+  - `ToolCallCompleted` 新增 `output` 字段，携带工具输出原文。
+  - 新增 `UserMessageReceived` 变体。
+- 升级 `config` 版本到 `0.15`：v0.14 配置自动升级（Web channel 可选，不影响现有 Telegram/DingTalk/CLI 配置）。
+- 新增 `axum` 0.8 依赖（含 WebSocket 特性）。
 
 # 0.14.3
 

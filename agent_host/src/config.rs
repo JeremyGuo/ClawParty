@@ -17,6 +17,7 @@ mod v0_11;
 mod v0_12;
 mod v0_13;
 mod v0_14;
+mod v0_15;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -27,7 +28,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.14";
+pub const LATEST_CONFIG_VERSION: &str = "0.15";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -89,6 +90,17 @@ pub struct DingtalkChannelConfig {
     pub client_secret_env: String,
     #[serde(default = "default_dingtalk_api_base_url")]
     pub api_base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WebChannelConfig {
+    pub id: String,
+    #[serde(default = "default_web_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    #[serde(default = "default_web_auth_token_env")]
+    pub auth_token_env: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -517,6 +529,7 @@ pub enum ChannelConfig {
     CommandLine(CommandLineChannelConfig),
     Telegram(TelegramChannelConfig),
     Dingtalk(DingtalkChannelConfig),
+    Web(WebChannelConfig),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -709,6 +722,14 @@ fn default_dingtalk_api_base_url() -> String {
     "https://api.dingtalk.com".to_string()
 }
 
+fn default_web_listen_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_web_auth_token_env() -> String {
+    "WEB_AUTH_TOKEN".to_string()
+}
+
 fn default_poll_timeout_seconds() -> u64 {
     30
 }
@@ -826,7 +847,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 14] = [
+    let loaders: [&dyn ConfigLoader; 15] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -841,6 +862,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_12::LatestConfigLoader,
         &v0_13::LatestConfigLoader,
         &v0_14::LatestConfigLoader,
+        &v0_15::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -942,7 +964,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 14] = [
+        let loaders: [&dyn ConfigLoader; 15] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -957,6 +979,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_12::LatestConfigLoader,
             &v0_13::LatestConfigLoader,
             &v0_14::LatestConfigLoader,
+            &v0_15::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()

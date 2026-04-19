@@ -1149,6 +1149,7 @@ pub(super) fn log_agent_frame_event(
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            assistant_message: _,
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,
@@ -1247,6 +1248,7 @@ pub(super) fn log_agent_frame_event(
             tool_call_id,
             output_len,
             errored,
+            output: _,
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,
@@ -1308,6 +1310,21 @@ pub(super) fn log_agent_frame_event(
             message_count = *message_count as u64,
             total_tokens = *total_tokens,
             "agent_frame session completed"
+        ),
+        SessionEvent::UserMessageReceived {
+            text,
+            attachment_count,
+        } => info!(
+            log_stream = "agent",
+            log_key = %agent_id,
+            kind = "agent_frame_user_message_received",
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
+            agent_kind,
+            model = model_key,
+            has_text = text.is_some(),
+            attachment_count = *attachment_count as u64,
+            "agent_frame user message received"
         ),
     }
 }

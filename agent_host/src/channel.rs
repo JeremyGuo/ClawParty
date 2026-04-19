@@ -1,6 +1,7 @@
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingMessage, ProcessingState, StoredAttachment,
 };
+use agent_frame::SessionEvent;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -140,6 +141,17 @@ pub trait Channel: Send + Sync {
 
     fn processing_keepalive_interval(&self, _state: ProcessingState) -> Option<Duration> {
         None
+    }
+
+    /// Called when an agent_frame SessionEvent fires during a turn.
+    /// Default implementation is a no-op. WebChannel uses this to push
+    /// skeleton events to connected WebSocket clients.
+    async fn on_session_event(
+        &self,
+        _address: &ChannelAddress,
+        _event: &SessionEvent,
+    ) {
+        // no-op for Telegram, DingTalk, CLI
     }
 }
 

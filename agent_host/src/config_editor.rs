@@ -1485,10 +1485,12 @@ impl ConfigEditorApp {
                                 "command_line".to_string(),
                                 "telegram".to_string(),
                                 "dingtalk".to_string(),
+                                "web".to_string(),
                             ],
                             selected: match kind.as_str() {
                                 "telegram" => 1,
                                 "dingtalk" => 2,
+                                "web" => 3,
                                 _ => 0,
                             },
                             target: SelectTarget::ChannelKind,
@@ -1767,7 +1769,7 @@ impl ConfigEditorApp {
                 Ok(())
             }
             SelectTarget::ChannelKind => {
-                let kinds = ["command_line", "telegram", "dingtalk"];
+                let kinds = ["command_line", "telegram", "dingtalk", "web"];
                 let value = kinds
                     .get(selected)
                     .ok_or_else(|| anyhow!("invalid channel kind selection"))?;
@@ -2120,6 +2122,21 @@ impl ConfigEditorApp {
             channel.remove("client_secret_env");
             channel.remove("commands");
             channel.remove("prompt");
+            channel.remove("listen_addr");
+            channel.remove("auth_token");
+            channel.remove("auth_token_env");
+        } else if form.kind == "web" {
+            set_optional_trimmed_string(&mut channel, "listen_addr", &form.listen_addr);
+            set_optional_trimmed_string(&mut channel, "auth_token_env", &form.auth_token_env);
+            channel.remove("bot_token");
+            channel.remove("bot_token_env");
+            channel.remove("client_id");
+            channel.remove("client_id_env");
+            channel.remove("client_secret");
+            channel.remove("client_secret_env");
+            channel.remove("commands");
+            channel.remove("prompt");
+            channel.remove("api_base_url");
         } else {
             set_optional_trimmed_string(&mut channel, "client_id_env", &form.client_id_env);
             set_optional_trimmed_string(&mut channel, "client_secret_env", &form.client_secret_env);
@@ -2492,7 +2509,7 @@ struct ChannelKindWizardState {
 }
 
 impl ChannelKindWizardState {
-    const OPTIONS: [&str; 3] = ["telegram", "dingtalk", "command_line"];
+    const OPTIONS: [&str; 4] = ["telegram", "dingtalk", "command_line", "web"];
 
     fn selected_kind(&self) -> &'static str {
         Self::OPTIONS
@@ -3282,6 +3299,8 @@ enum ChannelFormField {
     ClientIdEnv,
     ClientSecretEnv,
     ApiBaseUrl,
+    ListenAddr,
+    AuthTokenEnv,
 }
 
 impl ChannelFormField {
@@ -3294,18 +3313,22 @@ impl ChannelFormField {
             Self::ClientIdEnv => "client_id_env",
             Self::ClientSecretEnv => "client_secret_env",
             Self::ApiBaseUrl => "api_base_url",
+            Self::ListenAddr => "listen_addr",
+            Self::AuthTokenEnv => "auth_token_env",
         }
     }
 
     fn help(self) -> &'static str {
         match self {
-            Self::Kind => "Choose command_line, telegram, or dingtalk",
+            Self::Kind => "Choose command_line, telegram, dingtalk, or web",
             Self::Id => "Stable channel identifier",
             Self::Prompt => "CLI prompt text such as you> ",
             Self::BotTokenEnv => "Environment variable for Telegram bot token",
             Self::ClientIdEnv => "Environment variable for DingTalk client id",
             Self::ClientSecretEnv => "Environment variable for DingTalk client secret",
             Self::ApiBaseUrl => "DingTalk API base URL",
+            Self::ListenAddr => "Web channel listen address (e.g. 0.0.0.0:8080)",
+            Self::AuthTokenEnv => "Environment variable for web channel auth token",
         }
     }
 }
@@ -3322,6 +3345,8 @@ struct ChannelFormState {
     client_id_env: String,
     client_secret_env: String,
     api_base_url: String,
+    listen_addr: String,
+    auth_token_env: String,
 }
 
 impl ChannelFormState {
@@ -3337,6 +3362,8 @@ impl ChannelFormState {
             client_id_env: "DINGTALK_CLIENT_ID".to_string(),
             client_secret_env: "DINGTALK_CLIENT_SECRET".to_string(),
             api_base_url: "https://api.dingtalk.com".to_string(),
+            listen_addr: "0.0.0.0:8080".to_string(),
+            auth_token_env: "WEB_AUTH_TOKEN".to_string(),
         }
     }
 
@@ -3373,6 +3400,16 @@ impl ChannelFormState {
                 .and_then(Value::as_str)
                 .unwrap_or("https://api.dingtalk.com")
                 .to_string(),
+            listen_addr: raw
+                .get("listen_addr")
+                .and_then(Value::as_str)
+                .unwrap_or("0.0.0.0:8080")
+                .to_string(),
+            auth_token_env: raw
+                .get("auth_token_env")
+                .and_then(Value::as_str)
+                .unwrap_or("WEB_AUTH_TOKEN")
+                .to_string(),
         }
     }
 
@@ -3388,6 +3425,13 @@ impl ChannelFormState {
                 ("kind", self.kind.clone()),
                 ("id", self.id.clone()),
                 ("bot_token_env", self.bot_token_env.clone()),
+            ]
+        } else if self.kind == "web" {
+            vec![
+                ("kind", self.kind.clone()),
+                ("id", self.id.clone()),
+                ("listen_addr", self.listen_addr.clone()),
+                ("auth_token_env", self.auth_token_env.clone()),
             ]
         } else {
             vec![
@@ -3413,6 +3457,13 @@ impl ChannelFormState {
                 1 => ChannelFormField::Id,
                 _ => ChannelFormField::BotTokenEnv,
             }
+        } else if self.kind == "web" {
+            match self.selected {
+                0 => ChannelFormField::Kind,
+                1 => ChannelFormField::Id,
+                2 => ChannelFormField::ListenAddr,
+                _ => ChannelFormField::AuthTokenEnv,
+            }
         } else {
             match self.selected {
                 0 => ChannelFormField::Kind,
@@ -3433,6 +3484,8 @@ impl ChannelFormState {
             ChannelFormField::ClientIdEnv => self.client_id_env.clone(),
             ChannelFormField::ClientSecretEnv => self.client_secret_env.clone(),
             ChannelFormField::ApiBaseUrl => self.api_base_url.clone(),
+            ChannelFormField::ListenAddr => self.listen_addr.clone(),
+            ChannelFormField::AuthTokenEnv => self.auth_token_env.clone(),
         }
     }
 
@@ -3445,6 +3498,8 @@ impl ChannelFormState {
             ChannelFormField::ClientIdEnv => self.client_id_env = value,
             ChannelFormField::ClientSecretEnv => self.client_secret_env = value,
             ChannelFormField::ApiBaseUrl => self.api_base_url = value,
+            ChannelFormField::ListenAddr => self.listen_addr = value,
+            ChannelFormField::AuthTokenEnv => self.auth_token_env = value,
         }
     }
 }
@@ -3560,6 +3615,17 @@ fn channel_kind_wizard_text(kind: &str) -> String {
             "  Stream websocket subscriptions",
             "  sessionWebhook-based replies",
             "  default api.dingtalk.com endpoint",
+        ]
+        .join("\n"),
+        "web" => [
+            "Web Channel",
+            "",
+            "Adds a web-based UI entrypoint.",
+            "Provides an HTTP/WebSocket server for a browser-based client.",
+            "",
+            "Configuration",
+            "  listen_addr: address to bind (default 0.0.0.0:8080)",
+            "  auth_token_env: environment variable for the bearer auth token",
         ]
         .join("\n"),
         _ => [
@@ -3735,6 +3801,16 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
             "The DingTalk API base URL.",
             "https://api.dingtalk.com",
             "Usually keep the default unless you need a special endpoint for testing.",
+        ),
+        ChannelFormField::ListenAddr => (
+            "The address the web channel HTTP/WS server binds to.",
+            "0.0.0.0:8080",
+            "Accepts connections from any interface on port 8080 by default.",
+        ),
+        ChannelFormField::AuthTokenEnv => (
+            "The environment variable holding the bearer token for web channel auth.",
+            "WEB_AUTH_TOKEN",
+            "Clients must send this token to authenticate. If empty, the channel is open.",
         ),
     };
     format!(

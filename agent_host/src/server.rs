@@ -2243,6 +2243,24 @@ impl ServerRuntime {
                         );
                     }
                     log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
+                    // Record the event into the session transcript.
+                    if let Err(error) = self.with_sessions(|sessions| {
+                        sessions.record_transcript_event(&event_session.address, &event)?;
+                        Ok(())
+                    }) {
+                        tracing::warn!(
+                            log_stream = "agent",
+                            log_key = %agent_id,
+                            kind = "transcript_record_failed",
+                            session_id = %event_session.id,
+                            error = %format!("{error:#}"),
+                            "failed to record transcript event"
+                        );
+                    }
+                    // Notify the channel for real-time WebSocket push.
+                    if let Some(channel) = self.channels.get(&event_session.address.channel_id) {
+                        channel.on_session_event(&event_session.address, &event).await;
+                    }
                 }
                 DriverEvent::Completed(result) => {
                     for task in relay_tasks {
@@ -2403,7 +2421,21 @@ impl ServerRuntime {
                             "failed to persist compaction artifacts from runtime event"
                         );
                     }
-                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
+                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
+                    // Record the event into the session transcript (blocking context).
+                    if let Err(error) = self.with_sessions(|sessions| {
+                        sessions.record_transcript_event(&event_session.address, &event)?;
+                        Ok(())
+                    }) {
+                        tracing::warn!(
+                            log_stream = "agent",
+                            log_key = %agent_id,
+                            kind = "transcript_record_failed",
+                            session_id = %event_session.id,
+                            error = %format!("{error:#}"),
+                            "failed to record transcript event in blocking context"
+                        );
+                    }
                 }
                 DriverEvent::Completed(result) => {
                     let state = match result {
@@ -3047,6 +3079,17 @@ impl Server {
                     let id = dingtalk.id.clone();
                     command_catalog.insert(id.clone(), default_dingtalk_commands());
                     channels.insert(id, Arc::new(DingtalkChannel::from_config(dingtalk)?));
+                }
+                ChannelConfig::Web(web) => {
+                    let id = web.id.clone();
+                    command_catalog.insert(id.clone(), default_bot_commands());
+                    channels.insert(
+                        id,
+                        Arc::new(
+                            crate::channels::web::WebChannel::from_config(web)
+                                .context("failed to create web channel")?,
+                        ),
+                    );
                 }
             }
         }

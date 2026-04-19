@@ -453,6 +453,10 @@ pub enum SessionEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        /// The complete assistant message including text and tool_calls.
+        /// Used by transcript recording; not logged to structured logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_message: Option<ChatMessage>,
     },
     ToolWaitCompactionScheduled {
         tool_name: String,
@@ -483,6 +487,10 @@ pub enum SessionEvent {
         tool_call_id: String,
         output_len: usize,
         errored: bool,
+        /// The complete tool output string.
+        /// Used by transcript recording; not logged to structured logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     SessionYielded {
         phase: String,
@@ -496,6 +504,12 @@ pub enum SessionEvent {
     SessionCompleted {
         message_count: usize,
         total_tokens: u64,
+    },
+    /// Emitted when a user message is about to be processed.
+    /// Used by transcript recording to capture user input.
+    UserMessageReceived {
+        text: Option<String>,
+        attachment_count: usize,
     },
 }
 
@@ -797,6 +811,12 @@ fn run_session_state_controlled_internal(
         control.set_stable_prefix_messages(&messages);
     }
     if !prompt.is_empty() {
+        if let Some(control) = &control {
+            control.emit_event(SessionEvent::UserMessageReceived {
+                text: Some(prompt.clone()),
+                attachment_count: 0,
+            });
+        }
         messages.push(ChatMessage::text("user", prompt));
     }
 
@@ -910,6 +930,7 @@ fn run_session_state_controlled_internal(
                 prompt_tokens: outcome.usage.prompt_tokens,
                 completion_tokens: outcome.usage.completion_tokens,
                 total_tokens: outcome.usage.total_tokens,
+                assistant_message: Some(outcome.message.clone()),
             });
         }
         if tool_calls.is_empty() && !assistant_message_has_content_or_tool_calls(&outcome.message) {
@@ -1042,6 +1063,7 @@ fn run_session_state_controlled_internal(
                     tool_call_id: completed_tool.tool_call_id,
                     output_len: result.len(),
                     errored: tool_result_looks_like_error(&result),
+                    output: Some(result.clone()),
                 });
             }
         }

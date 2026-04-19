@@ -1,6 +1,7 @@
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
+use crate::transcript::SessionTranscript;
 use crate::workspace::WorkspaceManager;
-use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
+use agent_frame::{ChatMessage, SessionCompactionStats, SessionEvent, TokenUsage};
 pub use agent_frame::{SessionErrno, SessionPhase};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -198,6 +199,7 @@ struct Session {
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
+    transcript: SessionTranscript,
 }
 
 impl Session {
@@ -293,6 +295,7 @@ impl Session {
     ) -> Result<Self> {
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create {}", root_dir.display()))?;
+        let transcript = SessionTranscript::open(&root_dir)?;
         let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
@@ -343,6 +346,7 @@ impl Session {
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
+            transcript,
         })
     }
 }
@@ -749,6 +753,7 @@ impl SessionManager {
         let root_dir = self.sessions_root.join(session_id.to_string());
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
+        let transcript = SessionTranscript::open(&root_dir)?;
         let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
@@ -788,6 +793,7 @@ impl SessionManager {
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
+            transcript,
         };
         session.persist()?;
         let key = address.session_key();
@@ -1399,6 +1405,7 @@ impl SessionManager {
         let root_dir = self.sessions_root.join(session_id.to_string());
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
+        let transcript = SessionTranscript::open(&root_dir)?;
         let attachments_dir = workspace.files_dir.join("upload");
         fs::create_dir_all(&attachments_dir).with_context(|| {
             format!(
@@ -1436,6 +1443,7 @@ impl SessionManager {
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
+            transcript,
         };
         session.persist()?;
         Ok(session)
@@ -1445,6 +1453,74 @@ impl SessionManager {
         self.background_sessions
             .get_mut(&session_id)
             .with_context(|| format!("no active background session for {}", session_id))
+    }
+
+    // ── Transcript API ──────────────────────────────────────────────
+
+    /// Record a SessionEvent into the transcript of the foreground session
+    /// identified by `address`. Returns the written entry, or None if the
+    /// event is not transcript-relevant or the session doesn't exist.
+    pub fn record_transcript_event(
+        &mut self,
+        address: &ChannelAddress,
+        event: &SessionEvent,
+    ) -> Result<Option<crate::transcript::TranscriptEntry>> {
+        let key = address.session_key();
+        let Some(session) = self.foreground_sessions.get_mut(&key) else {
+            return Ok(None);
+        };
+        session.transcript.record_event(event)
+    }
+
+    /// Record a SessionEvent into a background session's transcript.
+    pub fn record_background_transcript_event(
+        &mut self,
+        session_id: Uuid,
+        event: &SessionEvent,
+    ) -> Result<Option<crate::transcript::TranscriptEntry>> {
+        let Some(session) = self.background_sessions.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        session.transcript.record_event(event)
+    }
+
+    /// List transcript entries (newest first) for a foreground session.
+    pub fn list_transcript(
+        &self,
+        address: &ChannelAddress,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<crate::transcript::TranscriptEntrySkeleton>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get(&key)
+            .with_context(|| format!("no foreground session for {}", key))?;
+        session.transcript.list(offset, limit)
+    }
+
+    /// Get full transcript detail for a seq range in a foreground session.
+    pub fn get_transcript_detail(
+        &self,
+        address: &ChannelAddress,
+        seq_start: usize,
+        seq_end: usize,
+    ) -> Result<Vec<crate::transcript::TranscriptEntry>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get(&key)
+            .with_context(|| format!("no foreground session for {}", key))?;
+        session.transcript.get_detail(seq_start, seq_end)
+    }
+
+    /// Total transcript entry count for a foreground session.
+    pub fn transcript_len(&self, address: &ChannelAddress) -> usize {
+        let key = address.session_key();
+        self.foreground_sessions
+            .get(&key)
+            .map(|s| s.transcript.len())
+            .unwrap_or(0)
     }
 }
 

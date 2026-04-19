@@ -207,7 +207,8 @@ pub(super) fn update_active_foreground_phase(
         | SessionEvent::ToolCallCompleted { .. }
         | SessionEvent::SessionYielded { .. }
         | SessionEvent::PrefixRewriteApplied { .. }
-        | SessionEvent::SessionCompleted { .. } => Some(ForegroundRuntimePhase::Running),
+        | SessionEvent::SessionCompleted { .. }
+        | SessionEvent::UserMessageReceived { .. } => Some(ForegroundRuntimePhase::Running),
     };
     if let Some(phase) = phase
         && let Ok(mut phases) = active_phases.lock()
