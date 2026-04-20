@@ -52,6 +52,7 @@ struct TelegramProgressMessage {
     message_id: i64,
     last_text: String,
     last_update: Instant,
+    started_at: Instant,
 }
 
 struct PendingTelegramMediaGroup {
@@ -1785,22 +1786,28 @@ impl Channel for TelegramChannel {
             .and_then(|value| value.parse::<i64>().ok());
         if feedback.final_state == Some(ProgressFeedbackFinalState::Done) {
             let existing = self.progress_messages.lock().await.remove(&key);
-            let message_id = existing
-                .map(|existing| existing.message_id)
-                .or(persisted_message_id);
-            if let Some(message_id) = message_id
-                && let Err(error) = self
-                    .delete_message(&address.conversation_id, message_id)
+            let (message_id, elapsed) = match existing {
+                Some(existing) => (
+                    Some(existing.message_id),
+                    Some(Instant::now().duration_since(existing.started_at)),
+                ),
+                None => (persisted_message_id, None),
+            };
+            if let Some(message_id) = message_id {
+                let summary = format_completion_summary(elapsed);
+                if let Err(error) = self
+                    .edit_progress_text(&address.conversation_id, message_id, &summary)
                     .await
-            {
-                warn!(
-                    log_stream = "channel",
-                    log_key = %self.id,
-                    kind = "telegram_progress_delete_failed",
-                    conversation_id = %address.conversation_id,
-                    error = %format!("{error:#}"),
-                    "failed to delete telegram progress message"
-                );
+                {
+                    warn!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_progress_summary_failed",
+                        conversation_id = %address.conversation_id,
+                        error = %format!("{error:#}"),
+                        "failed to edit telegram progress message to completion summary"
+                    );
+                }
             }
             return Ok(ProgressFeedbackUpdate::ClearMessage);
         }
@@ -1819,6 +1826,9 @@ impl Channel for TelegramChannel {
                     last_update: now
                         .checked_sub(Self::MIN_PROGRESS_EDIT_INTERVAL)
                         .unwrap_or(now),
+                    started_at: now
+                        .checked_sub(Self::MIN_PROGRESS_EDIT_INTERVAL)
+                        .unwrap_or(now),
                 })
             });
         let Some(existing) = existing else {
@@ -1831,6 +1841,7 @@ impl Channel for TelegramChannel {
                     message_id,
                     last_text: feedback.text,
                     last_update: now,
+                    started_at: now,
                 },
             );
             return Ok(ProgressFeedbackUpdate::StoreMessage {
@@ -1865,6 +1876,7 @@ impl Channel for TelegramChannel {
                     message_id: existing.message_id,
                     last_text: feedback.text,
                     last_update: now,
+                    started_at: existing.started_at,
                 },
             );
         }
@@ -1892,6 +1904,21 @@ impl Channel for TelegramChannel {
             }
             Err(error) => Err(error.context("failed to probe telegram conversation")),
         }
+    }
+}
+
+fn format_completion_summary(elapsed: Option<Duration>) -> String {
+    match elapsed {
+        Some(duration) => {
+            let total_secs = duration.as_secs();
+            let elapsed_text = if total_secs >= 60 {
+                format!("{}m{}s", total_secs / 60, total_secs % 60)
+            } else {
+                format!("{}s", total_secs)
+            };
+            format!("✅ 完成 | ⏱ {elapsed_text}")
+        }
+        None => "✅ 完成".to_string(),
     }
 }
 
@@ -2783,17 +2810,39 @@ fn render_blocks_to_telegram_entities(
             RichBlock::CodeBlock { language, code } => {
                 ensure_block_break_text(&mut builder.text, need_paragraph_break);
                 maybe_render_nested_quote_prefix(builder, quote_depth);
+                let collapse = quote_depth == 0 && should_collapse_code_block(code);
+                let outer_start = builder.cursor();
                 let start = builder.cursor();
                 builder.push_text(code);
                 builder.push_entity_trimmed(start, "pre", None, language.clone());
+                if collapse {
+                    builder.push_entity_trimmed(
+                        outer_start,
+                        "expandable_blockquote",
+                        None,
+                        None,
+                    );
+                }
                 *need_paragraph_break = true;
             }
             RichBlock::Table(table) => {
                 ensure_block_break_text(&mut builder.text, need_paragraph_break);
                 maybe_render_nested_quote_prefix(builder, quote_depth);
+                let table_text = render_table_text(table);
+                let collapse = quote_depth == 0
+                    && (table_text.lines().count() >= 15 || table_text.chars().count() >= 600);
+                let outer_start = builder.cursor();
                 let start = builder.cursor();
-                builder.push_text(&render_table_text(table));
+                builder.push_text(&table_text);
                 builder.push_entity_trimmed(start, "pre", None, None);
+                if collapse {
+                    builder.push_entity_trimmed(
+                        outer_start,
+                        "expandable_blockquote",
+                        None,
+                        None,
+                    );
+                }
                 *need_paragraph_break = true;
             }
             RichBlock::ThematicBreak => {
@@ -2940,6 +2989,14 @@ fn classify_blockquote_entity(text: &str) -> &'static str {
     } else {
         "blockquote"
     }
+}
+
+/// Returns true if a code block is long enough to warrant collapsing
+/// with an expandable_blockquote wrapper.
+fn should_collapse_code_block(code: &str) -> bool {
+    let line_count = code.lines().count();
+    let char_count = code.chars().count();
+    line_count >= 15 || char_count >= 600
 }
 
 fn maybe_push_wrapping_entity(
@@ -4844,6 +4901,75 @@ mod tests {
         assert_eq!(attachments[0].kind, AttachmentKind::Pdf);
         assert_eq!(attachments[1].kind, AttachmentKind::Video);
         assert_eq!(attachments[2].kind, AttachmentKind::Voice);
+    }
+
+    #[test]
+    fn wraps_long_code_blocks_in_expandable_blockquote() {
+        let long_code = (0..20)
+            .map(|index| format!("let x{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = format!("```rust\n{long_code}\n```");
+        let document = parse_markdown_to_rich_document(&input);
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "pre"),
+            "should have a pre entity for the code block"
+        );
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "expandable_blockquote"),
+            "long code blocks should be wrapped in expandable_blockquote"
+        );
+    }
+
+    #[test]
+    fn does_not_wrap_short_code_blocks_in_expandable_blockquote() {
+        let input = "```rust\nlet x = 42;\nlet y = 43;\n```";
+        let document = parse_markdown_to_rich_document(input);
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "pre"),
+            "should have a pre entity for the code block"
+        );
+        assert!(
+            !rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "expandable_blockquote"),
+            "short code blocks should not be wrapped in expandable_blockquote"
+        );
+    }
+
+    #[test]
+    fn format_completion_summary_with_elapsed() {
+        let summary = super::format_completion_summary(Some(std::time::Duration::from_secs(75)));
+        assert!(summary.contains("✅"));
+        assert!(summary.contains("1m15s"));
+    }
+
+    #[test]
+    fn format_completion_summary_short_duration() {
+        let summary = super::format_completion_summary(Some(std::time::Duration::from_secs(8)));
+        assert!(summary.contains("✅"));
+        assert!(summary.contains("8s"));
+    }
+
+    #[test]
+    fn format_completion_summary_without_elapsed() {
+        let summary = super::format_completion_summary(None);
+        assert!(summary.contains("✅"));
+        assert!(!summary.contains("⏱"));
     }
 }
 

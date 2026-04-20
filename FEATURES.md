@@ -115,6 +115,10 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Web browser clients scroll to the newest history on initial load and automatically request the previous transcript page when the user scrolls to the top, preserving the viewport while older entries are inserted.
 - Web transcript history renders `user_tell` model calls as normal assistant messages and suppresses the matching ok-only tool result row.
 - Regression coverage should protect Web channel auth, config/TUI visibility for Web fields, and session transcript append/list/detail behavior.
+- Telegram progress messages use emoji-decorated status indicators: phase icons (🧠 thinking, 🔧 tools, 🗜️ compaction), per-tool status markers (⏳ running, ✅ completed, ❌ failed), and plan step markers (✅ completed, ▶️ in-progress, ⬜ pending).
+- Telegram progress messages are edited to a one-line completion summary with elapsed time on success instead of being deleted, so users can see that the turn finished and how long it took.
+- Telegram long code blocks (≥15 lines or ≥600 chars) and long tables are wrapped in `expandable_blockquote` entities so they render collapsed by default and can be expanded on tap, reducing visual clutter for verbose tool output.
+- Regression coverage should protect emoji progress rendering, completion summary formatting, and expandable blockquote wrapping for long code blocks.
 
 ### Session Transcript
 

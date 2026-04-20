@@ -756,7 +756,7 @@ impl SessionActor {
             turn_id: self.session.id.to_string(),
             text: progress_text(
                 model_key,
-                &format!("失败：{}", truncate_single_line(error_summary, 160)),
+                &format!("❌ 失败：{}", truncate_single_line(error_summary, 160)),
             ),
             important: true,
             final_state: Some(ProgressFeedbackFinalState::Failed),
@@ -793,14 +793,16 @@ impl SessionActor {
         event: &SessionEvent,
     ) -> Option<ProgressFeedback> {
         let (activity, important, final_state) = match event {
-            SessionEvent::CompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+            SessionEvent::CompactionStarted { .. } => ("🗜️ 压缩中...".to_string(), true, None),
             SessionEvent::SessionStarted { .. } | SessionEvent::CompactionCompleted { .. } => {
                 return None;
             }
             SessionEvent::RoundStarted { .. }
             | SessionEvent::ModelCallStarted { .. }
             | SessionEvent::ModelCallCompleted { .. } => return None,
-            SessionEvent::ToolWaitCompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+            SessionEvent::ToolWaitCompactionStarted { .. } => {
+                ("🗜️ 压缩中...".to_string(), true, None)
+            }
             SessionEvent::ToolWaitCompactionScheduled { .. }
             | SessionEvent::ToolWaitCompactionCompleted { .. } => return None,
             SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallCompleted { .. } => {
@@ -809,11 +811,11 @@ impl SessionActor {
                 } = event
                 {
                     let activity = if *errored {
-                        format!("工具失败：{tool_name}")
+                        format!("❌ 工具失败：{tool_name}")
                     } else if tool_name == "update_plan" {
-                        "计划已更新".to_string()
+                        "📋 计划已更新".to_string()
                     } else {
-                        format!("工具完成：{tool_name}")
+                        format!("✅ 工具完成：{tool_name}")
                     };
                     return Some(ProgressFeedback {
                         turn_id: self.session.id.to_string(),
@@ -838,7 +840,7 @@ impl SessionActor {
                 return None;
             }
             SessionEvent::SessionCompleted { .. } => (
-                "完成".to_string(),
+                "✅ 完成".to_string(),
                 true,
                 Some(ProgressFeedbackFinalState::Done),
             ),
@@ -1845,7 +1847,7 @@ fn progress_text(model_key: &str, activity: &str) -> String {
 
 fn progress_text_with_plan(model_key: &str, activity: &str, plan: Option<&SessionPlan>) -> String {
     let mut text = format!(
-        "正在执行\n模型：{}\n阶段：{}\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
+        "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
         model_key, activity
     );
     if let Some(plan_text) = render_plan_progress(plan) {
@@ -1862,21 +1864,27 @@ fn progress_text_for_execution(
 ) -> String {
     let mut text = match progress.phase {
         ExecutionProgressPhase::Thinking => format!(
-            "正在执行\n模型：{}\n状态：思考中...\n\n发送新消息可打断；/continue 可继续最近中断的回合。",
+            "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：思考中...\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
             model_key
         ),
         ExecutionProgressPhase::Tools => {
-            let mut lines = vec!["正在执行".to_string(), format!("模型：{model_key}")];
-            lines.push("状态：工具执行中".to_string());
+            let mut lines = vec!["⚙️ 正在执行".to_string(), format!("🤖 模型：{model_key}")];
+            lines.push("🔧 状态：工具执行中".to_string());
             for tool in &progress.tools {
+                let status_icon = match tool.status {
+                    agent_frame::ToolExecutionStatus::Running => "⏳",
+                    agent_frame::ToolExecutionStatus::Completed => "✅",
+                    agent_frame::ToolExecutionStatus::Failed => "❌",
+                };
                 lines.push(format!(
-                    "- {}：{}",
+                    "  {} {}：{}",
+                    status_icon,
                     tool.tool_name,
                     render_tool_brief_arguments(&tool.tool_name, tool.arguments.as_deref())
                 ));
             }
             lines.push(String::new());
-            lines.push("发送新消息可打断；/continue 可继续最近中断的回合。".to_string());
+            lines.push("💡 发送新消息可打断；/continue 可继续最近中断的回合。".to_string());
             lines.join("\n")
         }
     };
@@ -1893,7 +1901,7 @@ fn render_plan_progress(plan: Option<&SessionPlan>) -> Option<String> {
         return None;
     }
     let mut lines = Vec::with_capacity(plan.steps.len() + 2);
-    lines.push("执行计划：".to_string());
+    lines.push("📋 执行计划：".to_string());
     if let Some(explanation) = plan
         .explanation
         .as_deref()
@@ -1901,18 +1909,18 @@ fn render_plan_progress(plan: Option<&SessionPlan>) -> Option<String> {
         .filter(|value| !value.is_empty())
     {
         lines.push(format!(
-            "- 说明：{}",
+            "  💬 {}",
             truncate_single_line_strict(explanation, 60)
         ));
     }
     for step in plan.steps.iter().take(7) {
         let marker = match step.status {
-            SessionPlanStepStatus::Completed => "[x]",
-            SessionPlanStepStatus::InProgress => "[>]",
-            SessionPlanStepStatus::Pending => "[ ]",
+            SessionPlanStepStatus::Completed => "✅",
+            SessionPlanStepStatus::InProgress => "▶️",
+            SessionPlanStepStatus::Pending => "⬜",
         };
         lines.push(format!(
-            "- {} {}",
+            "  {} {}",
             marker,
             truncate_single_line_strict(&step.step, 50)
         ));
@@ -3621,8 +3629,8 @@ mod tests {
 
         let SessionEffect::UpdateProgress(feedback) = &effects[0];
         assert!(feedback.text.contains("状态：工具执行中"));
-        assert!(feedback.text.contains("- exec_start：cargo test --mani..."));
-        assert!(feedback.text.contains("- file_read：src/main.rs"));
+        assert!(feedback.text.contains("exec_start：cargo test --mani..."));
+        assert!(feedback.text.contains("file_read：src/main.rs"));
         assert!(!feedback.text.contains("已完成"));
     }
 
