@@ -7,7 +7,7 @@ import { messageOrderFromId } from '../lib/messageUtils';
 
 function hasUnreadMessage(session, active) {
   if (active) return false;
-  const lastId = messageOrderFromId(session?.last_message_id);
+  const lastId = messageOrderFromId(session?.last_final_message_id || session?.last_message_id);
   if (lastId === undefined) return false;
   const seenId = messageOrderFromId(session?.last_seen_message_id) ?? -1;
   return lastId > seenId;

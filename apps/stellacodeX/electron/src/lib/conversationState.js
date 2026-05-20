@@ -34,6 +34,10 @@ function mergeConversationSummary(existing, incoming) {
   if (!incoming) return existing;
   existing = normalizeConversationSummary(existing);
   const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
+  const incomingHasNewerFinalMessage = compareMessageIds(
+    incoming.last_final_message_id,
+    existing.last_final_message_id
+  ) >= 0;
   const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
   const incomingSeenIsNewer = compareMessageIds(incoming?.last_seen_message_id, existing?.last_seen_message_id) >= 0;
   const merged = {
@@ -47,7 +51,13 @@ function mergeConversationSummary(existing, incoming) {
       : existing.last_message_time,
     message_count: incomingHasNewerMessage
       ? incoming.message_count ?? existing.message_count
-      : existing.message_count
+      : existing.message_count,
+    last_final_message_id: incomingHasNewerFinalMessage
+      ? incoming.last_final_message_id ?? existing.last_final_message_id
+      : existing.last_final_message_id,
+    last_final_message_time: incomingHasNewerFinalMessage
+      ? incoming.last_final_message_time ?? existing.last_final_message_time
+      : existing.last_final_message_time
   };
   if (!seen) return merged;
   return {
@@ -224,16 +234,39 @@ export function applyConversationStreamEvent(current, payload) {
   }
 
   if (
-    (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
+    (eventType === 'last_final_message_id_updated' || eventType === 'foreground_session_final_message_updated')
     && payload.conversation_id
-    && payload.seen
   ) {
     const foregroundSessionId = payload.foreground_session_id || 'main';
+    const patch = {
+      last_final_message_id: payload.last_final_message_id || null,
+      last_final_message_time: payload.last_final_message_time || null
+    };
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
         ? patchConversationForegroundSession(conversation, foregroundSessionId, {
-          last_seen_message_id: payload.seen.last_seen_message_id,
-          last_seen_at: payload.seen.updated_at
+          ...patch,
+          ...(foregroundSessionId === 'main' ? patch : {})
+        })
+        : conversation
+    ));
+  }
+
+  if (
+    (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
+    && payload.conversation_id
+  ) {
+    const foregroundSessionId = payload.foreground_session_id || 'main';
+    const seen = payload.seen || {
+      last_seen_message_id: payload.last_seen_message_id,
+      updated_at: payload.last_seen_at
+    };
+    if (!seen.last_seen_message_id) return current;
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
+          last_seen_message_id: seen.last_seen_message_id,
+          last_seen_at: seen.updated_at
         })
         : conversation
     ));
@@ -244,6 +277,6 @@ export function applyConversationStreamEvent(current, payload) {
 
 export function hasUnreadConversation(conversation) {
   return foregroundSessions(conversation).some((session) => (
-    compareMessageIds(session?.last_message_id, session?.last_seen_message_id) > 0
+    compareMessageIds(session?.last_final_message_id || session?.last_message_id, session?.last_seen_message_id) > 0
   ));
 }

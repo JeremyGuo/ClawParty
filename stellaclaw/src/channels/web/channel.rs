@@ -23,7 +23,7 @@ use crate::{
     conversation_new::ConversationRuntimeConfig,
     logger::StellaclawLogger,
     service_protos::{
-        agent_session::AgentMessageOrigin,
+        agent_session::{AgentMessageOrigin, AgentSessionMessageHistory},
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
         kernel::{KernelMetadataPatch, KernelResponse},
     },
@@ -501,6 +501,49 @@ impl WebChannel {
         conversation_id: &str,
         foreground_session_id: &str,
     ) -> HttpResult<MessageSummary> {
+        let history = self.query_message_history(conversation_id, foreground_session_id, 0, 0)?;
+        let final_window = history.total.min(256);
+        let final_history = if final_window == 0 {
+            None
+        } else {
+            let offset = history.total.saturating_sub(final_window);
+            self.query_message_history(conversation_id, foreground_session_id, offset, final_window)
+                .ok()
+        };
+        let final_message = final_history.as_ref().and_then(|history| {
+            history
+                .messages
+                .iter()
+                .rev()
+                .find(|record| is_final_assistant_message(&record.message))
+        });
+        Ok(MessageSummary {
+            message_count: history.total,
+            last_message_id: history
+                .last_message
+                .as_ref()
+                .map(|record| record.message.message_id.clone())
+                .filter(|id| !id.is_empty()),
+            last_message_index: history.last_message.as_ref().map(|record| record.index),
+            last_message_time: history
+                .last_message
+                .as_ref()
+                .and_then(|record| record.message.message_time.clone()),
+            last_final_message_id: final_message
+                .map(|record| record.message.message_id.clone())
+                .filter(|id| !id.is_empty()),
+            last_final_message_time: final_message
+                .and_then(|record| record.message.message_time.clone()),
+        })
+    }
+
+    fn query_message_history(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> HttpResult<AgentSessionMessageHistory> {
         self.conversation_runtime
             .ensure_conversation_started(conversation_id)
             .map_err(HttpError::internal)?;
@@ -512,8 +555,8 @@ impl WebChannel {
                 ChannelIngress::QueryMessageHistory {
                     foreground_session_id: Some(foreground_session_id.to_string()),
                     request_id: request_id.clone(),
-                    offset: 0,
-                    limit: 0,
+                    offset,
+                    limit,
                 },
             )
             .map_err(HttpError::internal)?;
@@ -523,18 +566,7 @@ impl WebChannel {
             }
             _ => None,
         })?;
-        Ok(MessageSummary {
-            message_count: history.total,
-            last_message_id: history
-                .last_message
-                .as_ref()
-                .map(|record| record.message.message_id.clone())
-                .filter(|id| !id.is_empty()),
-            last_message_index: history.last_message.as_ref().map(|record| record.index),
-            last_message_time: history
-                .last_message
-                .and_then(|record| record.message.message_time),
-        })
+        Ok(history)
     }
 
     fn post_message(
@@ -775,6 +807,8 @@ impl WebChannel {
             "last_message_time": summary.last_message_time.clone(),
             "last_committed_message_id": summary.last_message_id.clone(),
             "last_committed_message_index": summary.last_message_index,
+            "last_final_message_id": summary.last_final_message_id.clone(),
+            "last_final_message_time": summary.last_final_message_time.clone(),
             "updated_at": summary.last_message_time,
             "foreground_sessions": self.foreground_session_summaries(metadata),
         }))
@@ -836,6 +870,8 @@ impl WebChannel {
             "last_message_time": summary.last_message_time.clone(),
             "last_committed_message_id": summary.last_message_id.clone(),
             "last_committed_message_index": summary.last_message_index,
+            "last_final_message_id": summary.last_final_message_id.clone(),
+            "last_final_message_time": summary.last_final_message_time.clone(),
             "last_activity_at": summary.last_message_time,
             "last_seen_message_id": seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
             "last_seen_at": seen.map(|seen| seen.updated_at),
@@ -1089,4 +1125,22 @@ fn conversation_model_label(
         .map(|profile| profile.main_model.display_name(&config.models))
         .or_else(|| config.initial_main_model_name())
         .unwrap_or_else(|| "unconfigured".to_string())
+}
+
+fn is_final_assistant_message(message: &ChatMessage) -> bool {
+    if message.role != ChatRole::Assistant {
+        return false;
+    }
+    let has_tool_call = message
+        .data
+        .iter()
+        .any(|item| matches!(item, ChatMessageItem::ToolCall(_)));
+    if has_tool_call {
+        return false;
+    }
+    message.data.iter().any(|item| match item {
+        ChatMessageItem::Context(context) => !context.text.trim().is_empty(),
+        ChatMessageItem::File(_) => true,
+        _ => false,
+    })
 }

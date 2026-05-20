@@ -6,6 +6,7 @@ export function normalizeForegroundSessionSummary(session = {}, conversation = {
   const id = String(session.id || session.foreground_session_id || session.session_id || 'main')
     .replace(/^local__agent__foreground__/, '') || 'main';
   const lastMessageId = session.last_message_id || session.last_committed_message_id || null;
+  const lastFinalMessageId = session.last_final_message_id || null;
   const lastMessageIndex = Number(session.last_message_index ?? session.last_committed_message_index);
   const messageCount = Number(session.message_count);
   const state = String(session.state || session.processing_state || 'idle').toLowerCase();
@@ -29,6 +30,8 @@ export function normalizeForegroundSessionSummary(session = {}, conversation = {
     last_message_time: session.last_message_time || session.last_activity_at || session.updated_at || null,
     last_committed_message_id: session.last_committed_message_id || lastMessageId,
     last_committed_message_index: Number.isFinite(lastMessageIndex) ? lastMessageIndex : null,
+    last_final_message_id: lastFinalMessageId,
+    last_final_message_time: session.last_final_message_time || null,
     last_seen_message_id: session.last_seen_message_id || null,
     last_seen_at: session.last_seen_at || null
   };
@@ -42,7 +45,9 @@ export function normalizeConversationSummary(conversation = {}) {
     last_message_id: conversation.last_message_id || conversation.last_committed_message_id || null,
     last_message_time: conversation.last_message_time || conversation.updated_at || conversation.last_activity_at || null,
     last_committed_message_id: conversation.last_committed_message_id || conversation.last_message_id || null,
-    last_committed_message_index: conversation.last_committed_message_index ?? conversation.last_message_index ?? null
+    last_committed_message_index: conversation.last_committed_message_index ?? conversation.last_message_index ?? null,
+    last_final_message_id: conversation.last_final_message_id || null,
+    last_final_message_time: conversation.last_final_message_time || null
   };
   const lastIndex = Number(normalized.last_committed_message_index);
   const count = Number(conversation.message_count);
@@ -65,6 +70,8 @@ export function normalizeConversationSummary(conversation = {}) {
       last_message_time: normalized.last_message_time,
       last_committed_message_id: normalized.last_committed_message_id,
       last_committed_message_index: normalized.last_committed_message_index,
+      last_final_message_id: normalized.last_final_message_id,
+      last_final_message_time: normalized.last_final_message_time,
       last_seen_message_id: normalized.last_seen_message_id,
       last_seen_at: normalized.last_seen_at,
       is_main: true
@@ -95,6 +102,8 @@ export function foregroundSessions(conversation) {
     message_count: conversation?.message_count || 0,
     last_message_id: conversation?.last_message_id || null,
     last_message_time: conversation?.last_message_time || null,
+    last_final_message_id: conversation?.last_final_message_id || null,
+    last_final_message_time: conversation?.last_final_message_time || null,
     last_seen_message_id: conversation?.last_seen_message_id || null,
     is_main: true
   }];

@@ -508,18 +508,32 @@ fn project_channel_event(
                     event: serde_json::to_value(event)?,
                 }));
             }
-            event @ AgentSessionEvent::TurnCompleted { .. } => {
+            AgentSessionEvent::TurnCompleted { message } => {
                 events.push(ChannelEvent::Processing(OutgoingProcessing {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     state: ProcessingState::Idle,
                 }));
+                if !message.message_id.is_empty() {
+                    let storage_session_id = service_addr_storage_component(&session_addr);
+                    events.push(ChannelEvent::Home(OutgoingHomeEvent {
+                        channel_id: metadata.channel_id.clone(),
+                        platform_chat_id: metadata.platform_chat_id.clone(),
+                        payload: serde_json::json!({
+                            "type": "home.last_final_message_id_updated",
+                            "conversation_id": metadata.conversation_id.clone(),
+                            "foreground_session_id": foreground_route_id_from_storage_component(&storage_session_id),
+                            "last_final_message_id": message.message_id.clone(),
+                            "last_final_message_time": message.message_time.clone(),
+                        }),
+                    }));
+                }
                 events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
                     session_id: service_addr_storage_component(&session_addr),
-                    event: serde_json::to_value(event)?,
+                    event: serde_json::to_value(AgentSessionEvent::TurnCompleted { message })?,
                 }));
             }
             AgentSessionEvent::TurnFailed {
@@ -708,6 +722,13 @@ fn service_addr_storage_component(addr: &conversation_new::ServiceAddr) -> Strin
         }
     };
     format!("{scope}__{}", addr.path.join("__"))
+}
+
+fn foreground_route_id_from_storage_component(storage_id: &str) -> String {
+    storage_id
+        .strip_prefix("local__agent__foreground__")
+        .unwrap_or(storage_id)
+        .to_string()
 }
 
 struct Args {

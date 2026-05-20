@@ -7,6 +7,8 @@ pub(super) struct MessageSummary {
     pub(super) last_message_id: Option<String>,
     pub(super) last_message_index: Option<usize>,
     pub(super) last_message_time: Option<String>,
+    pub(super) last_final_message_id: Option<String>,
+    pub(super) last_final_message_time: Option<String>,
 }
 
 pub(super) fn decorate_message(message: &ChatMessage, index: usize) -> Value {

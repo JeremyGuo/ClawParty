@@ -98,6 +98,21 @@ pub fn home_foreground_session_seen_state_updated(
     })
 }
 
+pub fn home_last_final_message_id_updated(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    last_final_message_id: &str,
+    last_final_message_time: Option<&str>,
+) -> Value {
+    json!({
+        "type": "home.last_final_message_id_updated",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "last_final_message_id": last_final_message_id,
+        "last_final_message_time": last_final_message_time,
+    })
+}
+
 pub fn chat_snapshot(
     conversation_id: &str,
     foreground_session_id: &str,
@@ -243,6 +258,10 @@ pub struct HomeConversationSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_committed_message_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_final_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_final_message_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
     #[serde(default)]
     pub foreground_sessions: Vec<HomeForegroundSessionSummary>,
@@ -259,6 +278,10 @@ pub struct HomeForegroundSessionSummary {
     pub last_committed_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_committed_message_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_final_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_final_message_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,6 +362,16 @@ pub enum HomeEvent {
         last_seen_message_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_seen_at: Option<String>,
+    },
+    #[serde(rename = "home.last_final_message_id_updated")]
+    LastFinalMessageIdUpdated {
+        seq: u64,
+        conversation_id: String,
+        foreground_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_final_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_final_message_time: Option<String>,
     },
     #[serde(rename = "home.heartbeat")]
     Heartbeat(WebHeartbeat),

@@ -11,6 +11,27 @@ export function revokeFilePreviewUrls(files = []) {
   });
 }
 
+function normalizeOpenFileList(files = []) {
+  const orderedPaths = [];
+  const byPath = new Map();
+  const discarded = [];
+  files.forEach((file) => {
+    const path = normalizeWorkspacePath(file?.path);
+    if (!path) return;
+    const normalized = { ...file, path };
+    if (byPath.has(path)) {
+      discarded.push(byPath.get(path));
+    } else {
+      orderedPaths.push(path);
+    }
+    byPath.set(path, normalized);
+  });
+  return {
+    files: orderedPaths.map((path) => byPath.get(path)).filter(Boolean),
+    discarded
+  };
+}
+
 export function useWorkspaceState() {
   const [workspaceListings, setWorkspaceListings] = useState(() => new Map());
   const [workspaceExpanded, setWorkspaceExpanded] = useState(() => new Set(['']));
@@ -24,7 +45,8 @@ export function useWorkspaceState() {
   const setOpenFiles = useCallback((updater) => {
     setOpenFilesState((current) => {
       const next = typeof updater === 'function' ? updater(current) : updater;
-      const normalized = Array.isArray(next) ? next : [];
+      const { files: normalized, discarded } = normalizeOpenFileList(Array.isArray(next) ? next : []);
+      revokeFilePreviewUrls(discarded);
       openFilesRef.current = normalized;
       return normalized;
     });
