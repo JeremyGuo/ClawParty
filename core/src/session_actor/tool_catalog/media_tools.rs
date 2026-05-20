@@ -147,9 +147,32 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
     }
 
     if options.enable_provider_image_generation {
-        let mut schema_properties = properties([("prompt", json!({"type": "string"}))]);
+        let mut schema_properties = properties([
+            ("prompt", json!({"type": "string"})),
+            (
+                "output_dir",
+                json!({
+                    "type": "string",
+                    "description": "Directory where generated images should be written. In remote mode this is resolved on the remote target; the result returns generated file names only."
+                }),
+            ),
+        ]);
         add_images_property(&mut schema_properties, true);
         schema_properties.insert("generation_id".to_string(), json!({"type": "string"}));
+        schema_properties.insert(
+            "size".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional output image size, for example 1024x1024. Passed through to the image generation provider when supported."
+            }),
+        );
+        schema_properties.insert(
+            "mask_path".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional mask image for inpainting. Transparent pixels mark the area to edit; requires at least one input image."
+            }),
+        );
         schema_properties.insert("return_immediate".to_string(), json!({"type": "boolean"}));
         schema_properties.insert(
             "wait_timeout_seconds".to_string(),
@@ -159,9 +182,10 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
             "on_timeout".to_string(),
             json!({"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}),
         );
+        add_remote_property(&mut schema_properties, &options.remote_mode);
         tools.push(ToolDefinition::new(
             "image_generation",
-            "Generate an image using the configured generation model. First call with prompt starts a job and returns an id; call again with generation_id to wait or observe.",
+            "Generate or edit an image using the configured generation model. First call with prompt and output_dir starts a job and returns an id; include images for edit/inpaint and optional mask_path for inpainting. Call again with generation_id to wait or observe.",
             object_schema(schema_properties, &[]),
             ToolExecutionMode::Interruptible,
             ToolBackend::ProviderBacked {
@@ -305,6 +329,35 @@ fn native_view(
     Ok(ToolResultContent::from_json(status).with_file(file))
 }
 
+#[derive(Debug, Clone)]
+enum OutputDirectoryTarget {
+    Local {
+        path: PathBuf,
+    },
+    RemoteSsh {
+        host: String,
+        cwd: Option<String>,
+        path: String,
+    },
+}
+
+fn output_directory_target(
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
+) -> Result<OutputDirectoryTarget, LocalToolError> {
+    let output_dir = string_arg(arguments, "output_dir")?;
+    match context.execution_target(arguments)? {
+        ExecutionTarget::Local => Ok(OutputDirectoryTarget::Local {
+            path: resolve_local_path(context.workspace_root, &output_dir),
+        }),
+        ExecutionTarget::RemoteSsh { host, cwd } => Ok(OutputDirectoryTarget::RemoteSsh {
+            host,
+            cwd,
+            path: output_dir,
+        }),
+    }
+}
+
 fn analysis_tool(
     tool_name: &str,
     arguments: &Map<String, Value>,
@@ -331,6 +384,10 @@ fn analysis_tool(
         model_config.clone(),
         prompt,
         vec![file],
+        None,
+        None,
+        None,
+        context.data_root.to_path_buf(),
         tool_usage_log_path(context.data_root),
     );
     initial_job_result(
@@ -353,7 +410,18 @@ fn image_generation_tool(
     }
 
     let prompt = string_arg(arguments, "prompt")?;
+    let output_target = output_directory_target(arguments, context)?;
+    let image_size = optional_non_empty_string_arg(arguments, "size")?.map(str::to_string);
     let images = collect_optional_images(arguments, context)?;
+    let mask = collect_optional_mask(arguments, context)?;
+    if mask.is_some() && images.is_empty() {
+        return Err(LocalToolError::InvalidArguments(
+            "mask_path requires at least one input image in images".to_string(),
+        ));
+    }
+    if let Some(mask) = mask.as_ref() {
+        validate_image_edit_mask(&images[0], mask)?;
+    }
     let job_id = next_media_job_id("image_generation");
     start_provider_job(
         tool_name.to_string(),
@@ -361,6 +429,10 @@ fn image_generation_tool(
         model_config.clone(),
         prompt,
         images,
+        mask,
+        image_size,
+        Some(output_target),
+        context.data_root.to_path_buf(),
         tool_usage_log_path(context.data_root),
     );
     initial_job_result(
@@ -378,6 +450,10 @@ fn start_provider_job(
     model_config: ModelConfig,
     prompt: String,
     files: Vec<FileItem>,
+    image_edit_mask: Option<FileItem>,
+    image_size: Option<String>,
+    output_target: Option<OutputDirectoryTarget>,
+    data_root: PathBuf,
     usage_log_path: PathBuf,
 ) {
     let status = Arc::new(Mutex::new(MediaJobStatus::Running));
@@ -412,10 +488,19 @@ fn start_provider_job(
                 return;
             }
         };
-        let handle = match fork_server.start(
-            model_config.clone(),
-            ProviderRequestOwned::new(normalized_messages),
-        ) {
+        let handle = match fork_server.start(model_config.clone(), {
+            let request = ProviderRequestOwned::new(normalized_messages);
+            let request = if let Some(mask) = image_edit_mask.clone() {
+                request.with_image_edit_mask(mask)
+            } else {
+                request
+            };
+            if let Some(size) = image_size.clone() {
+                request.with_image_size(size)
+            } else {
+                request
+            }
+        }) {
             Ok(handle) => handle,
             Err(error) => {
                 *status.lock().expect("mutex poisoned") = MediaJobStatus::Failed(error.to_string());
@@ -435,7 +520,8 @@ fn start_provider_job(
 
         let result = handle
             .wait()
-            .map(|message| {
+            .map_err(|error| error.to_string())
+            .and_then(|message| {
                 append_tool_usage(
                     &usage_log_path,
                     &tool_name,
@@ -443,9 +529,12 @@ fn start_provider_job(
                     &model_config,
                     &message,
                 );
-                provider_message_to_tool_result(message)
-            })
-            .map_err(|error| error.to_string());
+                match output_target.as_ref() {
+                    Some(target) => provider_message_to_output_dir_result(message, target)
+                        .map_err(|error| error.to_string()),
+                    None => Ok(provider_message_to_tool_result(message, &data_root)),
+                }
+            });
 
         if cancel.load(Ordering::SeqCst) {
             *status.lock().expect("mutex poisoned") = MediaJobStatus::Cancelled;
@@ -594,7 +683,147 @@ fn job_snapshot_result(
     }))
 }
 
-fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
+fn provider_message_to_output_dir_result(
+    message: ChatMessage,
+    target: &OutputDirectoryTarget,
+) -> Result<ToolResultContent, LocalToolError> {
+    let mut filenames = Vec::new();
+    for item in message.data {
+        match item {
+            ChatMessageItem::File(file) => {
+                filenames.push(copy_provider_file_to_output_dir(&file, target)?)
+            }
+            ChatMessageItem::ToolResult(result) => {
+                for file in result.result.files {
+                    filenames.push(copy_provider_file_to_output_dir(&file, target)?);
+                }
+            }
+            _ => {}
+        }
+    }
+    if filenames.is_empty() {
+        return Err(LocalToolError::InvalidArguments(
+            "image generation completed without a generated file".to_string(),
+        ));
+    }
+    Ok(ToolResultContent::from_json(json!({
+        "status": "completed",
+        "filenames": filenames,
+    })))
+}
+
+fn copy_provider_file_to_output_dir(
+    file: &FileItem,
+    target: &OutputDirectoryTarget,
+) -> Result<String, LocalToolError> {
+    let source = file_uri_path(file)?;
+    let filename = file
+        .name
+        .clone()
+        .or_else(|| {
+            source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| {
+            LocalToolError::InvalidArguments(
+                "generated file did not include a file name".to_string(),
+            )
+        })?;
+    match target {
+        OutputDirectoryTarget::Local { path } => {
+            fs::create_dir_all(path).map_err(|error| {
+                LocalToolError::Io(format!(
+                    "failed to create output_dir {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let destination = path.join(&filename);
+            if source != destination {
+                fs::copy(&source, &destination).map_err(|error| {
+                    LocalToolError::Io(format!(
+                        "failed to copy generated file {} to {}: {error}",
+                        source.display(),
+                        destination.display()
+                    ))
+                })?;
+            }
+        }
+        OutputDirectoryTarget::RemoteSsh { host, cwd, path } => {
+            let bytes = fs::read(&source).map_err(|error| {
+                LocalToolError::Io(format!(
+                    "failed to read generated file {} for remote copy: {error}",
+                    source.display()
+                ))
+            })?;
+            write_remote_output_file(host, cwd.as_deref(), path, &filename, &bytes)?;
+        }
+    }
+    Ok(filename)
+}
+
+fn file_uri_path(file: &FileItem) -> Result<PathBuf, LocalToolError> {
+    file.uri
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            LocalToolError::InvalidArguments(format!(
+                "generated output must be a local file before copying to output_dir, got {}",
+                file.uri
+            ))
+        })
+}
+
+fn write_remote_output_file(
+    host: &str,
+    cwd: Option<&str>,
+    output_dir: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), LocalToolError> {
+    let script = format!(
+        "set -e; mkdir -p {dir}; cat > {dir}/{file}",
+        dir = shell_quote(output_dir),
+        file = shell_quote(filename)
+    );
+    let remote_command = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), script),
+        None => script,
+    };
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-T")
+        .arg(host)
+        .arg(remote_command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| LocalToolError::Remote(format!("failed to spawn ssh: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(bytes).map_err(|error| {
+            LocalToolError::Remote(format!(
+                "failed to write generated file to ssh stdin: {error}"
+            ))
+        })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| LocalToolError::Remote(format!("failed to wait for ssh: {error}")))?;
+    if !output.status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "ssh exited with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn provider_message_to_tool_result(message: ChatMessage, data_root: &Path) -> ToolResultContent {
     let mut text = Vec::new();
     let mut file = None;
     for item in message.data {
@@ -613,7 +842,19 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
             _ => {}
         }
     }
-    let result = if text.is_empty() {
+    let output = file
+        .as_ref()
+        .map(|file| provider_output_json(file, data_root));
+    let result = if let Some(output) = output {
+        let mut value = json!({
+            "status": "completed",
+            "outputs": [output],
+        });
+        if !text.is_empty() {
+            value["text"] = Value::String(text.join("\n"));
+        }
+        ToolResultContent::from_json(value)
+    } else if text.is_empty() {
         ToolResultContent::from_json(json!({"status": "completed"}))
     } else {
         ToolResultContent::from_text(text.join("\n"))
@@ -623,6 +864,25 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
     } else {
         result
     }
+}
+
+fn provider_output_json(file: &FileItem, data_root: &Path) -> Value {
+    let mut output = json!({
+        "uri": file.uri,
+        "media_type": file.media_type,
+        "name": file.name,
+        "width": file.width,
+        "height": file.height,
+        "location": "conversation_artifact",
+    });
+    if let Some(path) = file.uri.strip_prefix("file://") {
+        let path = Path::new(path);
+        if let Ok(relative) = path.strip_prefix(data_root) {
+            output["conversation_path"] =
+                Value::String(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    output
 }
 
 fn tool_usage_log_path(data_root: &Path) -> PathBuf {
@@ -894,6 +1154,62 @@ fn collect_optional_images(
         .collect()
 }
 
+fn collect_optional_mask(
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
+) -> Result<Option<FileItem>, LocalToolError> {
+    let Some(mask_path) = optional_non_empty_string_arg(arguments, "mask_path")? else {
+        return Ok(None);
+    };
+    let mut map = Map::new();
+    map.insert("path".to_string(), Value::String(mask_path.to_string()));
+    file_item_from_path(&map, context, "image").map(Some)
+}
+
+fn validate_image_edit_mask(image: &FileItem, mask: &FileItem) -> Result<(), LocalToolError> {
+    if image.media_type != mask.media_type {
+        return Err(LocalToolError::InvalidArguments(format!(
+            "mask_path must use the same image format as the input image: input={}, mask={}",
+            image.media_type.as_deref().unwrap_or("unknown"),
+            mask.media_type.as_deref().unwrap_or("unknown")
+        )));
+    }
+    if image.width != mask.width || image.height != mask.height {
+        return Err(LocalToolError::InvalidArguments(format!(
+            "mask_path must have the same dimensions as the input image: input={}x{}, mask={}x{}",
+            image.width.unwrap_or(0),
+            image.height.unwrap_or(0),
+            mask.width.unwrap_or(0),
+            mask.height.unwrap_or(0)
+        )));
+    }
+    if !image_mask_has_alpha(mask)? {
+        return Err(LocalToolError::InvalidArguments(
+            "mask_path must include an alpha channel; transparent pixels mark the editable area"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn image_mask_has_alpha(mask: &FileItem) -> Result<bool, LocalToolError> {
+    let Some(path) = mask.uri.strip_prefix("file://") else {
+        return Ok(true);
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| LocalToolError::Io(format!("failed to read mask image: {error}")))?;
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| {
+            LocalToolError::InvalidArguments(format!("failed to detect mask image format: {error}"))
+        })?
+        .decode()
+        .map_err(|error| {
+            LocalToolError::InvalidArguments(format!("failed to decode mask image: {error}"))
+        })?;
+    Ok(image.color().has_alpha())
+}
+
 fn nonce() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1011,6 +1327,74 @@ mod tests {
     }
 
     #[test]
+    fn provider_message_result_includes_conversation_artifact_path() {
+        let data_root = Path::new("/tmp/stellaclaw-session");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/stellaclaw-session/.stellaclaw/output/2026-05-18/output.png"
+                    .to_string(),
+                name: Some("output.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: Some(128),
+                height: Some(128),
+                state: None,
+            })],
+        );
+
+        let result = provider_message_to_tool_result(message, data_root);
+        let payload = json_result_value(&result);
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(
+            payload["outputs"][0]["uri"],
+            "file:///tmp/stellaclaw-session/.stellaclaw/output/2026-05-18/output.png"
+        );
+        assert_eq!(
+            payload["outputs"][0]["conversation_path"],
+            ".stellaclaw/output/2026-05-18/output.png"
+        );
+        assert_eq!(payload["outputs"][0]["location"], "conversation_artifact");
+        assert_eq!(result.files.len(), 1);
+    }
+
+    #[test]
+    fn provider_message_output_dir_result_copies_file_and_returns_filename_only() {
+        let temp = TempDir::new("provider-output-dir");
+        let source = temp.write_file("provider-output.png", b"image-bytes");
+        let output_dir = temp.path().join("requested-output");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: format!("file://{}", source.display()),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        );
+
+        let result = provider_message_to_output_dir_result(
+            message,
+            &OutputDirectoryTarget::Local {
+                path: output_dir.clone(),
+            },
+        )
+        .expect("output file should be copied");
+        let payload = json_result_value(&result);
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["filenames"], json!(["generated.png"]));
+        assert!(payload.get("outputs").is_none());
+        assert!(result.files.is_empty());
+        assert_eq!(
+            fs::read(output_dir.join("generated.png")).expect("copied image should exist"),
+            b"image-bytes"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn provider_backed_media_job_returns_completed_worker_result() {
         let _lock = MEDIA_TEST_LOCK
@@ -1074,6 +1458,10 @@ mod tests {
             Value::String("draw a quiet moon".to_string()),
         );
         arguments.insert("generation_id".to_string(), Value::String(String::new()));
+        arguments.insert(
+            "output_dir".to_string(),
+            Value::String("generated".to_string()),
+        );
         arguments.insert("return_immediate".to_string(), Value::Bool(true));
 
         let result = execute_provider_backed_media_tool(

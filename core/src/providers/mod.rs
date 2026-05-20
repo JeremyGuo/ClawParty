@@ -380,6 +380,8 @@ pub struct ProviderRequest<'a> {
     pub system_prompt: Option<&'a str>,
     pub messages: &'a [ChatMessage],
     pub tools: Vec<&'a ToolDefinition>,
+    pub image_edit_mask: Option<&'a crate::session_actor::FileItem>,
+    pub image_size: Option<&'a str>,
 }
 
 impl<'a> ProviderRequest<'a> {
@@ -388,6 +390,8 @@ impl<'a> ProviderRequest<'a> {
             system_prompt: None,
             messages,
             tools: Vec::new(),
+            image_edit_mask: None,
+            image_size: None,
         }
     }
 
@@ -400,6 +404,16 @@ impl<'a> ProviderRequest<'a> {
         self.tools = tools;
         self
     }
+
+    pub fn with_image_edit_mask(mut self, mask: &'a crate::session_actor::FileItem) -> Self {
+        self.image_edit_mask = Some(mask);
+        self
+    }
+
+    pub fn with_image_size(mut self, size: &'a str) -> Self {
+        self.image_size = Some(size);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +421,8 @@ pub struct ProviderRequestOwned {
     pub system_prompt: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub image_edit_mask: Option<crate::session_actor::FileItem>,
+    pub image_size: Option<String>,
 }
 
 impl ProviderRequestOwned {
@@ -415,6 +431,8 @@ impl ProviderRequestOwned {
             system_prompt: None,
             messages,
             tools: Vec::new(),
+            image_edit_mask: None,
+            image_size: None,
         }
     }
 
@@ -423,7 +441,19 @@ impl ProviderRequestOwned {
             system_prompt: request.system_prompt.map(str::to_string),
             messages: request.messages.to_vec(),
             tools: request.tools.iter().map(|tool| (*tool).clone()).collect(),
+            image_edit_mask: request.image_edit_mask.cloned(),
+            image_size: request.image_size.map(str::to_string),
         }
+    }
+
+    pub fn with_image_edit_mask(mut self, mask: crate::session_actor::FileItem) -> Self {
+        self.image_edit_mask = Some(mask);
+        self
+    }
+
+    pub fn with_image_size(mut self, size: String) -> Self {
+        self.image_size = Some(size);
+        self
     }
 
     pub fn as_provider_request(&self) -> ProviderRequest<'_> {
@@ -431,6 +461,8 @@ impl ProviderRequestOwned {
             system_prompt: self.system_prompt.as_deref(),
             messages: &self.messages,
             tools: self.tools.iter().collect(),
+            image_edit_mask: self.image_edit_mask.as_ref(),
+            image_size: self.image_size.as_deref(),
         }
     }
 }

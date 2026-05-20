@@ -1367,7 +1367,8 @@ impl TerminalEmulator {
             }
             'S' => {
                 self.non_sgr_sequences += 1;
-                for _ in 0..csi_param(&params, 0, 1) {
+                let count = csi_param(&params, 0, 1).min(self.rows);
+                for _ in 0..count {
                     self.scroll_up();
                 }
             }
@@ -2172,6 +2173,13 @@ mod tests {
             .expect("repeated carriage return should snapshot");
 
         assert_eq!(snapshot["visible_text"], "progress done");
+    }
+
+    #[test]
+    fn terminal_render_caps_large_scroll_up_sequences() {
+        let rendered = render_terminal_output(20, 4, "before\n\u{1b}[999999999Safter", 1_000);
+
+        assert!(rendered.plain_text.contains("before\nafter"));
     }
 
     #[test]

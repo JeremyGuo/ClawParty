@@ -64,6 +64,8 @@ impl OpenAiImageEditProvider {
         let api_key = std::env::var(&model_config.api_key_env)
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
         let (prompt, image) = prompt_and_optional_image_from_request(request)?;
+        let mask = request.image_edit_mask.cloned();
+        let size = request.image_size.map(str::to_string);
 
         let client = self.client_for_timeout(
             model_config.conn_timeout_secs(),
@@ -71,8 +73,15 @@ impl OpenAiImageEditProvider {
         )?;
         let (request_url, response) = if let Some(image) = image {
             let (image_part, image_payload_bytes) = image_file_part(&image)?;
+            let mask_part = mask.as_ref().map(image_file_part).transpose()?;
             let request_url = image_edit_url(&model_config.url);
             let estimated_payload_bytes = image_payload_bytes
+                .saturating_add(
+                    mask_part
+                        .as_ref()
+                        .map(|(_, byte_len)| *byte_len)
+                        .unwrap_or(0),
+                )
                 .saturating_add(prompt.len())
                 .saturating_add(model_config.model_name.len())
                 .saturating_add(1024);
@@ -81,11 +90,17 @@ impl OpenAiImageEditProvider {
                 "openai_image multipart",
                 estimated_payload_bytes,
             )?;
-            let form = multipart::Form::new()
+            let mut form = multipart::Form::new()
                 .text("model", model_config.model_name.clone())
                 .text("prompt", prompt)
-                .text("n", "1")
-                .part("image", image_part);
+                .text("n", "1");
+            if let Some(size) = size.as_ref() {
+                form = form.text("size", size.clone());
+            }
+            form = form.part("image", image_part);
+            if let Some((part, _)) = mask_part {
+                form = form.part("mask", part);
+            }
 
             (
                 request_url.clone(),
@@ -99,11 +114,14 @@ impl OpenAiImageEditProvider {
             )
         } else {
             let request_url = image_generation_url(&model_config.url);
-            let payload = json!({
+            let mut payload = json!({
                 "model": model_config.model_name.clone(),
                 "prompt": prompt,
                 "n": 1,
             });
+            if let Some(size) = size {
+                payload["size"] = json!(size);
+            }
             let body = serialize_json_request_body(model_config, "openai_image", &payload)?;
             (
                 request_url.clone(),
@@ -414,7 +432,8 @@ mod tests {
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "model": "gpt-image-2",
                 "prompt": "draw a cat",
-                "n": 1
+                "n": 1,
+                "size": "1024x1024"
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -435,7 +454,7 @@ mod tests {
         let response = provider
             .send(
                 &test_model_config(format!("{}/v1", server.url())),
-                ProviderRequest::new(&messages),
+                ProviderRequest::new(&messages).with_image_size("1024x1024"),
             )
             .expect("image generation request should succeed");
 
@@ -507,7 +526,7 @@ mod tests {
                 mockito::Matcher::Regex("multipart/form-data; boundary=.*".to_string()),
             )
             .match_body(mockito::Matcher::Regex(
-                "(?s).*name=\"model\".*gpt-image-2.*name=\"prompt\".*draw a moon.*name=\"image\".*"
+                "(?s).*name=\"model\".*gpt-image-2.*name=\"prompt\".*draw a moon.*name=\"size\".*1024x1024.*name=\"image\".*"
                     .to_string(),
             ))
             .with_status(200)
@@ -537,12 +556,72 @@ mod tests {
         let response = provider
             .send(
                 &test_model_config(format!("{}/v1", server.url())),
-                ProviderRequest::new(&messages),
+                ProviderRequest::new(&messages).with_image_size("1024x1024"),
             )
             .expect("image edit request should succeed");
 
         mock.assert();
         assert_eq!(response.role, ChatRole::Assistant);
+        assert!(response.data.iter().any(
+            |item| matches!(item, ChatMessageItem::File(file) if file.uri.starts_with("file://"))
+        ));
+    }
+
+    #[test]
+    fn sends_multipart_image_edit_with_mask() {
+        let _cwd = temp_cwd("openai-image-edit-mask-provider");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/images/edits")
+            .match_header("authorization", "Bearer test-key")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("multipart/form-data; boundary=.*".to_string()),
+            )
+            .match_body(mockito::Matcher::Regex(
+                "(?s).*name=\"image\".*name=\"mask\".*".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"b64_json":"aGVsbG8="}]}"#)
+            .create();
+
+        std::env::set_var("OPENAI_IMAGE_EDIT_API_KEY_TEST", "test-key");
+        let provider = OpenAiImageEditProvider::new();
+        let input = FileItem {
+            uri: "data:image/png;base64,aW1hZ2U=".to_string(),
+            name: Some("input.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            width: Some(1),
+            height: Some(1),
+            state: None,
+        };
+        let mask = FileItem {
+            uri: "data:image/png;base64,bWFzaw==".to_string(),
+            name: Some("mask.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            width: Some(1),
+            height: Some(1),
+            state: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![
+                ChatMessageItem::Context(ContextItem {
+                    text: "paint a star".to_string(),
+                }),
+                ChatMessageItem::File(input),
+            ],
+        )];
+
+        let response = provider
+            .send(
+                &test_model_config(format!("{}/v1", server.url())),
+                ProviderRequest::new(&messages).with_image_edit_mask(&mask),
+            )
+            .expect("masked image edit request should succeed");
+
+        mock.assert();
         assert!(response.data.iter().any(
             |item| matches!(item, ChatMessageItem::File(file) if file.uri.starts_with("file://"))
         ));

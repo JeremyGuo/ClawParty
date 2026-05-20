@@ -32,7 +32,7 @@ use super::{
     CompressionError, CompressionReport, ContextItem, ConversationBridge,
     ConversationBridgeRequest, SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial,
     SessionMailbox, SessionMailboxKind, SessionMessageHistory, SessionMessageRecord,
-    SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator, ToolBatch,
+    SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimate, TokenEstimator, ToolBatch,
     ToolBatchCompletion, ToolBatchExecutor, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
     ToolCatalog, ToolResultContent,
 };
@@ -1291,8 +1291,25 @@ impl SessionActor {
             let provider_history = self
                 .provider
                 .normalize_messages_for_provider(&normalized_history);
-            if let Some(estimated_tokens) =
-                self.provider_request_exceeds_context(&provider_history)?
+            let estimate = self.provider_request_token_estimate(&provider_history)?;
+            if let Some(estimate) = estimate.as_ref() {
+                self.log_info(
+                    "provider_request_token_estimate",
+                    serde_json::json!({
+                        "turn_id": &turn_id,
+                        "step_index": step_index,
+                        "text_tokens": estimate.text_tokens,
+                        "multimodal_tokens": estimate.multimodal_tokens,
+                        "reasoning_tokens": estimate.reasoning_tokens,
+                        "total_tokens": estimate.total_tokens,
+                        "token_max_context": self.model_config.token_max_context,
+                    }),
+                );
+            }
+            if let Some(estimated_tokens) = estimate
+                .as_ref()
+                .filter(|estimate| estimate.total_tokens >= self.model_config.token_max_context)
+                .map(|estimate| estimate.total_tokens)
             {
                 if request_too_large_attempts >= REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS {
                     return Err(SessionActorError::provider_preflight(format!(
@@ -1329,6 +1346,8 @@ impl SessionActor {
                     .iter()
                     .map(|(_, tool)| tool.clone())
                     .collect(),
+                image_edit_mask: None,
+                image_size: None,
             };
             self.provider
                 .start(request_id.clone(), request)
@@ -2644,10 +2663,10 @@ impl SessionActor {
         }
     }
 
-    fn provider_request_exceeds_context(
+    fn provider_request_token_estimate(
         &self,
         messages: &[ChatMessage],
-    ) -> Result<Option<u64>, SessionActorError> {
+    ) -> Result<Option<TokenEstimate>, SessionActorError> {
         if self.model_config.token_max_context == 0 {
             return Ok(None);
         }
@@ -2657,10 +2676,7 @@ impl SessionActor {
         let estimate = estimator
             .estimate(messages)
             .map_err(|error| SessionActorError::Compression(error.to_string()))?;
-        if estimate.total_tokens >= self.model_config.token_max_context {
-            return Ok(Some(estimate.total_tokens));
-        }
-        Ok(None)
+        Ok(Some(estimate))
     }
 
     fn log_info(&self, event: &str, data: serde_json::Value) {

@@ -988,6 +988,45 @@ mod tests {
     }
 
     #[test]
+    fn estimates_multimodal_tokens_from_image_view_tool_result_files() {
+        let estimator = build_test_estimator(
+            "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}",
+            MultimodalTokenStrategy::FixedTokens {
+                tokens_per_file: 85,
+            },
+        );
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolResult(ToolResultItem {
+                tool_call_id: "call_image".to_string(),
+                tool_name: "image_view".to_string(),
+                result: ToolResultContent::from_json(serde_json::json!({
+                    "status": "viewed",
+                    "uri": "file:///tmp/preview.png",
+                    "media_type": "image/png"
+                }))
+                .with_file(FileItem {
+                    uri: "file:///tmp/preview.png".to_string(),
+                    name: Some("preview.png".to_string()),
+                    media_type: Some("image/png".to_string()),
+                    width: Some(1024),
+                    height: Some(1536),
+                    state: None,
+                }),
+            })],
+        )];
+
+        let estimate = estimator.estimate(&messages).expect("estimate should work");
+
+        assert_eq!(estimate.multimodal_tokens, 85);
+        assert!(estimate.text_tokens > 0);
+        assert_eq!(
+            estimate.total_tokens,
+            estimate.text_tokens + estimate.multimodal_tokens
+        );
+    }
+
+    #[test]
     fn ignores_pdf_and_audio_files_when_multimodal_strategy_is_ignore() {
         let estimator = build_test_estimator(
             "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}",
