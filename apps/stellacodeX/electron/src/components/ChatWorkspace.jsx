@@ -1461,23 +1461,26 @@ function toolRoundTitle(elapsed, complete, summary = {}) {
 function toolRoundSummary(blocks) {
   const names = [];
   let reasoning = 0;
+  let toolCount = 0;
   for (const block of blocks || []) {
     if (block?.kind === 'reasoning') reasoning += 1;
     if (block?.type !== 'tools') continue;
-    for (const card of mergedToolCards(block.cards || [])) {
+    const rows = mergedToolCards(block.cards || []);
+    toolCount += rows.length;
+    for (const card of rows) {
       const name = String(card.name || 'tool').trim() || 'tool';
       if (!names.includes(name)) names.push(name);
     }
   }
   const parts = [];
   if (reasoning > 0) parts.push(`${reasoning} 思考`);
-  if (names.length > 0) parts.push(`${names.length} 工具`);
+  if (toolCount > 0) parts.push(`${toolCount} 工具`);
   return {
     reasoning,
-    tools: names.length,
+    tools: toolCount,
     names,
     extra: Math.max(0, names.length - 4),
-    total: reasoning + names.length,
+    total: reasoning + toolCount,
     label: parts.join(' · ')
   };
 }

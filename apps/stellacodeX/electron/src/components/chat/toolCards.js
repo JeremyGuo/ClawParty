@@ -170,13 +170,8 @@ export function toolGroupSummary(cards, fallbackName) {
 
 function toolOperationRecords(cards) {
   const hasCalls = cards.some((card) => card.kind === 'call');
-  const seen = new Set();
-  return cards.filter((card, index) => {
+  return cards.filter((card) => {
     if (hasCalls && card.kind !== 'call') return false;
-    const id = String(card.id || '').trim();
-    const key = id || `${card.kind}:${card.name || 'tool'}:${index}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
     return true;
   });
 }
