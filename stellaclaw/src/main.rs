@@ -63,6 +63,7 @@ fn run() -> Result<()> {
     let args = match parse_args()? {
         Command::Serve(args) => args,
         Command::Setup(args) => return setup::run(args),
+        Command::ToolBinaryEnsureHelper => return tool_binary_manager::run_helper_from_stdin(),
     };
     fs::create_dir_all(&args.workdir)
         .with_context(|| format!("failed to create {}", args.workdir.display()))?;
@@ -739,11 +740,15 @@ struct Args {
 enum Command {
     Serve(Args),
     Setup(setup::SetupArgs),
+    ToolBinaryEnsureHelper,
 }
 
 fn parse_args() -> Result<Command> {
     let mut args = env::args().skip(1);
     let first = args.next().ok_or_else(|| anyhow!(usage()))?;
+    if tool_binary_manager::is_helper_command(&first) {
+        return Ok(Command::ToolBinaryEnsureHelper);
+    }
     if first == "setup" {
         return parse_setup_args(args);
     }

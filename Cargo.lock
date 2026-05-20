@@ -2479,6 +2479,7 @@ dependencies = [
  "flate2",
  "image",
  "jieba-rs",
+ "libc",
  "portable-pty",
  "pulldown-cmark",
  "reqwest",

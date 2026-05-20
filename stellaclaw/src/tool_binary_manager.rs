@@ -1,13 +1,15 @@
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{mpsc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use stellaclaw_core::session_actor::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
@@ -23,6 +25,13 @@ const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/rele
 
 const RIPGREP_TOOL_NAME: &str = "ripgrep";
 const RIPGREP_VERSION: &str = "15.1.0";
+const TOOL_BINARY_HELPER_COMMAND: &str = "__tool-binary-ensure-helper";
+#[cfg(not(test))]
+const TOOL_BINARY_ENSURE_TIMEOUT: Duration = Duration::from_secs(420);
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_TOOL_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ToolBinaryClient {
@@ -64,10 +73,23 @@ struct ToolBinaryManager {
     lock: Mutex<()>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ToolBinaryRuntime {
     local_cache_root: PathBuf,
     local_visible_root: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToolBinaryHelperInput {
+    request: ToolBinaryEnsureRequest,
+    runtime: ToolBinaryRuntime,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ToolBinaryHelperOutput {
+    Success { response: ToolBinaryEnsureResponse },
+    Failure { reason: String },
 }
 
 impl ToolBinaryRuntime {
@@ -113,16 +135,76 @@ impl ToolBinaryManager {
         runtime: ToolBinaryRuntime,
     ) -> Result<ToolBinaryEnsureResponse> {
         let _guard = self.lock.lock().expect("tool binary manager lock poisoned");
-        let spec = spec_for_tool(&request.tool)?;
-        match request
-            .host
-            .as_deref()
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
+        #[cfg(test)]
         {
-            Some(host) => ensure_remote(spec, host, &runtime),
-            None => ensure_local(spec, &runtime),
+            return ensure_direct(request, runtime);
         }
+        #[cfg(not(test))]
+        ensure_in_helper_process(request, runtime)
+    }
+}
+
+pub fn is_helper_command(arg: &str) -> bool {
+    arg == TOOL_BINARY_HELPER_COMMAND
+}
+
+pub fn run_helper_from_stdin() -> Result<()> {
+    let input: ToolBinaryHelperInput = serde_json::from_reader(io::stdin())
+        .context("failed to decode tool binary helper input")?;
+    let output = match ensure_direct(input.request, input.runtime) {
+        Ok(response) => ToolBinaryHelperOutput::Success { response },
+        Err(error) => ToolBinaryHelperOutput::Failure {
+            reason: format!("{error:#}"),
+        },
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to encode tool binary result")?;
+    Ok(())
+}
+
+fn ensure_direct(
+    request: ToolBinaryEnsureRequest,
+    runtime: ToolBinaryRuntime,
+) -> Result<ToolBinaryEnsureResponse> {
+    let spec = spec_for_tool(&request.tool)?;
+    match request
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        Some(host) => ensure_remote(spec, host, &runtime),
+        None => ensure_local(spec, &runtime),
+    }
+}
+
+#[cfg(not(test))]
+fn ensure_in_helper_process(
+    request: ToolBinaryEnsureRequest,
+    runtime: ToolBinaryRuntime,
+) -> Result<ToolBinaryEnsureResponse> {
+    let current_exe = env::current_exe().context("failed to locate stellaclaw executable")?;
+    let mut command = Command::new(current_exe);
+    command.arg(TOOL_BINARY_HELPER_COMMAND);
+    let input = serde_json::to_vec(&ToolBinaryHelperInput { request, runtime })
+        .context("failed to encode tool binary helper input")?;
+    let output = run_command_with_timeout(&mut command, TOOL_BINARY_ENSURE_TIMEOUT, Some(&input))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tool binary helper exited with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let result: ToolBinaryHelperOutput =
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "failed to decode tool binary helper output: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })?;
+    match result {
+        ToolBinaryHelperOutput::Success { response } => Ok(response),
+        ToolBinaryHelperOutput::Failure { reason } => Err(anyhow!(reason)),
     }
 }
 
@@ -298,7 +380,9 @@ fn ensure_remote(
 }
 
 fn fetch_manifest_asset(spec: &ToolSpec, manifest_url: &str, platform: &str) -> Result<ToolAsset> {
-    let value: Value = reqwest::blocking::get(manifest_url)
+    let value: Value = http_client(MANIFEST_TIMEOUT)?
+        .get(manifest_url)
+        .send()
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json())
         .with_context(|| format!("failed to fetch {} manifest", spec.name))?;
@@ -485,11 +569,44 @@ fn install_local_binary(
 }
 
 fn download_file(url: &str, path: &Path) -> Result<()> {
-    let bytes = reqwest::blocking::get(url)
+    let mut response = http_client(DOWNLOAD_TIMEOUT)?
+        .get(url)
+        .send()
         .and_then(|response| response.error_for_status())
-        .and_then(|response| response.bytes())
         .with_context(|| format!("failed to download {url}"))?;
-    fs::write(path, &bytes).with_context(|| format!("failed to write {}", path.display()))
+    if let Some(length) = response.content_length() {
+        if length > MAX_TOOL_ARCHIVE_BYTES {
+            return Err(anyhow!(
+                "downloaded archive is too large: {length} bytes exceeds {MAX_TOOL_ARCHIVE_BYTES}"
+            ));
+        }
+    }
+    let tmp_path = path.with_extension("download");
+    let mut file = fs::File::create(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    let copied = io::copy(&mut response, &mut file)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    if copied > MAX_TOOL_ARCHIVE_BYTES {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow!(
+            "downloaded archive is too large: {copied} bytes exceeds {MAX_TOOL_ARCHIVE_BYTES}"
+        ));
+    }
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })
+}
+
+fn http_client(timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()
+        .context("failed to create HTTP client")
 }
 
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
@@ -601,10 +718,17 @@ fn run_command_with_timeout(
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     if stdin.is_some() {
-        command.stdin(std::process::Stdio::piped());
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
     }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     let mut child = command.spawn().context("failed to spawn command")?;
     if let (Some(input), Some(mut child_stdin)) = (stdin, child.stdin.take()) {
         use std::io::Write;
@@ -618,7 +742,7 @@ fn run_command_with_timeout(
                 .context("failed to collect command output");
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_child_process_group(&mut child);
             let output = child
                 .wait_with_output()
                 .context("failed to collect timed out command output")?;
@@ -632,10 +756,63 @@ fn run_command_with_timeout(
     }
 }
 
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
     let escaped = value.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_helper_command_is_recognized() {
+        assert!(is_helper_command("__tool-binary-ensure-helper"));
+        assert!(!is_helper_command("setup"));
+    }
+
+    #[test]
+    fn direct_ensure_rejects_unknown_tool_without_network() {
+        let runtime = ToolBinaryRuntime {
+            local_cache_root: env::temp_dir().join("stellaclaw-test-tools"),
+            local_visible_root: env::temp_dir().join("stellaclaw-test-tools"),
+        };
+        let error = ensure_direct(
+            ToolBinaryEnsureRequest {
+                tool: "unknown-tool-for-test".to_string(),
+                host: None,
+            },
+            runtime,
+        )
+        .expect_err("unknown tool should fail before network access");
+        assert!(format!("{error:#}").contains("unsupported managed tool binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_kills_slow_process() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        let started = Instant::now();
+        let error =
+            run_command_with_timeout(&mut command, Duration::from_millis(100), None).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(format!("{error:#}").contains("command timed out"));
+    }
 }
