@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crossbeam_channel::{select, Receiver, Sender};
+use crossbeam_channel::{select_biased, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Map, Value};
 
@@ -58,18 +58,13 @@ struct ShellSession {
     shell: String,
     cwd: String,
     tty: bool,
-    cols: u16,
-    rows: u16,
     _master: Option<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Option<SyncSender<Vec<u8>>>,
     stopper: ProcessStopper,
-    output: Mutex<HeadTailBuffer>,
-    stdout: Mutex<HeadTailBuffer>,
-    stderr: Mutex<HeadTailBuffer>,
-    event_tx: Sender<()>,
-    event_rx: Receiver<()>,
-    terminal: Mutex<TerminalEmulator>,
-    status: Mutex<ShellStatus>,
+    data_tx: Sender<ShellDataEvent>,
+    state_tx: Sender<ShellStateEvent>,
+    command_tx: Sender<ShellDataCommand>,
+    event_rx: Receiver<ShellDataNotification>,
 }
 
 enum ProcessStopper {
@@ -77,7 +72,7 @@ enum ProcessStopper {
     Pid(u32),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ShellStatus {
     running: bool,
     exit_code: Option<i32>,
@@ -91,6 +86,39 @@ enum ShellOutputStream {
     Pty,
     Stdout,
     Stderr,
+}
+
+enum ShellDataEvent {
+    Output {
+        stream: ShellOutputStream,
+        bytes: Vec<u8>,
+    },
+}
+
+enum ShellStateEvent {
+    Exited { exit_code: Option<i32> },
+    Stopped,
+}
+
+enum ShellDataCommand {
+    Drain {
+        max_output_chars: usize,
+        reply_tx: Sender<ShellDataSnapshot>,
+    },
+    MarkTimedOut {
+        reply_tx: Sender<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShellDataNotification {
+    Exited,
+}
+
+struct ShellDataSnapshot {
+    drain: ShellOutputDrain,
+    status: ShellStatus,
+    terminal_snapshot: Option<Value>,
 }
 
 #[derive(Default)]
@@ -111,14 +139,7 @@ struct TruncatedShellText {
     original_tokens: Option<u64>,
 }
 
-impl ShellOutputDrain {
-    fn extend(&mut self, other: ShellOutputDrain) {
-        self.aggregate.extend_from_slice(&other.aggregate);
-        self.stdout.extend_from_slice(&other.stdout);
-        self.stderr.extend_from_slice(&other.stderr);
-    }
-}
-
+#[cfg(test)]
 struct TerminalRender {
     plain_text: String,
     snapshot: Option<Value>,
@@ -239,6 +260,189 @@ impl HeadTailBuffer {
 
 fn shell_manager() -> &'static Mutex<ShellManager> {
     SHELL_MANAGER.get_or_init(|| Mutex::new(ShellManager::default()))
+}
+
+fn spawn_shell_data_thread(
+    tty: bool,
+    cols: u16,
+    rows: u16,
+) -> (
+    Sender<ShellDataEvent>,
+    Sender<ShellStateEvent>,
+    Sender<ShellDataCommand>,
+    Receiver<ShellDataNotification>,
+) {
+    let (data_tx, data_rx) = crossbeam_channel::bounded::<ShellDataEvent>(1024);
+    let (state_tx, state_rx) = crossbeam_channel::bounded::<ShellStateEvent>(32);
+    let (command_tx, command_rx) = crossbeam_channel::bounded::<ShellDataCommand>(32);
+    let (event_tx, event_rx) = crossbeam_channel::bounded::<ShellDataNotification>(1);
+    thread::spawn(move || {
+        run_shell_data_thread(tty, cols, rows, data_rx, state_rx, command_rx, event_tx);
+    });
+    (data_tx, state_tx, command_tx, event_rx)
+}
+
+fn run_shell_data_thread(
+    tty: bool,
+    cols: u16,
+    rows: u16,
+    data_rx: Receiver<ShellDataEvent>,
+    state_rx: Receiver<ShellStateEvent>,
+    command_rx: Receiver<ShellDataCommand>,
+    event_tx: Sender<ShellDataNotification>,
+) {
+    let mut output = HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES);
+    let mut stdout = HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES);
+    let mut stderr = HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES);
+    let mut terminal = TerminalEmulator::new(cols as usize, rows as usize);
+    let mut status = ShellStatus {
+        running: true,
+        exit_code: None,
+        timed_out: false,
+        created_ms: unix_millis(),
+        updated_ms: unix_millis(),
+    };
+
+    loop {
+        select_biased! {
+            recv(state_rx) -> event => {
+                match event {
+                    Ok(event) => handle_shell_state_event(event, &mut status, &event_tx),
+                    Err(_) => break,
+                }
+            }
+            recv(command_rx) -> command => {
+                match command {
+                    Ok(command) => handle_shell_data_command(
+                        command,
+                        tty,
+                        &data_rx,
+                        &mut output,
+                        &mut stdout,
+                        &mut stderr,
+                        &mut terminal,
+                        &mut status,
+                        cols,
+                        rows,
+                    ),
+                    Err(_) => break,
+                }
+            }
+            recv(data_rx) -> event => {
+                match event {
+                    Ok(event) => handle_shell_data_event(
+                        event,
+                        tty,
+                        &mut output,
+                        &mut stdout,
+                        &mut stderr,
+                        &mut terminal,
+                        &mut status,
+                    ),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+fn handle_shell_data_event(
+    event: ShellDataEvent,
+    tty: bool,
+    output: &mut HeadTailBuffer,
+    stdout: &mut HeadTailBuffer,
+    stderr: &mut HeadTailBuffer,
+    terminal: &mut TerminalEmulator,
+    status: &mut ShellStatus,
+) {
+    match event {
+        ShellDataEvent::Output { stream, bytes } => {
+            output.push(&bytes);
+            match stream {
+                ShellOutputStream::Pty => {}
+                ShellOutputStream::Stdout => stdout.push(&bytes),
+                ShellOutputStream::Stderr => stderr.push(&bytes),
+            }
+            if tty {
+                terminal.feed(&String::from_utf8_lossy(&bytes));
+            }
+            status.updated_ms = unix_millis();
+        }
+    }
+}
+
+fn handle_shell_state_event(
+    event: ShellStateEvent,
+    status: &mut ShellStatus,
+    event_tx: &Sender<ShellDataNotification>,
+) {
+    match event {
+        ShellStateEvent::Exited { exit_code } => {
+            status.running = false;
+            status.exit_code = exit_code;
+            status.updated_ms = unix_millis();
+            let _ = event_tx.try_send(ShellDataNotification::Exited);
+        }
+        ShellStateEvent::Stopped => {
+            status.running = false;
+            status.updated_ms = unix_millis();
+            let _ = event_tx.try_send(ShellDataNotification::Exited);
+        }
+    }
+}
+
+fn handle_shell_data_command(
+    command: ShellDataCommand,
+    tty: bool,
+    data_rx: &Receiver<ShellDataEvent>,
+    output: &mut HeadTailBuffer,
+    stdout: &mut HeadTailBuffer,
+    stderr: &mut HeadTailBuffer,
+    terminal: &mut TerminalEmulator,
+    status: &mut ShellStatus,
+    cols: u16,
+    rows: u16,
+) {
+    match command {
+        ShellDataCommand::Drain {
+            max_output_chars,
+            reply_tx,
+        } => {
+            flush_pending_shell_output(data_rx, tty, output, stdout, stderr, terminal, status);
+            let snapshot = ShellDataSnapshot {
+                drain: ShellOutputDrain {
+                    aggregate: output.drain(),
+                    stdout: stdout.drain(),
+                    stderr: stderr.drain(),
+                },
+                status: status.clone(),
+                terminal_snapshot: terminal_snapshot_value(terminal, cols, rows, max_output_chars),
+            };
+            let _ = reply_tx.send(snapshot);
+        }
+        ShellDataCommand::MarkTimedOut { reply_tx } => {
+            let should_stop = status.running;
+            if should_stop {
+                status.timed_out = true;
+                status.updated_ms = unix_millis();
+            }
+            let _ = reply_tx.send(should_stop);
+        }
+    }
+}
+
+fn flush_pending_shell_output(
+    data_rx: &Receiver<ShellDataEvent>,
+    tty: bool,
+    output: &mut HeadTailBuffer,
+    stdout: &mut HeadTailBuffer,
+    stderr: &mut HeadTailBuffer,
+    terminal: &mut TerminalEmulator,
+    status: &mut ShellStatus,
+) {
+    while let Ok(event) = data_rx.try_recv() {
+        handle_shell_data_event(event, tty, output, stdout, stderr, terminal, status);
+    }
 }
 
 pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition> {
@@ -409,10 +613,7 @@ fn shell_stop(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
     drop(manager);
 
     stop_process(&session, signal_arg(arguments));
-    if let Ok(mut status) = session.status.lock() {
-        status.running = false;
-        status.updated_ms = unix_millis();
-    }
+    let _ = session.state_tx.send(ShellStateEvent::Stopped);
     Ok(json!({
         "process_id": process_id,
         "stopped": true,
@@ -552,7 +753,7 @@ fn spawn_pty_process(
         }
     });
 
-    let (event_tx, event_rx) = crossbeam_channel::bounded(1);
+    let (data_tx, state_tx, command_tx, event_rx) = spawn_shell_data_thread(true, cols, rows);
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
         command: command_text.to_string(),
@@ -560,24 +761,13 @@ fn spawn_pty_process(
         shell,
         cwd: cwd_label,
         tty: true,
-        cols,
-        rows,
         _master: Some(Mutex::new(pair.master)),
         writer: Some(writer_tx),
         stopper,
-        output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        event_tx,
+        data_tx,
+        state_tx,
+        command_tx,
         event_rx,
-        terminal: Mutex::new(TerminalEmulator::new(cols as usize, rows as usize)),
-        status: Mutex::new(ShellStatus {
-            running: true,
-            exit_code: None,
-            timed_out: false,
-            created_ms: unix_millis(),
-            updated_ms: unix_millis(),
-        }),
     });
 
     let reader_session = Arc::clone(&session);
@@ -665,7 +855,8 @@ fn spawn_pipe_process(
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let (event_tx, event_rx) = crossbeam_channel::bounded(1);
+    let (data_tx, state_tx, command_tx, event_rx) =
+        spawn_shell_data_thread(false, SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS);
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
         command: command_text.to_string(),
@@ -673,27 +864,13 @@ fn spawn_pipe_process(
         shell,
         cwd: cwd_label,
         tty: false,
-        cols: SHELL_DEFAULT_COLS,
-        rows: SHELL_DEFAULT_ROWS,
         _master: None,
         writer: None,
         stopper: ProcessStopper::Pid(pid),
-        output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
-        event_tx,
+        data_tx,
+        state_tx,
+        command_tx,
         event_rx,
-        terminal: Mutex::new(TerminalEmulator::new(
-            SHELL_DEFAULT_COLS as usize,
-            SHELL_DEFAULT_ROWS as usize,
-        )),
-        status: Mutex::new(ShellStatus {
-            running: true,
-            exit_code: None,
-            timed_out: false,
-            created_ms: unix_millis(),
-            updated_ms: unix_millis(),
-        }),
     });
 
     if let Some(stdout) = stdout {
@@ -761,16 +938,14 @@ fn spawn_timeout_watcher(session: Arc<ShellSession>, timeout_ms: usize) {
     }
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(timeout_ms as u64));
-        let running = session
-            .status
-            .lock()
-            .map(|status| status.running)
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let should_stop = session
+            .command_tx
+            .send(ShellDataCommand::MarkTimedOut { reply_tx })
+            .ok()
+            .and_then(|_| reply_rx.recv_timeout(Duration::from_secs(1)).ok())
             .unwrap_or(false);
-        if running {
-            if let Ok(mut status) = session.status.lock() {
-                status.timed_out = true;
-                status.updated_ms = unix_millis();
-            }
+        if should_stop {
             stop_process(&session, "kill");
             push_process_output(
                 &session,
@@ -782,39 +957,14 @@ fn spawn_timeout_watcher(session: Arc<ShellSession>, timeout_ms: usize) {
 }
 
 fn push_process_output(session: &ShellSession, stream: ShellOutputStream, bytes: &[u8]) {
-    if let Ok(mut output) = session.output.lock() {
-        output.push(bytes);
-    }
-    match stream {
-        ShellOutputStream::Pty => {}
-        ShellOutputStream::Stdout => {
-            if let Ok(mut stdout) = session.stdout.lock() {
-                stdout.push(bytes);
-            }
-        }
-        ShellOutputStream::Stderr => {
-            if let Ok(mut stderr) = session.stderr.lock() {
-                stderr.push(bytes);
-            }
-        }
-    }
-    if let Ok(mut status) = session.status.lock() {
-        status.updated_ms = unix_millis();
-    }
-    notify_shell_session(session);
+    let _ = session.data_tx.send(ShellDataEvent::Output {
+        stream,
+        bytes: bytes.to_vec(),
+    });
 }
 
 fn mark_process_exited(session: &ShellSession, exit_code: Option<i32>) {
-    if let Ok(mut status) = session.status.lock() {
-        status.running = false;
-        status.exit_code = exit_code;
-        status.updated_ms = unix_millis();
-    }
-    notify_shell_session(session);
-}
-
-fn notify_shell_session(session: &ShellSession) {
-    let _ = session.event_tx.try_send(());
+    let _ = session.state_tx.send(ShellStateEvent::Exited { exit_code });
 }
 
 fn stop_process(session: &ShellSession, signal: &str) {
@@ -871,46 +1021,7 @@ fn collect_until(
     operation: &str,
 ) -> Result<Value, LocalToolError> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
-    let mut collected = ShellOutputDrain::default();
-    let mut exit_code = None;
-    let mut post_exit_deadline = None;
     loop {
-        collected.extend(drain_shell_output(session));
-
-        let running = session
-            .status
-            .lock()
-            .map(|status| status.running)
-            .unwrap_or(false);
-        if !running {
-            exit_code = session
-                .status
-                .lock()
-                .ok()
-                .and_then(|status| status.exit_code);
-            let now = Instant::now();
-            let close_deadline =
-                *post_exit_deadline.get_or_insert_with(|| now + Duration::from_millis(50));
-            let remaining = close_deadline.saturating_duration_since(now);
-            if remaining.is_zero() || cancel_token.is_cancelled() {
-                collected.extend(drain_shell_output(session));
-                break;
-            }
-            let close_timer = crossbeam_channel::after(remaining);
-            select! {
-                recv(session.event_rx) -> _ => {}
-                recv(cancel_token.cancel_rx()) -> _ => {
-                    collected.extend(drain_shell_output(session));
-                    break;
-                }
-                recv(close_timer) -> _ => {
-                    collected.extend(drain_shell_output(session));
-                    break;
-                }
-            }
-            continue;
-        }
-
         if Instant::now() >= deadline || cancel_token.is_cancelled() {
             break;
         }
@@ -919,9 +1030,16 @@ fn collect_until(
             break;
         }
         let wait_timer = crossbeam_channel::after(wait_remaining);
-        select! {
-            recv(session.event_rx) -> _ => {}
+        select_biased! {
             recv(cancel_token.cancel_rx()) -> _ => {
+                break;
+            }
+            recv(session.event_rx) -> _ => {
+                let close_timer = crossbeam_channel::after(Duration::from_millis(50));
+                select_biased! {
+                    recv(cancel_token.cancel_rx()) -> _ => {}
+                    recv(close_timer) -> _ => {}
+                }
                 break;
             }
             recv(wait_timer) -> _ => {
@@ -930,11 +1048,11 @@ fn collect_until(
         }
     }
 
-    let status = session.status.lock().expect("mutex poisoned");
+    let snapshot = drain_shell_data(session, shell_char_safety_limit(output_limit.max_tokens))?;
+    let collected = snapshot.drain;
+    let status = snapshot.status;
     let running = status.running;
-    if exit_code.is_none() {
-        exit_code = status.exit_code;
-    }
+    let exit_code = status.exit_code;
     let timed_out = status.timed_out;
     let created_ms = status.created_ms;
     let updated_ms = status.updated_ms;
@@ -943,22 +1061,16 @@ fn collect_until(
     } else {
         updated_ms.saturating_sub(created_ms)
     };
-    drop(status);
 
     let raw_text = String::from_utf8_lossy(&collected.aggregate).to_string();
-    let rendered = render_session_terminal_output(
-        session,
-        &raw_text,
-        shell_char_safety_limit(output_limit.max_tokens),
-    );
-    let plain = rendered.plain_text;
+    let plain = strip_ansi(&raw_text);
     let total_output_lines = plain.lines().count();
     let output = truncate_shell_text(&plain, output_limit, context.token_estimator);
     let stdout_text = String::from_utf8_lossy(&collected.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&collected.stderr).to_string();
     let stdout = truncate_shell_text(&stdout_text, output_limit, context.token_estimator);
     let stderr = truncate_shell_text(&stderr_text, output_limit, context.token_estimator);
-    let snapshot = rendered.snapshot;
+    let terminal_snapshot = snapshot.terminal_snapshot;
     let result = structured_shell_result(
         operation,
         session,
@@ -971,7 +1083,7 @@ fn collect_until(
         output,
         stdout,
         stderr,
-        snapshot,
+        terminal_snapshot,
     );
     if !running {
         remove_completed_process(&session.process_id);
@@ -981,34 +1093,24 @@ fn collect_until(
 
 fn remove_completed_process(process_id: &str) {
     let mut manager = shell_manager().lock().expect("mutex poisoned");
-    let should_remove = manager
-        .sessions
-        .get(process_id)
-        .and_then(|session| session.status.lock().ok().map(|status| !status.running))
-        .unwrap_or(false);
-    if should_remove {
-        manager.sessions.remove(process_id);
-    }
+    manager.sessions.remove(process_id);
 }
 
-fn drain_shell_output(session: &ShellSession) -> ShellOutputDrain {
-    ShellOutputDrain {
-        aggregate: session
-            .output
-            .lock()
-            .map(|mut output| output.drain())
-            .unwrap_or_default(),
-        stdout: session
-            .stdout
-            .lock()
-            .map(|mut output| output.drain())
-            .unwrap_or_default(),
-        stderr: session
-            .stderr
-            .lock()
-            .map(|mut output| output.drain())
-            .unwrap_or_default(),
-    }
+fn drain_shell_data(
+    session: &ShellSession,
+    max_output_chars: usize,
+) -> Result<ShellDataSnapshot, LocalToolError> {
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    session
+        .command_tx
+        .send(ShellDataCommand::Drain {
+            max_output_chars,
+            reply_tx,
+        })
+        .map_err(|_| LocalToolError::Io("shell data thread is closed".to_string()))?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| LocalToolError::Io("shell data thread did not reply".to_string()))
 }
 
 fn write_to_process(session: &ShellSession, bytes: &[u8]) -> Result<(), LocalToolError> {
@@ -1076,22 +1178,6 @@ fn render_terminal_output(
     let mut terminal = TerminalEmulator::new(cols as usize, rows as usize);
     terminal.feed(raw_text);
     let snapshot = terminal_snapshot_value(&terminal, cols, rows, max_output_chars);
-    TerminalRender {
-        plain_text,
-        snapshot,
-    }
-}
-
-fn render_session_terminal_output(
-    session: &ShellSession,
-    raw_text: &str,
-    max_output_chars: usize,
-) -> TerminalRender {
-    let plain_text = strip_ansi(raw_text);
-    let snapshot = session.terminal.lock().ok().and_then(|mut terminal| {
-        terminal.feed(raw_text);
-        terminal_snapshot_value(&terminal, session.cols, session.rows, max_output_chars)
-    });
     TerminalRender {
         plain_text,
         snapshot,

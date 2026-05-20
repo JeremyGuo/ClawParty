@@ -283,8 +283,10 @@ export function ConversationBar({
             }}
             onClick={() => selectSession(selectionTarget)}
           >
-            {unread && <i className="conversation-unread-dot" aria-label="有新消息" />}
-            <strong>{title}</strong>
+            <strong className="conversation-session-title">
+              {unread && <i className="conversation-unread-dot" aria-label="有新消息" />}
+              <b>{title}</b>
+            </strong>
             <span>{session?.is_main ? 'Main' : (conversation.nickname || conversation.platform_chat_id || 'Foreground')}</span>
             <em title={working ? '正在工作' : undefined}>
               {working && <i className="conversation-working-dot" aria-hidden="true" />}

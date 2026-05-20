@@ -1111,8 +1111,19 @@ button {
 }
 
 .conversation-row.session-row strong {
+  position: relative;
+  overflow: visible;
   font-size: 13px;
   line-height: 1.25;
+}
+
+.conversation-row.session-row strong b {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conversation-row.session-row span {
@@ -1127,8 +1138,8 @@ button {
 
 .conversation-unread-dot {
   position: absolute;
-  top: 7px;
-  right: 7px;
+  top: -4px;
+  left: -7px;
   width: 8px;
   height: 8px;
   border: 2px solid var(--panel);

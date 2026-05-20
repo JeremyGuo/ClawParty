@@ -589,6 +589,9 @@ impl ToolOperationRunner {
 
     fn cap_tool_result_context(&self, mut result: ToolResultItem) -> ToolResultItem {
         result.result.normalize_legacy_context();
+        if is_shell_result(&result.result) {
+            return result;
+        }
         let rendered = crate::session_actor::tool_result_text(&result);
         let total_chars = rendered.chars().count();
         if total_chars <= MAX_TOOL_RESULT_CONTEXT_CHARS {
@@ -606,6 +609,15 @@ impl ToolOperationRunner {
         result.result.files = files;
         result
     }
+}
+
+fn is_shell_result(result: &ToolResultContent) -> bool {
+    result
+        .structured
+        .as_ref()
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("shell_result")
 }
 
 fn capped_truncated_tool_result_preview(total_chars: usize, original: &str) -> String {
