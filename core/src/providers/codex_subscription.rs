@@ -227,7 +227,11 @@ impl CodexSubscriptionProvider {
         }
         payload.insert(
             "prompt_cache_key".to_string(),
-            Value::String(self.session_id.clone()),
+            Value::String(codex_prompt_cache_key(
+                &self.session_id,
+                model_config,
+                request,
+            )),
         );
         payload.insert(
             "client_metadata".to_string(),
@@ -364,7 +368,11 @@ impl CodexSubscriptionProvider {
         }
         payload.insert(
             "prompt_cache_key".to_string(),
-            Value::String(self.session_id.clone()),
+            Value::String(codex_prompt_cache_key(
+                &self.session_id,
+                model_config,
+                request,
+            )),
         );
         Ok(payload)
     }
@@ -1273,6 +1281,39 @@ fn value_truthy_str(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "y" | "on" | "fast" | "priority" => Some(true),
         "0" | "false" | "no" | "n" | "off" | "default" | "standard" => Some(false),
         _ => None,
+    }
+}
+
+fn codex_prompt_cache_key(
+    session_id: &str,
+    model_config: &ModelConfig,
+    request: &ProviderRequest<'_>,
+) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    fnv1a_write(&mut hash, model_config.model_name.as_bytes());
+    fnv1a_write(&mut hash, b"\0");
+    if let Some(system_prompt) = request.system_prompt {
+        fnv1a_write(&mut hash, system_prompt.as_bytes());
+    }
+    fnv1a_write(&mut hash, b"\0");
+    for tool in &request.tools {
+        fnv1a_write(&mut hash, tool.name.as_bytes());
+        fnv1a_write(&mut hash, b"\0");
+        if let Ok(bytes) = serde_json::to_vec(&tool.responses_tool_schema()) {
+            fnv1a_write(&mut hash, &bytes);
+        }
+        fnv1a_write(&mut hash, b"\0");
+    }
+    format!("{session_id}-schema-{hash:016x}")
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+fn fnv1a_write(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
     }
 }
 
@@ -3871,6 +3912,42 @@ mod tests {
                 .unwrap()
                 .contains("single poll can wait up to 300000ms")
         );
+    }
+
+    #[test]
+    fn codex_prompt_cache_key_includes_tool_schema() {
+        let config = test_model_config();
+        let messages = Vec::new();
+        let initial = SessionInitial::new("session_1", SessionType::Foreground);
+        let provider = CodexSubscriptionProvider::new();
+        let tool_set = provider
+            .tool_set(&config)
+            .expect("codex provider should expose a tool set");
+        let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+            &config,
+            &initial,
+            Some(tool_set.as_ref()),
+        )
+        .expect("catalog should build");
+        let write_stdin = catalog.get("write_stdin").expect("write_stdin exists");
+
+        let empty_request = ProviderRequest::new(&messages);
+        let tool_request = ProviderRequest::new(&messages).with_tools(vec![write_stdin]);
+        let empty_key = provider
+            .build_payload(&config, &empty_request)
+            .expect("payload should build")["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tool_key = provider
+            .build_payload(&config, &tool_request)
+            .expect("payload should build")["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(empty_key, tool_key);
+        assert!(tool_key.contains("-schema-"));
     }
 
     #[test]
