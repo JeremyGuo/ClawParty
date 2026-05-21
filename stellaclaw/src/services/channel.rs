@@ -882,7 +882,7 @@ fn handle_workspace_response(
     response: WorkspaceResponse,
 ) -> Result<()> {
     match pop_pending_workspace(pending_workspace, response_id, &response) {
-        Some(PendingWorkspaceRequest::Platform { request_id, .. }) => {
+        Some((PendingWorkspaceRequest::Platform { request_id, .. }, matched_by_id)) => {
             emit_channel_event(
                 event_tx,
                 ChannelEvent::Workspace {
@@ -896,16 +896,21 @@ fn handle_workspace_response(
                 detail: serde_json::json!({
                     "request_id": request_id,
                     "response": response,
+                    "matched_by": if matched_by_id { "request_id" } else { "payload" },
+                    "response_id": response_id,
                 }),
             }))?;
         }
-        Some(PendingWorkspaceRequest::IncomingMessage {
-            request_id,
-            foreground_session_id,
-            platform_message_id,
-            origin,
-            metadata,
-        }) => {
+        Some((
+            PendingWorkspaceRequest::IncomingMessage {
+                request_id,
+                foreground_session_id,
+                platform_message_id,
+                origin,
+                metadata,
+            },
+            _matched_by_id,
+        )) => {
             let WorkspaceResponse::MessageMaterialized { message } = response else {
                 ctx.outbox.send(ServiceOutput::Failed(
                     crate::conversation_new::ServiceFailure {
@@ -963,13 +968,15 @@ fn pop_pending_workspace(
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
     response_id: Option<&str>,
     response: &WorkspaceResponse,
-) -> Option<PendingWorkspaceRequest> {
+) -> Option<(PendingWorkspaceRequest, bool)> {
     if let Some(response_id) = response_id {
         if let Some(index) = pending_workspace
             .iter()
             .position(|pending| pending.request_id() == response_id)
         {
-            return pending_workspace.remove(index);
+            return pending_workspace
+                .remove(index)
+                .map(|pending| (pending, true));
         }
         let matches: Vec<usize> = pending_workspace
             .iter()
@@ -979,12 +986,14 @@ fn pop_pending_workspace(
             })
             .collect();
         return if matches.len() == 1 {
-            pending_workspace.remove(matches[0])
+            pending_workspace
+                .remove(matches[0])
+                .map(|pending| (pending, false))
         } else {
             None
         };
     }
-    pending_workspace.pop_front()
+    pending_workspace.pop_front().map(|pending| (pending, true))
 }
 
 fn pending_workspace_matches_response(
@@ -1532,8 +1541,14 @@ mod tests {
         );
 
         assert_eq!(
-            popped.map(|pending| pending.request_id().to_string()),
+            popped
+                .as_ref()
+                .map(|(pending, _)| pending.request_id().to_string()),
             Some("workspace-b".to_string())
+        );
+        assert_eq!(
+            popped.as_ref().map(|(_, matched_by_id)| *matched_by_id),
+            Some(false)
         );
         assert_eq!(pending.len(), 1);
         assert_eq!(
@@ -1553,8 +1568,14 @@ mod tests {
             pop_pending_workspace(&mut pending, Some("workspace-b"), &file_response("a.png"));
 
         assert_eq!(
-            popped.map(|pending| pending.request_id().to_string()),
+            popped
+                .as_ref()
+                .map(|(pending, _)| pending.request_id().to_string()),
             Some("workspace-b".to_string())
+        );
+        assert_eq!(
+            popped.as_ref().map(|(_, matched_by_id)| *matched_by_id),
+            Some(true)
         );
         assert_eq!(pending.len(), 1);
         assert_eq!(
