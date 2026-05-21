@@ -635,7 +635,7 @@ impl ExtTool for CodexExecCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "exec_command",
-            "Runs a command in a fresh shell process, returning output or a session id for ongoing interaction.",
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
             json!({
                 "type": "object",
                 "properties": {
@@ -643,10 +643,10 @@ impl ExtTool for CodexExecCommandTool {
                     "workdir": {"type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd."},
                     "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
                     "login": {"type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to false."},
-                    "tty": {"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false; set to true to keep stdin writable."},
+                    "tty": {"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."},
                     "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."},
                     "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
-                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum output tokens to return. Excess output will be truncated."}
+                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}
                 },
                 "required": ["cmd"],
                 "additionalProperties": false
@@ -685,14 +685,14 @@ impl ExtTool for CodexWriteStdinTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "write_stdin",
-            "Writes characters to an existing shell session and returns recent output.",
+            "Writes characters to an existing unified exec session and returns recent output.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "Identifier of the running shell session."},
-                    "chars": {"type": "string", "description": "Bytes to write to stdin; pass an empty string to poll recent output."},
-                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."},
-                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum output tokens to return. Excess output will be truncated."}
+                    "session_id": {"type": "string", "description": "Identifier of the running unified exec session."},
+                    "chars": {"type": "string", "description": "Bytes to write to stdin (may be empty to poll)."},
+                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait in milliseconds for output before yielding. Empty polls can wait up to 300000ms; non-empty writes are still capped lower by the runtime."},
+                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}
                 },
                 "required": ["session_id"],
                 "additionalProperties": false

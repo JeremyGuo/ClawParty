@@ -29,6 +29,7 @@ const SHELL_WRITE_DEFAULT_YIELD_MS: usize = 250;
 const SHELL_WRITE_EMPTY_MIN_YIELD_MS: usize = 5_000;
 const SHELL_MIN_YIELD_MS: usize = 250;
 const SHELL_MAX_YIELD_MS: usize = 30_000;
+const SHELL_WRITE_EMPTY_MAX_YIELD_MS: usize = 300_000;
 const SHELL_MAX_OUTPUT_CHARS: usize = 200_000;
 const SHELL_DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const SHELL_MAX_OUTPUT_TOKENS: usize = 50_000;
@@ -486,7 +487,7 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         ("chars", json!({"type": "string"})),
         (
             "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input; empty poll waits at least 5000."}),
+            json!({"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input; empty poll waits at least 5000 and can wait up to 300000."}),
         ),
         (
             "max_output_tokens",
@@ -582,7 +583,7 @@ fn shell_write_stdin(
             arguments,
             SHELL_WRITE_EMPTY_MIN_YIELD_MS,
             SHELL_WRITE_EMPTY_MIN_YIELD_MS,
-            SHELL_MAX_YIELD_MS,
+            SHELL_WRITE_EMPTY_MAX_YIELD_MS,
         )?
     } else {
         yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?
