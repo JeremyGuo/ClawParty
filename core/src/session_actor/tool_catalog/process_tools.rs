@@ -487,7 +487,7 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         ("chars", json!({"type": "string"})),
         (
             "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input; empty poll waits at least 5000 and can wait up to 300000."}),
+            json!({"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input. With chars=\"\", empty polling waits at least 5000 and a single poll can wait up to 300000."}),
         ),
         (
             "max_output_tokens",
@@ -514,7 +514,7 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "shell_write_stdin",
-            "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. Empty polling waits at least 5000ms unless the process exits or produces output earlier. Non-empty chars against tty=false returns stdin_closed.",
+            "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. With empty chars, a single poll can wait up to 300000ms. Empty polling waits at least 5000ms unless the process exits or produces output earlier. Non-empty chars against tty=false returns stdin_closed.",
             object_schema(write_properties, &["process_id"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,

@@ -685,13 +685,13 @@ impl ExtTool for CodexWriteStdinTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "write_stdin",
-            "Writes characters to an existing unified exec session and returns recent output.",
+            "Writes characters to an existing unified exec session and returns recent output. With empty chars, a single poll can wait up to 300000ms.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string", "description": "Identifier of the running unified exec session."},
                     "chars": {"type": "string", "description": "Bytes to write to stdin (may be empty to poll)."},
-                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait in milliseconds for output before yielding. Empty polls can wait up to 300000ms; non-empty writes are still capped lower by the runtime."},
+                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait in milliseconds for output before yielding. With chars=\"\", a single poll can wait up to 300000ms (5 minutes). Non-empty writes are still capped lower by the runtime."},
                     "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}
                 },
                 "required": ["session_id"],
@@ -3859,6 +3859,18 @@ mod tests {
         assert!(!catalog.contains("shell_exec"));
         assert!(!catalog.contains("shell_write_stdin"));
         assert!(!catalog.contains("shell_stop"));
+
+        let write_stdin = catalog.get("write_stdin").expect("write_stdin exists");
+        assert_eq!(
+            write_stdin.parameters["properties"]["yield_time_ms"]["maximum"],
+            json!(300000)
+        );
+        assert!(
+            write_stdin.parameters["properties"]["yield_time_ms"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("single poll can wait up to 300000ms")
+        );
     }
 
     #[test]
