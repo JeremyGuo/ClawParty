@@ -2075,6 +2075,7 @@ export function MarkdownBlock({ text, attachments = [], onOpenAttachment, onDown
           if (src && !isExternalUrl(src) && !/^(?:data:|blob:)/i.test(src)) {
             return (
               <AttachmentCard
+                key={'markdown-image-' + src}
                 attachment={artifactAttachmentForPath(src, attachments)}
                 inline
                 onOpenAttachment={onOpenAttachment}
