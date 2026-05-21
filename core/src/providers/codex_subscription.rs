@@ -62,10 +62,15 @@ You may challenge the user to raise their technical bar, but you never patronize
 pub struct CodexSubscriptionProvider {
     output_persistor: OutputPersistor,
     auth_manager: CodexSubscriptionAuthManager,
-    socket: Mutex<Option<WebSocket<MaybeTlsStream<TcpStream>>>>,
+    socket: Mutex<Option<CachedCodexSocket>>,
     models_cache: Mutex<Option<CachedCodexModels>>,
     session_id: String,
     installation_id: String,
+}
+
+struct CachedCodexSocket {
+    window_id: String,
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
 }
 
 #[derive(Debug, Default)]
@@ -160,14 +165,15 @@ impl CodexSubscriptionProvider {
     ) -> Result<ChatMessage, ProviderError> {
         let auth = self.auth_manager.resolve(model_config)?;
 
-        let payload = self.build_payload(model_config, request)?;
+        let identity = codex_request_identity(&self.session_id, model_config, request);
+        let payload = self.build_payload(model_config, request, &identity)?;
 
-        match self.send_with_auth(model_config, payload.clone(), &auth, on_stream) {
+        match self.send_with_auth(model_config, payload.clone(), &identity, &auth, on_stream) {
             Ok(message) => Ok(message),
             Err(error) if is_unauthorized(&error) => {
                 self.clear_socket();
                 let refreshed = self.auth_manager.refresh(model_config, &auth)?;
-                self.send_with_auth(model_config, payload, &refreshed, on_stream)
+                self.send_with_auth(model_config, payload, &identity, &refreshed, on_stream)
             }
             Err(error) => Err(error),
         }
@@ -177,6 +183,7 @@ impl CodexSubscriptionProvider {
         &self,
         model_config: &ModelConfig,
         request: &ProviderRequest<'_>,
+        identity: &CodexRequestIdentity,
     ) -> Result<Map<String, Value>, ProviderError> {
         let mut payload = Map::new();
         payload.insert(
@@ -227,17 +234,13 @@ impl CodexSubscriptionProvider {
         }
         payload.insert(
             "prompt_cache_key".to_string(),
-            Value::String(codex_prompt_cache_key(
-                &self.session_id,
-                model_config,
-                request,
-            )),
+            Value::String(identity.prompt_cache_key.clone()),
         );
         payload.insert(
             "client_metadata".to_string(),
             json!({
                 "x-codex-installation-id": self.installation_id,
-                "x-codex-window-id": format!("{}:0", self.session_id),
+                "x-codex-window-id": identity.window_id,
             }),
         );
 
@@ -248,17 +251,22 @@ impl CodexSubscriptionProvider {
         &self,
         model_config: &ModelConfig,
         payload: Map<String, Value>,
+        identity: &CodexRequestIdentity,
         auth: &CodexAuthMaterial,
         on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ChatMessage, ProviderError> {
         let socket = {
             let mut cached = self.socket.lock().expect("mutex poisoned");
-            cached.take()
+            cached
+                .take()
+                .filter(|cached| cached.window_id == identity.window_id)
+                .map(|cached| cached.socket)
         };
 
         let response = self.send_response_create_with_transport_reconnect(
             model_config,
             payload,
+            identity,
             auth,
             socket,
             on_stream,
@@ -270,6 +278,7 @@ impl CodexSubscriptionProvider {
         &self,
         model_config: &ModelConfig,
         payload: Map<String, Value>,
+        identity: &CodexRequestIdentity,
         auth: &CodexAuthMaterial,
         initial_socket: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
         on_stream: &mut dyn FnMut(ProviderStreamEvent),
@@ -285,13 +294,17 @@ impl CodexSubscriptionProvider {
                     auth,
                     &self.session_id,
                     &self.installation_id,
+                    &identity.window_id,
                 )?,
             };
             let response =
                 send_response_create(&mut active_socket, payload.clone(), model_config, on_stream);
             if response.is_ok() {
                 let mut cached = self.socket.lock().expect("mutex poisoned");
-                *cached = Some(active_socket);
+                *cached = Some(CachedCodexSocket {
+                    window_id: identity.window_id.clone(),
+                    socket: active_socket,
+                });
             }
 
             if is_websocket_transport_error(&response) && !retried_transport_error {
@@ -366,13 +379,10 @@ impl CodexSubscriptionProvider {
         if let Some(service_tier) = codex_service_tier_payload(model_config) {
             payload.insert("service_tier".to_string(), Value::String(service_tier));
         }
+        let identity = codex_request_identity(&self.session_id, model_config, request);
         payload.insert(
             "prompt_cache_key".to_string(),
-            Value::String(codex_prompt_cache_key(
-                &self.session_id,
-                model_config,
-                request,
-            )),
+            Value::String(identity.prompt_cache_key),
         );
         Ok(payload)
     }
@@ -699,7 +709,7 @@ impl ExtTool for CodexWriteStdinTool {
                 "properties": {
                     "session_id": {"type": "string", "description": "Identifier of the running unified exec session."},
                     "chars": {"type": "string", "description": "Bytes to write to stdin (may be empty to poll)."},
-                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait in milliseconds for output before yielding. With chars=\"\", a single poll can wait up to 300000ms (5 minutes). Non-empty writes are still capped lower by the runtime."},
+                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait in milliseconds for output before yielding. With chars=\"\", a single poll can wait up to 300000ms (5 minutes)."},
                     "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}
                 },
                 "required": ["session_id"],
@@ -899,6 +909,7 @@ fn connect_codex_websocket(
     auth: &CodexAuthMaterial,
     session_id: &str,
     installation_id: &str,
+    window_id: &str,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ProviderError> {
     let websocket_url = build_websocket_url(&model_config.url)?;
     let mut request = websocket_url
@@ -940,7 +951,7 @@ fn connect_codex_websocket(
     );
     request.headers_mut().insert(
         "x-codex-window-id",
-        HeaderValue::from_str(&format!("{session_id}:0"))
+        HeaderValue::from_str(window_id)
             .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
     );
     request.headers_mut().insert(
@@ -1284,11 +1295,25 @@ fn value_truthy_str(value: &str) -> Option<bool> {
     }
 }
 
-fn codex_prompt_cache_key(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRequestIdentity {
+    prompt_cache_key: String,
+    window_id: String,
+}
+
+fn codex_request_identity(
     session_id: &str,
     model_config: &ModelConfig,
     request: &ProviderRequest<'_>,
-) -> String {
+) -> CodexRequestIdentity {
+    let signature = codex_request_signature(model_config, request);
+    CodexRequestIdentity {
+        prompt_cache_key: format!("{session_id}-schema-{signature}"),
+        window_id: format!("{session_id}:{signature}"),
+    }
+}
+
+fn codex_request_signature(model_config: &ModelConfig, request: &ProviderRequest<'_>) -> String {
     let mut hash = FNV_OFFSET_BASIS;
     fnv1a_write(&mut hash, model_config.model_name.as_bytes());
     fnv1a_write(&mut hash, b"\0");
@@ -1304,7 +1329,7 @@ fn codex_prompt_cache_key(
         }
         fnv1a_write(&mut hash, b"\0");
     }
-    format!("{session_id}-schema-{hash:016x}")
+    format!("{hash:016x}")
 }
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -3915,7 +3940,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_prompt_cache_key_includes_tool_schema() {
+    fn codex_request_identity_includes_tool_schema() {
         let config = test_model_config();
         let messages = Vec::new();
         let initial = SessionInitial::new("session_1", SessionType::Foreground);
@@ -3933,21 +3958,25 @@ mod tests {
 
         let empty_request = ProviderRequest::new(&messages);
         let tool_request = ProviderRequest::new(&messages).with_tools(vec![write_stdin]);
+        let empty_identity = codex_request_identity(&provider.session_id, &config, &empty_request);
+        let tool_identity = codex_request_identity(&provider.session_id, &config, &tool_request);
         let empty_key = provider
-            .build_payload(&config, &empty_request)
+            .build_payload(&config, &empty_request, &empty_identity)
             .expect("payload should build")["prompt_cache_key"]
             .as_str()
             .unwrap()
             .to_string();
         let tool_key = provider
-            .build_payload(&config, &tool_request)
+            .build_payload(&config, &tool_request, &tool_identity)
             .expect("payload should build")["prompt_cache_key"]
             .as_str()
             .unwrap()
             .to_string();
 
         assert_ne!(empty_key, tool_key);
+        assert_ne!(empty_identity.window_id, tool_identity.window_id);
         assert!(tool_key.contains("-schema-"));
+        assert!(tool_identity.window_id.contains(':'));
     }
 
     #[test]
