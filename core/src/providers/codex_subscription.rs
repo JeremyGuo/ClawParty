@@ -706,7 +706,7 @@ struct CodexWriteStdinTool;
 impl ExtTool for CodexWriteStdinTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
-            "write_stdin",
+            "exec_write_stdin",
             "Writes characters to an existing unified exec session and returns recent output. With empty chars, a single poll can wait up to 300000ms.",
             json!({
                 "type": "object",
@@ -3978,14 +3978,16 @@ mod tests {
         assert!(apply_patch.parameters["properties"].get("patch").is_some());
         assert!(apply_patch.parameters["properties"].get("format").is_none());
         assert!(catalog.contains("exec_command"));
-        assert!(catalog.contains("write_stdin"));
+        assert!(catalog.contains("exec_write_stdin"));
         assert!(catalog.contains("exec_stop"));
         assert!(catalog.contains("update_plan"));
         assert!(!catalog.contains("shell_exec"));
         assert!(!catalog.contains("shell_write_stdin"));
         assert!(!catalog.contains("shell_stop"));
 
-        let write_stdin = catalog.get("write_stdin").expect("write_stdin exists");
+        let write_stdin = catalog
+            .get("exec_write_stdin")
+            .expect("exec_write_stdin exists");
         assert_eq!(
             write_stdin.parameters["properties"]["yield_time_ms"]["maximum"],
             json!(300000)
@@ -4013,7 +4015,9 @@ mod tests {
             Some(tool_set.as_ref()),
         )
         .expect("catalog should build");
-        let write_stdin = catalog.get("write_stdin").expect("write_stdin exists");
+        let write_stdin = catalog
+            .get("exec_write_stdin")
+            .expect("exec_write_stdin exists");
 
         let empty_request = ProviderRequest::new(&messages);
         let tool_request = ProviderRequest::new(&messages).with_tools(vec![write_stdin]);
