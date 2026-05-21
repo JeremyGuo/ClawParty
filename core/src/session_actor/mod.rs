@@ -57,8 +57,8 @@ pub use tool_catalog::{
     ToolDefinition, ToolEnablementEnv, ToolExecutionMode, ToolSet,
 };
 pub(crate) use tool_catalog::{
-    builtin_tool_entry, media_tool_entries, ApplyPatchTool, ExtTool, ShellExecTool,
-    ShellMakeVisibleTool, ShellStopTool, ShellWriteStdinTool, ToolCallContext, ToolEntry,
+    builtin_tool_entry, ApplyPatchTool, ExtTool, ShellExecTool, ShellMakeVisibleTool,
+    ShellStopTool, ShellWriteStdinTool, ToolCallContext, ToolEntry,
 };
 pub use tool_executor::LocalToolBatchExecutor;
 pub(crate) use tool_runtime::LocalToolError;

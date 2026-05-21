@@ -18,12 +18,12 @@ use url::Url;
 use crate::{
     model_config::{ModelConfig, ProviderType},
     session_actor::{
-        builtin_tool_entry, media_tool_entries, normalize_messages_for_model, ApplyPatchTool,
-        ChatMessage, ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem,
-        LocalToolError, ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool,
-        ShellWriteStdinTool, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog,
-        ToolCatalogError, ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry,
-        ToolExecutionMode, ToolResultContent, ToolSet,
+        builtin_tool_entry, normalize_messages_for_model, ApplyPatchTool, ChatMessage,
+        ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem, LocalToolError,
+        ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool, ShellWriteStdinTool,
+        ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError, ToolConcurrency,
+        ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode, ToolResultContent,
+        ToolSet,
     },
 };
 
@@ -575,7 +575,6 @@ impl ToolSet for CodexSubscriptionToolSet {
         for tool in CODEX_BUILTIN_BASE_TOOLS {
             add_builtin_base_tool(catalog, env, tool)?;
         }
-        add_native_image_generation_tool(catalog, env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecCommandTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexWriteStdinTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecStopTool)), env)?;
@@ -625,27 +624,6 @@ fn add_builtin_base_tool(
     };
     if entry.definition().is_enabled_for_model(env.model_config) {
         catalog.add_tool_entry(entry)?;
-    }
-    Ok(())
-}
-
-fn add_native_image_generation_tool(
-    catalog: &mut ToolCatalog,
-    env: &ToolEnablementEnv<'_>,
-) -> Result<(), ToolCatalogError> {
-    for entry in media_tool_entries(env.options) {
-        let tool = entry.definition();
-        if tool.name == "image_generation"
-            && matches!(
-                tool.backend,
-                ToolBackend::ProviderNative {
-                    kind: crate::session_actor::ProviderNativeToolKind::ImageGeneration
-                }
-            )
-            && tool.is_enabled_for_model(env.model_config)
-        {
-            catalog.add_tool_entry(entry)?;
-        }
     }
     Ok(())
 }
@@ -3998,6 +3976,34 @@ mod tests {
                 .unwrap()
                 .contains("single poll can wait up to 300000ms")
         );
+    }
+
+    #[test]
+    fn codex_tool_set_registers_image_generation_once() {
+        let mut config = test_model_config();
+        config.capabilities.push(ModelCapability::ImageOut);
+        let initial = SessionInitial::new("session_1", SessionType::Foreground);
+        let provider = CodexSubscriptionProvider::new();
+        let tool_set = provider
+            .tool_set(&config)
+            .expect("codex provider should expose a tool set");
+        let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+            &config,
+            &initial,
+            Some(tool_set.as_ref()),
+        )
+        .expect("catalog should build without duplicate image_generation");
+        let image_generation = catalog
+            .get("image_generation")
+            .expect("native image_generation should be exposed");
+
+        assert_eq!(
+            image_generation.backend,
+            ToolBackend::ProviderNative {
+                kind: crate::session_actor::ProviderNativeToolKind::ImageGeneration
+            }
+        );
+        assert!(!catalog.contains("image_generation_stop"));
     }
 
     #[test]
