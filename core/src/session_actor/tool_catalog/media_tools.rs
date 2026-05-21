@@ -17,8 +17,9 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
-    BuiltinToolCatalogOptions, ProviderBackedToolKind, ProviderNativeToolKind, ToolBackend,
-    ToolConcurrency, ToolDefinition, ToolExecutionMode,
+    BaseTool, BuiltinToolCatalogOptions, ProviderBackedToolKind, ProviderNativeTool,
+    ProviderNativeToolKind, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition,
+    ToolEntry, ToolExecutionMode,
 };
 use crate::{
     model_config::ModelConfig,
@@ -75,33 +76,15 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
     }
 
     if options.enable_native_image_view {
-        tools.push(ToolDefinition::new(
-            "image_view",
-            "View a local image file in the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_view more than 3 times in the same assistant tool-call batch; excess image_view calls in that batch will fail. View more images after inspecting the first batch.",
-            media_view_schema("path", &options.remote_mode),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ));
+        tools.push(image_view_tool_definition(&options.remote_mode));
     }
 
     if options.enable_native_pdf_view {
-        tools.push(ToolDefinition::new(
-            "pdf_view",
-            "View a local PDF file in the next model request for direct inspection by the current model. Returns immediately.",
-            media_view_schema("path", &options.remote_mode),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ));
+        tools.push(pdf_view_tool_definition(&options.remote_mode));
     }
 
     if options.enable_native_audio_view {
-        tools.push(ToolDefinition::new(
-            "audio_view",
-            "View a local audio file in the next model request for direct inspection by the current model. Returns immediately.",
-            media_view_schema("path", &options.remote_mode),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ));
+        tools.push(audio_view_tool_definition(&options.remote_mode));
     }
 
     if options.enable_provider_pdf_analysis {
@@ -135,62 +118,12 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
     }
 
     if options.enable_native_image_generation {
-        tools.push(ToolDefinition::new(
-            "image_generation",
-            "Generate an image using the current model's native image generation tool.",
-            object_schema(Map::new(), &[]),
-            ToolExecutionMode::Immediate,
-            ToolBackend::ProviderNative {
-                kind: ProviderNativeToolKind::ImageGeneration,
-            },
-        ));
+        tools.push(native_image_generation_tool_definition());
     }
 
     if options.enable_provider_image_generation {
-        let mut schema_properties = properties([
-            ("prompt", json!({"type": "string"})),
-            (
-                "output_dir",
-                json!({
-                    "type": "string",
-                    "description": "Directory where generated images should be written. In remote mode this is resolved on the remote target; the result returns generated file names only."
-                }),
-            ),
-        ]);
-        add_images_property(&mut schema_properties, true);
-        schema_properties.insert("generation_id".to_string(), json!({"type": "string"}));
-        schema_properties.insert(
-            "size".to_string(),
-            json!({
-                "type": "string",
-                "description": "Optional output image size, for example 1024x1024. Passed through to the image generation provider when supported."
-            }),
-        );
-        schema_properties.insert(
-            "mask_path".to_string(),
-            json!({
-                "type": "string",
-                "description": "Optional mask image for inpainting. Transparent pixels mark the area to edit; requires at least one input image."
-            }),
-        );
-        schema_properties.insert("return_immediate".to_string(), json!({"type": "boolean"}));
-        schema_properties.insert(
-            "wait_timeout_seconds".to_string(),
-            json!({"type": "number"}),
-        );
-        schema_properties.insert(
-            "on_timeout".to_string(),
-            json!({"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}),
-        );
-        add_remote_property(&mut schema_properties, &options.remote_mode);
-        tools.push(ToolDefinition::new(
-            "image_generation",
-            "Generate or edit an image using the configured generation model. First call with prompt and output_dir starts a job and returns an id; include images for edit/inpaint and optional mask_path for inpainting. Call again with generation_id to wait or observe.",
-            object_schema(schema_properties, &[]),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::ProviderBacked {
-                kind: ProviderBackedToolKind::ImageGeneration,
-            },
+        tools.push(provider_image_generation_tool_definition(
+            &options.remote_mode,
         ));
         tools.push(stop_tool_definition(
             "image_generation_stop",
@@ -200,6 +133,476 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
     }
 
     tools
+}
+
+pub(crate) fn media_tool_entries(options: &BuiltinToolCatalogOptions) -> Vec<ToolEntry> {
+    let mut entries = Vec::new();
+
+    if options.enable_provider_image_analysis {
+        entries.extend([
+            ToolEntry::Base(Arc::new(ImageAnalysisTool {
+                remote_mode: options.remote_mode.clone(),
+            })),
+            ToolEntry::Base(Arc::new(ImageStopTool)),
+        ]);
+    }
+
+    if options.enable_native_image_view {
+        entries.push(ToolEntry::Base(Arc::new(ImageViewTool {
+            remote_mode: options.remote_mode.clone(),
+        })));
+    }
+
+    if options.enable_native_pdf_view {
+        entries.push(ToolEntry::Base(Arc::new(PdfViewTool {
+            remote_mode: options.remote_mode.clone(),
+        })));
+    }
+
+    if options.enable_native_audio_view {
+        entries.push(ToolEntry::Base(Arc::new(AudioViewTool {
+            remote_mode: options.remote_mode.clone(),
+        })));
+    }
+
+    if options.enable_provider_pdf_analysis {
+        entries.extend([
+            ToolEntry::Base(Arc::new(PdfAnalysisTool {
+                remote_mode: options.remote_mode.clone(),
+            })),
+            ToolEntry::Base(Arc::new(PdfStopTool)),
+        ]);
+    }
+
+    if options.enable_provider_audio_analysis {
+        entries.extend([
+            ToolEntry::Base(Arc::new(AudioAnalysisTool {
+                remote_mode: options.remote_mode.clone(),
+            })),
+            ToolEntry::Base(Arc::new(AudioStopTool)),
+        ]);
+    }
+
+    if options.enable_native_image_generation {
+        entries.push(ToolEntry::ProviderNative(Arc::new(
+            NativeImageGenerationTool,
+        )));
+    }
+
+    if options.enable_provider_image_generation {
+        entries.extend([
+            ToolEntry::Base(Arc::new(ProviderImageGenerationTool {
+                remote_mode: options.remote_mode.clone(),
+            })),
+            ToolEntry::Base(Arc::new(ImageGenerationStopTool)),
+        ]);
+    }
+
+    entries
+}
+
+struct ImageViewTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for ImageViewTool {
+    fn definition(&self) -> ToolDefinition {
+        image_view_tool_definition(&self.remote_mode)
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        native_view(&arguments, &ctx.execution, "image")
+    }
+}
+
+struct PdfViewTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for PdfViewTool {
+    fn definition(&self) -> ToolDefinition {
+        pdf_view_tool_definition(&self.remote_mode)
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        native_view(&arguments, &ctx.execution, "pdf")
+    }
+}
+
+struct AudioViewTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for AudioViewTool {
+    fn definition(&self) -> ToolDefinition {
+        audio_view_tool_definition(&self.remote_mode)
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        native_view(&arguments, &ctx.execution, "audio")
+    }
+}
+
+struct ImageAnalysisTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for ImageAnalysisTool {
+    fn definition(&self) -> ToolDefinition {
+        analysis_tool_definition(
+            "image_analysis",
+            "image_id",
+            "Analyze a local image using the configured helper model. First call with path and question starts a job and returns an id; call again with image_id to wait or observe.",
+            ProviderBackedToolKind::ImageAnalysis,
+            &self.remote_mode,
+        )
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        let model_config = provider_backed_model_config(
+            "image_analysis",
+            ProviderBackedToolKind::ImageAnalysis,
+            &ctx.execution,
+        )?;
+        analysis_tool(
+            "image_analysis",
+            &arguments,
+            &ctx.execution,
+            model_config,
+            "image_id",
+            "image",
+        )
+    }
+}
+
+struct PdfAnalysisTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for PdfAnalysisTool {
+    fn definition(&self) -> ToolDefinition {
+        analysis_tool_definition(
+            "pdf_analysis",
+            "pdf_id",
+            "Analyze a local PDF using the configured helper model. First call with path and question starts a job and returns an id; call again with pdf_id to wait or observe.",
+            ProviderBackedToolKind::PdfAnalysis,
+            &self.remote_mode,
+        )
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        let model_config = provider_backed_model_config(
+            "pdf_analysis",
+            ProviderBackedToolKind::PdfAnalysis,
+            &ctx.execution,
+        )?;
+        analysis_tool(
+            "pdf_analysis",
+            &arguments,
+            &ctx.execution,
+            model_config,
+            "pdf_id",
+            "pdf",
+        )
+    }
+}
+
+struct AudioAnalysisTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for AudioAnalysisTool {
+    fn definition(&self) -> ToolDefinition {
+        analysis_tool_definition(
+            "audio_analysis",
+            "audio_id",
+            "Analyze or transcribe a local audio file using the configured helper model. First call with path and optional question starts a job and returns an id; call again with audio_id to wait or observe.",
+            ProviderBackedToolKind::AudioAnalysis,
+            &self.remote_mode,
+        )
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        let model_config = provider_backed_model_config(
+            "audio_analysis",
+            ProviderBackedToolKind::AudioAnalysis,
+            &ctx.execution,
+        )?;
+        analysis_tool(
+            "audio_analysis",
+            &arguments,
+            &ctx.execution,
+            model_config,
+            "audio_id",
+            "audio",
+        )
+    }
+}
+
+struct ImageStopTool;
+
+impl BaseTool for ImageStopTool {
+    fn definition(&self) -> ToolDefinition {
+        stop_tool_definition(
+            "image_stop",
+            "image_id",
+            "Stop a running image_analysis job.",
+        )
+    }
+
+    fn call(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        stop_media_job(&arguments, "image_id")
+    }
+}
+
+struct PdfStopTool;
+
+impl BaseTool for PdfStopTool {
+    fn definition(&self) -> ToolDefinition {
+        stop_tool_definition("pdf_stop", "pdf_id", "Stop a running pdf_analysis job.")
+    }
+
+    fn call(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        stop_media_job(&arguments, "pdf_id")
+    }
+}
+
+struct AudioStopTool;
+
+impl BaseTool for AudioStopTool {
+    fn definition(&self) -> ToolDefinition {
+        stop_tool_definition(
+            "audio_stop",
+            "audio_id",
+            "Stop a running audio_analysis job.",
+        )
+    }
+
+    fn call(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        stop_media_job(&arguments, "audio_id")
+    }
+}
+
+struct ProviderImageGenerationTool {
+    remote_mode: super::ToolRemoteMode,
+}
+
+impl BaseTool for ProviderImageGenerationTool {
+    fn definition(&self) -> ToolDefinition {
+        provider_image_generation_tool_definition(&self.remote_mode)
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        let model_config = provider_backed_model_config(
+            "image_generation",
+            ProviderBackedToolKind::ImageGeneration,
+            &ctx.execution,
+        )?;
+        image_generation_tool("image_generation", &arguments, &ctx.execution, model_config)
+    }
+}
+
+struct ImageGenerationStopTool;
+
+impl BaseTool for ImageGenerationStopTool {
+    fn definition(&self) -> ToolDefinition {
+        stop_tool_definition(
+            "image_generation_stop",
+            "generation_id",
+            "Stop a running image_generation job.",
+        )
+    }
+
+    fn call(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        stop_media_job(&arguments, "generation_id")
+    }
+}
+
+struct NativeImageGenerationTool;
+
+impl ProviderNativeTool for NativeImageGenerationTool {
+    fn definition(&self) -> ToolDefinition {
+        native_image_generation_tool_definition()
+    }
+}
+
+fn object_arguments(args: Value) -> Result<Map<String, Value>, LocalToolError> {
+    let Value::Object(arguments) = args else {
+        return Err(LocalToolError::InvalidArguments(
+            "tool arguments must be a JSON object".to_string(),
+        ));
+    };
+    Ok(arguments)
+}
+
+fn provider_backed_model_config<'a>(
+    tool_name: &str,
+    kind: ProviderBackedToolKind,
+    context: &'a ToolExecutionContext<'_>,
+) -> Result<&'a ModelConfig, LocalToolError> {
+    let Some(models) = context.provider_backed_tool_models else {
+        return Err(LocalToolError::UnsupportedTool(format!(
+            "{tool_name} requires provider-backed tool model configuration"
+        )));
+    };
+    match kind {
+        ProviderBackedToolKind::ImageAnalysis => models.image.as_ref(),
+        ProviderBackedToolKind::PdfAnalysis => models.pdf.as_ref(),
+        ProviderBackedToolKind::AudioAnalysis => models.audio.as_ref(),
+        ProviderBackedToolKind::ImageGeneration => models.image_generation.as_ref(),
+    }
+    .ok_or_else(|| {
+        LocalToolError::UnsupportedTool(format!(
+            "{tool_name} requires provider-backed model configuration"
+        ))
+    })
+}
+
+fn image_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefinition {
+    ToolDefinition::new(
+        "image_view",
+        "View a local image file in the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_view more than 3 times in the same assistant tool-call batch; excess image_view calls in that batch will fail. View more images after inspecting the first batch.",
+        media_view_schema("path", remote_mode),
+        ToolExecutionMode::Immediate,
+        ToolBackend::Local,
+    )
+}
+
+fn pdf_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefinition {
+    ToolDefinition::new(
+        "pdf_view",
+        "View a local PDF file in the next model request for direct inspection by the current model. Returns immediately.",
+        media_view_schema("path", remote_mode),
+        ToolExecutionMode::Immediate,
+        ToolBackend::Local,
+    )
+}
+
+fn audio_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefinition {
+    ToolDefinition::new(
+        "audio_view",
+        "View a local audio file in the next model request for direct inspection by the current model. Returns immediately.",
+        media_view_schema("path", remote_mode),
+        ToolExecutionMode::Immediate,
+        ToolBackend::Local,
+    )
+}
+
+fn native_image_generation_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "image_generation",
+        "Generate an image using the current model's native image generation tool.",
+        object_schema(Map::new(), &[]),
+        ToolExecutionMode::Immediate,
+        ToolBackend::ProviderNative {
+            kind: ProviderNativeToolKind::ImageGeneration,
+        },
+    )
+}
+
+fn provider_image_generation_tool_definition(
+    remote_mode: &super::ToolRemoteMode,
+) -> ToolDefinition {
+    let mut schema_properties = properties([
+        ("prompt", json!({"type": "string"})),
+        (
+            "output_dir",
+            json!({
+                "type": "string",
+                "description": "Directory where generated images should be written. In remote mode this is resolved on the remote target; the result returns generated file names only."
+            }),
+        ),
+    ]);
+    add_images_property(&mut schema_properties, true);
+    schema_properties.insert("generation_id".to_string(), json!({"type": "string"}));
+    schema_properties.insert(
+        "size".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional output image size, for example 1024x1024. Passed through to the image generation provider when supported."
+        }),
+    );
+    schema_properties.insert(
+        "mask_path".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional mask image for inpainting. Transparent pixels mark the area to edit; requires at least one input image."
+        }),
+    );
+    schema_properties.insert("return_immediate".to_string(), json!({"type": "boolean"}));
+    schema_properties.insert(
+        "wait_timeout_seconds".to_string(),
+        json!({"type": "number"}),
+    );
+    schema_properties.insert(
+        "on_timeout".to_string(),
+        json!({"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}),
+    );
+    add_remote_property(&mut schema_properties, remote_mode);
+    ToolDefinition::new(
+        "image_generation",
+        "Generate or edit an image using the configured generation model. First call with prompt and output_dir starts a job and returns an id; include images for edit/inpaint and optional mask_path for inpainting. Call again with generation_id to wait or observe.",
+        object_schema(schema_properties, &[]),
+        ToolExecutionMode::Interruptible,
+        ToolBackend::ProviderBacked {
+            kind: ProviderBackedToolKind::ImageGeneration,
+        },
+    )
 }
 
 fn analysis_tool_definition(
@@ -256,24 +659,7 @@ fn stop_tool_definition(name: &str, id_field: &str, description: &str) -> ToolDe
     .with_concurrency(ToolConcurrency::Serial)
 }
 
-pub(crate) fn execute_media_tool(
-    tool_name: &str,
-    arguments: &Map<String, Value>,
-    context: &ToolExecutionContext<'_>,
-) -> Result<Option<ToolResultContent>, LocalToolError> {
-    let result = match tool_name {
-        "image_view" => native_view(arguments, context, "image")?,
-        "pdf_view" => native_view(arguments, context, "pdf")?,
-        "audio_view" => native_view(arguments, context, "audio")?,
-        "image_stop" => stop_media_job(arguments, "image_id")?,
-        "pdf_stop" => stop_media_job(arguments, "pdf_id")?,
-        "audio_stop" => stop_media_job(arguments, "audio_id")?,
-        "image_generation_stop" => stop_media_job(arguments, "generation_id")?,
-        _ => return Ok(None),
-    };
-    Ok(Some(result))
-}
-
+#[cfg(test)]
 pub(crate) fn execute_provider_backed_media_tool(
     tool_name: &str,
     kind: ProviderBackedToolKind,
@@ -1560,9 +1946,7 @@ mod tests {
         let mut stop_arguments = Map::new();
         stop_arguments.insert("image_id".to_string(), Value::String(job_id));
         let stop_result =
-            execute_media_tool("image_stop", &stop_arguments, &test_context(temp.path()))
-                .expect("image_stop should run")
-                .expect("image_stop should return result");
+            stop_media_job(&stop_arguments, "image_id").expect("image_stop should run");
         let stop_payload = json_result_value(&stop_result);
 
         assert_eq!(stop_payload["status"], "cancelled");
@@ -1627,7 +2011,7 @@ mod tests {
 
         let mut stop_arguments = Map::new();
         stop_arguments.insert("image_id".to_string(), Value::String(job_id));
-        let _ = execute_media_tool("image_stop", &stop_arguments, &test_context(temp.path()));
+        let _ = stop_media_job(&stop_arguments, "image_id");
         wait_until(Duration::from_secs(2), || closed.load(Ordering::SeqCst))
             .expect("provider worker connection should close after cleanup");
     }

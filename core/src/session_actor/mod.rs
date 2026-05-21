@@ -39,12 +39,16 @@ pub use token_estimator::{
     ChatTemplate, ChatTemplateError, JinjaChatTemplate, MultimodalTokenStrategy,
     RenderedChatPrompt, TokenEstimate, TokenEstimator, TokenEstimatorError, VisionDetail,
 };
+#[cfg(test)]
+pub use tool_batch::ToolBatchExecutor;
 pub use tool_batch::{
     ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
     ProviderBackedToolModels, SearchToolModels, ToolBatch, ToolBatchCompletion, ToolBatchError,
-    ToolBatchExecutor, ToolBatchHandle, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
+    ToolBatchHandle, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
 };
 pub use tool_binary::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
+#[cfg(test)]
+pub(crate) use tool_catalog::execute_bridge_tool;
 pub use tool_catalog::{
     builtin_tool_catalog, file_tool_definitions, host_tool_definitions, media_tool_definitions,
     process_tool_definitions, skill_tool_definitions, web_tool_definitions,
@@ -52,6 +56,9 @@ pub use tool_catalog::{
     ProviderNativeToolKind, ToolBackend, ToolCatalog, ToolCatalogError, ToolConcurrency,
     ToolDefinition, ToolEnablementEnv, ToolExecutionMode, ToolSet,
 };
-pub(crate) use tool_catalog::{BuiltinBaseTool, ExtTool, ToolCallContext, ToolEntry};
+pub(crate) use tool_catalog::{
+    builtin_tool_entry, media_tool_entries, ApplyPatchTool, ExtTool, ShellExecTool,
+    ShellMakeVisibleTool, ShellStopTool, ShellWriteStdinTool, ToolCallContext, ToolEntry,
+};
 pub use tool_executor::LocalToolBatchExecutor;
 pub(crate) use tool_runtime::LocalToolError;

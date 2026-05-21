@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -220,6 +221,7 @@ impl ToolBatchHandle {
     }
 }
 
+#[cfg(test)]
 pub trait ToolBatchExecutor {
     fn start(
         &self,

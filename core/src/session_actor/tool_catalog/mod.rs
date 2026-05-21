@@ -17,7 +17,7 @@ use std::{
 
 use crossbeam_channel::{select, Receiver};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use crate::model_config::{ModelCapability, ModelConfig, ProviderType};
@@ -28,15 +28,19 @@ use super::{
     ConversationBridge, ConversationBridgeRequest, SessionInitial, SessionType, ToolResultContent,
 };
 
-pub(crate) use file_tools::execute_file_tool;
 pub use file_tools::file_tool_definitions;
+pub(crate) use file_tools::{file_tool_entries, ApplyPatchTool, ShellMakeVisibleTool};
+pub(crate) use host_tools::host_tool_entries;
 pub use host_tools::{host_tool_definitions, HostToolScope};
 pub use media_tools::media_tool_definitions;
-pub(crate) use media_tools::{execute_media_tool, execute_provider_backed_media_tool};
-pub(crate) use process_tools::execute_process_tool;
+pub(crate) use media_tools::media_tool_entries;
 pub use process_tools::process_tool_definitions;
+pub(crate) use process_tools::{
+    process_tool_entries, ShellExecTool, ShellStopTool, ShellWriteStdinTool,
+};
 pub use skill_tools::skill_tool_definitions;
-pub(crate) use web_tools::execute_web_tool;
+pub(crate) use skill_tools::skill_tool_entries;
+pub(crate) use web_tools::web_tool_entries;
 pub use web_tools::{web_tool_definitions, WebSearchOptions};
 
 #[allow(dead_code)]
@@ -99,7 +103,7 @@ pub(crate) enum ToolEntry {
 }
 
 impl ToolEntry {
-    fn definition(&self) -> ToolDefinition {
+    pub(crate) fn definition(&self) -> ToolDefinition {
         match self {
             Self::Base(tool) => tool.definition(),
             Self::Ext(tool) => tool.definition(),
@@ -124,121 +128,6 @@ pub trait ToolSet: Send + Sync {
     ) -> Result<(), ToolCatalogError>;
 }
 
-pub(crate) struct BuiltinBaseTool;
-
-impl BuiltinBaseTool {
-    pub(crate) fn definition(
-        tool_name: &str,
-        options: &BuiltinToolCatalogOptions,
-    ) -> Option<ToolDefinition> {
-        all_builtin_base_tool_definitions(options)
-            .into_iter()
-            .find(|definition| definition.name == tool_name)
-    }
-
-    pub(crate) fn is_enabled(tool_name: &str, env: &ToolEnablementEnv<'_>) -> bool {
-        Self::definition(tool_name, env.options)
-            .is_some_and(|definition| definition.is_enabled_for_model(env.model_config))
-    }
-
-    pub(crate) fn call_local(
-        tool_name: &str,
-        ctx: &ToolCallContext<'_>,
-        args: Value,
-    ) -> Result<ToolResultContent, LocalToolError> {
-        let Value::Object(arguments) = args else {
-            return Err(LocalToolError::InvalidArguments(
-                "tool arguments must be a JSON object".to_string(),
-            ));
-        };
-
-        if let Some(result) = execute_file_tool(tool_name, &arguments, &ctx.execution)? {
-            return Ok(ToolResultContent::from_tool_value(result));
-        }
-        if let Some(result) = execute_process_tool(tool_name, &arguments, &ctx.execution)? {
-            return Ok(ToolResultContent::from_tool_value(result));
-        }
-        if let Some(result) = execute_web_tool(
-            tool_name,
-            &arguments,
-            Some(&ctx.execution),
-            ctx.execution.search_tool_models,
-        )? {
-            return Ok(ToolResultContent::from_tool_value(result));
-        }
-        if let Some(result) = execute_media_tool(tool_name, &arguments, &ctx.execution)? {
-            return Ok(result);
-        }
-        Err(LocalToolError::UnsupportedTool(tool_name.to_string()))
-    }
-}
-
-struct DefinitionBaseTool {
-    definition: ToolDefinition,
-}
-
-impl DefinitionBaseTool {
-    fn new(definition: ToolDefinition) -> Self {
-        Self { definition }
-    }
-}
-
-impl BaseTool for DefinitionBaseTool {
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
-    }
-
-    fn call(
-        &self,
-        ctx: &ToolCallContext<'_>,
-        args: Value,
-    ) -> Result<ToolResultContent, LocalToolError> {
-        match &self.definition.backend {
-            ToolBackend::Local => BuiltinBaseTool::call_local(&self.definition.name, ctx, args),
-            ToolBackend::ConversationBridge { action } => {
-                execute_bridge_tool(&self.definition.name, action, ctx, args)
-            }
-            ToolBackend::ProviderBacked { kind } => {
-                execute_provider_backed_tool(&self.definition.name, *kind, ctx, args)
-            }
-            _ => Err(LocalToolError::UnsupportedTool(format!(
-                "{} is not a locally callable BaseTool yet",
-                self.definition.name
-            ))),
-        }
-    }
-}
-
-fn execute_provider_backed_tool(
-    tool_name: &str,
-    kind: ProviderBackedToolKind,
-    ctx: &ToolCallContext<'_>,
-    args: Value,
-) -> Result<ToolResultContent, LocalToolError> {
-    let Value::Object(arguments) = args else {
-        return Err(LocalToolError::InvalidArguments(
-            "tool arguments must be a JSON object".to_string(),
-        ));
-    };
-    let Some(models) = ctx.execution.provider_backed_tool_models else {
-        return Err(LocalToolError::UnsupportedTool(format!(
-            "{tool_name} requires provider-backed tool model configuration"
-        )));
-    };
-    let model_config = match kind {
-        ProviderBackedToolKind::ImageAnalysis => models.image.as_ref(),
-        ProviderBackedToolKind::PdfAnalysis => models.pdf.as_ref(),
-        ProviderBackedToolKind::AudioAnalysis => models.audio.as_ref(),
-        ProviderBackedToolKind::ImageGeneration => models.image_generation.as_ref(),
-    }
-    .ok_or_else(|| {
-        LocalToolError::UnsupportedTool(format!(
-            "{tool_name} requires provider-backed model configuration"
-        ))
-    })?;
-    execute_provider_backed_media_tool(tool_name, kind, model_config, &arguments, &ctx.execution)
-}
-
 static NEXT_BRIDGE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_bridge_request_id(tool_name: &str) -> String {
@@ -246,9 +135,10 @@ fn next_bridge_request_id(tool_name: &str) -> String {
     format!("{tool_name}_{id}")
 }
 
-fn execute_bridge_tool(
+pub(crate) fn execute_bridge_tool(
     tool_name: &str,
     action: &str,
+    parameters: &Value,
     ctx: &ToolCallContext<'_>,
     args: Value,
 ) -> Result<ToolResultContent, LocalToolError> {
@@ -262,6 +152,7 @@ fn execute_bridge_tool(
             "tool arguments must be a JSON object".to_string(),
         ));
     };
+    validate_bridge_tool_payload(tool_name, parameters, &payload)?;
     let request_id = next_bridge_request_id(tool_name);
     let request = ConversationBridgeRequest {
         request_id,
@@ -271,6 +162,164 @@ fn execute_bridge_tool(
         payload: Value::Object(payload),
     };
     call_bridge_interruptibly(request, bridge, ctx.execution.cancel_token.cancel_rx())
+}
+
+fn validate_bridge_tool_payload(
+    tool_name: &str,
+    parameters: &Value,
+    payload: &Map<String, Value>,
+) -> Result<(), LocalToolError> {
+    let properties = parameters.get("properties").and_then(Value::as_object);
+    if parameters
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        if let Some(properties) = properties {
+            for key in payload.keys() {
+                if !properties.contains_key(key) {
+                    return invalid_bridge_args(tool_name, format!("unknown argument {key}"));
+                }
+            }
+        }
+    }
+
+    let required = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for field in required.iter().filter_map(Value::as_str) {
+        let Some(value) = payload.get(field) else {
+            return invalid_bridge_args(tool_name, format!("missing required argument {field}"));
+        };
+        if let Some(schema) = properties.and_then(|properties| properties.get(field)) {
+            validate_bridge_value(tool_name, field, value, schema)?;
+            if schema.get("type").and_then(Value::as_str) == Some("string")
+                && value.as_str().is_some_and(|text| text.trim().is_empty())
+            {
+                return invalid_bridge_args(
+                    tool_name,
+                    format!("argument {field} must not be empty"),
+                );
+            }
+        }
+    }
+
+    if let Some(properties) = properties {
+        for (key, value) in payload {
+            if required
+                .iter()
+                .any(|field| field.as_str() == Some(key.as_str()))
+            {
+                continue;
+            }
+            if let Some(schema) = properties.get(key) {
+                validate_bridge_value(tool_name, key, value, schema)?;
+                if bridge_string_argument_must_be_non_empty(key)
+                    && value.as_str().is_some_and(|text| text.trim().is_empty())
+                {
+                    return invalid_bridge_args(
+                        tool_name,
+                        format!("argument {key} must not be empty"),
+                    );
+                }
+            }
+        }
+    }
+
+    validate_bridge_business_rules(tool_name, payload)
+}
+
+fn validate_bridge_value(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    schema: &Value,
+) -> Result<(), LocalToolError> {
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let valid = match expected {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !valid {
+            return invalid_bridge_args(tool_name, format!("argument {key} must be a {expected}"));
+        }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.iter().any(|item| item == value) {
+            return invalid_bridge_args(tool_name, format!("argument {key} has invalid value"));
+        }
+    }
+
+    if let Some(items_schema) = schema.get("items") {
+        if let Some(items) = value.as_array() {
+            for (index, item) in items.iter().enumerate() {
+                validate_bridge_value(tool_name, &format!("{key}[{index}]"), item, items_schema)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bridge_business_rules(
+    tool_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<(), LocalToolError> {
+    if tool_name == "cron_task_update" {
+        let timing_fields = [
+            "cron_second",
+            "cron_minute",
+            "cron_hour",
+            "cron_day_of_month",
+            "cron_month",
+            "cron_day_of_week",
+        ];
+        let present = timing_fields
+            .iter()
+            .filter(|field| payload.contains_key(**field))
+            .count();
+        if present != 0 && present != timing_fields.len() {
+            return invalid_bridge_args(
+                tool_name,
+                "cron timing fields must be provided together".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bridge_string_argument_must_be_non_empty(key: &str) -> bool {
+    matches!(
+        key,
+        "agent_id"
+            | "description"
+            | "id"
+            | "memory_id"
+            | "query"
+            | "request_id"
+            | "scope"
+            | "skill_name"
+            | "task"
+            | "text"
+            | "tool"
+    )
+}
+
+fn invalid_bridge_args<T>(
+    tool_name: &str,
+    message: impl Into<String>,
+) -> Result<T, LocalToolError> {
+    Err(LocalToolError::InvalidArguments(format!(
+        "{tool_name}: {}",
+        message.into()
+    )))
 }
 
 fn call_bridge_interruptibly(
@@ -356,22 +405,6 @@ fn subagent_join_cancel_request(request: &ConversationBridgeRequest) -> Conversa
         tool_name: request.tool_name.clone(),
         action: "subagent_join_cancel".to_string(),
         payload,
-    }
-}
-
-struct DefinitionProviderNativeTool {
-    definition: ToolDefinition,
-}
-
-impl DefinitionProviderNativeTool {
-    fn new(definition: ToolDefinition) -> Self {
-        Self { definition }
-    }
-}
-
-impl ProviderNativeTool for DefinitionProviderNativeTool {
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
     }
 }
 
@@ -663,15 +696,6 @@ impl ToolCatalog {
         Ok(catalog.filtered_for_model_config(model_config))
     }
 
-    pub fn add(&mut self, tool: ToolDefinition) -> Result<(), ToolCatalogError> {
-        match &tool.backend {
-            ToolBackend::ProviderNative { .. } => self.add_tool_entry(ToolEntry::ProviderNative(
-                Arc::new(DefinitionProviderNativeTool::new(tool)),
-            )),
-            _ => self.add_tool_entry(ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool)))),
-        }
-    }
-
     pub(crate) fn add_tool_entry(&mut self, entry: ToolEntry) -> Result<(), ToolCatalogError> {
         let definition = entry.definition();
         if self.tools.contains_key(&definition.name) {
@@ -701,7 +725,8 @@ impl ToolCatalog {
         let base_tool_id = tool.base_tool_id();
         match self.entries.get(base_tool_id) {
             Some(base_entry) => base_entry.is_enabled(env),
-            None => BuiltinBaseTool::is_enabled(base_tool_id, env),
+            None => builtin_tool_definition(base_tool_id, env.options)
+                .is_some_and(|definition| definition.is_enabled_for_model(env.model_config)),
         }
     }
 
@@ -858,51 +883,27 @@ impl ToolSet for BuiltinToolSet {
         catalog: &mut ToolCatalog,
         env: &ToolEnablementEnv<'_>,
     ) -> Result<(), ToolCatalogError> {
-        for tool in file_tool_definitions(&env.options.remote_mode) {
-            catalog.add_enabled_tool_entry(
-                ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                env,
-            )?;
+        for entry in file_tool_entries(&env.options.remote_mode) {
+            catalog.add_enabled_tool_entry(entry, env)?;
         }
-        for tool in process_tool_definitions(&env.options.remote_mode) {
-            catalog.add_enabled_tool_entry(
-                ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                env,
-            )?;
+        for entry in process_tool_entries(&env.options.remote_mode) {
+            catalog.add_enabled_tool_entry(entry, env)?;
         }
-        for tool in web_tool_definitions(env.options.web_search) {
-            catalog.add_enabled_tool_entry(
-                ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                env,
-            )?;
+        for entry in web_tool_entries(env.options.web_search) {
+            catalog.add_enabled_tool_entry(entry, env)?;
         }
-        for tool in media_tool_definitions(env.options) {
-            match &tool.backend {
-                ToolBackend::ProviderNative { .. } => catalog.add_enabled_tool_entry(
-                    ToolEntry::ProviderNative(Arc::new(DefinitionProviderNativeTool::new(tool))),
-                    env,
-                )?,
-                _ => catalog.add_enabled_tool_entry(
-                    ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                    env,
-                )?,
-            }
+        for entry in media_tool_entries(env.options) {
+            catalog.add_enabled_tool_entry(entry, env)?;
         }
-        for tool in skill_tool_definitions(
+        for entry in skill_tool_entries(
             &env.options.skill_names,
             env.options.enable_skill_persistence_tools,
         ) {
-            catalog.add_enabled_tool_entry(
-                ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                env,
-            )?;
+            catalog.add_enabled_tool_entry(entry, env)?;
         }
         if let Some(scope) = env.options.host_tool_scope {
-            for tool in host_tool_definitions(scope, env.options.enable_memory_tools) {
-                catalog.add_enabled_tool_entry(
-                    ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                    env,
-                )?;
+            for entry in host_tool_entries(scope, env.options.enable_memory_tools) {
+                catalog.add_enabled_tool_entry(entry, env)?;
             }
         }
 
@@ -915,49 +916,60 @@ pub fn builtin_tool_catalog(
 ) -> Result<ToolCatalog, ToolCatalogError> {
     let mut catalog = ToolCatalog::new();
 
-    for tool in file_tool_definitions(&options.remote_mode) {
-        catalog.add(tool)?;
+    for entry in file_tool_entries(&options.remote_mode) {
+        catalog.add_tool_entry(entry)?;
     }
-    for tool in process_tool_definitions(&options.remote_mode) {
-        catalog.add(tool)?;
+    for entry in process_tool_entries(&options.remote_mode) {
+        catalog.add_tool_entry(entry)?;
     }
-    for tool in web_tool_definitions(options.web_search) {
-        catalog.add(tool)?;
+    for entry in web_tool_entries(options.web_search) {
+        catalog.add_tool_entry(entry)?;
     }
-    for tool in media_tool_definitions(&options) {
-        catalog.add(tool)?;
+    for entry in media_tool_entries(&options) {
+        catalog.add_tool_entry(entry)?;
     }
-    for tool in skill_tool_definitions(&options.skill_names, options.enable_skill_persistence_tools)
-    {
-        catalog.add(tool)?;
+    for entry in skill_tool_entries(&options.skill_names, options.enable_skill_persistence_tools) {
+        catalog.add_tool_entry(entry)?;
     }
     if let Some(scope) = options.host_tool_scope {
-        for tool in host_tool_definitions(scope, options.enable_memory_tools) {
-            catalog.add(tool)?;
+        for entry in host_tool_entries(scope, options.enable_memory_tools) {
+            catalog.add_tool_entry(entry)?;
         }
     }
 
     Ok(catalog)
 }
 
-fn all_builtin_base_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDefinition> {
-    let mut tools = Vec::new();
-    tools.extend(file_tool_definitions(&options.remote_mode));
-    tools.extend(process_tool_definitions(&options.remote_mode));
-    tools.extend(web_tool_definitions(options.web_search));
-    tools.extend(
-        media_tool_definitions(options)
-            .into_iter()
-            .filter(|tool| !matches!(tool.backend, ToolBackend::ProviderNative { .. })),
-    );
-    tools.extend(skill_tool_definitions(
+pub(crate) fn builtin_tool_entry(
+    options: &BuiltinToolCatalogOptions,
+    tool_name: &str,
+) -> Option<ToolEntry> {
+    builtin_tool_entries(options)
+        .into_iter()
+        .find(|entry| entry.definition().name == tool_name)
+}
+
+pub(crate) fn builtin_tool_definition(
+    tool_name: &str,
+    options: &BuiltinToolCatalogOptions,
+) -> Option<ToolDefinition> {
+    builtin_tool_entry(options, tool_name).map(|entry| entry.definition())
+}
+
+fn builtin_tool_entries(options: &BuiltinToolCatalogOptions) -> Vec<ToolEntry> {
+    let mut entries = Vec::new();
+    entries.extend(file_tool_entries(&options.remote_mode));
+    entries.extend(process_tool_entries(&options.remote_mode));
+    entries.extend(web_tool_entries(options.web_search));
+    entries.extend(media_tool_entries(options));
+    entries.extend(skill_tool_entries(
         &options.skill_names,
         options.enable_skill_persistence_tools,
     ));
     if let Some(scope) = options.host_tool_scope {
-        tools.extend(host_tool_definitions(scope, options.enable_memory_tools));
+        entries.extend(host_tool_entries(scope, options.enable_memory_tools));
     }
-    tools
+    entries
 }
 
 #[derive(Debug, Error)]
@@ -1055,7 +1067,15 @@ mod tests {
                 catalog: &mut ToolCatalog,
                 env: &ToolEnablementEnv<'_>,
             ) -> Result<(), ToolCatalogError> {
-                let tool = ToolDefinition::new(
+                catalog.add_enabled_tool_entry(ToolEntry::Base(Arc::new(ProviderExtShell)), env)
+            }
+        }
+
+        struct ProviderExtShell;
+
+        impl BaseTool for ProviderExtShell {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(
                     "provider_ext_shell",
                     "Provider-specific shell facade.",
                     json!({
@@ -1068,11 +1088,17 @@ mod tests {
                     }),
                     ToolExecutionMode::Interruptible,
                     ToolBackend::Local,
-                );
-                catalog.add_enabled_tool_entry(
-                    ToolEntry::Base(Arc::new(DefinitionBaseTool::new(tool))),
-                    env,
                 )
+            }
+
+            fn call(
+                &self,
+                _ctx: &ToolCallContext<'_>,
+                _args: Value,
+            ) -> Result<ToolResultContent, LocalToolError> {
+                Err(LocalToolError::UnsupportedTool(
+                    "provider_ext_shell is test-only".to_string(),
+                ))
             }
         }
 
@@ -1578,6 +1604,72 @@ mod tests {
         assert!(memory_write.parameters["properties"]
             .get("reason")
             .is_none());
+    }
+
+    #[test]
+    fn bridge_tool_validation_rejects_missing_required_fields_before_bridge() {
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            enable_memory_tools: true,
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("catalog should build");
+        let memory_search = catalog.get("memory_search").unwrap();
+        let payload = Map::new();
+
+        let error =
+            validate_bridge_tool_payload("memory_search", &memory_search.parameters, &payload)
+                .expect_err("missing query should be rejected");
+
+        assert!(
+            matches!(error, LocalToolError::InvalidArguments(message) if message.contains("missing required argument query"))
+        );
+    }
+
+    #[test]
+    fn bridge_tool_validation_rejects_bad_types_and_enums_before_bridge() {
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            enable_memory_tools: true,
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("catalog should build");
+        let memory_write = catalog.get("memory_write").unwrap();
+        let payload = json!({
+            "scope": "private",
+            "text": "remember this",
+        });
+        let payload = payload.as_object().unwrap();
+
+        let error = validate_bridge_tool_payload("memory_write", &memory_write.parameters, payload)
+            .expect_err("invalid memory scope should be rejected");
+
+        assert!(
+            matches!(error, LocalToolError::InvalidArguments(message) if message.contains("scope"))
+        );
+    }
+
+    #[test]
+    fn bridge_tool_validation_rejects_partial_cron_timing_patch() {
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("catalog should build");
+        let cron_update = catalog.get("cron_task_update").unwrap();
+        let payload = json!({
+            "id": "cron_0001",
+            "cron_minute": "0",
+        });
+        let payload = payload.as_object().unwrap();
+
+        let error =
+            validate_bridge_tool_payload("cron_task_update", &cron_update.parameters, payload)
+                .expect_err("partial cron timing should be rejected");
+
+        assert!(
+            matches!(error, LocalToolError::InvalidArguments(message) if message.contains("timing fields"))
+        );
     }
 
     #[test]

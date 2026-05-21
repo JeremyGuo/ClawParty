@@ -21,6 +21,7 @@ use crate::{
         ConversationService, ServiceAddr, ServiceCall, ServiceOutput, ServiceRunContext,
         ServiceStatusUpdate, ServiceStopped,
     },
+    logger::append_workdir_level_log,
     service_protos::{
         agent_session::{
             self, decode_request, encode_response, text_message, AgentMessageOrigin,
@@ -153,7 +154,7 @@ impl ConversationService for AgentSessionService {
                             )? {
                                 continue;
                             }
-                            handle_core_session_event(
+                            if let Err(error) = handle_core_session_event(
                                 &ctx,
                                 &event_sink,
                                 &self.kind,
@@ -168,7 +169,10 @@ impl ConversationService for AgentSessionService {
                                 &mut state,
                                 &mut current_plan,
                                 &event,
-                            )?;
+                            ) {
+                                log_host_bridge_protocol_error(&ctx, &event, &error);
+                                return Err(error);
+                            }
                             maybe_apply_pending_launch(
                                 &ctx,
                                 &self.kind,
@@ -946,6 +950,30 @@ fn handle_skeleton_enqueue(
         )?;
     }
     Ok(())
+}
+
+fn log_host_bridge_protocol_error(
+    ctx: &ServiceRunContext,
+    event: &CoreSessionEvent,
+    error: &anyhow::Error,
+) {
+    let CoreSessionEvent::HostCoordinationRequested { request } = event else {
+        return;
+    };
+    let _ = append_workdir_level_log(
+        &ctx.conversation.workdir,
+        "warn",
+        "agent_session_bad_bridge_payload",
+        serde_json::json!({
+            "conversation_id": &ctx.conversation.conversation_id,
+            "agent_addr": &ctx.addr,
+            "request_id": &request.request_id,
+            "tool_call_id": &request.tool_call_id,
+            "tool_name": &request.tool_name,
+            "action": &request.action,
+            "error": format!("{error:#}"),
+        }),
+    );
 }
 
 fn handle_core_session_event(

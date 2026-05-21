@@ -18,11 +18,12 @@ use url::Url;
 use crate::{
     model_config::{ModelConfig, ProviderType},
     session_actor::{
-        media_tool_definitions, normalize_messages_for_model, BuiltinBaseTool, ChatMessage,
-        ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem, LocalToolError,
-        ReasoningItem, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError,
-        ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode,
-        ToolResultContent, ToolSet,
+        builtin_tool_entry, media_tool_entries, normalize_messages_for_model, ApplyPatchTool,
+        ChatMessage, ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem,
+        LocalToolError, ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool,
+        ShellWriteStdinTool, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog,
+        ToolCatalogError, ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry,
+        ToolExecutionMode, ToolResultContent, ToolSet,
     },
 };
 
@@ -619,11 +620,11 @@ fn add_builtin_base_tool(
     env: &ToolEnablementEnv<'_>,
     tool_name: &str,
 ) -> Result<(), ToolCatalogError> {
-    let Some(tool) = BuiltinBaseTool::definition(tool_name, env.options) else {
+    let Some(entry) = builtin_tool_entry(env.options, tool_name) else {
         return Ok(());
     };
-    if tool.is_enabled_for_model(env.model_config) {
-        catalog.add(tool)?;
+    if entry.definition().is_enabled_for_model(env.model_config) {
+        catalog.add_tool_entry(entry)?;
     }
     Ok(())
 }
@@ -632,7 +633,8 @@ fn add_native_image_generation_tool(
     catalog: &mut ToolCatalog,
     env: &ToolEnablementEnv<'_>,
 ) -> Result<(), ToolCatalogError> {
-    for tool in media_tool_definitions(env.options) {
+    for entry in media_tool_entries(env.options) {
+        let tool = entry.definition();
         if tool.name == "image_generation"
             && matches!(
                 tool.backend,
@@ -642,7 +644,7 @@ fn add_native_image_generation_tool(
             )
             && tool.is_enabled_for_model(env.model_config)
         {
-            catalog.add(tool)?;
+            catalog.add_tool_entry(entry)?;
         }
     }
     Ok(())
@@ -694,7 +696,8 @@ impl ExtTool for CodexExecCommandTool {
             .remove("cmd")
             .ok_or_else(|| LocalToolError::InvalidArguments("missing required cmd".to_string()))?;
         arguments.insert("command".to_string(), command);
-        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+        ShellExecTool::new(&ctx.execution.remote_mode)
+            .call_with_context(Value::Object(arguments), &ctx.execution)
     }
 }
 
@@ -740,7 +743,7 @@ impl ExtTool for CodexWriteStdinTool {
             LocalToolError::InvalidArguments("missing required session_id".to_string())
         })?;
         arguments.insert("process_id".to_string(), session_id);
-        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+        ShellWriteStdinTool.call_with_context(Value::Object(arguments), &ctx.execution)
     }
 }
 
@@ -772,7 +775,7 @@ impl ExtTool for CodexExecStopTool {
 
     fn call(
         &self,
-        ctx: &ToolCallContext<'_>,
+        _ctx: &ToolCallContext<'_>,
         args: Value,
     ) -> Result<ToolResultContent, LocalToolError> {
         let Value::Object(mut arguments) = args else {
@@ -784,7 +787,7 @@ impl ExtTool for CodexExecStopTool {
             LocalToolError::InvalidArguments("missing required session_id".to_string())
         })?;
         arguments.insert("process_id".to_string(), session_id);
-        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+        ShellStopTool.call_value(Value::Object(arguments))
     }
 }
 
@@ -819,7 +822,7 @@ impl ExtTool for CodexExecMakeVisibleTool {
         ctx: &ToolCallContext<'_>,
         args: Value,
     ) -> Result<ToolResultContent, LocalToolError> {
-        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, args)
+        ShellMakeVisibleTool.call_with_context(args, &ctx.execution)
     }
 }
 
@@ -862,7 +865,8 @@ impl ExtTool for CodexApplyPatchTool {
         arguments
             .entry("format".to_string())
             .or_insert_with(|| Value::String("freeform".to_string()));
-        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+        ApplyPatchTool::new(&ctx.execution.remote_mode)
+            .call_with_context(Value::Object(arguments), &ctx.execution)
     }
 }
 

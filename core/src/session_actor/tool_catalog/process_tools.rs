@@ -16,12 +16,16 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_remote_property, object_schema, properties},
-    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
+    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolEntry,
+    ToolExecutionMode, ToolRemoteMode,
 };
-use crate::session_actor::tool_binary::ensure_tool_binary;
-use crate::session_actor::tool_runtime::{
-    shell_quote, string_arg, usize_arg_with_default, ExecutionTarget, LocalToolError,
-    ToolCancellationToken, ToolExecutionContext,
+use crate::session_actor::{
+    tool_binary::ensure_tool_binary,
+    tool_runtime::{
+        shell_quote, string_arg, usize_arg_with_default, ExecutionTarget, LocalToolError,
+        ToolCancellationToken, ToolExecutionContext,
+    },
+    ToolResultContent,
 };
 
 const SHELL_EXEC_DEFAULT_YIELD_MS: usize = 10_000;
@@ -447,71 +451,186 @@ fn flush_pending_shell_output(
 }
 
 pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition> {
-    let mut exec_properties = properties([
-        ("command", json!({"type": "string"})),
-        ("workdir", json!({"type": "string"})),
-        ("shell", json!({"type": "string"})),
-        (
-            "login",
-            json!({"type": "boolean", "description": "Run the command through a login shell, for example zsh -lc. Defaults to false."}),
-        ),
-        (
-            "tty",
-            json!({"type": "boolean", "description": "Allocate a PTY and keep stdin writable. Defaults to false."}),
-        ),
-        (
-            "cols",
-            json!({"type": "integer", "minimum": 40, "maximum": 200}),
-        ),
-        (
-            "rows",
-            json!({"type": "integer", "minimum": 10, "maximum": 80}),
-        ),
-        (
-            "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait for output before yielding. Defaults to 10000."}),
-        ),
-        (
-            "timeout_ms",
-            json!({"type": "integer", "minimum": 0, "maximum": 86400000}),
-        ),
-        (
-            "max_output_tokens",
-            json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
-        ),
-    ]);
-    add_remote_property(&mut exec_properties, remote_mode);
-
-    let write_properties = properties([
-        ("process_id", json!({"type": "string"})),
-        ("chars", json!({"type": "string"})),
-        (
-            "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input. With chars=\"\", empty polling waits at least 5000 and a single poll can wait up to 300000."}),
-        ),
-        (
-            "max_output_tokens",
-            json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
-        ),
-    ]);
-
-    let stop_properties = properties([
-        ("process_id", json!({"type": "string"})),
-        (
-            "signal",
-            json!({"type": "string", "enum": ["interrupt", "terminate", "kill"]}),
-        ),
-    ]);
-
     vec![
+        ShellExecTool::new(remote_mode).definition(),
+        ShellWriteStdinTool.definition(),
+        ShellStopTool.definition(),
+    ]
+}
+
+pub(crate) fn process_tool_entries(remote_mode: &ToolRemoteMode) -> Vec<ToolEntry> {
+    vec![
+        ToolEntry::Base(Arc::new(ShellExecTool::new(remote_mode))),
+        ToolEntry::Base(Arc::new(ShellWriteStdinTool)),
+        ToolEntry::Base(Arc::new(ShellStopTool)),
+    ]
+}
+
+pub(crate) struct ShellExecTool {
+    remote_mode: ToolRemoteMode,
+}
+
+impl ShellExecTool {
+    pub(crate) fn new(remote_mode: &ToolRemoteMode) -> Self {
+        Self {
+            remote_mode: remote_mode.clone(),
+        }
+    }
+
+    pub(crate) fn call_with_context(
+        &self,
+        args: Value,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        self.execute(&arguments, context)
+            .map(ToolResultContent::from_tool_value)
+    }
+
+    fn execute(
+        &self,
+        arguments: &Map<String, Value>,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<Value, LocalToolError> {
+        let command = string_arg(arguments, "command")?;
+        if command.trim().is_empty() {
+            return Err(LocalToolError::InvalidArguments(
+                "command must not be empty".to_string(),
+            ));
+        }
+        let session = spawn_process(&command, arguments, context)?;
+        let wait = yield_ms(arguments, SHELL_EXEC_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?;
+        let output_limit = shell_output_limit(arguments)?;
+        collect_until(
+            &session,
+            wait,
+            &output_limit,
+            context,
+            &context.cancel_token,
+            "shell_exec",
+        )
+    }
+
+    fn tool_definition(&self) -> ToolDefinition {
+        let mut exec_properties = properties([
+            ("command", json!({"type": "string"})),
+            ("workdir", json!({"type": "string"})),
+            ("shell", json!({"type": "string"})),
+            (
+                "login",
+                json!({"type": "boolean", "description": "Run the command through a login shell, for example zsh -lc. Defaults to false."}),
+            ),
+            (
+                "tty",
+                json!({"type": "boolean", "description": "Allocate a PTY and keep stdin writable. Defaults to false."}),
+            ),
+            (
+                "cols",
+                json!({"type": "integer", "minimum": 40, "maximum": 200}),
+            ),
+            (
+                "rows",
+                json!({"type": "integer", "minimum": 10, "maximum": 80}),
+            ),
+            (
+                "yield_time_ms",
+                json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait for output before yielding. Defaults to 10000."}),
+            ),
+            (
+                "timeout_ms",
+                json!({"type": "integer", "minimum": 0, "maximum": 86400000}),
+            ),
+            (
+                "max_output_tokens",
+                json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
+            ),
+        ]);
+        add_remote_property(&mut exec_properties, &self.remote_mode);
+
         ToolDefinition::new(
             "shell_exec",
             "Execute a command as a fresh process. By default tty=false, stdin is closed, stdout/stderr are captured separately, no hidden shell is reused, and yield_time_ms defaults to 10000. If still running after yield_time_ms, the result includes process_id for shell_write_stdin polling or shell_stop. max_output_tokens controls model-visible output truncation; set tty=true only for interactive terminal sessions.",
-            object_schema(exec_properties.clone(), &["command"]),
+            object_schema(exec_properties, &["command"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
         )
-        .with_concurrency(ToolConcurrency::Serial),
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+}
+
+impl BaseTool for ShellExecTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition()
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        self.call_with_context(args, &ctx.execution)
+    }
+}
+
+pub(crate) struct ShellWriteStdinTool;
+
+impl ShellWriteStdinTool {
+    pub(crate) fn call_with_context(
+        &self,
+        args: Value,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        self.execute(&arguments, context)
+            .map(ToolResultContent::from_tool_value)
+    }
+
+    fn execute(
+        &self,
+        arguments: &Map<String, Value>,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<Value, LocalToolError> {
+        let session = find_process(arguments)?;
+        validate_remote_consistency(arguments, context, &session)?;
+        let chars = optional_string(arguments, "chars").unwrap_or_default();
+        if !chars.is_empty() {
+            write_to_process(&session, chars.as_bytes())?;
+        }
+        let wait = if chars.is_empty() {
+            yield_ms_with_min(
+                arguments,
+                SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+                SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+                SHELL_WRITE_EMPTY_MAX_YIELD_MS,
+            )?
+        } else {
+            yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?
+        };
+        let output_limit = shell_output_limit(arguments)?;
+        collect_until(
+            &session,
+            wait,
+            &output_limit,
+            context,
+            &context.cancel_token,
+            "shell_write_stdin",
+        )
+    }
+
+    fn tool_definition(&self) -> ToolDefinition {
+        let write_properties = properties([
+            ("process_id", json!({"type": "string"})),
+            ("chars", json!({"type": "string"})),
+            (
+                "yield_time_ms",
+                json!({"type": "integer", "minimum": 250, "maximum": 300000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input. With chars=\"\", empty polling waits at least 5000 and a single poll can wait up to 300000."}),
+            ),
+            (
+                "max_output_tokens",
+                json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
+            ),
+        ]);
+
         ToolDefinition::new(
             "shell_write_stdin",
             "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. With empty chars, a single poll can wait up to 300000ms. Empty polling waits at least 5000ms unless the process exits or produces output earlier. Non-empty chars against tty=false returns stdin_closed.",
@@ -519,7 +638,65 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
         )
-        .with_concurrency(ToolConcurrency::Serial),
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+}
+
+impl BaseTool for ShellWriteStdinTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition()
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        self.call_with_context(args, &ctx.execution)
+    }
+}
+
+pub(crate) struct ShellStopTool;
+
+impl ShellStopTool {
+    pub(crate) fn call_value(&self, args: Value) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        self.execute(&arguments)
+            .map(ToolResultContent::from_tool_value)
+    }
+
+    fn execute(&self, arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
+        let process_id = process_id_arg(arguments)
+            .ok_or_else(|| LocalToolError::InvalidArguments("missing process_id".to_string()))?;
+        validate_process_id(&process_id)?;
+        let mut manager = shell_manager().lock().expect("mutex poisoned");
+        let Some(session) = manager.sessions.remove(&process_id) else {
+            return Ok(json!({
+                "process_id": process_id,
+                "stopped": false,
+                "reason": "unknown_session",
+            }));
+        };
+        drop(manager);
+
+        stop_process(&session, signal_arg(arguments));
+        let _ = session.state_tx.send(ShellStateEvent::Stopped);
+        Ok(json!({
+            "process_id": process_id,
+            "stopped": true,
+            "remote": binding_label(&session.binding),
+        }))
+    }
+
+    fn tool_definition(&self) -> ToolDefinition {
+        let stop_properties = properties([
+            ("process_id", json!({"type": "string"})),
+            (
+                "signal",
+                json!({"type": "string", "enum": ["interrupt", "terminate", "kill"]}),
+            ),
+        ]);
+
         ToolDefinition::new(
             "shell_stop",
             "Stop a running shell process by process_id. signal defaults to terminate.",
@@ -527,99 +704,31 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         )
-        .with_concurrency(ToolConcurrency::Serial),
-    ]
+        .with_concurrency(ToolConcurrency::Serial)
+    }
 }
 
-pub(crate) fn execute_process_tool(
-    tool_name: &str,
-    arguments: &Map<String, Value>,
-    context: &ToolExecutionContext<'_>,
-) -> Result<Option<Value>, LocalToolError> {
-    let result = match tool_name {
-        "shell_exec" => shell_exec(arguments, context)?,
-        "shell_write_stdin" => shell_write_stdin(arguments, context)?,
-        "shell_stop" => shell_stop(arguments)?,
-        _ => return Ok(None),
-    };
-    Ok(Some(result))
+impl BaseTool for ShellStopTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition()
+    }
+
+    fn call(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        self.call_value(args)
+    }
 }
 
-fn shell_exec(
-    arguments: &Map<String, Value>,
-    context: &ToolExecutionContext<'_>,
-) -> Result<Value, LocalToolError> {
-    let command = string_arg(arguments, "command")?;
-    if command.trim().is_empty() {
+fn object_arguments(args: Value) -> Result<Map<String, Value>, LocalToolError> {
+    let Value::Object(arguments) = args else {
         return Err(LocalToolError::InvalidArguments(
-            "command must not be empty".to_string(),
+            "tool arguments must be a JSON object".to_string(),
         ));
-    }
-    let session = spawn_process(&command, arguments, context)?;
-    let wait = yield_ms(arguments, SHELL_EXEC_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?;
-    let output_limit = shell_output_limit(arguments)?;
-    collect_until(
-        &session,
-        wait,
-        &output_limit,
-        context,
-        &context.cancel_token,
-        "shell_exec",
-    )
-}
-
-fn shell_write_stdin(
-    arguments: &Map<String, Value>,
-    context: &ToolExecutionContext<'_>,
-) -> Result<Value, LocalToolError> {
-    let session = find_process(arguments)?;
-    validate_remote_consistency(arguments, context, &session)?;
-    let chars = optional_string(arguments, "chars").unwrap_or_default();
-    if !chars.is_empty() {
-        write_to_process(&session, chars.as_bytes())?;
-    }
-    let wait = if chars.is_empty() {
-        yield_ms_with_min(
-            arguments,
-            SHELL_WRITE_EMPTY_MIN_YIELD_MS,
-            SHELL_WRITE_EMPTY_MIN_YIELD_MS,
-            SHELL_WRITE_EMPTY_MAX_YIELD_MS,
-        )?
-    } else {
-        yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?
     };
-    let output_limit = shell_output_limit(arguments)?;
-    collect_until(
-        &session,
-        wait,
-        &output_limit,
-        context,
-        &context.cancel_token,
-        "shell_write_stdin",
-    )
-}
-
-fn shell_stop(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
-    let process_id = process_id_arg(arguments)
-        .ok_or_else(|| LocalToolError::InvalidArguments("missing process_id".to_string()))?;
-    validate_process_id(&process_id)?;
-    let mut manager = shell_manager().lock().expect("mutex poisoned");
-    let Some(session) = manager.sessions.remove(&process_id) else {
-        return Ok(json!({
-            "process_id": process_id,
-            "stopped": false,
-            "reason": "unknown_session",
-        }));
-    };
-    drop(manager);
-
-    stop_process(&session, signal_arg(arguments));
-    let _ = session.state_tx.send(ShellStateEvent::Stopped);
-    Ok(json!({
-        "process_id": process_id,
-        "stopped": true,
-        "remote": binding_label(&session.binding),
-    }))
+    Ok(arguments)
 }
 
 fn find_process(arguments: &Map<String, Value>) -> Result<Arc<ShellSession>, LocalToolError> {
@@ -1037,10 +1146,7 @@ fn collect_until(
             }
             recv(session.event_rx) -> _ => {
                 let close_timer = crossbeam_channel::after(Duration::from_millis(50));
-                select_biased! {
-                    recv(cancel_token.cancel_rx()) -> _ => {}
-                    recv(close_timer) -> _ => {}
-                }
+                let _ = close_timer.recv();
                 break;
             }
             recv(wait_timer) -> _ => {
@@ -2255,8 +2361,9 @@ mod tests {
             ("yield_time_ms".to_string(), Value::Number(250_u64.into())),
         ]);
 
-        let first = shell_exec(&args, &context).expect("first shell exec");
-        let second = shell_exec(&args, &context).expect("second shell exec");
+        let tool = ShellExecTool::new(&remote_mode);
+        let first = tool.execute(&args, &context).expect("first shell exec");
+        let second = tool.execute(&args, &context).expect("second shell exec");
 
         assert_eq!(bridge.requests().len(), 2);
         assert!(shell_stdout_text(&first).contains(&rg_path.display().to_string()));

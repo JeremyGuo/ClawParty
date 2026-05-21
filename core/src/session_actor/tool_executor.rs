@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
@@ -12,6 +11,8 @@ use serde_json::{json, Value};
 
 #[cfg(test)]
 use super::tool_runtime::ExecutionTarget;
+#[cfg(test)]
+use super::ToolBatchExecutor;
 use super::{
     tool_catalog::{ToolCallContext, ToolCatalog},
     tool_runtime::{
@@ -19,9 +20,9 @@ use super::{
         ToolExecutionContext,
     },
     ChatMessage, ConversationBridge, ProviderBackedToolModels, SearchToolModels, TokenEstimator,
-    ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
-    ToolBatchItem, ToolBatchOperation, ToolBatchProgress, ToolConcurrency, ToolRemoteMode,
-    ToolResultContent, ToolResultItem,
+    ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchHandle, ToolBatchItem,
+    ToolBatchOperation, ToolBatchProgress, ToolConcurrency, ToolRemoteMode, ToolResultContent,
+    ToolResultItem,
 };
 
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 100_000;
@@ -36,7 +37,7 @@ pub struct LocalToolBatchExecutor {
     search_tool_models: Option<SearchToolModels>,
     provider_backed_tool_models: Option<ProviderBackedToolModels>,
     tool_catalog: Option<ToolCatalog>,
-    running_batches: Mutex<HashMap<String, RunningToolBatch>>,
+    running_batch: Mutex<Option<RunningToolBatch>>,
 }
 
 impl LocalToolBatchExecutor {
@@ -55,7 +56,7 @@ impl LocalToolBatchExecutor {
             search_tool_models: None,
             provider_backed_tool_models: None,
             tool_catalog: None,
-            running_batches: Mutex::new(HashMap::new()),
+            running_batch: Mutex::new(None),
         }
     }
 
@@ -160,6 +161,7 @@ impl LocalToolBatchExecutor {
 }
 
 struct RunningToolBatch {
+    batch_id: String,
     interrupt_tx: Sender<()>,
     join_handle: JoinHandle<()>,
 }
@@ -195,7 +197,9 @@ impl ToolBatchRunner {
             }
 
             if batch.operations[index].concurrency == ToolConcurrency::Serial {
-                match self.execute_operation_interruptibly(batch.operations[index].clone()) {
+                let (outcome, batch_interrupted) =
+                    self.execute_operation_interruptibly(batch.operations[index].clone());
+                match outcome {
                     OperationOutcome::Completed(result) => {
                         self.emit_progress_result(&batch.batch_id, &result);
                         results.push(result);
@@ -205,14 +209,12 @@ impl ToolBatchRunner {
                         self.emit_progress_result(&batch.batch_id, &result);
                         results.push(result);
                     }
-                    OperationOutcome::Interrupted(result) => {
-                        self.emit_progress_result(&batch.batch_id, &result);
-                        results.push(result);
-                        let interrupted = interrupted_results(&batch.operations[index + 1..]);
-                        self.emit_progress_results(&batch.batch_id, &interrupted);
-                        results.extend(interrupted);
-                        break;
-                    }
+                }
+                if batch_interrupted {
+                    let interrupted = interrupted_results(&batch.operations[index + 1..]);
+                    self.emit_progress_results(&batch.batch_id, &interrupted);
+                    results.extend(interrupted);
+                    break;
                 }
                 index += 1;
                 continue;
@@ -249,7 +251,10 @@ impl ToolBatchRunner {
         }
     }
 
-    fn execute_operation_interruptibly(&self, scheduled: ToolBatchOperation) -> OperationOutcome {
+    fn execute_operation_interruptibly(
+        &self,
+        scheduled: ToolBatchOperation,
+    ) -> (OperationOutcome, bool) {
         let (result_tx, result_rx) = crossbeam_channel::bounded(1);
         let (operation_interrupt_tx, operation_interrupt_rx) = crossbeam_channel::bounded(1);
         let runner = self.operation_runner(ToolCancellationToken::from_interrupt_rx(
@@ -264,17 +269,15 @@ impl ToolBatchRunner {
         loop {
             select! {
                 recv(result_rx) -> result => {
-                    return finish_operation_result(result, join_handle);
+                    return (finish_operation_result(result, join_handle), false);
                 }
                 recv(self.interrupt_rx) -> _ => {
-                    if let Ok(result) = result_rx.try_recv() {
-                        return finish_received_operation_result(result, join_handle);
-                    }
                     let _ = operation_interrupt_tx.send(());
-                    return match result_rx.recv() {
-                        Ok(result) => finish_received_operation_result(result, join_handle).into_interrupted(),
-                        Err(_) => finish_disconnected_operation(join_handle).into_interrupted(),
+                    let outcome = match result_rx.recv() {
+                        Ok(result) => finish_received_operation_result(result, join_handle),
+                        Err(_) => finish_disconnected_operation(join_handle),
                     };
+                    return (outcome, true);
                 }
             }
         }
@@ -486,16 +489,6 @@ fn collect_disconnected_parallel_results(
 enum OperationOutcome {
     Completed(ToolResultItem),
     ToolError(String),
-    Interrupted(ToolResultItem),
-}
-
-impl OperationOutcome {
-    fn into_interrupted(self) -> Self {
-        match self {
-            Self::Completed(result) => Self::Interrupted(result),
-            other => other,
-        }
-    }
 }
 
 fn finish_operation_result(
@@ -674,8 +667,8 @@ fn truncate_context_text(value: &str, max_chars: usize) -> (String, bool) {
     (format!("{head}{marker}{tail}"), true)
 }
 
-impl ToolBatchExecutor for LocalToolBatchExecutor {
-    fn start(
+impl LocalToolBatchExecutor {
+    pub fn start(
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
@@ -686,46 +679,78 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
         }
 
         let handle = ToolBatchHandle::new(batch.batch_id.clone());
-        let mut running_batches = self.running_batches.lock().expect("mutex poisoned");
-        if running_batches.contains_key(&handle.batch_id) {
+        let mut running_batch = self.running_batch.lock().expect("mutex poisoned");
+        if let Some(running) = running_batch.as_ref() {
             return Err(ToolBatchError::Start(format!(
                 "tool batch {} is already running",
-                handle.batch_id
+                running.batch_id
             )));
         }
         let (interrupt_tx, join_handle) =
             self.spawn_batch_worker(batch, completion_tx, progress_tx);
-        running_batches.insert(
-            handle.batch_id.clone(),
-            RunningToolBatch {
-                interrupt_tx,
-                join_handle,
-            },
-        );
+        *running_batch = Some(RunningToolBatch {
+            batch_id: handle.batch_id.clone(),
+            interrupt_tx,
+            join_handle,
+        });
         Ok(handle)
     }
 
-    fn interrupt(&self, handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
-        let running_batches = self.running_batches.lock().expect("mutex poisoned");
-        let running = running_batches.get(&handle.batch_id).ok_or_else(|| {
-            ToolBatchError::Interrupt(format!("unknown tool batch {}", handle.batch_id))
-        })?;
+    pub fn interrupt(&self, handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
+        let running_batch = self.running_batch.lock().expect("mutex poisoned");
+        let Some(running) = running_batch.as_ref() else {
+            return Err(ToolBatchError::Interrupt(format!(
+                "unknown tool batch {}",
+                handle.batch_id
+            )));
+        };
+        if running.batch_id != handle.batch_id {
+            return Err(ToolBatchError::Interrupt(format!(
+                "unknown tool batch {}",
+                handle.batch_id
+            )));
+        }
         let _ = running.interrupt_tx.send(());
         Ok(())
     }
 
-    fn finish(&self, batch_id: &str) -> Result<(), ToolBatchError> {
-        let running = self
-            .running_batches
-            .lock()
-            .expect("mutex poisoned")
-            .remove(batch_id)
-            .ok_or_else(|| ToolBatchError::Finish(format!("unknown tool batch {batch_id}")))?;
+    pub fn finish(&self, batch_id: &str) -> Result<(), ToolBatchError> {
+        let running = {
+            let mut running_batch = self.running_batch.lock().expect("mutex poisoned");
+            match running_batch.as_ref() {
+                Some(running) if running.batch_id == batch_id => running_batch.take().unwrap(),
+                _ => {
+                    return Err(ToolBatchError::Finish(format!(
+                        "unknown tool batch {batch_id}"
+                    )));
+                }
+            }
+        };
 
         running
             .join_handle
             .join()
             .map_err(|_| ToolBatchError::Finish(format!("tool batch {batch_id} panicked")))
+    }
+}
+
+#[cfg(test)]
+impl ToolBatchExecutor for LocalToolBatchExecutor {
+    fn start(
+        &self,
+        batch: ToolBatch,
+        completion_tx: Sender<ToolBatchCompletion>,
+        progress_tx: Sender<ToolBatchProgress>,
+    ) -> Result<ToolBatchHandle, ToolBatchError> {
+        LocalToolBatchExecutor::start(self, batch, completion_tx, progress_tx)
+    }
+
+    fn interrupt(&self, handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
+        LocalToolBatchExecutor::interrupt(self, handle)
+    }
+
+    fn finish(&self, batch_id: &str) -> Result<(), ToolBatchError> {
+        LocalToolBatchExecutor::finish(self, batch_id)
     }
 }
 
@@ -762,18 +787,18 @@ fn interrupted_results(operations: &[ToolBatchOperation]) -> Vec<ToolResultItem>
 mod tests {
     use std::{
         fs,
-        sync::{mpsc, Mutex},
+        sync::{mpsc, Arc, Mutex},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use crate::session_actor::{
-        builtin_tool_catalog,
+        builtin_tool_catalog, execute_bridge_tool,
         tool_catalog::{
-            BuiltinBaseTool, BuiltinToolCatalogOptions, ExtTool, ToolCallContext, ToolEntry,
+            BaseTool, BuiltinToolCatalogOptions, ExtTool, ToolCallContext, ToolEntry,
             WebSearchOptions,
         },
         ChatMessageItem, ContextItem, ConversationBridgeRequest, ConversationBridgeResponse,
-        ToolBackend, ToolCallItem, ToolDefinition, ToolExecutionMode,
+        ShellExecTool, ToolBackend, ToolCallItem, ToolDefinition, ToolExecutionMode,
     };
 
     use super::*;
@@ -832,19 +857,7 @@ mod tests {
         let mut catalog = ToolCatalog::new();
         for tool_name in tool_names {
             catalog
-                .add(ToolDefinition::new(
-                    *tool_name,
-                    "Test conversation bridge tool.",
-                    json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": true
-                    }),
-                    ToolExecutionMode::Immediate,
-                    ToolBackend::ConversationBridge {
-                        action: (*tool_name).to_string(),
-                    },
-                ))
+                .add_tool_entry(test_bridge_tool_entry(tool_name))
                 .expect("bridge tool should register");
         }
         catalog
@@ -854,22 +867,53 @@ mod tests {
         let mut catalog = builtin_test_catalog();
         for tool_name in tool_names {
             catalog
-                .add(ToolDefinition::new(
-                    *tool_name,
-                    "Test conversation bridge tool.",
-                    json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": true
-                    }),
-                    ToolExecutionMode::Immediate,
-                    ToolBackend::ConversationBridge {
-                        action: (*tool_name).to_string(),
-                    },
-                ))
+                .add_tool_entry(test_bridge_tool_entry(tool_name))
                 .expect("bridge tool should register");
         }
         catalog
+    }
+
+    fn test_bridge_tool_entry(tool_name: &str) -> ToolEntry {
+        ToolEntry::Base(Arc::new(TestBridgeTool {
+            name: tool_name.to_string(),
+        }))
+    }
+
+    struct TestBridgeTool {
+        name: String,
+    }
+
+    impl BaseTool for TestBridgeTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(
+                self.name.clone(),
+                "Test conversation bridge tool.",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                }),
+                ToolExecutionMode::Immediate,
+                ToolBackend::ConversationBridge {
+                    action: self.name.clone(),
+                },
+            )
+        }
+
+        fn call(
+            &self,
+            ctx: &ToolCallContext<'_>,
+            args: Value,
+        ) -> Result<ToolResultContent, LocalToolError> {
+            let definition = self.definition();
+            execute_bridge_tool(
+                &definition.name,
+                &definition.name,
+                &definition.parameters,
+                ctx,
+                args,
+            )
+        }
     }
 
     fn result_text(message: &ChatMessage, index: usize) -> String {
@@ -962,14 +1006,13 @@ mod tests {
                 let message = args.get("message").and_then(Value::as_str).ok_or_else(|| {
                     LocalToolError::InvalidArguments("missing message".to_string())
                 })?;
-                BuiltinBaseTool::call_local(
-                    self.base_tool_id(),
-                    ctx,
+                ShellExecTool::new(&ctx.execution.remote_mode).call_with_context(
                     json!({
                         "command": format!("printf {}", shell_quote_for_test(message)),
                         "yield_time_ms": 250,
                         "max_output_chars": 1000,
                     }),
+                    &ctx.execution,
                 )
             }
         }

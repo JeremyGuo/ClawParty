@@ -3,6 +3,12 @@ version: 1.30.0
 
 # 1.30.0
 
+- 开始收敛工具系统注册模型：
+  新增 `TOOL_REFACTOR_TODO.md` 跟踪所有 builtin Base / ProviderNative / Ext 工具的具体类型化进度；文件工具、进程工具、Web 工具、media 工具、host / cron / memory / skill bridge 工具和 provider-native `image_generation` 已改为各自的 concrete `BaseTool` / `ProviderNativeTool` 实现并直接注册到 `ToolCatalog`，不再通过共享 `DefinitionBaseTool` 执行。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 简化 SessionActor turn 启动路径：
+  `recv_step` 收到事件后直接处理对应事件；actor 空闲并存在 pending data 时，会把当前已排队的用户/actor data request 按顺序一次性写入 history，并只启动一次 provider request。失败恢复的 pending continuation 同步改为保存整批 data request，避免批量 turn 启动失败后只能重试第一条消息。`LocalToolBatchExecutor` 内部运行状态同步收窄为单个 running batch，和 actor 的单 active tool batch 模型保持一致；工具执行 outcome 只保留 completed / error，interrupt 后当前工具结果按 completed 收敛，再单独停止后续工具。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 删除 idle timeout compact 功能：
   移除 `ModelConfig` 和 Conversation runtime config 中的 idle timeout compact 开关，删除 SessionActor 空闲超时自动压缩调度、Web / Telegram `/idle_compact` 与 `/idle_timeout_compact` 控制命令、Electron Conversation 属性面板中的空闲压缩设置和示例配置字段；手动 `/compact` 与 request-too-large 触发的 context compaction 保留。新增 config `0.13 -> 0.14` 升级，旧配置中的 `idle_timeout_compact_enabled` 会被忽略并在重写后消失；新增 workdir `0.25 -> 0.26` 升级，从 Conversation runtime config 文件移除旧字段。本次改变 `config` schema 至 `0.14`，改变 `workdir` schema 至 `0.26`。
 

@@ -9,8 +9,15 @@ use std::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::session_actor::tool_runtime::{
-    f64_arg_with_default, shell_quote, string_arg, LocalToolError, ToolExecutionContext,
+use super::super::{
+    schema::{object_schema, properties},
+    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+};
+use crate::session_actor::{
+    tool_runtime::{
+        f64_arg_with_default, shell_quote, string_arg, LocalToolError, ToolExecutionContext,
+    },
+    ToolResultContent,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,24 +46,121 @@ struct RemotePathInfo {
     kind: String,
 }
 
-pub(super) fn execute_visibility_tool(
-    tool_name: &str,
-    arguments: &Map<String, Value>,
-    context: &ToolExecutionContext<'_>,
-) -> Result<Option<Value>, LocalToolError> {
-    let super::super::ToolRemoteMode::FixedSsh { host, cwd } = context.remote_mode else {
-        return Ok(None);
+pub(crate) struct ShellMakeVisibleTool;
+
+impl ShellMakeVisibleTool {
+    pub(crate) fn call_with_context(
+        &self,
+        args: Value,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        self.execute(&arguments, context)
+            .map(ToolResultContent::from_tool_value)
+    }
+
+    fn execute(
+        &self,
+        arguments: &Map<String, Value>,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<Value, LocalToolError> {
+        let super::super::ToolRemoteMode::FixedSsh { host, cwd } = context.remote_mode else {
+            return Err(LocalToolError::UnsupportedTool(
+                "shell_make_visible requires fixed SSH remote mode".to_string(),
+            ));
+        };
+        shell_make_visible(arguments, context.workspace_root, host, cwd.as_deref())
+    }
+
+    fn tool_definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "shell_make_visible",
+            "Copy a local workspace-relative file or directory to the fixed remote workspace at the same relative path so remote shell and remote file tools can see it. Use this in Fixed SSH mode before shell_exec reads .stellaclaw/... paths; treat copied .stellaclaw files as read-only from shell and do not mutate .stellaclaw/ from shell. Requires path and optional timeout_seconds.",
+            object_schema(
+                properties([
+                    ("path", json!({"type": "string"})),
+                    ("timeout_seconds", json!({"type": "number"})),
+                ]),
+                &["path"],
+            ),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+}
+
+impl BaseTool for ShellMakeVisibleTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition()
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        self.call_with_context(args, &ctx.execution)
+    }
+}
+
+pub(super) struct AttachmentMakeVisibleTool;
+
+impl AttachmentMakeVisibleTool {
+    fn execute(
+        &self,
+        arguments: &Map<String, Value>,
+        context: &ToolExecutionContext<'_>,
+    ) -> Result<Value, LocalToolError> {
+        let super::super::ToolRemoteMode::FixedSsh { host, cwd } = context.remote_mode else {
+            return Err(LocalToolError::UnsupportedTool(
+                "attachment_make_visible requires fixed SSH remote mode".to_string(),
+            ));
+        };
+        attachment_make_visible(arguments, context.workspace_root, host, cwd.as_deref())
+    }
+
+    fn tool_definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "attachment_make_visible",
+            "Make a workspace-relative file or directory visible for foreground Markdown artifact links or image rendering. Before referencing a remote-only file with [name](path) or ![alt](path), call this when that file is not yet visible to the conversation workspace; reference it only after this tool succeeds. Requires path and optional timeout_seconds.",
+            object_schema(
+                properties([
+                    ("path", json!({"type": "string"})),
+                    ("timeout_seconds", json!({"type": "number"})),
+                ]),
+                &["path"],
+            ),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+}
+
+impl BaseTool for AttachmentMakeVisibleTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition()
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let arguments = object_arguments(args)?;
+        self.execute(&arguments, &ctx.execution)
+            .map(ToolResultContent::from_tool_value)
+    }
+}
+
+fn object_arguments(args: Value) -> Result<Map<String, Value>, LocalToolError> {
+    let Value::Object(arguments) = args else {
+        return Err(LocalToolError::InvalidArguments(
+            "tool arguments must be a JSON object".to_string(),
+        ));
     };
-    let result = match tool_name {
-        "shell_make_visible" => {
-            shell_make_visible(arguments, context.workspace_root, host, cwd.as_deref())?
-        }
-        "attachment_make_visible" => {
-            attachment_make_visible(arguments, context.workspace_root, host, cwd.as_deref())?
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(result))
+    Ok(arguments)
 }
 
 fn shell_make_visible(
