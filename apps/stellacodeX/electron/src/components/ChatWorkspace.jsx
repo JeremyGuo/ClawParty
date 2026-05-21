@@ -2096,7 +2096,7 @@ export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttach
   return (
     <div className="message-attachments">
       {attachments.map((attachment, index) => (
-        <AttachmentCard key={`${attachmentName(attachment)}-${attachment?.path || index}`} attachment={attachment} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />
+        <AttachmentCard key={attachmentRenderKey(attachment, index)} attachment={attachment} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />
       ))}
     </div>
   );
@@ -2104,6 +2104,7 @@ export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttach
 
 function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
   const rawUrl = attachmentUrl(attachment);
+  const resolveKey = attachmentRenderKey(attachment, 0);
   const needsResolve = isResolvableLocalAttachmentUrl(rawUrl) || (!rawUrl && hasLocalAttachmentPath(attachment));
   const initialUrl = needsResolve ? '' : rawUrl;
   const [url, setUrl] = useState(initialUrl);
@@ -2111,8 +2112,11 @@ function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
     let disposed = false;
     const nextRawUrl = attachmentUrl(attachment);
     const shouldResolve = isResolvableLocalAttachmentUrl(nextRawUrl) || (!nextRawUrl && hasLocalAttachmentPath(attachment));
-    setUrl(shouldResolve ? '' : nextRawUrl);
-    if (!shouldResolve || !onResolveAttachmentUrl) return undefined;
+    if (!shouldResolve) {
+      setUrl(nextRawUrl);
+      return undefined;
+    }
+    if (!onResolveAttachmentUrl) return undefined;
     Promise.resolve(onResolveAttachmentUrl(attachment, nextRawUrl))
       .then((resolvedUrl) => {
         if (!disposed) setUrl(resolvedUrl || nextRawUrl || '');
@@ -2123,8 +2127,27 @@ function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
     return () => {
       disposed = true;
     };
-  }, [attachment, onResolveAttachmentUrl]);
+  }, [resolveKey, rawUrl, onResolveAttachmentUrl]);
   return url;
+}
+
+function attachmentRenderKey(attachment, index = 0) {
+  const file = attachment?.file && typeof attachment.file === 'object' ? attachment.file : {};
+  return String(
+    attachment?.uri
+    || attachment?.file_uri
+    || attachment?.url
+    || attachment?.path
+    || attachment?.file_path
+    || attachment?.workspace_path
+    || attachment?.relative_path
+    || attachment?.workspace_relative_path
+    || file.uri
+    || file.file_uri
+    || file.url
+    || file.path
+    || `${attachmentName(attachment)}-${attachment?.size_bytes || attachment?.size || ''}-${attachment?.width || ''}x${attachment?.height || ''}-${index}`
+  ).trim();
 }
 
 function isResolvableLocalAttachmentUrl(value) {

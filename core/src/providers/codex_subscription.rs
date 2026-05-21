@@ -350,9 +350,10 @@ impl CodexSubscriptionProvider {
             "model".to_string(),
             Value::String(model_config.model_name.clone()),
         );
+        let normalized_messages = normalize_messages_for_model(request.messages, model_config);
         payload.insert(
             "input".to_string(),
-            Value::Array(build_responses_input(request.messages, model_config)?),
+            Value::Array(build_responses_input(&normalized_messages, model_config)?),
         );
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
@@ -3624,6 +3625,60 @@ mod tests {
             input[1]["content"][0]["image_url"],
             "data:image/png;base64,QUJD"
         );
+    }
+
+    #[test]
+    fn compact_payload_normalizes_local_user_images() {
+        let path = std::env::temp_dir().join(format!(
+            "stellaclaw-compact-image-{}-{}.png",
+            std::process::id(),
+            now_millis()
+        ));
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
+        image.save(&path).expect("test image should be written");
+
+        let mut config = test_model_config();
+        config.capabilities.push(ModelCapability::ImageIn);
+        config.multimodal_input = Some(MultimodalInputConfig {
+            image: Some(MediaInputConfig {
+                transport: MediaInputTransport::InlineBase64,
+                supported_media_types: vec!["image/png".to_string()],
+                max_width: Some(4096),
+                max_height: Some(4096),
+            }),
+            pdf: None,
+            audio: None,
+        });
+        let uri = format!("file://{}", path.display());
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![
+                ChatMessageItem::Context(ContextItem {
+                    text: "use this uploaded mask".to_string(),
+                }),
+                ChatMessageItem::File(FileItem {
+                    uri: uri.clone(),
+                    name: Some("mask.png".to_string()),
+                    media_type: Some("image/png".to_string()),
+                    width: Some(1),
+                    height: Some(1),
+                    state: None,
+                }),
+            ],
+        )];
+        let provider = CodexSubscriptionProvider::new();
+        let request = ProviderRequest::new(&messages);
+        let payload = provider
+            .build_compact_payload(&config, &request)
+            .expect("compact payload should build");
+        let image_url = payload["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .expect("image_url should be present");
+
+        assert!(image_url.starts_with("data:image/png;base64,"));
+        assert_ne!(image_url, uri);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use thiserror::Error;
@@ -9,6 +13,7 @@ use crate::session_actor::FileItem;
 const DATE_FORMAT: &[BorrowedFormatItem<'static>] = format_description!("[year]-[month]-[day]");
 const TIME_FORMAT: &[BorrowedFormatItem<'static>] =
     format_description!("[hour][minute][second]-[subsecond digits:3]");
+static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 pub struct OutputPersistor;
@@ -68,12 +73,13 @@ fn build_output_file_path(media_type: &str) -> Result<PathBuf, OutputPersistorEr
         .format(TIME_FORMAT)
         .map_err(OutputPersistorError::FormatTimestamp)?;
     let extension = media_type_to_extension(media_type);
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 
     Ok(base
         .join(".stellaclaw")
         .join("output")
         .join(date)
-        .join(format!("output.{time}.{extension}")))
+        .join(format!("output.{time}-{sequence:06}.{extension}")))
 }
 
 fn parse_data_url(input: &str) -> Result<(&str, &str), OutputPersistorError> {

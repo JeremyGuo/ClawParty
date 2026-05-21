@@ -509,6 +509,7 @@ function parseTarEntries(buffer) {
   const entries = [];
   let offset = 0;
   let paxPath = '';
+  let longName = '';
   while (offset + 512 <= buffer.length) {
     const header = buffer.subarray(offset, offset + 512);
     if (header.every((byte) => byte === 0)) break;
@@ -520,19 +521,50 @@ function parseTarEntries(buffer) {
     const data = buffer.subarray(offset, offset + size);
     offset += Math.ceil(size / 512) * 512;
     if (type === 'x') {
-      const text = data.toString('utf8');
-      const match = text.match(/path=([^\n]+)/);
-      paxPath = match?.[1] || '';
+      paxPath = parsePaxRecords(data).path || '';
+      continue;
+    }
+    if (type === 'L') {
+      longName = data.toString('utf8').replace(/\0.*$/, '');
       continue;
     }
     entries.push({
-      name: paxPath || name,
+      name: paxPath || longName || name,
       type,
       data: Buffer.from(data)
     });
     paxPath = '';
+    longName = '';
   }
   return entries;
+}
+
+function parsePaxRecords(data) {
+  const records = {};
+  const text = data.toString('utf8');
+  let offset = 0;
+  while (offset < text.length) {
+    const space = text.indexOf(' ', offset);
+    if (space === -1) break;
+    const length = Number.parseInt(text.slice(offset, space), 10);
+    if (!Number.isFinite(length) || length <= 0) break;
+    const record = text.slice(space + 1, offset + length).replace(/\n$/, '');
+    const eq = record.indexOf('=');
+    if (eq > 0) records[record.slice(0, eq)] = record.slice(eq + 1);
+    offset += length;
+  }
+  return records;
+}
+
+function safeDownloadFileName(value, fallback = 'workspace') {
+  const raw = String(value || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || fallback;
+  const clean = raw.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').trim() || fallback;
+  const maxLength = 180;
+  if (clean.length <= maxLength) return clean;
+  const tarGz = clean.toLowerCase().endsWith('.tar.gz') ? '.tar.gz' : '';
+  const ext = tarGz || path.extname(clean);
+  const stem = ext ? clean.slice(0, -ext.length) : clean;
+  return `${stem.slice(0, Math.max(1, maxLength - ext.length))}${ext}`;
 }
 
 async function fetchWorkspaceDownloadArchive(payload) {
@@ -608,14 +640,14 @@ async function uploadWorkspaceFile(_event, payload) {
 
 async function downloadWorkspaceFile(_event, payload) {
   const archive = await fetchWorkspaceDownloadArchive(payload);
-  const basename = payload.suggestedName || path.basename(payload.path || '') || 'workspace';
-  let saveName = payload.kind === 'file' ? basename : `${basename}.tar.gz`;
+  const basename = safeDownloadFileName(payload.suggestedName || payload.path, 'workspace');
+  let saveName = payload.kind === 'file' ? basename : safeDownloadFileName(`${basename}.tar.gz`, 'workspace.tar.gz');
   let saveBuffer = archive;
   let filters = [{ name: 'Archive', extensions: ['tar.gz'] }];
   if (payload.kind === 'file') {
     const first = firstFileFromWorkspaceArchive(archive);
     if (first) {
-      saveName = path.basename(first.name || basename);
+      saveName = safeDownloadFileName(first.name || basename, basename);
       saveBuffer = first.data;
       filters = [];
     }
