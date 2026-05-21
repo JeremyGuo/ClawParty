@@ -18,12 +18,12 @@ use url::Url;
 use crate::{
     model_config::{ModelConfig, ProviderType},
     session_actor::{
-        builtin_tool_entry, normalize_messages_for_model, ApplyPatchTool, ChatMessage,
-        ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem, LocalToolError,
-        ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool, ShellWriteStdinTool,
-        ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError, ToolConcurrency,
-        ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode, ToolResultContent,
-        ToolSet,
+        builtin_tool_entry, media_tool_entries, normalize_messages_for_model, ApplyPatchTool,
+        ChatMessage, ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem,
+        LocalToolError, ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool,
+        ShellWriteStdinTool, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog,
+        ToolCatalogError, ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry,
+        ToolExecutionMode, ToolResultContent, ToolSet,
     },
 };
 
@@ -575,6 +575,7 @@ impl ToolSet for CodexSubscriptionToolSet {
         for tool in CODEX_BUILTIN_BASE_TOOLS {
             add_builtin_base_tool(catalog, env, tool)?;
         }
+        add_image_generation_tools(catalog, env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecCommandTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexWriteStdinTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecStopTool)), env)?;
@@ -591,7 +592,6 @@ const CODEX_BUILTIN_BASE_TOOLS: &[&str] = &[
     "image_view",
     "pdf_view",
     "audio_view",
-    "image_generation",
     "skill_load",
     "skill_create",
     "skill_update",
@@ -624,6 +624,22 @@ fn add_builtin_base_tool(
     };
     if entry.definition().is_enabled_for_model(env.model_config) {
         catalog.add_tool_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn add_image_generation_tools(
+    catalog: &mut ToolCatalog,
+    env: &ToolEnablementEnv<'_>,
+) -> Result<(), ToolCatalogError> {
+    for entry in media_tool_entries(env.options) {
+        let definition = entry.definition();
+        if matches!(
+            definition.name.as_str(),
+            "image_generation" | "image_generation_stop"
+        ) {
+            catalog.add_enabled_tool_entry(entry, env)?;
+        }
     }
     Ok(())
 }
@@ -3959,6 +3975,7 @@ mod tests {
         assert!(catalog.contains("exec_write_stdin"));
         assert!(catalog.contains("exec_stop"));
         assert!(catalog.contains("update_plan"));
+        assert!(!catalog.contains("image_generation"));
         assert!(!catalog.contains("shell_exec"));
         assert!(!catalog.contains("shell_write_stdin"));
         assert!(!catalog.contains("shell_stop"));
@@ -4004,6 +4021,40 @@ mod tests {
             }
         );
         assert!(!catalog.contains("image_generation_stop"));
+    }
+
+    #[test]
+    fn codex_tool_set_uses_configured_image_generation_model() {
+        let config = test_model_config();
+        let mut image_generation_model = test_model_config();
+        image_generation_model.provider_type = ProviderType::OpenRouterCompletion;
+        image_generation_model.model_name = "image-generation-helper".to_string();
+        image_generation_model
+            .capabilities
+            .push(ModelCapability::ImageOut);
+        let mut initial = SessionInitial::new("session_1", SessionType::Foreground);
+        initial.image_generation_tool_model = Some(image_generation_model);
+        let provider = CodexSubscriptionProvider::new();
+        let tool_set = provider
+            .tool_set(&config)
+            .expect("codex provider should expose a tool set");
+        let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+            &config,
+            &initial,
+            Some(tool_set.as_ref()),
+        )
+        .expect("catalog should build with configured image generation model");
+        let image_generation = catalog
+            .get("image_generation")
+            .expect("provider-backed image_generation should be exposed");
+
+        assert_eq!(
+            image_generation.backend,
+            ToolBackend::ProviderBacked {
+                kind: crate::session_actor::ProviderBackedToolKind::ImageGeneration
+            }
+        );
+        assert!(catalog.contains("image_generation_stop"));
     }
 
     #[test]
