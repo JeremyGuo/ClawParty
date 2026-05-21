@@ -33,7 +33,7 @@ const SHELL_WRITE_DEFAULT_YIELD_MS: usize = 250;
 const SHELL_WRITE_EMPTY_MIN_YIELD_MS: usize = 5_000;
 const SHELL_MIN_YIELD_MS: usize = 250;
 const SHELL_MAX_YIELD_MS: usize = 30_000;
-const SHELL_WRITE_EMPTY_MAX_YIELD_MS: usize = 300_000;
+const SHELL_WRITE_MAX_YIELD_MS: usize = 300_000;
 const SHELL_MAX_OUTPUT_CHARS: usize = 200_000;
 const SHELL_DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const SHELL_MAX_OUTPUT_TOKENS: usize = 50_000;
@@ -601,10 +601,14 @@ impl ShellWriteStdinTool {
                 arguments,
                 SHELL_WRITE_EMPTY_MIN_YIELD_MS,
                 SHELL_WRITE_EMPTY_MIN_YIELD_MS,
-                SHELL_WRITE_EMPTY_MAX_YIELD_MS,
+                SHELL_WRITE_MAX_YIELD_MS,
             )?
         } else {
-            yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?
+            yield_ms(
+                arguments,
+                SHELL_WRITE_DEFAULT_YIELD_MS,
+                SHELL_WRITE_MAX_YIELD_MS,
+            )?
         };
         let output_limit = shell_output_limit(arguments)?;
         collect_until(
@@ -2226,6 +2230,34 @@ mod tests {
         ToolBinaryEnsureResponse, ToolResultContent, ToolResultItem,
     };
     use std::{fs, sync::Mutex};
+
+    #[test]
+    fn shell_write_stdin_uses_extended_yield_limit_for_writes_and_polls() {
+        let args = Map::from_iter([(
+            "yield_time_ms".to_string(),
+            Value::Number(300_000_u64.into()),
+        )]);
+
+        assert_eq!(
+            yield_ms(
+                &args,
+                SHELL_WRITE_DEFAULT_YIELD_MS,
+                SHELL_WRITE_MAX_YIELD_MS
+            )
+            .expect("write wait should parse"),
+            300_000
+        );
+        assert_eq!(
+            yield_ms_with_min(
+                &args,
+                SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+                SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+                SHELL_WRITE_MAX_YIELD_MS,
+            )
+            .expect("poll wait should parse"),
+            300_000
+        );
+    }
 
     #[test]
     fn terminal_render_keeps_colored_logs_as_plain_text() {
