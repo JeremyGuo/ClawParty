@@ -109,7 +109,7 @@ Concrete IO implementations.
 Examples:
 
 - REST API wrappers for `/api/models`, conversations, messages, status, and workspace.
-- WebSocket stream client for `/api/conversations/stream`.
+- WebSocket clients for `/api/ws/home` and `/api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/ws`.
 - kotlinx.serialization DTOs.
 - DTO-to-domain mappers.
 - DataStore-backed connection/profile settings.
@@ -246,17 +246,24 @@ Avoid hard-coding phone-only assumptions so a two-pane tablet layout can be adde
 First-version endpoints:
 
 - `GET /api/models`
-- `GET /api/conversations?limit=...`
+- `GET /api/ws/home` as WebSocket for home snapshots and conversation/session updates
 - `POST /api/conversations`
 - `PATCH /api/conversations/{conversation_id}`
 - `DELETE /api/conversations/{conversation_id}`
-- `GET /api/conversations/{conversation_id}/messages?offset=...&limit=...`
-- `POST /api/conversations/{conversation_id}/messages`
+- `POST /api/conversations/{conversation_id}/foreground_sessions`
+- `PATCH /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}`
+- `DELETE /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages?offset=...&limit=...`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages/{message_id}`
+- `POST /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages`
 - `POST /api/conversations/{conversation_id}/seen`
-- `GET /api/conversations/{conversation_id}/status`
 - `GET /api/conversations/{conversation_id}/workspace?path=...&limit=...`
 - `GET /api/conversations/{conversation_id}/workspace/file?path=...`
-- `GET /api/conversations/stream` as WebSocket
+- `DELETE /api/conversations/{conversation_id}/workspace?path=...`
+- `PATCH /api/conversations/{conversation_id}/workspace`
+- `POST /api/conversations/{conversation_id}/workspace/upload?path=...`
+- `GET /api/conversations/{conversation_id}/workspace/download?path=...`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/ws` as WebSocket
 
 Deferred terminal endpoints stay out of the first Android version.
 
@@ -298,7 +305,7 @@ Do not add a global Redux/MVI framework initially.
 
 Responsibilities:
 
-- Connect to `/api/conversations/stream`.
+- Connect to `/api/ws/home`.
 - Add bearer-token authentication.
 - Decode events.
 - Reconnect with backoff after transient failures.

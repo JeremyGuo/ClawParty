@@ -18,3 +18,29 @@ data class CreateConversationResponseDto(
     @SerialName("platform_chat_id") val platformChatId: String = "",
     @SerialName("model_selection_pending") val modelSelectionPending: Boolean = false,
 )
+
+@Serializable
+data class RenameConversationRequestDto(
+    val nickname: String,
+)
+
+@Serializable
+data class RenameConversationResponseDto(
+    val conversation: ConversationSummaryDto? = null,
+)
+
+@Serializable
+data class CreateForegroundSessionRequestDto(
+    @SerialName("session_id") val sessionId: String? = null,
+    val nickname: String? = null,
+)
+
+@Serializable
+data class ForegroundSessionResponseDto(
+    @SerialName("foreground_session") val foregroundSession: ForegroundSessionSummaryDto? = null,
+)
+
+@Serializable
+data class RenameForegroundSessionRequestDto(
+    val nickname: String,
+)

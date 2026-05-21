@@ -15,19 +15,19 @@ object ConversationRuntimeCache {
             size > MaxEntries
     }
 
-    fun get(profile: ConnectionProfile, conversationId: String): CachedChatSnapshot? = synchronized(lock) {
-        entries[cacheKey(profile, conversationId)]
+    fun get(profile: ConnectionProfile, conversationId: String, foregroundSessionId: String = "main"): CachedChatSnapshot? = synchronized(lock) {
+        entries[cacheKey(profile, conversationId, foregroundSessionId)]
     }
 
-    fun put(profile: ConnectionProfile, conversationId: String, snapshot: CachedChatSnapshot) {
+    fun put(profile: ConnectionProfile, conversationId: String, foregroundSessionId: String = "main", snapshot: CachedChatSnapshot) {
         if (conversationId.isBlank()) return
         if (snapshot.messages.isEmpty() && snapshot.totalMessages == 0) return
         synchronized(lock) {
-            entries[cacheKey(profile, conversationId)] = snapshot
+            entries[cacheKey(profile, conversationId, foregroundSessionId)] = snapshot
         }
     }
 
-    private fun cacheKey(profile: ConnectionProfile, conversationId: String): String = listOf(
+    private fun cacheKey(profile: ConnectionProfile, conversationId: String, foregroundSessionId: String): String = listOf(
         profile.connectionMode.wireName,
         profile.baseUrl.trim(),
         profile.effectiveTargetUrl.trim(),
@@ -36,6 +36,7 @@ object ConversationRuntimeCache {
         profile.sshUser.trim(),
         profile.token.hashCode().toString(),
         conversationId,
+        foregroundSessionId.ifBlank { "main" },
     ).joinToString("|")
 }
 

@@ -922,7 +922,35 @@ impl WebChannel {
                 live.queued_outbound_messages,
             ),
         )?;
-        websocket_event_loop(stream, rx, "chat.heartbeat")
+        self.session_websocket_event_loop(stream, rx, conversation_id, foreground_session_id)
+    }
+
+    fn session_websocket_event_loop(
+        &self,
+        mut stream: TcpStream,
+        rx: Receiver<Value>,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> Result<()> {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(protocol::HEARTBEAT_INTERVAL_SECS)) {
+                Ok(value) => send_websocket_json(&mut stream, &value)?,
+                Err(RecvTimeoutError::Timeout) => {
+                    let live = self.chat_live_snapshot(conversation_id, foreground_session_id);
+                    send_websocket_json(
+                        &mut stream,
+                        &protocol::chat_heartbeat(
+                            conversation_id,
+                            foreground_session_id,
+                            live,
+                            now_rfc3339(),
+                        ),
+                    )?;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
     }
 
     fn publish_conversation_event(&self, payload: Value) {

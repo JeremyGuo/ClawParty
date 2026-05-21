@@ -21,6 +21,21 @@ data class ConversationSummary(
     val lastMessageTime: String?,
     val lastSeenMessageId: String?,
     val lastSeenAt: String?,
+    val foregroundSessions: List<ForegroundSessionSummary> = emptyList(),
+) {
+    val hasUnread: Boolean = lastMessageId != null && lastMessageId != lastSeenMessageId
+}
+
+data class ForegroundSessionSummary(
+    val id: String,
+    val displayName: String,
+    val state: String,
+    val running: Boolean,
+    val messageCount: Int,
+    val lastMessageId: String?,
+    val lastMessageTime: String?,
+    val lastSeenMessageId: String?,
+    val lastSeenAt: String?,
 ) {
     val hasUnread: Boolean = lastMessageId != null && lastMessageId != lastSeenMessageId
 }

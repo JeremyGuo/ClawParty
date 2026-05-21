@@ -35,7 +35,7 @@ fun AppNavGraph(requestedConversationId: String? = null) {
         }
         composable(AppRoute.Conversations.route) {
             ConversationListScreen(
-                onOpenConversation = { id -> navController.navigate(AppRoute.Chat.create(id)) },
+                onOpenConversation = { id, foregroundSessionId -> navController.navigate(AppRoute.Chat.create(id, foregroundSessionId)) },
                 onOpenSettings = { navController.navigate(AppRoute.Settings.route) },
                 onOpenLogs = { navController.navigate(AppRoute.Logs.route) },
             )
@@ -43,9 +43,10 @@ fun AppNavGraph(requestedConversationId: String? = null) {
         composable(AppRoute.Chat.route) { backStackEntry ->
             ChatScreen(
                 conversationId = backStackEntry.arguments?.getString("conversationId").orEmpty(),
+                foregroundSessionId = backStackEntry.arguments?.getString("foregroundSessionId") ?: "main",
                 onBack = { navController.popBackStack() },
                 onOpenWorkspace = { conversationId ->
-                    navController.navigate("conversations/$conversationId/workspace?path=/")
+                    navController.navigate(AppRoute.Workspace.create(conversationId))
                 },
             )
         }
@@ -54,6 +55,7 @@ fun AppNavGraph(requestedConversationId: String? = null) {
                 conversationId = backStackEntry.arguments?.getString("conversationId").orEmpty(),
                 path = backStackEntry.arguments?.getString("path") ?: "/",
                 onBack = { navController.popBackStack() },
+                onOpenPath = { path -> navController.navigate(AppRoute.Workspace.create(backStackEntry.arguments?.getString("conversationId").orEmpty(), path)) },
             )
         }
         composable(AppRoute.Settings.route) {

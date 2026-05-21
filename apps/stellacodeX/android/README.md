@@ -56,24 +56,31 @@ The Android client should use the same Web channel API consumed by `apps/stellac
 First-version endpoints:
 
 - `GET /api/models`
-- `GET /api/conversations?limit=...`
+- `GET /api/ws/home` as WebSocket for the home snapshot and conversation/session updates
 - `POST /api/conversations`
 - `PATCH /api/conversations/{conversation_id}`
 - `DELETE /api/conversations/{conversation_id}`
-- `GET /api/conversations/{conversation_id}/messages?offset=...&limit=...`
-- `POST /api/conversations/{conversation_id}/messages`
+- `POST /api/conversations/{conversation_id}/foreground_sessions`
+- `PATCH /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}`
+- `DELETE /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages?offset=...&limit=...`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages/{message_id}`
+- `POST /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/messages`
+- `GET /api/conversations/{conversation_id}/foreground_sessions/{foreground_session_id}/ws` as WebSocket
 - `POST /api/conversations/{conversation_id}/seen`
-- `GET /api/conversations/{conversation_id}/status`
 - `GET /api/conversations/{conversation_id}/workspace?path=...&limit=...`
 - `GET /api/conversations/{conversation_id}/workspace/file?path=...`
-- `GET /api/conversations/stream` as WebSocket
+- `DELETE /api/conversations/{conversation_id}/workspace?path=...`
+- `PATCH /api/conversations/{conversation_id}/workspace`
+- `POST /api/conversations/{conversation_id}/workspace/upload?path=...`
+- `GET /api/conversations/{conversation_id}/workspace/download?path=...`
 
 Deferred terminal endpoints:
 
 - `GET /api/conversations/{conversation_id}/terminals`
 - `POST /api/conversations/{conversation_id}/terminals`
 - `DELETE /api/conversations/{conversation_id}/terminals/{terminal_id}`
-- `GET /api/conversations/{conversation_id}/terminals/{terminal_id}/stream` as WebSocket
+- `GET /api/conversations/{conversation_id}/terminals/{terminal_id}/ws` as WebSocket
 
 Authentication should mirror the Web channel bearer-token model. Native credential storage should be platform-specific and live in the Android project once created.
 
@@ -106,3 +113,26 @@ apps/stellacodeX/android/
 ## Project status
 
 Android build system and a minimal Compose skeleton are present. See [ARCHITECTURE.md](ARCHITECTURE.md) for the client architecture, package boundaries, first-version scope, and milestone plan.
+
+## Test RC Publishing
+
+Every Android development iteration should publish a test rc, while stable releases are published only when explicitly requested.
+
+Use the existing test update channel:
+
+```bash
+scripts/publish-test-rc.sh 0.2.0-rc.2
+```
+
+The script increments `versionCode` by default, updates `versionName`, builds `:app:assembleRelease`, then writes:
+
+- `dist/stellacodex-android-test.apk`
+- `dist/stellacodex-android-v<version-name>.apk`
+
+Pass an explicit version code only when needed:
+
+```bash
+scripts/publish-test-rc.sh 0.2.0-rc.2 66
+```
+
+Do not update `dist/stellacodex-android-stable.apk` unless a stable release is explicitly requested.

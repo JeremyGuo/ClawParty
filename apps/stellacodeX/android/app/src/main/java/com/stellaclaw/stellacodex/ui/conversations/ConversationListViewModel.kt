@@ -7,7 +7,7 @@ import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.core.result.userMessage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
 import com.stellaclaw.stellacodex.data.dto.ConversationSummaryDto
-import com.stellaclaw.stellacodex.data.dto.ConversationsResponseDto
+import com.stellaclaw.stellacodex.data.dto.HomeSnapshotDto
 import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.mapper.toDomain
 import com.stellaclaw.stellacodex.data.network.NetworkMonitor
@@ -164,8 +164,72 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
+    fun renameConversation(conversationId: String, nickname: String) {
+        viewModelScope.launch(coroutineErrorHandler) {
+            mutableState.update { it.copy(error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            when (val result = api.renameConversation(profile, conversationId, nickname.trim())) {
+                is AppResult.Ok -> {
+                    result.value?.let { updated -> upsertConversation(updated) }
+                    refresh(showLoading = false)
+                }
+                is AppResult.Err -> mutableState.update { it.copy(error = result.error.userMessage()) }
+            }
+        }
+    }
+
+    fun deleteConversation(conversationId: String) {
+        viewModelScope.launch(coroutineErrorHandler) {
+            mutableState.update { it.copy(error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            when (val result = api.deleteConversation(profile, conversationId)) {
+                is AppResult.Ok -> mutableState.update { state -> state.copy(conversations = state.conversations.filterNot { it.conversationId == conversationId }) }
+                is AppResult.Err -> mutableState.update { it.copy(error = result.error.userMessage()) }
+            }
+        }
+    }
+
+    fun createForegroundSession(conversationId: String) {
+        val conversation = state.value.conversations.firstOrNull { it.conversationId == conversationId }
+        val sessionId = nextSessionId(conversation)
+        val nickname = "Session ${conversation?.foregroundSessions.orEmpty().size + 1}"
+        viewModelScope.launch(coroutineErrorHandler) {
+            mutableState.update { it.copy(error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            when (val result = api.createForegroundSession(profile, conversationId, sessionId = sessionId, nickname = nickname)) {
+                is AppResult.Ok -> {
+                    mutableState.update { it.copy(pendingOpenConversationId = conversationId, pendingOpenForegroundSessionId = sessionId) }
+                    refresh(showLoading = false)
+                }
+                is AppResult.Err -> mutableState.update { it.copy(error = result.error.userMessage()) }
+            }
+        }
+    }
+
+    fun renameForegroundSession(conversationId: String, foregroundSessionId: String, nickname: String) {
+        viewModelScope.launch(coroutineErrorHandler) {
+            mutableState.update { it.copy(error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            when (val result = api.renameForegroundSession(profile, conversationId, foregroundSessionId, nickname.trim())) {
+                is AppResult.Ok -> refresh(showLoading = false)
+                is AppResult.Err -> mutableState.update { it.copy(error = result.error.userMessage()) }
+            }
+        }
+    }
+
+    fun deleteForegroundSession(conversationId: String, foregroundSessionId: String) {
+        viewModelScope.launch(coroutineErrorHandler) {
+            mutableState.update { it.copy(error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            when (val result = api.deleteForegroundSession(profile, conversationId, foregroundSessionId)) {
+                is AppResult.Ok -> refresh(showLoading = false)
+                is AppResult.Err -> mutableState.update { it.copy(error = result.error.userMessage()) }
+            }
+        }
+    }
+
     fun consumePendingOpenConversation() {
-        mutableState.update { it.copy(pendingOpenConversationId = null) }
+        mutableState.update { it.copy(pendingOpenConversationId = null, pendingOpenForegroundSessionId = null) }
     }
 
     override fun onCleared() {
@@ -235,26 +299,39 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
         try {
             val payload = json.decodeFromString<JsonObject>(text)
             when (payload["type"]?.jsonPrimitive?.content) {
-                "conversation_snapshot" -> {
-                    val response = json.decodeFromString<ConversationsResponseDto>(text)
-                    log("stream snapshot conversations=${response.conversations.size}")
+                "home.snapshot" -> {
+                    val response = json.decodeFromString<HomeSnapshotDto>(text)
+                    log("home snapshot conversations=${response.conversations.size}")
                     mutableState.update { it.copy(conversations = response.conversations.map { item -> item.toDomain() }, error = null) }
                 }
-                "conversation_upserted", "conversation_turn_completed" -> {
+                "home.conversation_upserted" -> {
                     val dto = payload["conversation"]?.let { json.decodeFromJsonElement<ConversationSummaryDto>(it) } ?: return
                     upsertConversation(dto.toDomain())
                 }
-                "conversation_processing" -> {
+                "home.conversation_updated" -> {
                     val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
-                    val running = payload["running"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: return
-                    val processingState = payload["processing_state"]?.jsonPrimitive?.content ?: if (running) "running" else "idle"
+                    val patch = payload["patch"] as? JsonObject ?: return
+                    patchConversation(conversationId) { summary -> patch.applyTo(summary) }
+                }
+                "home.conversation_deleted" -> {
+                    val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
+                    mutableState.update { state ->
+                        state.copy(conversations = state.conversations.filterNot { it.conversationId == conversationId })
+                    }
+                }
+                "home.foreground_session_upserted", "home.foreground_session_updated", "home.foreground_session_deleted" -> {
+                    refresh(showLoading = false)
+                }
+                "home.foreground_session_state_updated" -> {
+                    val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
+                    val processingState = payload["state"]?.jsonPrimitive?.content ?: return
+                    val running = processingState == "running" || processingState == "queued"
                     patchConversation(conversationId) { it.copy(running = running, processingState = processingState) }
                 }
-                "conversation_seen" -> {
+                "home.foreground_session_seen_state_updated" -> {
                     val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
-                    val seen = payload["seen"] as? JsonObject ?: return
-                    val lastSeenMessageId = seen["last_seen_message_id"]?.jsonPrimitive?.content
-                    val lastSeenAt = seen["updated_at"]?.jsonPrimitive?.content
+                    val lastSeenMessageId = payload["last_seen_message_id"]?.jsonPrimitive?.content
+                    val lastSeenAt = payload["last_seen_at"]?.jsonPrimitive?.content
                     patchConversation(conversationId) { it.copy(lastSeenMessageId = lastSeenMessageId, lastSeenAt = lastSeenAt) }
                 }
             }
@@ -287,7 +364,38 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
+    private fun JsonObject.applyTo(summary: ConversationSummary): ConversationSummary {
+        val name = this["conversation_name"]?.jsonPrimitive?.content
+            ?: this["nickname"]?.jsonPrimitive?.content
+        val processingState = this["processing_state"]?.jsonPrimitive?.content
+        val lastMessageId = this["last_committed_message_id"]?.jsonPrimitive?.content
+            ?: this["last_message_id"]?.jsonPrimitive?.content
+        val lastMessageTime = this["updated_at"]?.jsonPrimitive?.content
+            ?: this["last_message_time"]?.jsonPrimitive?.content
+        return summary.copy(
+            displayName = name?.takeIf { it.isNotBlank() } ?: summary.displayName,
+            model = this["model"]?.jsonPrimitive?.content ?: summary.model,
+            reasoning = this["reasoning"]?.jsonPrimitive?.content ?: summary.reasoning,
+            sandbox = this["sandbox"]?.jsonPrimitive?.content ?: summary.sandbox,
+            remote = this["remote"]?.jsonPrimitive?.content ?: summary.remote,
+            processingState = processingState ?: summary.processingState,
+            running = processingState?.let { it == "running" || it == "queued" } ?: summary.running,
+            lastMessageId = lastMessageId ?: summary.lastMessageId,
+            lastMessageTime = lastMessageTime ?: summary.lastMessageTime,
+        )
+    }
+
     private fun ConnectionProfile.displayName(): String = name.ifBlank { sshHost.ifBlank { baseUrl.ifBlank { "Stellaclaw" } } }
+
+    private fun nextSessionId(conversation: ConversationSummary?): String {
+        val existing = conversation?.foregroundSessions.orEmpty().map { it.id }.toSet()
+        var index = existing.size + 1
+        while (true) {
+            val candidate = "session-$index"
+            if (candidate !in existing) return candidate
+            index += 1
+        }
+    }
 
     private fun log(message: String) {
         AppLogStore.append(getApplication(), "conversations", message)
@@ -328,4 +436,5 @@ data class ConversationListUiState(
     val conversations: List<ConversationSummary> = emptyList(),
     val error: String? = null,
     val pendingOpenConversationId: String? = null,
+    val pendingOpenForegroundSessionId: String? = null,
 )

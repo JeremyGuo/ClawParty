@@ -13,8 +13,37 @@ data class ConversationsResponseDto(
 )
 
 @Serializable
+data class HomeSnapshotDto(
+    val type: String = "",
+    val seq: Long = 0,
+    @SerialName("server_time") val serverTime: String = "",
+    val conversations: List<ConversationSummaryDto> = emptyList(),
+)
+
+@Serializable
+data class ForegroundSessionSummaryDto(
+    val id: String = "",
+    @SerialName("foreground_session_id") val foregroundSessionId: String = "",
+    @SerialName("session_id") val sessionId: String = "",
+    val nickname: String? = null,
+    @SerialName("session_name") val sessionName: String? = null,
+    val state: String = "idle",
+    @SerialName("active_turn_id") val activeTurnId: String? = null,
+    @SerialName("is_main") val isMain: Boolean = false,
+    @SerialName("message_count") val messageCount: Int = 0,
+    @SerialName("last_message_id") val lastMessageId: String? = null,
+    @SerialName("last_message_time") val lastMessageTime: String? = null,
+    @SerialName("last_committed_message_id") val lastCommittedMessageId: String? = null,
+    @SerialName("last_committed_message_index") val lastCommittedMessageIndex: Int? = null,
+    @SerialName("last_activity_at") val lastActivityAt: String? = null,
+    @SerialName("last_seen_message_id") val lastSeenMessageId: String? = null,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+)
+
+@Serializable
 data class ConversationSummaryDto(
     @SerialName("conversation_id") val conversationId: String = "",
+    @SerialName("conversation_name") val conversationName: String? = null,
     @SerialName("platform_chat_id") val platformChatId: String = "",
     val nickname: String? = null,
     val model: String = "",
@@ -32,6 +61,10 @@ data class ConversationSummaryDto(
     @SerialName("message_count") val messageCount: Int = 0,
     @SerialName("last_message_id") val lastMessageId: String? = null,
     @SerialName("last_message_time") val lastMessageTime: String? = null,
+    @SerialName("last_committed_message_id") val lastCommittedMessageId: String? = null,
+    @SerialName("last_committed_message_index") val lastCommittedMessageIndex: Int? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
     @SerialName("last_seen_message_id") val lastSeenMessageId: String? = null,
     @SerialName("last_seen_at") val lastSeenAt: String? = null,
+    @SerialName("foreground_sessions") val foregroundSessions: List<ForegroundSessionSummaryDto> = emptyList(),
 )

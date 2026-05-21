@@ -15,6 +15,8 @@ data class ChatMessage(
     val hasTokenUsage: Boolean,
     val tokenUsage: MessageTokenUsage? = null,
     val localState: MessageLocalState = MessageLocalState.Synced,
+    val streamTurnId: String? = null,
+    val syntheticStream: Boolean = false,
 )
 
 data class MessageAttachment(
@@ -24,6 +26,17 @@ data class MessageAttachment(
     val mediaType: String?,
     val sizeBytes: Long?,
     val url: String,
+    val uri: String = "",
+    val fileUri: String = "",
+    val path: String = "",
+    val filePath: String = "",
+    val workspacePath: String = "",
+    val relativePath: String = "",
+    val src: String = "",
+    val dataUrl: String = "",
+    val dataBase64: String = "",
+    val data: String = "",
+    val encoding: String = "",
 )
 
 sealed interface MessageItem {
@@ -65,5 +78,6 @@ data class MessageTokenUsage(
 enum class MessageLocalState {
     Synced,
     Sending,
+    Streaming,
     Failed,
 }

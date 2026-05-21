@@ -57,6 +57,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -81,6 +82,9 @@ import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
+import kotlinx.coroutines.delay
+import org.json.JSONArray
+import org.json.JSONObject
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -99,6 +103,7 @@ private val CodeHeaderText = Color(0xFF8A8F98)
 @Composable
 fun ChatScreen(
     conversationId: String,
+    foregroundSessionId: String = "main",
     onBack: () -> Unit,
     onOpenWorkspace: (String) -> Unit,
 ) {
@@ -114,7 +119,23 @@ fun ChatScreen(
     var earlierLoadAnchor by remember(conversationId) { mutableStateOf<ScrollAnchor?>(null) }
     var showDetails by remember(conversationId) { mutableStateOf(false) }
     val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
-    val timeline = remember(visibleMessages) { buildChatTimeline(visibleMessages) }
+    val agentProcessing = remember(state.progressTitle, state.realtimeState) {
+        isAgentProcessing(state.progressTitle, state.realtimeState)
+    }
+    val timeline = remember(visibleMessages, agentProcessing) { buildChatTimeline(visibleMessages, agentProcessing) }
+    val timelineContentVersion = remember(visibleMessages) { visibleMessages.contentVersion() }
+    val scopedPreviewPrefix = remember(conversationId, foregroundSessionId) { "$conversationId:$foregroundSessionId:" }
+    val previews = remember(state.attachmentPreviews, scopedPreviewPrefix) {
+        state.attachmentPreviews
+            .filterKeys { it.startsWith(scopedPreviewPrefix) }
+            .mapKeys { (key, _) -> key.removePrefix(scopedPreviewPrefix) }
+    }
+    val isNearBottom by remember(listState, timeline) {
+        derivedStateOf {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            lastVisible >= timeline.lastIndex - 1
+        }
+    }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
@@ -125,18 +146,18 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(conversationId) {
+    LaunchedEffect(conversationId, foregroundSessionId) {
         initialBottomPlaced = false
         AgentNotificationCenter.dismissConversation(application, conversationId)
-        viewModel.load(conversationId)
+        viewModel.load(conversationId, foregroundSessionId)
     }
 
-    LaunchedEffect(timeline.lastOrNull()?.key) {
+    LaunchedEffect(timeline.lastOrNull()?.key, timelineContentVersion) {
         if (timeline.isNotEmpty() && earlierLoadAnchor == null) {
             if (!initialBottomPlaced) {
                 listState.scrollToItem(timeline.lastIndex)
                 initialBottomPlaced = true
-            } else {
+            } else if (isNearBottom) {
                 listState.animateScrollToItem(timeline.lastIndex)
             }
         }
@@ -153,6 +174,13 @@ fun ChatScreen(
                 listState.scrollToItem(index, anchor.scrollOffset)
             }
             earlierLoadAnchor = null
+        }
+    }
+
+    LaunchedEffect(visibleMessages) {
+        visibleMessages.forEach { message ->
+            if (message.attachments.isNotEmpty()) viewModel.previewAttachments(message.attachments)
+            message.markdownImageTargets().forEach { target -> viewModel.previewMarkdownImage(message.id, target) }
         }
     }
 
@@ -187,6 +215,9 @@ fun ChatScreen(
         topBar = {
             ChatHeader(
                 title = state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } },
+                realtimeState = state.realtimeState,
+                progressTitle = state.progressTitle,
+                progressImportant = state.progressImportant,
                 onBack = onBack,
                 onOpenWorkspace = { onOpenWorkspace(conversationId) },
                 onShowDetails = { showDetails = true },
@@ -215,27 +246,25 @@ fun ChatScreen(
                     isLoadingEarlier = state.isLoadingEarlier,
                     timeline = timeline,
                     listState = listState,
-                    previews = state.attachmentPreviews,
+                    previews = previews,
+                    onPreviewMarkdownImage = { _, _ -> },
                     onPreviewAttachment = viewModel::previewAttachment,
+                    onDownloadAttachment = viewModel::downloadAttachment,
+                    onOpenAttachment = viewModel::openAttachment,
                     onRetrySend = viewModel::retrySend,
                     modifier = Modifier.weight(1f),
                 )
             }
 
-            RealtimeStatus(
-                realtimeState = state.realtimeState,
-                progressTitle = state.progressTitle,
-                progressDetail = state.progressDetail,
-                progressImportant = state.progressImportant,
-            )
-
             Composer(
                 draft = state.draft,
                 pendingAttachments = state.pendingAttachments,
+                selectionReferences = state.selectionReferences,
                 isSending = state.isSending,
                 onDraftChanged = viewModel::onDraftChanged,
                 onAddAttachments = viewModel::addAttachments,
                 onRemoveAttachment = viewModel::removeAttachment,
+                onRemoveSelectionReference = viewModel::removeSelectionReference,
                 onSend = viewModel::send,
             )
         }
@@ -254,10 +283,29 @@ fun ChatScreen(
 @Composable
 private fun ChatHeader(
     title: String,
+    realtimeState: String,
+    progressTitle: String?,
+    progressImportant: Boolean,
     onBack: () -> Unit,
     onOpenWorkspace: () -> Unit,
     onShowDetails: () -> Unit,
 ) {
+    val statusText = listOfNotNull(progressTitle, realtimeState.takeIf { it.isNotBlank() }).joinToString(" · ")
+    val hasError = statusText.contains("error", ignoreCase = true) ||
+        statusText.contains("failed", ignoreCase = true) ||
+        statusText.contains("unavailable", ignoreCase = true)
+    val isActive = progressTitle?.let { title ->
+        !title.equals("Done", ignoreCase = true) && !title.equals("Failed", ignoreCase = true)
+    } == true || realtimeState.contains("active", ignoreCase = true)
+    val detailsIcon = when {
+        isActive -> Icons.Filled.Terminal
+        else -> Icons.Filled.Info
+    }
+    val detailsTint = when {
+        hasError || progressImportant -> MaterialTheme.colorScheme.error
+        isActive -> MaterialTheme.colorScheme.primary
+        else -> Color.Black
+    }
     Surface(
         color = ChatBackground,
         tonalElevation = 0.dp,
@@ -303,7 +351,11 @@ private fun ChatHeader(
                         Icon(Icons.Filled.Folder, contentDescription = "Files")
                     }
                     IconButton(onClick = onShowDetails) {
-                        Icon(Icons.Filled.Info, contentDescription = "Conversation details")
+                        Icon(
+                            detailsIcon,
+                            contentDescription = "Conversation details",
+                            tint = detailsTint,
+                        )
                     }
                 }
             }
@@ -345,6 +397,7 @@ private fun ConversationDetailsDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 DetailLine("名称", summary?.displayName?.takeIf(String::isNotBlank) ?: conversationId)
                 DetailLine("会话 ID", conversationId)
+                DetailLine("Foreground session", summary?.foregroundSessionId?.takeIf(String::isNotBlank) ?: "main")
                 DetailLine("模型", summary?.model?.takeIf(String::isNotBlank) ?: "未知")
                 if (summary?.modelSelectionPending == true) {
                     DetailLine("模型状态", "等待选择")
@@ -360,7 +413,6 @@ private fun ConversationDetailsDialog(
                         DetailLine("Sessions", "${it.totalBackground} background · ${it.totalSubagents} subagents")
                     }
                     it.lastMessageTime?.let { time -> DetailLine("最近消息", time) }
-                    it.foregroundSessionId.takeIf(String::isNotBlank)?.let { session -> DetailLine("Foreground session", session) }
                 }
             }
         },
@@ -468,7 +520,10 @@ private fun MessageList(
     timeline: List<ChatTimelineItem>,
     listState: LazyListState,
     previews: Map<String, AttachmentPreviewUiState>,
+    onPreviewMarkdownImage: (String, String) -> Unit,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onDownloadAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
     onRetrySend: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -478,33 +533,29 @@ private fun MessageList(
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        if (isLoadingEarlier) {
-            item(key = "loading-earlier") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator()
-                    Text(
-                        text = "Loading earlier messages...",
-                        modifier = Modifier.padding(start = 12.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-            }
-        }
         items(timeline, key = { it.key }) { item ->
             when (item) {
                 is ChatTimelineItem.Message -> MessageCard(
                     message = item.message,
+                    extraToolItems = item.extraToolItems,
+                    processStartedAt = item.processStartedAt,
+                    processEndedAt = item.processEndedAt,
                     previews = previews,
+                    onPreviewMarkdownImage = onPreviewMarkdownImage,
                     onPreviewAttachment = onPreviewAttachment,
+                    onDownloadAttachment = onDownloadAttachment,
+                    onOpenAttachment = onOpenAttachment,
                     onRetrySend = onRetrySend,
                 )
-                is ChatTimelineItem.ToolSummary -> ToolSummaryCard(summary = item)
+                is ChatTimelineItem.AgentRun -> AgentRunCard(
+                    run = item,
+                    previews = previews,
+                    onPreviewMarkdownImage = onPreviewMarkdownImage,
+                    onPreviewAttachment = onPreviewAttachment,
+                    onDownloadAttachment = onDownloadAttachment,
+                    onOpenAttachment = onOpenAttachment,
+                    onRetrySend = onRetrySend,
+                )
             }
         }
     }
@@ -519,43 +570,75 @@ private data class ScrollAnchor(
 private sealed interface ChatTimelineItem {
     val key: String
 
-    data class Message(val message: ChatMessage) : ChatTimelineItem {
+    data class Message(
+        val message: ChatMessage,
+        val extraToolItems: List<MessageItem> = emptyList(),
+        val processStartedAt: String? = null,
+        val processEndedAt: String? = null,
+    ) : ChatTimelineItem {
         override val key: String = "message:${message.id}"
     }
 
-    data class ToolSummary(val messages: List<ChatMessage>) : ChatTimelineItem {
-        override val key: String = "tools:${messages.first().id}:${messages.last().id}"
-        val toolCallCount: Int = messages.sumOf { message -> message.items.count { it is MessageItem.ToolCall } }
-        val toolResultCount: Int = messages.sumOf { message -> message.items.count { it is MessageItem.ToolResult } }
+    data class AgentRun(
+        val triggerKey: String,
+        val messages: List<ChatMessage>,
+        val closedByUser: Boolean = false,
+        val forceRunning: Boolean = false,
+    ) : ChatTimelineItem {
+        val finalMessage: ChatMessage = messages.lastOrNull { !it.isToolOnlyMessage() } ?: messages.last()
+        override val key: String = "agent:$triggerKey"
+        val processMessages: List<ChatMessage> = messages.filter { it.id != finalMessage.id }
+        val processItems: List<MessageItem> = messages.flatMap { it.items }.filter { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
+        val startedAt: String? = messages.firstOrNull()?.messageTime
+        val endedAt: String? = finalMessage.messageTime
+        val running: Boolean = !closedByUser && (forceRunning || messages.any { it.localState == MessageLocalState.Streaming })
     }
 }
 
-private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineItem> {
+private fun buildChatTimeline(messages: List<ChatMessage>, latestAgentActive: Boolean): List<ChatTimelineItem> {
     val output = mutableListOf<ChatTimelineItem>()
-    val pendingTools = mutableListOf<ChatMessage>()
-    fun flushPendingTools(fold: Boolean = true) {
-        if (pendingTools.isEmpty()) return
-        if (fold) {
-            output += ChatTimelineItem.ToolSummary(pendingTools.toList())
-        } else {
-            output += pendingTools.map { ChatTimelineItem.Message(it) }
-        }
-        pendingTools.clear()
+    val pendingAgent = mutableListOf<ChatMessage>()
+    var currentUserKey = "initial"
+
+    fun flushAgent(closedByUser: Boolean = false, forceRunning: Boolean = false) {
+        if (pendingAgent.isEmpty()) return
+        output += ChatTimelineItem.AgentRun(
+            triggerKey = currentUserKey,
+            messages = pendingAgent.toList(),
+            closedByUser = closedByUser,
+            forceRunning = forceRunning,
+        )
+        pendingAgent.clear()
     }
 
     messages.forEach { message ->
-        when {
-            message.isToolOnlyMessage() -> pendingTools += message
-            else -> {
-                flushPendingTools()
-                output += ChatTimelineItem.Message(message)
-            }
+        if (message.role.equals("user", ignoreCase = true)) {
+            flushAgent(closedByUser = true)
+            output += ChatTimelineItem.Message(message)
+            currentUserKey = message.id.ifBlank { "user-${message.index}" }
+        } else if (message.role.equals("assistant", ignoreCase = true)) {
+            pendingAgent += message
+        } else {
+            flushAgent()
+            output += ChatTimelineItem.Message(message)
         }
     }
-    // Only fold tool-only runs once a following non-tool message closes the chain.
-    // A trailing tool run means the assistant turn is still in progress, so keep each tool message visible.
-    flushPendingTools(fold = false)
+    flushAgent(forceRunning = latestAgentActive)
     return output
+}
+
+private fun isAgentProcessing(progressTitle: String?, realtimeState: String): Boolean {
+    val title = progressTitle.orEmpty()
+    if (title.isNotBlank() && !title.equals("Done", ignoreCase = true) && !title.equals("Failed", ignoreCase = true)) {
+        return true
+    }
+    return listOf(
+        "agent running",
+        "assistant streaming",
+        "assistant reasoning",
+        "preparing tool call",
+        "tool result received",
+    ).any { realtimeState.contains(it, ignoreCase = true) }
 }
 
 private fun ChatMessage.isRuntimeMetadataMessage(): Boolean {
@@ -571,84 +654,131 @@ private fun ChatMessage.isToolOnlyMessage(): Boolean =
         attachments.isEmpty() &&
         items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
 
-@Composable
-private fun ToolSummaryCard(summary: ChatTimelineItem.ToolSummary) {
-    var expanded by remember(summary.key) { mutableStateOf(false) }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { expanded = !expanded }
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Tools · ran ${summary.toolCallCount} commands",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    text = if (expanded) "Hide list" else "Show list",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            Text(
-                text = "${summary.messages.size} tool messages · ${summary.toolResultCount} results",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (expanded) {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    summary.messages.forEach { message ->
-                        Text(
-                            text = "#${message.index}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        ToolItemList(items = message.items)
-                    }
-                }
-            }
-        }
-    }
-}
-
 private fun ChatTimelineItem.anchorMessageId(): String? = when (this) {
     is ChatTimelineItem.Message -> message.id
-    is ChatTimelineItem.ToolSummary -> messages.firstOrNull()?.id
+    is ChatTimelineItem.AgentRun -> messages.firstOrNull()?.id
 }
 
 private fun ChatTimelineItem.containsMessageId(messageId: String): Boolean = when (this) {
     is ChatTimelineItem.Message -> message.id == messageId
-    is ChatTimelineItem.ToolSummary -> messages.any { it.id == messageId }
+    is ChatTimelineItem.AgentRun -> messages.any { it.id == messageId }
+}
+
+@Composable
+private fun AgentRunCard(
+    run: ChatTimelineItem.AgentRun,
+    previews: Map<String, AttachmentPreviewUiState>,
+    onPreviewMarkdownImage: (String, String) -> Unit,
+    onPreviewAttachment: (MessageAttachment) -> Unit,
+    onDownloadAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
+    onRetrySend: (String) -> Unit,
+) {
+    val processMessages = run.processMessages.filterNot { it.isToolOnlyMessage() }
+    val finalMessage = run.finalMessage
+    val finalText = finalMessage.text.ifBlank { finalMessage.preview }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start,
+        verticalAlignment = Alignment.Top,
+    ) {
+        AssistantAvatar()
+        Spacer(modifier = Modifier.size(10.dp))
+        Column(
+            modifier = Modifier.weight(1f),
+            horizontalAlignment = Alignment.Start,
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Text(
+                text = "Assistant",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MutedText,
+            )
+            if (run.processMessages.isNotEmpty() || run.processItems.isNotEmpty()) {
+                AgentProcessPanel(
+                    runKey = run.key,
+                    processMessages = processMessages,
+                    items = run.processItems,
+                    startedAt = run.startedAt,
+                    endedAt = if (run.running) null else run.endedAt,
+                    running = run.running,
+                )
+            }
+            if (finalText.isNotBlank()) {
+                SelectionContainer {
+                    MessageBody(
+                        messageId = finalMessage.id,
+                        text = finalText,
+                        attachments = finalMessage.attachments,
+                        previews = previews,
+                        onPreviewMarkdownImage = onPreviewMarkdownImage,
+                        onOpenAttachment = onOpenAttachment,
+                    )
+                }
+            } else {
+                val textItems = finalMessage.items.filterIsInstance<MessageItem.Text>()
+                if (textItems.isNotEmpty()) {
+                    SelectionContainer {
+                        MessageBody(
+                            messageId = finalMessage.id,
+                            text = textItems.joinToString("\n\n") { it.text },
+                            attachments = finalMessage.attachments,
+                            previews = previews,
+                            onPreviewMarkdownImage = onPreviewMarkdownImage,
+                            onOpenAttachment = onOpenAttachment,
+                        )
+                    }
+                }
+            }
+            if (finalMessage.attachments.isNotEmpty()) {
+                AttachmentList(
+                    attachments = finalMessage.attachments,
+                    previews = previews,
+                    compact = false,
+                    onPreviewAttachment = onPreviewAttachment,
+                    onDownloadAttachment = onDownloadAttachment,
+                    onOpenAttachment = onOpenAttachment,
+                )
+            }
+            MessageMetaRow(
+                message = finalMessage,
+                alignEnd = false,
+                onRetrySend = onRetrySend,
+            )
+        }
+    }
 }
 
 @Composable
 private fun MessageCard(
     message: ChatMessage,
+    extraToolItems: List<MessageItem>,
+    processStartedAt: String?,
+    processEndedAt: String?,
     previews: Map<String, AttachmentPreviewUiState>,
+    onPreviewMarkdownImage: (String, String) -> Unit,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onDownloadAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
     onRetrySend: (String) -> Unit,
 ) {
     val isUserMessage = message.role.equals("user", ignoreCase = true)
+    val toolItems = message.items + extraToolItems
     val roleLabel = when (message.role.lowercase()) {
         "user" -> message.userName?.takeIf { it.isNotBlank() } ?: "User"
         "assistant" -> "Assistant"
         "system" -> "System"
         else -> message.role.ifBlank { "Message" }
     }
-    val toolExplanations = message.items
+    val toolExplanations = toolItems
         .filterIsInstance<MessageItem.ToolCall>()
         .mapNotNull { it.explanation?.trim()?.takeIf(String::isNotEmpty) }
     val displayText = message.text.ifBlank {
         toolExplanations.joinToString("\n\n").ifBlank { message.preview }
     }
+    val hasToolProcess = toolItems.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
+    val processRunning = hasToolProcess && message.localState == MessageLocalState.Streaming
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUserMessage) Arrangement.End else Arrangement.Start,
@@ -701,20 +831,51 @@ private fun MessageCard(
                     fontWeight = FontWeight.Bold,
                     color = MutedText,
                 )
+                if (hasToolProcess) {
+                    AgentProcessPanel(
+                        runKey = "message:${message.id}:tools",
+                        processMessages = emptyList(),
+                        items = toolItems,
+                        startedAt = processStartedAt ?: message.messageTime,
+                        endedAt = processEndedAt,
+                        running = processRunning,
+                    )
+                }
                 if (displayText.isNotBlank()) {
                     SelectionContainer {
-                        MessageBody(text = displayText)
+                        MessageBody(
+                            messageId = message.id,
+                            text = displayText,
+                            attachments = message.attachments,
+                            previews = previews,
+                            onPreviewMarkdownImage = onPreviewMarkdownImage,
+                            onOpenAttachment = onOpenAttachment,
+                        )
+                    }
+                } else {
+                    val textItems = message.items.filterIsInstance<MessageItem.Text>()
+                    if (textItems.isNotEmpty()) {
+                        SelectionContainer {
+                            MessageBody(
+                                messageId = message.id,
+                                text = textItems.joinToString("\n\n") { it.text },
+                                attachments = message.attachments,
+                                previews = previews,
+                                onPreviewMarkdownImage = onPreviewMarkdownImage,
+                                onOpenAttachment = onOpenAttachment,
+                            )
+                        }
                     }
                 }
-            }
-            if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
-                ToolItemList(items = message.items)
             }
             if (message.attachments.isNotEmpty()) {
                 AttachmentList(
                     attachments = message.attachments,
                     previews = previews,
+                    compact = isUserMessage,
                     onPreviewAttachment = onPreviewAttachment,
+                    onDownloadAttachment = onDownloadAttachment,
+                    onOpenAttachment = onOpenAttachment,
                 )
             }
             MessageMetaRow(
@@ -771,6 +932,11 @@ private fun MessageMetaRow(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                 )
+                MessageLocalState.Streaming -> Text(
+                    text = "streaming...",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
                 MessageLocalState.Failed -> {
                     Text(
                         text = "send failed",
@@ -814,24 +980,49 @@ private fun MessageMetaRow(
 }
 
 @Composable
-private fun MessageBody(text: String) {
+private fun MessageBody(
+    messageId: String,
+    text: String,
+    attachments: List<MessageAttachment>,
+    previews: Map<String, AttachmentPreviewUiState>,
+    onPreviewMarkdownImage: (String, String) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
+) {
     val blocks = markdownBlocks(text)
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { block ->
             when (block) {
                 is MarkdownBlock.Code -> CodeBlock(block)
-                is MarkdownBlock.Text -> MarkdownText(block.text)
+                is MarkdownBlock.Text -> MarkdownText(messageId, block.text, attachments, previews, onPreviewMarkdownImage, onOpenAttachment)
             }
         }
     }
 }
 
 @Composable
-private fun MarkdownText(text: String) {
+private fun MarkdownText(
+    messageId: String,
+    text: String,
+    attachments: List<MessageAttachment>,
+    previews: Map<String, AttachmentPreviewUiState>,
+    onPreviewMarkdownImage: (String, String) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
         text.lines().forEach { rawLine ->
             val line = rawLine.trimEnd()
+            val inlineImage = line.markdownImageAttachment(attachments)
+            val inlineImageTarget = if (inlineImage == null) line.markdownImageTarget() else null
             when {
+                inlineImage != null -> Box(modifier = Modifier.clickable { onOpenAttachment(inlineImage) }) {
+                    AttachmentPreview(previews[inlineImage.previewKey()])
+                }
+                inlineImageTarget != null -> {
+                    MarkdownImageReference(
+                        path = inlineImageTarget,
+                        onClick = { onOpenAttachment(inlineImageTarget.toMarkdownImageAttachment()) },
+                    )
+                }
                 line.isBlank() -> Text("", style = MaterialTheme.typography.bodySmall)
                 line.startsWith("### ") -> Text(
                     text = line.removePrefix("### "),
@@ -861,6 +1052,101 @@ private fun MarkdownText(text: String) {
         }
     }
 }
+
+private fun String.markdownImageAttachment(attachments: List<MessageAttachment>): MessageAttachment? {
+    val target = markdownImageTarget() ?: return null
+    val normalizedTarget = target.normalizedAttachmentTarget()
+    return attachments.firstOrNull { attachment ->
+        attachment.kind == "image" && attachment.normalizedTargets().any { it == normalizedTarget }
+    }
+}
+
+@Composable
+private fun MarkdownImageReference(path: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
+        shape = RoundedCornerShape(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.Folder, contentDescription = null, tint = CodeHeaderText)
+            Text(
+                text = path.substringBefore('?').substringBefore('#').substringAfterLast('/').ifBlank { path },
+                style = MaterialTheme.typography.bodySmall,
+                color = CodeHeaderText,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private fun String.markdownImageTarget(): String? = MarkdownImageLinePattern.matchEntire(trim())
+    ?.groupValues
+    ?.getOrNull(2)
+    ?.trim()
+    ?.takeIf { it.isMarkdownImagePath() }
+
+private fun String.toMarkdownImageAttachment(): MessageAttachment = MessageAttachment(
+    index = -1,
+    kind = "image",
+    name = substringBefore('?').substringBefore('#').substringAfterLast('/').ifBlank { "image" },
+    mediaType = markdownImageMediaType(),
+    sizeBytes = null,
+    url = takeIf { it.contains("://") }.orEmpty(),
+    path = takeUnless { it.contains("://") }.orEmpty(),
+)
+
+private fun ChatMessage.markdownImageTargets(): List<String> = emptyList()
+
+private fun List<ChatMessage>.contentVersion(): Int = fold(1) { acc, message ->
+    31 * acc + message.contentSignature().hashCode()
+}
+
+private fun ChatMessage.contentSignature(): String = buildString {
+    append(id).append('|')
+    append(index).append('|')
+    append(localState).append('|')
+    append(text.length).append('|')
+    append(preview.length).append('|')
+    append(items.size).append('|')
+    append(attachments.size)
+}
+
+private fun String.isMarkdownImagePath(): Boolean {
+    if (isBlank() || startsWith("#") || startsWith("data:") || startsWith("blob:")) return false
+    val extension = substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase()
+    return extension in setOf("png", "jpg", "jpeg", "gif", "webp", "svg")
+}
+
+private fun MessageAttachment.normalizedTargets(): List<String> = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
+    .filter { it.isNotBlank() }
+    .map { it.normalizedAttachmentTarget() }
+
+private fun String.normalizedAttachmentTarget(): String = trim()
+    .substringBefore('?')
+    .substringBefore('#')
+    .removePrefix("file://")
+    .replace('\\', '/')
+    .trimStart('/')
+
+private fun String.markdownImageMediaType(): String? = when (substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase()) {
+    "png" -> "image/png"
+    "jpg", "jpeg" -> "image/jpeg"
+    "gif" -> "image/gif"
+    "webp" -> "image/webp"
+    "svg" -> "image/svg+xml"
+    else -> null
+}
+
+private val MarkdownImageLinePattern = Regex("!\\[([^\\]]*)]\\(([^)]+)\\)")
 
 @Composable
 private fun CodeBlock(block: MarkdownBlock.Code) {
@@ -924,24 +1210,202 @@ private fun CodeBlock(block: MarkdownBlock.Code) {
 
 @Composable
 private fun ToolItemList(items: List<MessageItem>) {
+    val toolItems = remember(items) { buildToolDisplayItems(items) }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        items.forEach { item ->
-            when (item) {
-                is MessageItem.ToolCall -> ToolCard(
-                    title = "tool call · ${item.toolName.ifBlank { item.toolCallId }}",
-                    body = item.arguments.ifBlank { "{}" },
-                    isResult = false,
+        toolItems.forEach { item ->
+            ToolCard(
+                title = item.title,
+                body = item.body,
+                isResult = item.completed,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AgentProcessPanel(
+    runKey: String,
+    processMessages: List<ChatMessage>,
+    items: List<MessageItem>,
+    startedAt: String?,
+    endedAt: String?,
+    running: Boolean,
+) {
+    var expanded by remember(runKey) { mutableStateOf(running) }
+    var wasRunning by remember(runKey) { mutableStateOf(running) }
+    var now by remember { mutableStateOf(Instant.now()) }
+    LaunchedEffect(running) {
+        if (running) {
+            expanded = true
+        } else if (wasRunning) {
+            expanded = false
+        }
+        wasRunning = running
+        while (running) {
+            now = Instant.now()
+            delay(1_000)
+        }
+    }
+    val start = startedAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+    val end = endedAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+    val elapsed = start?.let { formatElapsedDuration(it, if (running) now else end ?: now) }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = !expanded },
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (running) MaterialTheme.colorScheme.primary else MutedText),
+                    )
+                    Text(
+                        text = listOfNotNull("已处理", elapsed).joinToString(" "),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = CodeHeaderText,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Icon(
+                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (expanded) "Hide process" else "Show process",
+                    tint = CodeHeaderText,
                 )
-                is MessageItem.ToolResult -> ToolCard(
-                    title = "tool result · ${item.toolName.ifBlank { item.toolCallId }}" +
-                        item.fileAttachmentIndex?.let { " · file #$it" }.orEmpty(),
-                    body = item.context?.takeIf { it.isNotBlank() } ?: "[no textual result]",
-                    isResult = true,
-                )
-                else -> Unit
+            }
+            if (expanded) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    processMessages.forEach { message ->
+                        val body = message.text.ifBlank { message.preview }
+                        if (body.isNotBlank()) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = Color(0xFFF0F0F4),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text(
+                                    text = body.take(2_000),
+                                    modifier = Modifier.padding(10.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                    if (items.isNotEmpty()) {
+                        ToolItemList(items = items)
+                    }
+                }
             }
         }
     }
+}
+
+private data class ToolDisplayItem(
+    val id: String,
+    val title: String,
+    val body: String,
+    val completed: Boolean,
+)
+
+private fun buildToolDisplayItems(items: List<MessageItem>): List<ToolDisplayItem> {
+    val calls = linkedMapOf<String, MessageItem.ToolCall>()
+    val results = linkedMapOf<String, MutableList<MessageItem.ToolResult>>()
+    items.forEach { item ->
+        when (item) {
+            is MessageItem.ToolCall -> calls[item.toolCallId.ifBlank { "tool-${item.index}" }] = item
+            is MessageItem.ToolResult -> results.getOrPut(item.toolCallId.ifBlank { "tool-${item.index}" }) { mutableListOf() } += item
+            else -> Unit
+        }
+    }
+    val display = mutableListOf<ToolDisplayItem>()
+    calls.forEach { (id, call) ->
+        val callResults = results.remove(id).orEmpty().ifEmpty {
+            val name = call.toolName.ifBlank { call.toolCallId }
+            val matchingKey = results.entries.singleOrNull { (_, values) ->
+                values.any { it.toolName == name && name.isNotBlank() }
+            }?.key
+            if (matchingKey == null) emptyList() else results.remove(matchingKey).orEmpty()
+        }
+        display += call.toDisplayItem(id, callResults)
+    }
+    results.forEach { (id, orphanResults) ->
+        display += orphanResults.first().toDisplayItem(id, orphanResults)
+    }
+    return display
+}
+
+private fun List<MessageItem>.hasOpenToolCall(): Boolean {
+    val resultIds = filterIsInstance<MessageItem.ToolResult>()
+        .map { it.toolCallId }
+        .filter { it.isNotBlank() }
+        .toSet()
+    return filterIsInstance<MessageItem.ToolCall>().any { call ->
+        val id = call.toolCallId
+        id.isBlank() || id !in resultIds
+    }
+}
+
+private fun MessageItem.ToolCall.toDisplayItem(id: String, results: List<MessageItem.ToolResult>): ToolDisplayItem {
+    val name = toolName.ifBlank { toolCallId.ifBlank { "tool" } }
+    val completed = results.isNotEmpty()
+    val body = buildString {
+        appendToolSection("参数", arguments)
+        results.forEachIndexed { index, result ->
+            if (isNotBlank()) append("\n\n")
+            appendToolSection(if (results.size == 1) "结果" else "结果 ${index + 1}", result.context?.takeIf { it.isNotBlank() } ?: "[no textual result]")
+            result.fileAttachmentIndex?.let { append("\n文件: #$it") }
+        }
+    }.ifBlank { "[no tool detail]" }
+    return ToolDisplayItem(
+        id = id,
+        title = if (completed) "已运行 $name" else "正在运行 $name",
+        body = body,
+        completed = completed,
+    )
+}
+
+private fun MessageItem.ToolResult.toDisplayItem(id: String, results: List<MessageItem.ToolResult>): ToolDisplayItem {
+    val name = toolName.ifBlank { toolCallId.ifBlank { "tool" } }
+    val body = buildString {
+        results.forEachIndexed { index, result ->
+            if (isNotBlank()) append("\n\n")
+            appendToolSection(if (results.size == 1) "结果" else "结果 ${index + 1}", result.context?.takeIf { it.isNotBlank() } ?: "[no textual result]")
+            result.fileAttachmentIndex?.let { append("\n文件: #$it") }
+        }
+    }.ifBlank { "[no textual result]" }
+    return ToolDisplayItem(id = id, title = "已运行 $name", body = body, completed = true)
+}
+
+private fun StringBuilder.appendToolSection(title: String, raw: String) {
+    append(title)
+    append(":\n")
+    append(formatToolContent(raw))
+}
+
+private fun formatToolContent(raw: String): String {
+    val text = raw.trim().ifBlank { return "[empty]" }
+    return runCatching {
+        when {
+            text.startsWith("{") -> JSONObject(text).toString(2)
+            text.startsWith("[") -> JSONArray(text).toString(2)
+            else -> text
+        }
+    }.getOrElse { text }
 }
 
 @Composable
@@ -1010,14 +1474,20 @@ private fun ToolCard(
 private fun AttachmentList(
     attachments: List<MessageAttachment>,
     previews: Map<String, AttachmentPreviewUiState>,
+    compact: Boolean,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onDownloadAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         attachments.forEach { attachment ->
             AttachmentCard(
                 attachment = attachment,
                 preview = previews[attachment.previewKey()],
+                compact = compact,
                 onPreviewAttachment = onPreviewAttachment,
+                onDownloadAttachment = onDownloadAttachment,
+                onOpenAttachment = onOpenAttachment,
             )
         }
     }
@@ -1027,36 +1497,51 @@ private fun AttachmentList(
 private fun AttachmentCard(
     attachment: MessageAttachment,
     preview: AttachmentPreviewUiState?,
+    compact: Boolean,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onDownloadAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = attachment.url.isNotBlank()) { onPreviewAttachment(attachment) },
+            .clickable(enabled = attachment.hasLoadTarget()) {
+                if (compact) onOpenAttachment(attachment) else onPreviewAttachment(attachment)
+            },
     ) {
         Column(
             modifier = Modifier.padding(10.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(
-                text = "${attachment.kind.ifBlank { "file" }} · ${attachment.name.ifBlank { "attachment-${attachment.index}" }}",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = listOfNotNull(
-                    attachment.mediaType,
-                    attachment.sizeBytes?.let(::formatBytes),
-                ).joinToString(" · ").ifBlank { "Tap to preview" },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            AttachmentPreview(preview)
-            if (attachment.url.isNotBlank()) {
+            if (!compact) {
                 Text(
-                    text = "tap to load · ${attachment.url}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
+                    text = "${attachment.kind.ifBlank { "file" }} · ${attachment.name.ifBlank { "attachment-${attachment.index}" }}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
                 )
+                Text(
+                    text = listOfNotNull(
+                        attachment.mediaType,
+                        attachment.sizeBytes?.let(::formatBytes),
+                    ).joinToString(" · ").ifBlank { "Tap to preview" },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else if (preview?.image == null) {
+                Text(
+                    text = attachment.name.ifBlank { "attachment-${attachment.index}" },
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            AttachmentPreview(preview)
+            if (attachment.hasLoadTarget() && !compact) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { onPreviewAttachment(attachment) }) { Text("Preview") }
+                    TextButton(onClick = { onDownloadAttachment(attachment) }) { Text("Download") }
+                    TextButton(onClick = { onOpenAttachment(attachment) }) { Text("Open") }
+                }
             }
         }
     }
@@ -1102,7 +1587,12 @@ private fun AttachmentPreview(preview: AttachmentPreviewUiState?) {
     }
 }
 
-private fun MessageAttachment.previewKey(): String = url.ifBlank { "$index:$name" }
+private fun MessageAttachment.previewKey(): String = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
+    .firstOrNull { it.isNotBlank() }
+    ?: "$index:$name"
+
+private fun MessageAttachment.hasLoadTarget(): Boolean = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data)
+    .any { it.isNotBlank() }
 
 private sealed interface MarkdownBlock {
     data class Text(val text: String) : MarkdownBlock
@@ -1161,6 +1651,18 @@ private fun formatBytes(value: Long): String {
     }
 }
 
+private fun formatElapsedDuration(start: Instant, end: Instant): String {
+    val seconds = java.time.Duration.between(start, end).seconds.coerceAtLeast(0)
+    val hours = seconds / 3600
+    val minutes = (seconds % 3600) / 60
+    val remainingSeconds = seconds % 60
+    return when {
+        hours > 0 -> "${hours}h ${minutes}m ${remainingSeconds}s"
+        minutes > 0 -> "${minutes}m ${remainingSeconds}s"
+        else -> "${remainingSeconds}s"
+    }
+}
+
 private fun formatCompactNumber(value: Long): String = when {
     value >= 1_000_000 -> "${String.format("%.1f", value / 1_000_000.0)}M"
     value >= 1_000 -> {
@@ -1182,10 +1684,12 @@ private val LocalMinuteFormatter: DateTimeFormatter = DateTimeFormatter.ofPatter
 private fun Composer(
     draft: String,
     pendingAttachments: List<PendingAttachmentUiState>,
+    selectionReferences: List<SelectionReferenceUiState>,
     isSending: Boolean,
     onDraftChanged: (String) -> Unit,
     onAddAttachments: (List<android.net.Uri>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
+    onRemoveSelectionReference: (String) -> Unit,
     onSend: () -> Unit,
 ) {
     val attachmentLauncher = rememberLauncherForActivityResult(
@@ -1222,6 +1726,31 @@ private fun Composer(
                     }
                 }
             }
+            }
+        }
+        if (selectionReferences.isNotEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
+            ) {
+                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    selectionReferences.forEach { reference ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(text = reference.label ?: reference.path, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(text = reference.path, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            IconButton(onClick = { onRemoveSelectionReference(reference.path) }) {
+                                Icon(Icons.Filled.Close, contentDescription = "Remove reference")
+                            }
+                        }
+                    }
+                }
             }
         }
         Row(
@@ -1261,7 +1790,7 @@ private fun Composer(
             Surface(
                 modifier = Modifier.size(58.dp),
                 shape = CircleShape,
-                color = if ((draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending) {
+                color = if ((draft.isNotBlank() || pendingAttachments.isNotEmpty() || selectionReferences.isNotEmpty()) && !isSending) {
                     Color(0xFF7A7A7A)
                 } else {
                     Color(0x33808080)
@@ -1269,7 +1798,7 @@ private fun Composer(
             ) {
                 IconButton(
                     onClick = onSend,
-                    enabled = (draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending,
+                    enabled = (draft.isNotBlank() || pendingAttachments.isNotEmpty() || selectionReferences.isNotEmpty()) && !isSending,
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.Send,

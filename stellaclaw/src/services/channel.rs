@@ -113,6 +113,7 @@ impl ConversationService for ChannelService {
 enum PendingWorkspaceRequest {
     Platform {
         request_id: String,
+        request: WorkspaceRequest,
     },
     IncomingMessage {
         request_id: String,
@@ -126,7 +127,7 @@ enum PendingWorkspaceRequest {
 impl PendingWorkspaceRequest {
     fn request_id(&self) -> &str {
         match self {
-            PendingWorkspaceRequest::Platform { request_id }
+            PendingWorkspaceRequest::Platform { request_id, .. }
             | PendingWorkspaceRequest::IncomingMessage { request_id, .. } => request_id,
         }
     }
@@ -781,6 +782,7 @@ fn handle_channel_ingress(
         } => {
             pending_workspace.push_back(PendingWorkspaceRequest::Platform {
                 request_id: request_id.clone(),
+                request: request.clone(),
             });
             emit_channel_event(
                 event_tx,
@@ -879,8 +881,8 @@ fn handle_workspace_response(
     response_id: Option<&str>,
     response: WorkspaceResponse,
 ) -> Result<()> {
-    match pop_pending_workspace(pending_workspace, response_id) {
-        Some(PendingWorkspaceRequest::Platform { request_id }) => {
+    match pop_pending_workspace(pending_workspace, response_id, &response) {
+        Some(PendingWorkspaceRequest::Platform { request_id, .. }) => {
             emit_channel_event(
                 event_tx,
                 ChannelEvent::Workspace {
@@ -960,6 +962,7 @@ fn handle_workspace_response(
 fn pop_pending_workspace(
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
     response_id: Option<&str>,
+    response: &WorkspaceResponse,
 ) -> Option<PendingWorkspaceRequest> {
     if let Some(response_id) = response_id {
         if let Some(index) = pending_workspace
@@ -968,8 +971,77 @@ fn pop_pending_workspace(
         {
             return pending_workspace.remove(index);
         }
+        let matches: Vec<usize> = pending_workspace
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pending)| {
+                pending_workspace_matches_response(pending, response).then_some(index)
+            })
+            .collect();
+        return if matches.len() == 1 {
+            pending_workspace.remove(matches[0])
+        } else {
+            None
+        };
     }
     pending_workspace.pop_front()
+}
+
+fn pending_workspace_matches_response(
+    pending: &PendingWorkspaceRequest,
+    response: &WorkspaceResponse,
+) -> bool {
+    match (pending, response) {
+        (
+            PendingWorkspaceRequest::Platform {
+                request: WorkspaceRequest::ReadFile { path, .. },
+                ..
+            },
+            WorkspaceResponse::File {
+                path: response_path,
+                ..
+            },
+        ) => workspace_path_eq(path, response_path),
+        (
+            PendingWorkspaceRequest::Platform {
+                request: WorkspaceRequest::List { path, .. },
+                ..
+            },
+            WorkspaceResponse::Listing {
+                path: response_path,
+                ..
+            },
+        ) => workspace_path_eq(path.as_deref().unwrap_or_default(), response_path),
+        (
+            PendingWorkspaceRequest::Platform {
+                request: WorkspaceRequest::DownloadArchive { paths, .. },
+                ..
+            },
+            WorkspaceResponse::ArchiveDownloaded {
+                paths: response_paths,
+                ..
+            },
+        ) => {
+            paths.len() == response_paths.len()
+                && paths
+                    .iter()
+                    .zip(response_paths.iter())
+                    .all(|(left, right)| workspace_path_eq(left, right))
+        }
+        _ => false,
+    }
+}
+
+fn workspace_path_eq(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .replace('\\', "/")
+    };
+    normalize(left) == normalize(right)
 }
 
 fn pop_pending_terminal(
@@ -1391,4 +1463,103 @@ fn handle_session_event(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_read(request_id: &str, path: &str) -> PendingWorkspaceRequest {
+        PendingWorkspaceRequest::Platform {
+            request_id: request_id.to_string(),
+            request: WorkspaceRequest::ReadFile {
+                path: path.to_string(),
+                target: Default::default(),
+                offset: Some(0),
+                limit_bytes: Some(1024),
+            },
+        }
+    }
+
+    fn file_response(path: &str) -> WorkspaceResponse {
+        WorkspaceResponse::File {
+            target: Default::default(),
+            remote: None,
+            workspace_root: String::new(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size_bytes: 0,
+            modified_ms: None,
+            offset: 0,
+            returned_bytes: 0,
+            truncated: false,
+            encoding: workspace::WorkspaceFileEncoding::Utf8,
+            data: String::new(),
+        }
+    }
+
+    #[test]
+    fn unmatched_workspace_response_id_does_not_pop_unrelated_pending_request() {
+        let mut pending = VecDeque::from([
+            pending_read("workspace-a", "a.png"),
+            pending_read("workspace-b", "b.png"),
+        ]);
+
+        assert!(pop_pending_workspace(
+            &mut pending,
+            Some("workspace-stale"),
+            &file_response("c.png")
+        )
+        .is_none());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending.front().map(PendingWorkspaceRequest::request_id),
+            Some("workspace-a")
+        );
+    }
+
+    #[test]
+    fn mismatched_workspace_response_id_can_match_by_file_path() {
+        let mut pending = VecDeque::from([
+            pending_read("workspace-a", "a.png"),
+            pending_read("workspace-b", "b.png"),
+        ]);
+
+        let popped = pop_pending_workspace(
+            &mut pending,
+            Some("workspace-stale"),
+            &file_response("b.png"),
+        );
+
+        assert_eq!(
+            popped.map(|pending| pending.request_id().to_string()),
+            Some("workspace-b".to_string())
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.front().map(PendingWorkspaceRequest::request_id),
+            Some("workspace-a")
+        );
+    }
+
+    #[test]
+    fn matching_workspace_response_id_removes_that_pending_request() {
+        let mut pending = VecDeque::from([
+            pending_read("workspace-a", "a.png"),
+            pending_read("workspace-b", "b.png"),
+        ]);
+
+        let popped =
+            pop_pending_workspace(&mut pending, Some("workspace-b"), &file_response("a.png"));
+
+        assert_eq!(
+            popped.map(|pending| pending.request_id().to_string()),
+            Some("workspace-b".to_string())
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.front().map(PendingWorkspaceRequest::request_id),
+            Some("workspace-a")
+        );
+    }
 }

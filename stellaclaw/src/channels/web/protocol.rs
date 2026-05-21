@@ -8,6 +8,8 @@ use stellaclaw_core::session_actor::{
 
 use crate::service_protos::agent_session::{AgentMessageOrigin, AgentSessionState};
 
+use super::main::ChatLiveState;
+
 pub const HOME_WS_PATH: &str = "/api/ws/home";
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
@@ -136,6 +138,30 @@ pub fn chat_snapshot(
         "current_provisional_assistant_message": current_provisional_assistant_message,
         "running_tool_results": running_tool_results,
         "queued_outbound_messages": queued_outbound_messages,
+    })
+}
+
+pub(super) fn chat_heartbeat(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    live: ChatLiveState,
+    server_time: String,
+) -> Value {
+    let state = live.summary_state();
+    let active_turn_id = live.active_turn_id();
+    json!({
+        "type": "chat.heartbeat",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "server_time": server_time,
+        "state": state,
+        "running": state == "running",
+        "active_turn_id": active_turn_id,
+        "current_turn_state": live.current_turn_state,
+        "current_provisional_assistant_message": live.current_provisional_assistant_message,
+        "running_tool_results": live.running_tool_results,
+        "queued_outbound_messages": live.queued_outbound_messages,
+        "last_error": live.last_error,
     })
 }
 
