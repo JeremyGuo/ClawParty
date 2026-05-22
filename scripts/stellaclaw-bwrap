@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_bwrap=/usr/bin/bwrap
+runtime_root=/home/liuhao/clawparty_workdir/rundir/.sandbox-tmp
+owner_pid=$$
+
+mkdir -p "$runtime_root"
+chmod 700 "$runtime_root"
+
+cleanup_stale_tmpdirs() {
+  local dir base pid
+  shopt -s nullglob
+  for dir in "$runtime_root"/tmp.*.* "$runtime_root"/var-tmp.*.*; do
+    [[ -d "$dir" ]] || continue
+    base=$(basename "$dir")
+    pid=${base#*.}
+    pid=${pid%%.*}
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    rm -rf --one-file-system "$dir"
+  done
+  # Clean legacy directories from older wrapper versions. These names do not
+  # encode an owner PID, so only remove them when they are old enough that they
+  # cannot belong to a just-started wrapper.
+  find "$runtime_root" -maxdepth 1 -type d \( -name 'tmp.*' -o -name 'var-tmp.*' \) \
+    ! -name 'tmp.*.*' ! -name 'var-tmp.*.*' -mmin +60 -exec rm -rf --one-file-system {} + 2>/dev/null || true
+}
+
+cleanup_stale_tmpdirs
+
+tmpdir=$(mktemp -d "$runtime_root/tmp.${owner_pid}.XXXXXXXXXX")
+vartmpdir=$(mktemp -d "$runtime_root/var-tmp.${owner_pid}.XXXXXXXXXX")
+chmod 1777 "$tmpdir" "$vartmpdir"
+
+cleanup() {
+  rm -rf --one-file-system "$tmpdir" "$vartmpdir"
+}
+trap cleanup EXIT INT TERM HUP
+
+args=(
+  --setenv TMPDIR /tmp
+)
+
+while (($#)); do
+  if [[ "$1" == "--tmpfs" && "${2:-}" == "/tmp" ]]; then
+    args+=(--bind "$tmpdir" /tmp)
+    shift 2
+  elif [[ "$1" == "--tmpfs" && "${2:-}" == "/var/tmp" ]]; then
+    args+=(--bind "$vartmpdir" /var/tmp)
+    shift 2
+  else
+    args+=("$1")
+    shift
+  fi
+done
+
+"$real_bwrap" "${args[@]}"
