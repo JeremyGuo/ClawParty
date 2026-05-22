@@ -235,7 +235,7 @@ struct WebChannelMain {
     home_subscribers: Vec<Sender<Value>>,
     chat_subscribers: HashMap<WebSessionKey, Vec<Sender<Value>>>,
     live_states: HashMap<WebSessionKey, ChatLiveState>,
-    stream_renderers: HashMap<String, StreamMarkdownRenderer>,
+    stream_renderers: HashMap<StreamRendererKey, StreamMarkdownRenderer>,
     seen_states: HashMap<String, ConversationSeen>,
     processing_states: HashMap<String, ProcessingState>,
 }
@@ -553,6 +553,9 @@ impl WebChannelMain {
         for manifest in manifests {
             self.publish_chat(&key, manifest);
         }
+        for pending_event in self.drain_stream_renderer_pending(&key, &stream, &event_type) {
+            self.publish_chat(&key, pending_event);
+        }
         let payload = protocol::public_chat_stream_payload(
             &stream.conversation_id,
             &key.foreground_session_id,
@@ -568,15 +571,6 @@ impl WebChannelMain {
         stream: &OutgoingSessionStream,
         event_type: &str,
     ) -> (Value, Vec<Value>) {
-        if event_type == "turn_started"
-            || event_type == "turn_completed"
-            || event_type == "stream_error"
-        {
-            if let Some(turn_id) = stream.event.get("turn_id").and_then(Value::as_str) {
-                self.stream_renderers
-                    .retain(|renderer_key, _| !renderer_key.contains(turn_id));
-            }
-        }
         if event_type != "stream_assistant_message_delta" {
             return (stream.event.clone(), Vec::new());
         }
@@ -594,7 +588,12 @@ impl WebChannelMain {
             .get("turn_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let renderer_key = format!("{}:{}:{}", key.conversation_id, turn_id, message_id);
+        let renderer_key = StreamRendererKey {
+            conversation_id: key.conversation_id.clone(),
+            foreground_session_id: key.foreground_session_id.clone(),
+            turn_id: turn_id.to_string(),
+            message_id: message_id.to_string(),
+        };
         let conversation_root =
             WorkdirLayout::new(&self.workdir).conversation_root(&key.conversation_id);
         let renderer = self.stream_renderers.entry(renderer_key).or_default();
@@ -626,6 +625,64 @@ impl WebChannelMain {
             .collect();
         (event, manifests)
     }
+
+    fn drain_stream_renderer_pending(
+        &mut self,
+        key: &WebSessionKey,
+        stream: &OutgoingSessionStream,
+        event_type: &str,
+    ) -> Vec<Value> {
+        if event_type == "turn_started" {
+            let conversation_id = &key.conversation_id;
+            let foreground_session_id = &key.foreground_session_id;
+            self.stream_renderers.retain(|renderer_key, _| {
+                renderer_key.conversation_id != *conversation_id
+                    || renderer_key.foreground_session_id != *foreground_session_id
+            });
+            return Vec::new();
+        }
+        if event_type != "turn_completed" && event_type != "stream_error" {
+            return Vec::new();
+        }
+        let turn_id = stream
+            .event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let renderer_keys = self
+            .stream_renderers
+            .keys()
+            .filter(|renderer_key| {
+                renderer_key.conversation_id == key.conversation_id
+                    && renderer_key.foreground_session_id == key.foreground_session_id
+                    && (turn_id.is_empty() || renderer_key.turn_id == turn_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        renderer_keys
+            .into_iter()
+            .filter_map(|renderer_key| {
+                let mut renderer = self.stream_renderers.remove(&renderer_key)?;
+                let pending = renderer.take_pending();
+                if pending.is_empty() {
+                    return None;
+                }
+                let event = json!({
+                    "type": "stream_assistant_message_delta",
+                    "message_id": renderer_key.message_id,
+                    "next_message_id": renderer_key.message_id,
+                    "turn_id": renderer_key.turn_id,
+                    "delta": pending,
+                });
+                Some(protocol::public_chat_stream_payload(
+                    &key.conversation_id,
+                    &key.foreground_session_id,
+                    "stream_assistant_message_delta",
+                    &event,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -633,6 +690,16 @@ pub(super) struct WebSessionKey {
     conversation_id: String,
     foreground_session_id: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StreamRendererKey {
+    conversation_id: String,
+    foreground_session_id: String,
+    turn_id: String,
+    message_id: String,
+}
+
+const STREAM_MARKDOWN_PENDING_LIMIT: usize = 2048;
 
 #[derive(Default)]
 struct StreamMarkdownRenderer {
@@ -675,7 +742,11 @@ impl StreamMarkdownRenderer {
             out.push_str(&rest[..start]);
             let candidate = &rest[start..];
             let Some(end) = candidate.find(')') else {
-                self.pending.push_str(candidate);
+                if candidate.len() > STREAM_MARKDOWN_PENDING_LIMIT {
+                    out.push_str(candidate);
+                } else {
+                    self.pending.push_str(candidate);
+                }
                 break;
             };
             let segment = &candidate[..=end];
@@ -743,6 +814,10 @@ impl StreamMarkdownRenderer {
             id,
             &segment[target_end..]
         )
+    }
+
+    fn take_pending(&mut self) -> String {
+        std::mem::take(&mut self.pending)
     }
 }
 
@@ -1782,7 +1857,10 @@ mod tests {
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolCallItem,
     };
 
-    use super::{protocol::public_chat_stream_payload, ChatLiveState, StreamMarkdownRenderer};
+    use super::{
+        protocol::public_chat_stream_payload, ChatLiveState, StreamMarkdownRenderer,
+        STREAM_MARKDOWN_PENDING_LIMIT,
+    };
 
     fn temp_root(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1860,6 +1938,26 @@ mod tests {
         assert!(second.delta.ends_with(" done"));
         assert_eq!(second.manifests.len(), 1);
         assert_eq!(second.manifests[0].attachments[0]["name"], "image.png");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_renderer_releases_oversized_incomplete_markdown_link() {
+        let root = temp_root("stream-oversized-link");
+        let mut renderer = StreamMarkdownRenderer::default();
+        let target = "x".repeat(STREAM_MARKDOWN_PENDING_LIMIT + 1);
+
+        let rendered = renderer.render_delta(
+            &format!("before [link]({target}"),
+            "c1",
+            "main",
+            "msg_1",
+            &root,
+        );
+
+        assert!(rendered.delta.starts_with("before [link]("));
+        assert!(rendered.delta.ends_with(&target));
+        assert!(renderer.take_pending().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -96,6 +96,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var sawActiveTurnProgress: Boolean = false
     private val pendingSeen = mutableMapOf<String, String>()
     private val pendingSends = linkedMapOf<String, PendingSend>()
+    private val pendingStreamAttachments = mutableMapOf<String, List<MessageAttachment>>()
 
     init {
         AppLogStore.append(application, "chat", "ChatViewModel.init")
@@ -1239,6 +1240,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 streamType == "stream_turn_start" -> {
                     sawActiveTurnProgress = true
+                    pendingStreamAttachments.clear()
                     mutableState.update {
                         it.copy(
                             messages = removeStreamingMessages(it.messages, payload.normalizedStreamEvent().turnId()),
@@ -1249,6 +1251,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 streamType == "stream_turn_done" -> {
                     sawActiveTurnProgress = false
+                    pendingStreamAttachments.clear()
                     mutableState.update {
                         it.copy(
                             messages = removeStreamingMessages(it.messages, payload.normalizedStreamEvent().turnId()),
@@ -1270,6 +1273,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     mutableState.update { it.copy(realtimeState = "Plan updated") }
                 }
                 streamType == "stream_error" || payloadType == "chat.error" -> mutableState.update {
+                    pendingStreamAttachments.clear()
                     it.copy(
                         realtimeState = payload["message"]?.jsonPrimitive?.content
                             ?: payload["error"]?.jsonPrimitive?.content
@@ -1382,12 +1386,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val id = event.streamMessageId().ifBlank { return messages }
         if (messages.any { it.localState != MessageLocalState.Streaming && it.id == id }) return messages
         val delta = event.streamDeltaText().ifBlank { return messages }
+        val pendingAttachments = pendingStreamAttachments.remove(id).orEmpty()
         return upsertStreamingMessage(messages, event, id) { existing ->
             val text = existing?.text.orEmpty() + delta
+            val baseAttachments = existing?.attachments.orEmpty()
+            val mergedAttachments = baseAttachments + pendingAttachments.filterNot { incoming ->
+                baseAttachments.any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
+            }
             (existing ?: newStreamingMessage(messages, event, id)).copy(
                 text = text,
                 preview = text.take(160),
                 items = upsertTextItem(existing?.items.orEmpty(), text),
+                attachments = mergedAttachments,
+                attachmentCount = mergedAttachments.size,
             )
         }
     }
@@ -1452,15 +1463,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }.orEmpty()
         if (attachments.isEmpty()) return
         val id = event.streamMessageId().ifBlank { return }
+        pendingStreamAttachments[id] = pendingStreamAttachments[id].orEmpty() + attachments.filterNot { incoming ->
+            pendingStreamAttachments[id].orEmpty().any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
+        }
         mutableState.update { current ->
-            val messages = upsertStreamingMessage(current.messages, event, id) { existing ->
-                val base = existing ?: newStreamingMessage(current.messages, event, id)
-                val merged = base.attachments + attachments.filterNot { incoming ->
-                    base.attachments.any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
-                }
-                base.copy(attachments = merged, attachmentCount = merged.size)
-            }
-            current.copy(messages = messages, realtimeState = "Attachment ready", progressTitle = "Agent running")
+            current.copy(realtimeState = "Attachment ready", progressTitle = "Agent running")
         }
         previewAttachments(attachments)
     }
