@@ -41,6 +41,25 @@ const REASONING_EFFORTS = [
 
 const datePartFormatters = new Map();
 const clockFormatters = new Map();
+const chatScrollMemory = new Map();
+const CHAT_SCROLL_MEMORY_LIMIT = 80;
+
+function boundedScrollTop(list, value) {
+  return Math.max(0, Math.min(Number(value) || 0, Math.max(0, list.scrollHeight - list.clientHeight)));
+}
+
+function rememberChatScroll(scope, state) {
+  if (!scope || !state) return;
+  chatScrollMemory.delete(scope);
+  chatScrollMemory.set(scope, { ...state, savedAt: Date.now() });
+  while (chatScrollMemory.size > CHAT_SCROLL_MEMORY_LIMIT) {
+    chatScrollMemory.delete(chatScrollMemory.keys().next().value);
+  }
+}
+
+function readChatScrollMemory(scope) {
+  return scope ? chatScrollMemory.get(scope) || null : null;
+}
 
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
   const renderStartedAt = renderCommitStart();
@@ -101,6 +120,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const stickToBottomRef = useRef(true);
   const stickyScrollPausedUntilRef = useRef(0);
   const stickyAnchorRestoreTimerRef = useRef(0);
+  const lastScopeRef = useRef(activeMessageScope);
+  const restoringScrollRef = useRef(false);
+  const pendingScrollRestoreRef = useRef(null);
+  const lastScrollStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
@@ -216,6 +239,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     updateResponseSpacerMetrics();
     if (stickyAutoScrollEnabled()) {
       requestAnimationFrame(scrollToBottom);
+    } else if (lastScopeRef.current === activeMessageScope) {
+      requestAnimationFrame(() => restoreScrollState(lastScrollStateRef.current));
     }
   }, [responseSpacerVisible, activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature, pendingAssistantVisible]);
 
@@ -229,6 +254,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
         updateResponseSpacerMetrics();
         syncViewport();
         if (stickyAutoScrollEnabled()) requestAnimationFrame(scrollToBottom);
+        else requestAnimationFrame(() => restoreScrollState(lastScrollStateRef.current));
       });
     });
     observer.observe(list);
@@ -260,6 +286,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       if (changed) {
         setVirtualHeightVersion((value) => value + 1);
         if (stickyAutoScrollEnabled()) requestAnimationFrame(scrollToBottom);
+        else requestAnimationFrame(() => restoreScrollState(lastScrollStateRef.current));
       }
     };
     const scheduleMeasure = () => {
@@ -286,6 +313,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     updateComposerMetrics();
     if (stickyAutoScrollEnabled()) {
       requestAnimationFrame(scrollToBottom);
+    } else {
+      requestAnimationFrame(() => restoreScrollState(lastScrollStateRef.current));
     }
   }, [draft, composerAttachments.length, selectionReferences.length]);
 
@@ -301,6 +330,65 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const list = scrollRef.current;
     if (!list) return;
     list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+  };
+
+  const visibleScrollAnchor = () => {
+    const list = scrollRef.current;
+    if (!list) return null;
+    const listRect = list.getBoundingClientRect();
+    const candidates = Array.from(list.querySelectorAll('[data-virtual-key]'));
+    const anchorNode = candidates.find((node) => node.getBoundingClientRect().bottom >= listRect.top + 1)
+      || candidates[0]
+      || null;
+    if (!anchorNode) return null;
+    const key = anchorNode.getAttribute('data-virtual-key');
+    if (!key) return null;
+    return {
+      key,
+      offsetTop: anchorNode.getBoundingClientRect().top - listRect.top
+    };
+  };
+
+  const captureScrollState = () => {
+    const list = scrollRef.current;
+    if (!list) return null;
+    const state = {
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      stickToBottom: list.scrollHeight - list.scrollTop - list.clientHeight < 80,
+      anchor: visibleScrollAnchor()
+    };
+    lastScrollStateRef.current = state;
+    return state;
+  };
+
+  const restoreScrollState = (state) => {
+    const list = scrollRef.current;
+    if (!list || !state) return false;
+    restoringScrollRef.current = true;
+    try {
+      if (state.stickToBottom) {
+        list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+        return true;
+      }
+      if (state.anchor?.key) {
+        const node = list.querySelector(`[data-virtual-key="${CSS.escape(state.anchor.key)}"]`);
+        if (node) {
+          const listRect = list.getBoundingClientRect();
+          const nodeTop = node.getBoundingClientRect().top - listRect.top;
+          list.scrollTop = boundedScrollTop(list, list.scrollTop + nodeTop - Number(state.anchor.offsetTop || 0));
+          return true;
+        }
+      }
+      list.scrollTop = boundedScrollTop(list, state.scrollTop);
+      return true;
+    } finally {
+      requestAnimationFrame(() => {
+        restoringScrollRef.current = false;
+        syncViewport();
+      });
+    }
   };
 
   const syncViewport = () => {
@@ -320,34 +408,62 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   useLayoutEffect(() => {
     const list = scrollRef.current;
     if (!list) return;
+    if (lastScopeRef.current !== activeMessageScope) {
+      const remembered = readChatScrollMemory(activeMessageScope);
+      lastScopeRef.current = activeMessageScope;
+      lastScrollStateRef.current = remembered;
+      pendingScrollRestoreRef.current = remembered;
+      stickToBottomRef.current = remembered ? Boolean(remembered.stickToBottom) : true;
+    }
     if (prependAdjustRef.current) {
       const { previousScrollHeight, previousScrollTop } = prependAdjustRef.current;
       prependAdjustRef.current = null;
       list.scrollTop = previousScrollTop + (list.scrollHeight - previousScrollHeight);
-    } else if ((previousCountRef.current === 0 && renderedMessages.length > 0) || stickyAutoScrollEnabled()) {
+      captureScrollState();
+    } else if (pendingScrollRestoreRef.current) {
+      const pending = pendingScrollRestoreRef.current;
+      pendingScrollRestoreRef.current = null;
+      restoreScrollState(pending);
+    } else if ((previousCountRef.current === 0 && renderedMessages.length > 0 && !readChatScrollMemory(activeMessageScope)) || stickyAutoScrollEnabled()) {
       scrollToBottom();
       requestAnimationFrame(() => {
         scrollToBottom();
         requestAnimationFrame(scrollToBottom);
       });
+    } else {
+      restoreScrollState(lastScrollStateRef.current);
     }
     previousCountRef.current = renderedMessages.length;
   }, [activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature]);
 
+  useLayoutEffect(() => {
+    const scope = activeMessageScope;
+    return () => {
+      rememberChatScroll(scope, captureScrollState());
+    };
+  }, [activeMessageScope]);
+
   useEffect(() => {
+    const remembered = readChatScrollMemory(activeMessageScope);
     previousCountRef.current = 0;
     visibleReadIdRef.current = '';
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
-    stickToBottomRef.current = true;
+    stickToBottomRef.current = remembered ? Boolean(remembered.stickToBottom) : true;
     stickyScrollPausedUntilRef.current = 0;
     if (stickyAnchorRestoreTimerRef.current) {
       window.clearTimeout(stickyAnchorRestoreTimerRef.current);
       stickyAnchorRestoreTimerRef.current = 0;
     }
     scrollRef.current?.style.removeProperty('overflow-anchor');
-    setViewport({ scrollTop: 0, clientHeight: scrollRef.current?.clientHeight || 0 });
-    requestAnimationFrame(() => scrollToBottom({ force: true }));
+    lastScopeRef.current = activeMessageScope;
+    lastScrollStateRef.current = remembered;
+    pendingScrollRestoreRef.current = remembered;
+    setViewport({ scrollTop: remembered?.scrollTop || 0, clientHeight: scrollRef.current?.clientHeight || remembered?.clientHeight || 0 });
+    requestAnimationFrame(() => {
+      if (remembered) restoreScrollState(remembered);
+      else scrollToBottom({ force: true });
+    });
     setDraft('');
     setComposerAttachments((current) => {
       current.forEach((attachment) => {
@@ -362,6 +478,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   }, [composerAttachments]);
 
   useEffect(() => () => {
+    rememberChatScroll(lastScopeRef.current, captureScrollState());
     if (stickyAnchorRestoreTimerRef.current) {
       window.clearTimeout(stickyAnchorRestoreTimerRef.current);
       stickyAnchorRestoreTimerRef.current = 0;
@@ -416,6 +533,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!list) return;
     syncViewport();
     stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    if (!restoringScrollRef.current) {
+      rememberChatScroll(activeMessageScope, captureScrollState());
+    }
     if (list.scrollTop <= 96) {
       loadOlderPreservingViewport();
     }
