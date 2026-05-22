@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{Cursor, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -12,8 +12,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossbeam_channel::select_biased;
 use image::ImageReader;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
@@ -26,6 +28,7 @@ use crate::{
     providers::{global_provider_fork_server, ProviderRequestAbortHandle, ProviderRequestOwned},
     session_actor::{
         normalize_messages_for_model,
+        tool_binary::ensure_tool_binary_interruptibly,
         tool_runtime::{
             bool_arg_with_default, f64_arg_with_default, resolve_local_path, shell_quote,
             string_arg, ExecutionTarget, LocalToolError, ToolCancellationToken,
@@ -38,6 +41,11 @@ use crate::{
 
 static MEDIA_JOBS: OnceLock<Mutex<HashMap<String, MediaJob>>> = OnceLock::new();
 const TOOL_USAGE_LOG_PATH: &str = ".stellaclaw/log/tool_usage.jsonl";
+const FS_TOOL_NAME: &str = "stellaclaw-fs-tool";
+const REMOTE_MEDIA_STAGING_TIMEOUT: Duration = Duration::from_secs(300);
+const REMOTE_MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const REMOTE_SAFE_PATH_PREFIX: &str =
+    "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
 
 struct MediaJob {
     status: Arc<Mutex<MediaJobStatus>>,
@@ -1343,6 +1351,7 @@ fn file_item_from_path(
     {
         return remote_file_item_from_path(
             context.data_root,
+            context,
             &host,
             cwd.as_deref(),
             &path,
@@ -1383,59 +1392,407 @@ fn local_file_item_from_path(path: &Path, media_kind: &str) -> Result<FileItem, 
 
 fn remote_file_item_from_path(
     data_root: &Path,
+    context: &ToolExecutionContext<'_>,
     host: &str,
     cwd: Option<&str>,
     path: &str,
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let file_name = remote_file_name(path);
-    let local_dir = data_root
-        .join(".stellaclaw")
-        .join("output")
-        .join("remote-media");
+    let local_dir = remote_media_staging_dir(data_root);
     fs::create_dir_all(&local_dir).map_err(|error| {
         LocalToolError::Io(format!("failed to create {}: {error}", local_dir.display()))
     })?;
-    let local_path = local_dir.join(format!("{}-{}", nonce(), sanitize_file_name(&file_name)));
-    let remote_command = remote_media_read_command(cwd, path);
-    let output = Command::new("ssh")
+
+    let remote_binary =
+        ensure_tool_binary_interruptibly(context, FS_TOOL_NAME, Some(host), &context.cancel_token)?
+            .remote_path
+            .ok_or_else(|| {
+                LocalToolError::Bridge("tool_binary_ensure did not return remote_path".to_string())
+            })?;
+    let remote_hash =
+        remote_media_file_hash(host, cwd, path, &remote_binary, &context.cancel_token)?;
+    let local_path = local_dir.join(format!(
+        "{}-{}",
+        remote_hash.sha256,
+        sanitize_file_name(&file_name)
+    ));
+    if local_media_hash_matches(&local_path, &remote_hash)? {
+        return local_file_item_from_path(&local_path, media_kind);
+    }
+
+    copy_remote_media_file_to_local(
+        host,
+        cwd,
+        path,
+        &remote_binary,
+        &local_path,
+        &context.cancel_token,
+    )?;
+    if !local_media_hash_matches(&local_path, &remote_hash)? {
+        return Err(LocalToolError::Remote(format!(
+            "staged remote media hash mismatch for {}",
+            display_remote_media_path(host, path)
+        )));
+    }
+    local_file_item_from_path(&local_path, media_kind)
+}
+
+#[derive(Debug)]
+struct RemoteMediaHash {
+    bytes: u64,
+    sha256: String,
+}
+
+fn remote_media_file_hash(
+    host: &str,
+    cwd: Option<&str>,
+    path: &str,
+    remote_binary: &str,
+    cancel_token: &ToolCancellationToken,
+) -> Result<RemoteMediaHash, LocalToolError> {
+    let command = remote_fs_tool_command(cwd, remote_binary, "file-hash", path);
+    let output = run_ssh_capture_with_cancel(
+        host,
+        &command,
+        REMOTE_MEDIA_STAGING_TIMEOUT,
+        cancel_token,
+        "remote media hash",
+    )?;
+    if !output.status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "remote media hash failed with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        LocalToolError::Remote(format!("failed to parse remote media hash result: {error}"))
+    })?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(LocalToolError::Remote(format!(
+            "remote media hash failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )));
+    }
+    let bytes = value
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| LocalToolError::Remote("remote media hash missing bytes".to_string()))?;
+    let sha256 = value
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| is_sha256_hex(value))
+        .ok_or_else(|| LocalToolError::Remote("remote media hash missing sha256".to_string()))?
+        .to_string();
+    Ok(RemoteMediaHash { bytes, sha256 })
+}
+
+fn copy_remote_media_file_to_local(
+    host: &str,
+    cwd: Option<&str>,
+    path: &str,
+    remote_binary: &str,
+    local_path: &Path,
+    cancel_token: &ToolCancellationToken,
+) -> Result<(), LocalToolError> {
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            LocalToolError::Io(format!("failed to create {}: {error}", parent.display()))
+        })?;
+    }
+    let tmp_path = local_path.with_extension(format!("incoming.{}", nonce()));
+    let command = remote_fs_tool_command(cwd, remote_binary, "file-bytes", path);
+    if let Err(error) = run_ssh_stdout_to_file_with_cancel(
+        host,
+        &command,
+        &tmp_path,
+        REMOTE_MEDIA_STAGING_TIMEOUT,
+        cancel_token,
+        "remote media copy",
+    ) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    fs::rename(&tmp_path, local_path).map_err(|error| {
+        let _ = fs::remove_file(&tmp_path);
+        LocalToolError::Io(format!(
+            "failed to install staged media {} to {}: {error}",
+            tmp_path.display(),
+            local_path.display()
+        ))
+    })
+}
+
+fn remote_fs_tool_command(
+    cwd: Option<&str>,
+    remote_binary: &str,
+    subcommand: &str,
+    path: &str,
+) -> String {
+    let command = format!(
+        "{} {} --workspace . --file-path {}",
+        shell_quote(remote_binary),
+        shell_quote(subcommand),
+        shell_quote(path)
+    );
+    let command = format!("{REMOTE_SAFE_PATH_PREFIX} {command}");
+    match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), command),
+        None => command,
+    }
+}
+
+fn remote_media_staging_dir(data_root: &Path) -> PathBuf {
+    data_root
+        .join(".stellaclaw")
+        .join("output")
+        .join("remote-media")
+}
+
+fn local_media_hash_matches(
+    local_path: &Path,
+    remote_hash: &RemoteMediaHash,
+) -> Result<bool, LocalToolError> {
+    if !local_path.is_file() {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(local_path).map_err(|error| {
+        LocalToolError::Io(format!("failed to stat {}: {error}", local_path.display()))
+    })?;
+    if metadata.len() != remote_hash.bytes {
+        return Ok(false);
+    }
+    Ok(sha256_file(local_path)?.eq_ignore_ascii_case(&remote_hash.sha256))
+}
+
+fn sha256_file(path: &Path) -> Result<String, LocalToolError> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        LocalToolError::Io(format!("failed to open {}: {error}", path.display()))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 64];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            LocalToolError::Io(format!("failed to read {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn display_remote_media_path(host: &str, path: &str) -> String {
+    format!("{host}:{path}")
+}
+
+fn run_ssh_capture_with_cancel(
+    host: &str,
+    remote_command: &str,
+    timeout: Duration,
+    cancel_token: &ToolCancellationToken,
+    command_label: &str,
+) -> Result<Output, LocalToolError> {
+    let mut command = ssh_command(host, remote_command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        LocalToolError::Remote(format!("failed to spawn {command_label}: {error}"))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        LocalToolError::Remote(format!("{command_label} stdout was not captured"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        LocalToolError::Remote(format!("{command_label} stderr was not captured"))
+    })?;
+    let stdout_handle = thread::spawn(move || read_pipe(stdout));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr));
+    let status = wait_child_with_cancel(&mut child, timeout, cancel_token, command_label)?;
+    let stdout = join_pipe_reader(stdout_handle, command_label, "stdout")?;
+    let stderr = join_pipe_reader(stderr_handle, command_label, "stderr")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn run_ssh_stdout_to_file_with_cancel(
+    host: &str,
+    remote_command: &str,
+    destination: &Path,
+    timeout: Duration,
+    cancel_token: &ToolCancellationToken,
+    command_label: &str,
+) -> Result<(), LocalToolError> {
+    let mut command = ssh_command(host, remote_command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        LocalToolError::Remote(format!("failed to spawn {command_label}: {error}"))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        LocalToolError::Remote(format!("{command_label} stdout was not captured"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        LocalToolError::Remote(format!("{command_label} stderr was not captured"))
+    })?;
+    let destination = destination.to_path_buf();
+    let stdout_handle = thread::spawn(move || copy_pipe_to_file(stdout, &destination));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr));
+    let status = wait_child_with_cancel(&mut child, timeout, cancel_token, command_label)?;
+    let stderr = join_pipe_reader(stderr_handle, command_label, "stderr")?;
+    join_file_writer(stdout_handle, command_label)?;
+    if !status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "{command_label} failed with {}; stderr: {}",
+            status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn ssh_command(host: &str, remote_command: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-T")
         .arg(host)
-        .arg(remote_command)
-        .output()
-        .map_err(|error| LocalToolError::Remote(format!("failed to spawn ssh: {error}")))?;
-    if !output.status.success() {
-        return Err(LocalToolError::Remote(format!(
-            "ssh exited with {}; stderr: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    fs::write(&local_path, &output.stdout).map_err(|error| {
-        LocalToolError::Io(format!("failed to write {}: {error}", local_path.display()))
-    })?;
-    local_file_item_from_path(&local_path, media_kind)
+        .arg(remote_command);
+    command
 }
 
-fn remote_media_read_command(cwd: Option<&str>, path: &str) -> String {
-    let script = r#"
-import os, sys
-
-path = os.path.expanduser(sys.argv[1])
-if not os.path.isfile(path):
-    raise SystemExit(f"path is not a file: {path}")
-with open(path, "rb") as handle:
-    sys.stdout.buffer.write(handle.read())
-"#;
-    let command = format!("python3 -c {} {}", shell_quote(script), shell_quote(path));
-    match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
-        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), command),
-        None => command,
+fn wait_child_with_cancel(
+    child: &mut Child,
+    timeout: Duration,
+    cancel_token: &ToolCancellationToken,
+    command_label: &str,
+) -> Result<std::process::ExitStatus, LocalToolError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel_token.is_cancelled() {
+            kill_child_process_group(child);
+            let _ = child.wait();
+            return Err(LocalToolError::Io("tool interrupted".to_string()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_child_process_group(child);
+                    let _ = child.wait();
+                    return Err(LocalToolError::Remote(format!(
+                        "{command_label} timed out after {} seconds",
+                        timeout.as_secs()
+                    )));
+                }
+                let wait_timer = crossbeam_channel::after(REMOTE_MEDIA_POLL_INTERVAL);
+                select_biased! {
+                    recv(cancel_token.cancel_rx()) -> _ => {
+                        kill_child_process_group(child);
+                        let _ = child.wait();
+                        return Err(LocalToolError::Io("tool interrupted".to_string()));
+                    }
+                    recv(wait_timer) -> _ => {}
+                }
+            }
+            Err(error) => {
+                return Err(LocalToolError::Remote(format!(
+                    "failed to wait for {command_label}: {error}"
+                )));
+            }
+        }
     }
+}
+
+fn kill_child_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_command: &mut Command) {}
+
+fn read_pipe<R: Read>(mut pipe: R) -> Result<Vec<u8>, std::io::Error> {
+    let mut buffer = Vec::new();
+    pipe.read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn copy_pipe_to_file<R: Read>(mut pipe: R, destination: &Path) -> Result<(), std::io::Error> {
+    let mut file = fs::File::create(destination)?;
+    let mut buffer = [0_u8; 1024 * 64];
+    loop {
+        let read = pipe.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])?;
+    }
+    file.flush()
+}
+
+fn join_pipe_reader(
+    handle: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    command_label: &str,
+    stream_name: &str,
+) -> Result<Vec<u8>, LocalToolError> {
+    handle
+        .join()
+        .map_err(|_| {
+            LocalToolError::Remote(format!(
+                "{command_label} {stream_name} reader thread panicked"
+            ))
+        })?
+        .map_err(|error| {
+            LocalToolError::Remote(format!(
+                "failed to read {command_label} {stream_name}: {error}"
+            ))
+        })
+}
+
+fn join_file_writer(
+    handle: thread::JoinHandle<Result<(), std::io::Error>>,
+    command_label: &str,
+) -> Result<(), LocalToolError> {
+    handle
+        .join()
+        .map_err(|_| LocalToolError::Remote(format!("{command_label} writer thread panicked")))?
+        .map_err(|error| {
+            LocalToolError::Remote(format!("failed to write {command_label} output: {error}"))
+        })
 }
 
 fn remote_file_name(path: &str) -> String {

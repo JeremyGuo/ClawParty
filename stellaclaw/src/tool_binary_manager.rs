@@ -20,12 +20,13 @@ const SAFE_REMOTE_PATH: &str =
     "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
 
 const FS_TOOL_NAME: &str = "stellaclaw-fs-tool";
-const FS_TOOL_VERSION: &str = "0.2.0";
-const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-fs-tool-v0.2.0/tools-manifest.json";
+const FS_TOOL_VERSION: &str = "0.2.1";
+const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-fs-tool-v0.2.1/tools-manifest.json";
 
 const RIPGREP_TOOL_NAME: &str = "ripgrep";
 const RIPGREP_VERSION: &str = "15.1.0";
 const TOOL_BINARY_HELPER_COMMAND: &str = "__tool-binary-ensure-helper";
+const TOOL_BINARY_CLIENT_TIMEOUT: Duration = Duration::from_secs(480);
 #[cfg(not(test))]
 const TOOL_BINARY_ENSURE_TIMEOUT: Duration = Duration::from_secs(420);
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,8 +65,16 @@ impl ToolBinaryClient {
             })
             .map_err(|error| format!("tool binary manager is unavailable: {error}"))?;
         response_rx
-            .recv()
-            .map_err(|error| format!("tool binary manager response failed: {error}"))?
+            .recv_timeout(TOOL_BINARY_CLIENT_TIMEOUT)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => format!(
+                    "tool binary manager timed out after {} seconds",
+                    TOOL_BINARY_CLIENT_TIMEOUT.as_secs()
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "tool binary manager response failed: channel disconnected".to_string()
+                }
+            })?
     }
 }
 

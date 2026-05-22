@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::PathBuf,
     process,
 };
@@ -8,11 +8,23 @@ use std::{
 use serde_json::{json, Value};
 
 use stellaclaw_fs_tool::{
-    apply_patch, file_read, file_write, ApplyPatchOptions, FileReadOptions, FileWriteOptions,
-    PatchFormat,
+    apply_patch, file_bytes_to_writer, file_hash, file_read, file_write, ApplyPatchOptions,
+    FileHashOptions, FileReadOptions, FileWriteOptions, PatchFormat,
 };
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("file-bytes") {
+        let mut raw_args = env::args().skip(2).collect::<Vec<_>>();
+        let exit_code = match run_file_bytes(std::mem::take(&mut raw_args)) {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = writeln!(io::stderr(), "{error}");
+                2
+            }
+        };
+        process::exit(exit_code);
+    }
+
     let exit_code = match run() {
         Ok(result) => {
             println!("{result}");
@@ -48,10 +60,14 @@ fn run() -> Result<Value, String> {
             raw_args.remove(0);
             run_file_write(raw_args)
         }
+        Some("file-hash") => {
+            raw_args.remove(0);
+            run_file_hash(raw_args)
+        }
         Some("-h" | "--help" | "--version") | None => run_apply_patch(raw_args),
         Some(command) if command.starts_with('-') => run_apply_patch(raw_args),
         Some(command) => Err(format!(
-            "unknown command: {command}; expected apply-patch, file-read, or file-write"
+            "unknown command: {command}; expected apply-patch, file-read, file-write, file-hash, or file-bytes"
         )),
     }
 }
@@ -243,6 +259,55 @@ fn run_file_write(raw_args: Vec<String>) -> Result<Value, String> {
     }))
 }
 
+fn run_file_hash(raw_args: Vec<String>) -> Result<Value, String> {
+    let options = parse_file_path_command(raw_args, "file-hash")?;
+    Ok(file_hash(&options))
+}
+
+fn run_file_bytes(raw_args: Vec<String>) -> Result<(), String> {
+    let options = parse_file_path_command(raw_args, "file-bytes")?;
+    let mut stdout = io::stdout().lock();
+    file_bytes_to_writer(&options, &mut stdout)?;
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to flush stdout: {error}"))
+}
+
+fn parse_file_path_command(
+    raw_args: Vec<String>,
+    command_name: &str,
+) -> Result<FileHashOptions, String> {
+    let mut workspace =
+        env::current_dir().map_err(|error| format!("failed to read cwd: {error}"))?;
+    let mut file_path: Option<String> = None;
+
+    let mut args = raw_args.into_iter().peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                process::exit(0);
+            }
+            "--version" => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                process::exit(0);
+            }
+            "--workspace" => {
+                workspace = PathBuf::from(next_value(&mut args, "--workspace")?);
+            }
+            "--file-path" | "--path" => {
+                file_path = Some(next_value(&mut args, &arg)?);
+            }
+            _ => return Err(format!("unknown {command_name} argument: {arg}")),
+        }
+    }
+
+    Ok(FileHashOptions {
+        workspace,
+        file_path: file_path.ok_or_else(|| format!("{command_name} requires --file-path"))?,
+    })
+}
+
 fn tool_exit_code(result: &Value) -> i32 {
     if let Some(applied) = result.get("applied").and_then(Value::as_bool) {
         return if applied { 0 } else { 1 };
@@ -280,7 +345,7 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
 
 fn print_help() {
     println!(
-        "stellaclaw-fs-tool {}\n\nUSAGE:\n  stellaclaw-fs-tool apply-patch [OPTIONS] < patch.txt\n  stellaclaw-fs-tool file-read --file-path <PATH> [OPTIONS]\n  stellaclaw-fs-tool file-write --file-path <PATH> [OPTIONS] < content.txt\n  stellaclaw-fs-tool [OPTIONS] < patch.txt\n\nCOMMANDS:\n  apply-patch                  Apply a Codex or unified patch.\n  file-read                    Read UTF-8 text from a file with optional line range.\n  file-write                   Write UTF-8 text to a file.\n\nCOMMON OPTIONS:\n      --workspace <DIR>          Workspace root. Defaults to current directory.\n      --version                  Print version.\n  -h, --help                     Print help.",
+        "stellaclaw-fs-tool {}\n\nUSAGE:\n  stellaclaw-fs-tool apply-patch [OPTIONS] < patch.txt\n  stellaclaw-fs-tool file-read --file-path <PATH> [OPTIONS]\n  stellaclaw-fs-tool file-write --file-path <PATH> [OPTIONS] < content.txt\n  stellaclaw-fs-tool file-hash --file-path <PATH> [OPTIONS]\n  stellaclaw-fs-tool file-bytes --file-path <PATH> [OPTIONS]\n  stellaclaw-fs-tool [OPTIONS] < patch.txt\n\nCOMMANDS:\n  apply-patch                  Apply a Codex or unified patch.\n  file-read                    Read UTF-8 text from a file with optional line range.\n  file-write                   Write UTF-8 text to a file.\n  file-hash                    Print file size and SHA-256 as JSON.\n  file-bytes                   Print raw file bytes to stdout.\n\nCOMMON OPTIONS:\n      --workspace <DIR>          Workspace root. Defaults to current directory.\n      --version                  Print version.\n  -h, --help                     Print help.",
         env!("CARGO_PKG_VERSION")
     );
 }

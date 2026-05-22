@@ -1,5 +1,10 @@
-version: 1.31.0
+version: 1.31.1
 ---
+
+# 1.31.1
+
+- 改进远程 media 文件 staging：
+  `image_view` / `pdf_view` / `audio_view` 以及 provider-backed media 输入在 remote SSH 路径下改为先通过 tool binary bridge 确保远端 `stellaclaw-fs-tool` 可用，再用 `file-hash` 做远端哈希检查，命中本地 staging 缓存时跳过复制；不命中时用 `file-bytes` 子进程把远端文件流式写入本地 staging 文件。bridge 等待和远端 hash/copy 子进程现在支持工具 cancel，cancel 时会取消 bridge 请求或杀掉 ssh 子进程。`stellaclaw-fs-tool` 升级到 `0.2.1`，新增 `file-hash` / `file-bytes` 命令；tool binary service client 等待结果增加总超时，避免底层服务无响应时无限等待。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.0
 

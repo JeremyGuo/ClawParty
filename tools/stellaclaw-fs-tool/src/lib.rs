@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchFormat {
@@ -53,6 +54,12 @@ pub struct FileWriteOptions {
     pub mode: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileHashOptions {
+    pub workspace: PathBuf,
+    pub file_path: String,
+}
+
 pub fn file_read(options: &FileReadOptions) -> Value {
     match file_read_inner(options) {
         Ok(result) => result,
@@ -65,6 +72,20 @@ pub fn file_write(options: &FileWriteOptions) -> Value {
         Ok(result) => result,
         Err(error) => tool_error(error),
     }
+}
+
+pub fn file_hash(options: &FileHashOptions) -> Value {
+    match file_hash_inner(options) {
+        Ok(result) => result,
+        Err(error) => tool_error(error),
+    }
+}
+
+pub fn file_bytes_to_writer(
+    options: &FileHashOptions,
+    writer: &mut impl Write,
+) -> Result<u64, String> {
+    file_bytes_to_writer_inner(options, writer).map_err(|error| error.message)
 }
 
 fn apply_patch_inner(patch: &str, options: &ApplyPatchOptions) -> Result<Value, PatchError> {
@@ -725,21 +746,8 @@ fn normalize_unified_path_token(
 }
 
 fn file_read_inner(options: &FileReadOptions) -> Result<Value, PatchError> {
-    let workspace = canonical_workspace(&options.workspace)?;
-    let path = resolve_workspace_path(&workspace, &options.file_path)?;
-    let canonical = path.canonicalize().map_err(|error| {
-        PatchError::io(format!(
-            "failed to canonicalize {}: {error}",
-            path.display()
-        ))
-    })?;
-    ensure_inside_workspace(&workspace, &canonical)?;
-    if canonical.is_dir() {
-        return Err(PatchError::invalid(format!(
-            "{} is a directory, not a file",
-            path.display()
-        )));
-    }
+    let (_, path, canonical) =
+        resolve_existing_workspace_file(&options.workspace, &options.file_path)?;
     let text = fs::read_to_string(&canonical)
         .map_err(|error| PatchError::io(format!("failed to read {}: {error}", path.display())))?;
     let total_lines = text.lines().count();
@@ -776,6 +784,45 @@ fn file_read_inner(options: &FileReadOptions) -> Result<Value, PatchError> {
         "truncated": end_line < total_lines,
         "content": selected.join("\n"),
     }))
+}
+
+fn file_hash_inner(options: &FileHashOptions) -> Result<Value, PatchError> {
+    let (_, path, canonical) =
+        resolve_existing_workspace_file(&options.workspace, &options.file_path)?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| PatchError::io(format!("failed to stat {}: {error}", path.display())))?;
+    let mut file = fs::File::open(&canonical)
+        .map_err(|error| PatchError::io(format!("failed to open {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 64];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            PatchError::io(format!("failed to read {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(json!({
+        "ok": true,
+        "file_path": path.display().to_string(),
+        "bytes": metadata.len(),
+        "sha256": hex_lower(&hasher.finalize()),
+    }))
+}
+
+fn file_bytes_to_writer_inner(
+    options: &FileHashOptions,
+    writer: &mut impl Write,
+) -> Result<u64, PatchError> {
+    let (_, path, canonical) =
+        resolve_existing_workspace_file(&options.workspace, &options.file_path)?;
+    let mut file = fs::File::open(&canonical)
+        .map_err(|error| PatchError::io(format!("failed to open {}: {error}", path.display())))?;
+    std::io::copy(&mut file, writer).map_err(|error| {
+        PatchError::io(format!("failed to write {} bytes: {error}", path.display()))
+    })
 }
 
 fn file_write_inner(options: &FileWriteOptions) -> Result<Value, PatchError> {
@@ -818,6 +865,28 @@ fn file_write_inner(options: &FileWriteOptions) -> Result<Value, PatchError> {
         "mode": options.mode,
         "bytes_written": options.content.len(),
     }))
+}
+
+fn resolve_existing_workspace_file(
+    workspace: &Path,
+    file_path: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf), PatchError> {
+    let workspace = canonical_workspace(workspace)?;
+    let path = resolve_workspace_path(&workspace, file_path)?;
+    let canonical = path.canonicalize().map_err(|error| {
+        PatchError::io(format!(
+            "failed to canonicalize {}: {error}",
+            path.display()
+        ))
+    })?;
+    ensure_inside_workspace(&workspace, &canonical)?;
+    if canonical.is_dir() {
+        return Err(PatchError::invalid(format!(
+            "{} is a directory, not a file",
+            path.display()
+        )));
+    }
+    Ok((workspace, path, canonical))
 }
 
 fn resolve_workspace_path(workspace: &Path, path: &str) -> Result<PathBuf, PatchError> {
@@ -925,6 +994,16 @@ fn truncate_text(text: &str, max_chars: usize) -> (String, bool) {
     let mut output = text.chars().take(max_chars).collect::<String>();
     output.push_str("\n... truncated ...");
     (output, true)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -1093,6 +1172,46 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
         .expect_err("parent escape should be rejected");
 
         assert!(err.message.contains("without .."));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn file_hash_returns_size_and_sha256() {
+        let workspace = temp_workspace("file-hash");
+        fs::write(workspace.join("media.bin"), b"hello\n").expect("write file");
+
+        let result = file_hash(&FileHashOptions {
+            workspace: workspace.clone(),
+            file_path: "media.bin".to_string(),
+        });
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["bytes"], 6);
+        assert_eq!(
+            result["sha256"],
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn file_bytes_writes_raw_bytes() {
+        let workspace = temp_workspace("file-bytes");
+        let bytes = [0_u8, 1, b'a', b'\n', 255];
+        fs::write(workspace.join("media.bin"), bytes).expect("write file");
+        let mut output = Vec::new();
+
+        let written = file_bytes_to_writer(
+            &FileHashOptions {
+                workspace: workspace.clone(),
+                file_path: "media.bin".to_string(),
+            },
+            &mut output,
+        )
+        .expect("file bytes should write");
+
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(output, bytes);
         let _ = fs::remove_dir_all(workspace);
     }
 

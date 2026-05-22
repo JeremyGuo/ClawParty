@@ -1050,6 +1050,19 @@ fn handle_core_session_event(
             }))?;
             return Ok(());
         }
+        if let Some(response) = tool_binary_cancel_bridge_response(
+            request,
+            runner,
+            pending_tool_binary_requests,
+            pending_service_responses,
+        )? {
+            if let Some(runner) = runner.as_mut() {
+                runner.send(AgentSessionRequest::ResolveHostCoordination {
+                    response: serde_json::to_value(&response)?,
+                })?;
+            }
+            return Ok(());
+        }
         if let Some(call) = tool_binary_bridge_call(ctx, request)? {
             let (call, pending) = track_service_request(
                 call,
@@ -2043,6 +2056,53 @@ fn tool_binary_bridge_call(
     )?))
 }
 
+fn tool_binary_cancel_bridge_response(
+    request: &ConversationBridgeRequest,
+    runner: &mut Option<RealAgentSessionRuntime>,
+    pending_tool_binary_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
+) -> Result<Option<ConversationBridgeResponse>> {
+    if request.action != "tool_binary_ensure_cancel" {
+        return Ok(None);
+    }
+    let payload: LegacyToolBinaryEnsureCancelPayload =
+        serde_json::from_value(request.payload.clone())
+            .context("failed to parse tool_binary_ensure_cancel request")?;
+    let Some(index) = pending_tool_binary_requests
+        .iter()
+        .position(|pending| pending.request.request_id == payload.request_id)
+    else {
+        return Ok(Some(bridge_json_response(
+            request.clone(),
+            serde_json::json!({
+                "status": "not_found",
+                "request_id": payload.request_id,
+            }),
+        )));
+    };
+    let pending = pending_tool_binary_requests
+        .remove(index)
+        .expect("pending tool binary index should exist");
+    pending_service_responses.remove(&pending.service_request_id);
+    resolve_bridge_json(
+        runner,
+        bridge_json_response(
+            pending.request,
+            serde_json::json!({
+                "status": "interrupted",
+                "reason": payload.reason.unwrap_or_else(|| "tool_interrupted".to_string()),
+            }),
+        ),
+    )?;
+    Ok(Some(bridge_json_response(
+        request.clone(),
+        serde_json::json!({
+            "status": "cancelled",
+            "request_id": payload.request_id,
+        }),
+    )))
+}
+
 fn cron_bridge_call(
     ctx: &ServiceRunContext,
     request: &ConversationBridgeRequest,
@@ -2677,6 +2737,13 @@ struct LegacyToolBinaryEnsurePayload {
     tool: String,
     #[serde(default, alias = "remote_host")]
     host: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyToolBinaryEnsureCancelPayload {
+    request_id: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,5 +1,12 @@
-version: 0.2.0
+version: 0.2.1
 ---
+
+# 0.2.1
+
+- Add `file-hash`, which returns workspace-scoped file size and SHA-256 as
+  stable JSON.
+- Add `file-bytes`, which writes workspace-scoped raw file bytes to stdout so
+  remote media staging can avoid depending on `python3`.
 
 # 0.2.0
 
