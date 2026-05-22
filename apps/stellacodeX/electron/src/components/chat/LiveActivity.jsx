@@ -30,7 +30,7 @@ export function shouldShowInlineActivity(activity) {
   if (!activity) return false;
   const state = String(activity?.state || 'running').toLowerCase();
   if (state === 'failed') return true;
-  return false;
+  return state !== 'done';
 }
 
 function normalizeActivityPlan(rawPlan) {

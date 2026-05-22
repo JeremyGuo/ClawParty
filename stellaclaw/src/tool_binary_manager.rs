@@ -191,8 +191,8 @@ fn ensure_in_helper_process(
     request: ToolBinaryEnsureRequest,
     runtime: ToolBinaryRuntime,
 ) -> Result<ToolBinaryEnsureResponse> {
-    let current_exe = env::current_exe().context("failed to locate stellaclaw executable")?;
-    let mut command = Command::new(current_exe);
+    let helper_exe = helper_executable_path()?;
+    let mut command = Command::new(helper_exe);
     command.arg(TOOL_BINARY_HELPER_COMMAND);
     let input = serde_json::to_vec(&ToolBinaryHelperInput { request, runtime })
         .context("failed to encode tool binary helper input")?;
@@ -214,6 +214,37 @@ fn ensure_in_helper_process(
     match result {
         ToolBinaryHelperOutput::Success { response } => Ok(response),
         ToolBinaryHelperOutput::Failure { reason } => Err(anyhow!(reason)),
+    }
+}
+
+#[cfg(not(test))]
+fn helper_executable_path() -> Result<PathBuf> {
+    let current_exe = env::current_exe().context("failed to locate stellaclaw executable")?;
+    if current_exe.is_file() {
+        return Ok(current_exe);
+    }
+    if let Some(path) = strip_deleted_executable_marker(&current_exe).filter(|path| path.is_file()) {
+        return Ok(path);
+    }
+    if let Some(path) = invocation_executable_path().filter(|path| path.is_file()) {
+        return Ok(path);
+    }
+    Ok(current_exe)
+}
+
+fn strip_deleted_executable_marker(path: &Path) -> Option<PathBuf> {
+    path.to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map(PathBuf::from)
+}
+
+#[cfg(not(test))]
+fn invocation_executable_path() -> Option<PathBuf> {
+    let path = PathBuf::from(env::args_os().next()?);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        env::current_dir().ok().map(|cwd| cwd.join(path))
     }
 }
 
@@ -794,6 +825,15 @@ mod tests {
     fn hidden_helper_command_is_recognized() {
         assert!(is_helper_command("__tool-binary-ensure-helper"));
         assert!(!is_helper_command("setup"));
+    }
+
+    #[test]
+    fn deleted_executable_marker_is_stripped() {
+        assert_eq!(
+            strip_deleted_executable_marker(Path::new("/tmp/stellaclaw (deleted)")),
+            Some(PathBuf::from("/tmp/stellaclaw"))
+        );
+        assert_eq!(strip_deleted_executable_marker(Path::new("/tmp/stellaclaw")), None);
     }
 
     #[test]

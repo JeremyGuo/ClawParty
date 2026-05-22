@@ -127,7 +127,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
-  const [elapsedTickMs, setElapsedTickMs] = useState(() => Date.now());
   const inlineActivity = shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
@@ -174,15 +173,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       visible: virtualWindow.items.length,
       activity: currentActivity?.id || currentActivity?.kind || ''
   }));
-
-  useEffect(() => {
-    if (!sessionRunning) return undefined;
-    setElapsedTickMs(Date.now());
-    const timer = window.setInterval(() => {
-      setElapsedTickMs(Date.now());
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [sessionRunning, activeMessageScope]);
 
   useEffect(() => {
     if (!toolStopNoticeCandidate) {
@@ -728,7 +718,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           contentRef={contentRef}
           sessionRunning={sessionRunning}
           latestAssistantTurnIndex={latestAssistantTurnIndex}
-          elapsedTickMs={elapsedTickMs}
           pendingAssistantVisible={pendingAssistantVisible}
           inlineActivity={inlineActivity}
           turnStoppedAfterTool={turnStoppedAfterTool}
@@ -954,7 +943,6 @@ function MessageStreamView({
   contentRef,
   sessionRunning,
   latestAssistantTurnIndex,
-  elapsedTickMs,
   pendingAssistantVisible,
   inlineActivity,
   turnStoppedAfterTool,
@@ -999,7 +987,6 @@ function MessageStreamView({
               <MemoAssistantTurn
                 entry={entry}
                 active={sessionRunning && index === latestAssistantTurnIndex}
-                elapsedNowMs={sessionRunning && index === latestAssistantTurnIndex ? elapsedTickMs : undefined}
                 onOpenAttachment={onOpenAttachment}
                 onDownloadAttachment={onDownloadAttachment}
                 onResolveAttachmentUrl={onResolveAttachmentUrl}
@@ -1050,7 +1037,6 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.contentRef === next.contentRef
     && previous.sessionRunning === next.sessionRunning
     && previous.latestAssistantTurnIndex === next.latestAssistantTurnIndex
-    && previous.elapsedTickMs === next.elapsedTickMs
     && previous.pendingAssistantVisible === next.pendingAssistantVisible
     && previous.inlineActivity === next.inlineActivity
     && previous.turnStoppedAfterTool === next.turnStoppedAfterTool
@@ -1347,7 +1333,7 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onToolToggleInteraction }) {
+export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onToolToggleInteraction }) {
   const finalMessage = entry.finalMessage;
   const complete = isFinalAssistantMessage(finalMessage);
   return (
@@ -1355,7 +1341,6 @@ export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttac
       <MemoToolProcessGroup
         group={entry.processGroup}
         active={active}
-        elapsedNowMs={elapsedNowMs}
         onToggleInteraction={onToolToggleInteraction}
       />
       {finalMessage && (
@@ -1373,7 +1358,6 @@ export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttac
 
 const MemoAssistantTurn = memo(AssistantTurn, (previous, next) => (
   previous.active === next.active
-  && previous.elapsedNowMs === next.elapsedNowMs
   && previous.onOpenAttachment === next.onOpenAttachment
   && previous.onDownloadAttachment === next.onDownloadAttachment
   && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
@@ -1422,8 +1406,9 @@ function sameToolGroup(left, right) {
   return true;
 }
 
-export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggleInteraction }) {
+export function ToolProcessGroup({ group, active = false, onToggleInteraction }) {
   const renderStartedAt = renderCommitStart();
+  const [localElapsedTickMs, setLocalElapsedTickMs] = useState(() => Date.now());
   const messages = group.messages || [];
   const expandedRows = useMemo(() => measureChatPerf('chat.tool_group.expand_rows', () => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
@@ -1473,7 +1458,13 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
     }
     hadFinalMessageRef.current = hasFinalMessage;
   }, [hasFinalMessage]);
-  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? elapsedNowMs : undefined);
+  useEffect(() => {
+    if (!active) return undefined;
+    setLocalElapsedTickMs(Date.now());
+    const timer = window.setInterval(() => setLocalElapsedTickMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? localElapsedTickMs : undefined);
   const summary = useMemo(() => measureChatPerf('chat.tool_group.summary', () => toolRoundSummary(blocks), { blocks: blocks.length }), [blocks]);
   const compactPresence = useCollapsePresence(!open && summary.total > 0, 150);
   const title = toolRoundTitle(elapsed, complete, summary);
@@ -1548,7 +1539,6 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
 
 const MemoToolProcessGroup = memo(ToolProcessGroup, (previous, next) => (
   previous.active === next.active
-  && previous.elapsedNowMs === next.elapsedNowMs
   && previous.onToggleInteraction === next.onToggleInteraction
   && sameToolGroup(previous.group, next.group)
 ));

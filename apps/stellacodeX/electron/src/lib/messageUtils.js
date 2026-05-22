@@ -1050,8 +1050,7 @@ export function attachAuxiliaryMessages(messages) {
   return result;
 }
 
-export function displayMessages(messages, options = {}) {
-  const groupOpenToolRounds = options.groupOpenToolRounds !== false;
+export function displayMessages(messages) {
   const source = attachAuxiliaryMessages(messages).filter(hasVisibleMessageContent);
   const result = [];
   let forceSeparateNext = false;
@@ -1063,16 +1062,11 @@ export function displayMessages(messages, options = {}) {
       while (cursor < source.length) {
         const current = source[cursor];
         if (cursor > index && isFinalAssistantMessage(current)) break;
-        if (!isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
+        if (cursor > index && !isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
         group.push(current);
         cursor += 1;
       }
       const nextMessage = source[cursor];
-      if (!groupOpenToolRounds && !isFinalAssistantMessage(nextMessage)) {
-        result.push(message);
-        forceSeparateNext = false;
-        continue;
-      }
       result.push({ type: 'toolGroup', id: `tools-${messageKey(group[0], index)}`, messages: group, nextMessage });
       forceSeparateNext = Boolean(isFinalAssistantMessage(nextMessage));
       index = cursor - 1;
@@ -1084,17 +1078,6 @@ export function displayMessages(messages, options = {}) {
   return result;
 }
 
-export function hasOpenToolRound(messages) {
-  const source = attachAuxiliaryMessages(messages || []).filter(hasVisibleMessageContent);
-  for (let index = source.length - 1; index >= 0; index -= 1) {
-    const message = source[index];
-    if (isFinalAssistantMessage(message)) return false;
-    if (isExecutionMessage(message) || startsToolRound(source, index)) return true;
-    if (!isRoundInterstitialMessage(message)) return false;
-  }
-  return false;
-}
-
 function isRoundInterstitialMessage(message) {
   const role = String(message?.role || '').toLowerCase();
   if (role === 'user') return false;
@@ -1103,8 +1086,8 @@ function isRoundInterstitialMessage(message) {
 
 function startsToolRound(source, index) {
   const message = source[index];
-  if (isStreamingAssistantMessage(message)) return hasAssistantProcessItems(message);
-  if (String(message?.role || '').toLowerCase() !== 'assistant' || isFinalAssistantMessage(message)) return false;
+  if (isStreamingAssistantMessage(message) && hasAssistantProcessItems(message)) return true;
+  if (String(message?.role || '').toLowerCase() !== 'assistant') return false;
   for (let cursor = index + 1; cursor < source.length; cursor += 1) {
     const current = source[cursor];
     if (isFinalAssistantMessage(current)) return false;
