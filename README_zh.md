@@ -310,7 +310,12 @@ target/release/stellaclaw --config config.json --workdir ./rundir
 
 ### 4. systemd
 
-生产环境建议用 systemd 或其他 supervisor 管理 `stellaclaw`，确保崩溃后自动重启。
+生产环境建议用 systemd 或其他 supervisor 管理 `stellaclaw`，确保崩溃后自动重启。本仓库的本地部署使用 `clawparty.service`，重启时使用：
+
+```bash
+bash graceful_restart.sh
+systemctl --user status clawparty.service --no-pager
+```
 
 ---
 

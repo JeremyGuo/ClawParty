@@ -382,8 +382,8 @@ The workdir stores conversations, sessions, runtime skills, logs, and migration 
 The local deployment used by this repository runs as a user service:
 
 ```bash
-systemctl --user restart stellaclaw
-systemctl --user status stellaclaw --no-pager
+bash graceful_restart.sh
+systemctl --user status clawparty.service --no-pager
 ```
 
 Your unit should point `ExecStart` at `target/release/stellaclaw` and pass `--config` plus `--workdir`.
