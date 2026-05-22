@@ -711,10 +711,11 @@ impl WebChannel {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let client_message_id = client_message_id.unwrap_or_else(ChatMessage::new_message_id);
         let message = ChatMessage::new(ChatRole::User, items)
+            .with_message_id(client_message_id.clone())
             .with_user_name_option(request.user_name)
             .with_message_time(now_rfc3339());
-        let client_message_id = client_message_id.unwrap_or_else(|| message.message_id.clone());
         self.conversation_runtime
             .ensure_conversation_started(conversation_id)
             .map_err(HttpError::internal)?;

@@ -1960,6 +1960,11 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
       .map((item) => Number(item.attachment_index))
       .filter((index) => Number.isFinite(index))
   );
+  structuredItems
+    .filter((item) => item?.type === 'file' && item.index !== undefined)
+    .map((item) => Number(item.index))
+    .filter((index) => Number.isFinite(index))
+    .forEach((index) => structuredAttachmentIndexes.add(index));
   const structuredAttachmentKeys = new Set(
     structuredItems
       .filter((item) => item?.type === 'file')
@@ -2042,7 +2047,9 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
         return <MemoMarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'file') {
-        return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
+        const attachmentIndex = Number(item.attachment_index ?? item.index);
+        const attachment = Number.isFinite(attachmentIndex) ? attachments[attachmentIndex] : null;
+        return <AttachmentCard key={index} attachment={attachment || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
       }
       if (item?.type === 'selection_reference') {
         return <SelectionReferenceCard key={index} selection={item.selection || item.payload || item} />;

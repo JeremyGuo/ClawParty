@@ -1086,8 +1086,9 @@ function App() {
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
       : slashCommandState(value);
     const previousLastServerIndex = lastServerMessageIndex(messagesRef.current);
+    const optimisticId = `local-${Date.now()}`;
     const optimistic = {
-      id: `local-${Date.now()}`,
+      id: optimisticId,
       role: 'user',
       user_name: activeUserName,
       text: value,
@@ -1100,6 +1101,8 @@ function App() {
       })),
       attachment_count: outgoingFiles.length,
       message_time: new Date().toISOString(),
+      client_message_id: optimisticId,
+      _clientMessageId: optimisticId,
       _optimistic: true,
       pending: true
     };
