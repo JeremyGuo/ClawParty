@@ -431,6 +431,16 @@ function App() {
     readSaveTimersRef.current.set(key, timer);
   }, []);
 
+  const latestReadableMessageId = useCallback((session) => {
+    const candidates = [session?.last_final_message_id, session?.last_message_id]
+      .map((id) => String(id || '').trim())
+      .filter((id) => messageOrderFromId(id) !== undefined);
+    if (!candidates.length) return '';
+    return candidates.reduce((latest, candidate) => (
+      (messageOrderFromId(candidate) ?? -1) > (messageOrderFromId(latest) ?? -1) ? candidate : latest
+    ), candidates[0]);
+  }, []);
+
   const scheduleForegroundReadMark = useCallback(() => {
     if (foregroundReadTimerRef.current) {
       window.clearTimeout(foregroundReadTimerRef.current);
@@ -444,15 +454,16 @@ function App() {
         item.conversation_id === currentSelected?.conversationId
       ));
       const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
-      if (!currentSelected || !session?.last_final_message_id) return;
+      const latestMessageId = latestReadableMessageId(session);
+      if (!currentSelected || !latestMessageId) return;
       markConversationRead(
         currentSelected.serverId,
         currentSelected.conversationId,
         sessionId,
-        session.last_final_message_id
+        latestMessageId
       );
     }, 240);
-  }, [markConversationRead]);
+  }, [latestReadableMessageId, markConversationRead]);
 
   const markVisibleMessageRead = useCallback((messageId) => {
     if (!appForegroundRef.current) return;
@@ -542,6 +553,7 @@ function App() {
     conversationsRef,
     selectedRef,
     appForegroundRef,
+    markConversationRead,
     setConversations,
     setSelected
   });

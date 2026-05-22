@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { conversationStreamUrl, displayConversationName, foregroundSessions } from '../lib/api';
 import { applyConversationStreamEvent, hasUnreadConversation } from '../lib/conversationState';
+import { messageOrderFromId } from '../lib/messageUtils';
 
 function homeEventType(payload) {
   const type = String(payload?.type || '');
@@ -11,12 +12,27 @@ function firstSessionId(conversation) {
   return conversation ? foregroundSessions(conversation)[0]?.id || 'main' : 'main';
 }
 
+function latestReadableMessageId(session) {
+  const candidates = [session?.last_final_message_id, session?.last_message_id]
+    .map((id) => String(id || '').trim())
+    .filter((id) => messageOrderFromId(id) !== undefined);
+  if (!candidates.length) return '';
+  return candidates.reduce((latest, candidate) => (
+    (messageOrderFromId(candidate) ?? -1) > (messageOrderFromId(latest) ?? -1) ? candidate : latest
+  ), candidates[0]);
+}
+
+function eventSessionId(payload) {
+  return String(payload?.foreground_session_id || payload?.foregroundSessionId || 'main') || 'main';
+}
+
 export function useHomeConversationStream({
   activeServerId,
   settingsReady,
   conversationsRef,
   selectedRef,
   appForegroundRef,
+  markConversationRead,
   setConversations,
   setSelected
 }) {
@@ -69,6 +85,19 @@ export function useHomeConversationStream({
               });
             }
           }
+          if (
+            appForegroundRef.current
+            && payload.conversation_id
+            && selectedRef.current?.serverId === activeServerId
+            && selectedRef.current?.conversationId === payload.conversation_id
+            && (selectedRef.current?.foregroundSessionId || 'main') === eventSessionId(payload)
+          ) {
+            const activeConversation = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
+            const activeSessionId = eventSessionId(payload);
+            const activeSession = foregroundSessions(activeConversation).find((session) => String(session?.id || 'main') === activeSessionId) || activeConversation;
+            const latestId = latestReadableMessageId(activeSession);
+            if (latestId) markConversationRead?.(activeServerId, payload.conversation_id, activeSessionId, latestId);
+          }
           if (type === 'conversation_turn_completed' && payload.conversation_id) {
             const completed = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
             const selectedConversation = selectedRef.current;
@@ -99,5 +128,5 @@ export function useHomeConversationStream({
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
     };
-  }, [activeServerId, settingsReady, conversationsRef, selectedRef, appForegroundRef, setConversations, setSelected]);
+  }, [activeServerId, settingsReady, conversationsRef, selectedRef, appForegroundRef, markConversationRead, setConversations, setSelected]);
 }

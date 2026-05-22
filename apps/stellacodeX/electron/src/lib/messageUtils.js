@@ -1050,7 +1050,8 @@ export function attachAuxiliaryMessages(messages) {
   return result;
 }
 
-export function displayMessages(messages) {
+export function displayMessages(messages, options = {}) {
+  const groupOpenToolRounds = options.groupOpenToolRounds !== false;
   const source = attachAuxiliaryMessages(messages).filter(hasVisibleMessageContent);
   const result = [];
   let forceSeparateNext = false;
@@ -1067,6 +1068,11 @@ export function displayMessages(messages) {
         cursor += 1;
       }
       const nextMessage = source[cursor];
+      if (!groupOpenToolRounds && !isFinalAssistantMessage(nextMessage)) {
+        result.push(message);
+        forceSeparateNext = false;
+        continue;
+      }
       result.push({ type: 'toolGroup', id: `tools-${messageKey(group[0], index)}`, messages: group, nextMessage });
       forceSeparateNext = Boolean(isFinalAssistantMessage(nextMessage));
       index = cursor - 1;
@@ -1076,6 +1082,17 @@ export function displayMessages(messages) {
     forceSeparateNext = false;
   }
   return result;
+}
+
+export function hasOpenToolRound(messages) {
+  const source = attachAuxiliaryMessages(messages || []).filter(hasVisibleMessageContent);
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const message = source[index];
+    if (isFinalAssistantMessage(message)) return false;
+    if (isExecutionMessage(message) || startsToolRound(source, index)) return true;
+    if (!isRoundInterstitialMessage(message)) return false;
+  }
+  return false;
 }
 
 function isRoundInterstitialMessage(message) {

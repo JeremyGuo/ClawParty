@@ -1436,13 +1436,13 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
     };
   }), { messages: messages.length }), [messages]);
   const blocks = useMemo(() => measureChatPerf('chat.tool_group.blocks', () => toolProcessBlocks(expandedRows), { rows: expandedRows.length }), [expandedRows]);
-  const visibleTextBlocks = useMemo(() => (
-    blocks.filter((block) => block.type === 'note' && block.kind === 'text')
-  ), [blocks]);
-  const collapsedBodyBlocks = useMemo(() => (
-    blocks.filter((block) => !(block.type === 'note' && block.kind === 'text'))
-  ), [blocks]);
   const activeTail = active && !group.nextMessage;
+  const visibleTextBlocks = useMemo(() => (
+    activeTail ? blocks.filter((block) => block.type === 'note' && block.kind === 'text') : []
+  ), [activeTail, blocks]);
+  const collapsedBodyBlocks = useMemo(() => (
+    activeTail ? blocks.filter((block) => !(block.type === 'note' && block.kind === 'text')) : blocks
+  ), [activeTail, blocks]);
   const lastToolBlockIndex = useMemo(() => {
     for (let index = collapsedBodyBlocks.length - 1; index >= 0; index -= 1) {
       if (collapsedBodyBlocks[index]?.type === 'tools') return index;
