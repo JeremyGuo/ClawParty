@@ -1,5 +1,10 @@
-version: 1.30.0
+version: 1.31.0
 ---
+
+# 1.31.0
+
+- 适配 StellaCodeX iOS 到新的 WebChannel Conversation / Session 协议：
+  Conversation 列表与状态读取改为通过 `/api/ws/home` 的 `home.snapshot`，home stream 支持 `home.*` typed event；消息分页、消息详情、发送消息和前台实时流改为默认走 `foreground_sessions/main` session 边界。iOS 消息解码同步支持新的 durable `ChatMessage.data[]` / `payload` 结构，chat websocket 可处理 `chat.snapshot`、用户消息生命周期、durable `chat.message_appended`、turn/plan/progress 和 stream error 事件；高频 stream delta 不直接写入消息列表，只保留轻量进度状态，避免 iOS 客户端在 streaming 期间频繁重排 timeline。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.30.0
 
