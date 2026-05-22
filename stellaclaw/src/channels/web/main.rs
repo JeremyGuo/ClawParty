@@ -521,7 +521,7 @@ impl WebChannelMain {
         let (rendered_event, manifests) = self.render_chat_stream_event(&key, &stream, &event_type);
         {
             let state = self.live_states.entry(key.clone()).or_default();
-            state.record_session_stream(&stream.event, &event_type);
+            state.record_session_stream(&rendered_event, &event_type);
         }
         if should_log_chat_stream_event(&event_type, &stream.event) {
             let state = self.live_states.get(&key).cloned().unwrap_or_default();

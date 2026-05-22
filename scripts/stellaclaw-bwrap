@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-real_bwrap=/usr/bin/bwrap
-runtime_root=/home/liuhao/clawparty_workdir/rundir/.sandbox-tmp
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+real_bwrap=${STELLACLAW_REAL_BWRAP:-}
+if [[ -z "$real_bwrap" ]]; then
+  for candidate in /usr/bin/bwrap /bin/bwrap "$(command -v bwrap 2>/dev/null || true)"; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    [[ "$(readlink -f "$candidate")" != "$script_path" ]] || continue
+    real_bwrap=$candidate
+    break
+  done
+fi
+if [[ -z "$real_bwrap" || ! -x "$real_bwrap" ]]; then
+  echo "stellaclaw-bwrap: set STELLACLAW_REAL_BWRAP to the real bubblewrap binary" >&2
+  exit 127
+fi
+
+runtime_root=${STELLACLAW_BWRAP_TMP_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/stellaclaw-bwrap-tmp}
 owner_pid=$$
 
 mkdir -p "$runtime_root"

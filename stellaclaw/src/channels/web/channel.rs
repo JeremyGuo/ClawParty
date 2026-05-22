@@ -52,6 +52,9 @@ use crate::channels::{
     ProcessingState,
 };
 
+const PREVIEW_ATTACHMENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const DOWNLOAD_ATTACHMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 pub struct WebChannel {
     pub(super) id: String,
     pub(super) bind_addr: String,
@@ -576,6 +579,7 @@ impl WebChannel {
             return Err(HttpError::new(400, "attachment is not a materialized file"));
         }
         let path = contained_attachment_path(&file.uri, &conversation_root)?;
+        enforce_attachment_size_limit(&path, action)?;
         let body = fs::read(&path).map_err(HttpError::internal)?;
         Ok(HttpResponse::bytes(
             200,
@@ -1294,6 +1298,22 @@ fn contained_attachment_path(uri: &str, conversation_root: &Path) -> HttpResult<
             "attachment path is outside conversation",
         ))
     }
+}
+
+fn enforce_attachment_size_limit(path: &Path, action: &str) -> HttpResult<()> {
+    let size = fs::metadata(path).map_err(HttpError::internal)?.len();
+    let limit = if action == "preview" {
+        PREVIEW_ATTACHMENT_MAX_BYTES
+    } else {
+        DOWNLOAD_ATTACHMENT_MAX_BYTES
+    };
+    if size > limit {
+        return Err(HttpError::new(
+            413,
+            format!("attachment is too large for {action}: {size} bytes exceeds {limit}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

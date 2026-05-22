@@ -17,6 +17,7 @@ import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ConnectionMode
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import com.stellaclaw.stellacodex.domain.model.ConversationSummary
+import com.stellaclaw.stellacodex.domain.model.ForegroundSessionSummary
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -324,15 +325,37 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
                 }
                 "home.foreground_session_state_updated" -> {
                     val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
+                    val foregroundSessionId = payload["foreground_session_id"]?.jsonPrimitive?.content ?: "main"
                     val processingState = payload["state"]?.jsonPrimitive?.content ?: return
                     val running = processingState == "running" || processingState == "queued"
-                    patchConversation(conversationId) { it.copy(running = running, processingState = processingState) }
+                    patchConversation(conversationId) { summary ->
+                        summary.patchForegroundSession(foregroundSessionId) { session ->
+                            session.copy(state = processingState, running = running)
+                        }.let { patched ->
+                            if (patched.foregroundSessionId == foregroundSessionId) {
+                                patched.copy(running = running, processingState = processingState)
+                            } else {
+                                patched
+                            }
+                        }
+                    }
                 }
                 "home.foreground_session_seen_state_updated" -> {
                     val conversationId = payload["conversation_id"]?.jsonPrimitive?.content ?: return
+                    val foregroundSessionId = payload["foreground_session_id"]?.jsonPrimitive?.content ?: "main"
                     val lastSeenMessageId = payload["last_seen_message_id"]?.jsonPrimitive?.content
                     val lastSeenAt = payload["last_seen_at"]?.jsonPrimitive?.content
-                    patchConversation(conversationId) { it.copy(lastSeenMessageId = lastSeenMessageId, lastSeenAt = lastSeenAt) }
+                    patchConversation(conversationId) { summary ->
+                        summary.patchForegroundSession(foregroundSessionId) { session ->
+                            session.copy(lastSeenMessageId = lastSeenMessageId, lastSeenAt = lastSeenAt)
+                        }.let { patched ->
+                            if (patched.foregroundSessionId == foregroundSessionId) {
+                                patched.copy(lastSeenMessageId = lastSeenMessageId, lastSeenAt = lastSeenAt)
+                            } else {
+                                patched
+                            }
+                        }
+                    }
                 }
             }
         } catch (error: SerializationException) {
@@ -362,6 +385,23 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
                 error = null,
             )
         }
+    }
+
+    private fun ConversationSummary.patchForegroundSession(
+        foregroundSessionId: String,
+        transform: (ForegroundSessionSummary) -> ForegroundSessionSummary,
+    ): ConversationSummary {
+        val sessionId = foregroundSessionId.ifBlank { "main" }
+        var changed = false
+        val sessions = foregroundSessions.map { session ->
+            if (session.id == sessionId) {
+                changed = true
+                transform(session)
+            } else {
+                session
+            }
+        }
+        return if (changed) copy(foregroundSessions = sessions) else this
     }
 
     private fun JsonObject.applyTo(summary: ConversationSummary): ConversationSummary {
