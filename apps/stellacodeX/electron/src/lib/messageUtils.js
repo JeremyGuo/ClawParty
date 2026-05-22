@@ -713,6 +713,24 @@ export function hasOlderMessages(messages) {
   return messages.length > 0 && messageIndex(messages[0]) > 0;
 }
 
+export function firstMessageIndexGap(messages) {
+  const indexes = (messages || [])
+    .map(messageIndex)
+    .filter((index) => Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER)
+    .sort((left, right) => left - right);
+  for (let index = 1; index < indexes.length; index += 1) {
+    const previous = indexes[index - 1];
+    const current = indexes[index];
+    if (current > previous + 1) {
+      return {
+        offset: previous + 1,
+        limit: Math.min(200, current - previous - 1)
+      };
+    }
+  }
+  return null;
+}
+
 export function mergeMessages(current, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return current;
   const serverEchoes = incoming.filter((message) => String(message?.role || '').toLowerCase() === 'user');

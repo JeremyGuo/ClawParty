@@ -65,13 +65,11 @@ export function chatAckHistoryPlan(currentMessages, ack) {
   }
   if (total <= lastIndex + 1) return { kind: 'none' };
   const gap = total - lastIndex - 1;
-  const replace = gap > 200;
   return {
     kind: 'fetch',
-    params: replace
-      ? recentMessagePageParams(null, 80, total)
-      : { offset: lastIndex + 1, limit: gap },
-    replace
+    params: { offset: lastIndex + 1, limit: Math.min(200, gap) },
+    total,
+    replace: false
   };
 }
 

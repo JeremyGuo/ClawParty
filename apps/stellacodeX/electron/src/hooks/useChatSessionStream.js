@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { conversationKey, foregroundSessions, loadMessages } from '../lib/api';
-import { addUsageTotals, mergeMessages } from '../lib/messageUtils';
+import { addUsageTotals, firstMessageIndexGap, mergeMessages } from '../lib/messageUtils';
 import {
   applyStreamErrorToMessages,
   createStreamBufferStore,
@@ -175,6 +175,22 @@ export function useChatSessionStream({
       });
       updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
       if (patch.activity) setSessionActivity(patch.activity);
+    };
+
+    const fillFirstMessageGap = async () => {
+      let gap = firstMessageIndexGap(messagesRef.current);
+      let previousOffset = -1;
+      while (!disposed && websocketKeyRef.current === key && gap) {
+        if (gap.offset === previousOffset) return;
+        previousOffset = gap.offset;
+        const missing = await loadMessages(serverId, conversationId, {
+          ...gap,
+          foregroundSessionId: sessionId
+        });
+        if (!missing.length) return;
+        applyIncomingMessages(missing);
+        gap = firstMessageIndexGap(messagesRef.current);
+      }
     };
 
     const streamBuffers = createStreamBufferStore();
@@ -446,6 +462,7 @@ export function useChatSessionStream({
         return next;
       });
       setMessagesReady(true);
+      fillFirstMessageGap().catch(() => {});
     };
 
     const reconcileAck = async (ack) => {
@@ -458,10 +475,22 @@ export function useChatSessionStream({
         setMessagesReady(true);
         return;
       }
-      const missing = await loadMessages(serverId, conversationId, {
+      let missing = await loadMessages(serverId, conversationId, {
         ...plan.params,
         foregroundSessionId: sessionId
       });
+      let nextOffset = Number(plan.params?.offset || 0) + missing.length;
+      const total = Number(plan.total);
+      while (!disposed && websocketKeyRef.current === key && Number.isFinite(total) && nextOffset < total && missing.length > 0) {
+        const chunk = await loadMessages(serverId, conversationId, {
+          offset: nextOffset,
+          limit: Math.min(200, total - nextOffset),
+          foregroundSessionId: sessionId
+        });
+        if (!chunk.length) break;
+        missing = missing.concat(chunk);
+        nextOffset += chunk.length;
+      }
       if (plan.replace) {
         replaceWithRecentMessages(missing);
       } else {
@@ -566,6 +595,7 @@ export function useChatSessionStream({
             return next;
           });
           setMessagesReady(true);
+          fillFirstMessageGap().catch(() => {});
         })
         .catch(() => {
           if (!disposed) {
@@ -581,6 +611,7 @@ export function useChatSessionStream({
     messagesRef.current = cachedMessages;
     setMessages(cachedMessages);
     setMessagesReady(cachedMessages.length > 0);
+    if (cachedMessages.length > 0) fillFirstMessageGap().catch(() => {});
     setSessionActivity('');
     setChatSessionState({ scopeKey: key, state: 'idle' });
     setRunningActivities([]);

@@ -4,6 +4,7 @@ import 'highlight.js/styles/github-dark.css';
 import './styles.css';
 import {
   conversationKey,
+  connectionInfo,
   createConversation,
   createForegroundSession,
   deleteConversation,
@@ -84,6 +85,40 @@ function workspaceFileAttachmentDataUrl(path, file) {
     return `data:text/html;charset=utf-8,${encodeURIComponent(String(data))}`;
   }
   return '';
+}
+
+function serverRelativeApiPath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('/api/')) return raw;
+  try {
+    const url = new URL(raw);
+    return url.pathname.startsWith('/api/') ? `${url.pathname}${url.search || ''}` : '';
+  } catch {
+    return '';
+  }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Failed to read attachment blob'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function serverAttachmentDataUrl(serverId, rawUrl) {
+  const path = serverRelativeApiPath(rawUrl);
+  if (!serverId || !path) return '';
+  const info = await connectionInfo(serverId);
+  const response = await fetch(new URL(path, info.baseUrl).toString(), {
+    headers: {
+      Authorization: `Bearer ${info.token}`
+    }
+  });
+  if (!response.ok) return '';
+  return blobToDataUrl(await response.blob());
 }
 
 function App() {
@@ -246,6 +281,22 @@ function App() {
     const serverId = selected?.serverId || '';
     const conversationId = selected?.conversationId || '';
     if (!serverId || !conversationId) return rawUrl || '';
+    const apiPath = serverRelativeApiPath(rawUrl || attachment?.preview_url || attachment?.download_url);
+    if (apiPath) {
+      const key = attachmentCacheKey(serverId, conversationId, apiPath, attachment, rawUrl);
+      if (attachmentImageUrlCacheRef.current.has(key)) {
+        return attachmentImageUrlCacheRef.current.get(key);
+      }
+      try {
+        const dataUrl = await serverAttachmentDataUrl(serverId, apiPath);
+        if (dataUrl) {
+          attachmentImageUrlCacheRef.current.set(key, dataUrl);
+          return dataUrl;
+        }
+      } catch {
+        return rawUrl || '';
+      }
+    }
     const target = attachmentConversationFileTarget(attachment, rawUrl, conversationId, messageAttachmentWorkspaceRoots);
     if (!target) return rawUrl || '';
     const key = attachmentCacheKey(serverId, target.conversationId, target.path, attachment, rawUrl);

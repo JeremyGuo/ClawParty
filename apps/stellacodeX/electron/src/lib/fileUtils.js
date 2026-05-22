@@ -97,7 +97,7 @@ export function imageMimeType(path = '') {
 }
 
 export function attachmentName(attachment) {
-  return attachment?.name || attachment?.filename || fileNameFromPath(attachment?.path || attachment?.url || attachment?.uri || attachment?.file_uri || '') || 'attachment';
+  return attachment?.name || attachment?.filename || fileNameFromPath(attachment?.open_in_workspace_path || attachment?.path || attachment?.url || attachment?.uri || attachment?.file_uri || attachment?.preview_url || attachment?.download_url || '') || 'attachment';
 }
 
 export function dataUrlFromPart(part, fallbackMime) {
@@ -123,7 +123,6 @@ export function dataUrlFromPart(part, fallbackMime) {
 
 export function externalAttachmentUrl(value) {
   if (typeof value !== 'string' || !value) return '';
-  if (value.startsWith('/api/')) return '';
   return value;
 }
 
@@ -142,8 +141,10 @@ export function attachmentUrl(attachment) {
     || dataUrlFromPart(attachment.preview, fallbackMime)
     || dataUrlFromPart(attachment, fallbackMime)
     || externalAttachmentUrl(attachment.url)
+    || externalAttachmentUrl(attachment.preview_url)
     || externalAttachmentUrl(attachment.uri)
     || externalAttachmentUrl(attachment.file_uri)
+    || externalAttachmentUrl(attachment.download_url)
     || externalAttachmentUrl(attachment.src)
   );
 }

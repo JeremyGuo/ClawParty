@@ -45,12 +45,13 @@ function localAttachmentPath(attachment, rawUrl = '') {
     || filePathFromFileUri(attachment?.file_uri)
     || filePathFromFileUri(attachment?.url);
   if (uriPath) return uriPath;
-  return String(attachment?.path || attachment?.file_path || attachment?.src || '').trim();
+  return String(attachment?.open_in_workspace_path || attachment?.path || attachment?.file_path || attachment?.src || '').trim();
 }
 
 function attachmentWorkspacePath(attachment, rawUrl, workspaceRoots = []) {
   const explicit = String(
-    attachment?.workspace_path
+    attachment?.open_in_workspace_path
+    || attachment?.workspace_path
     || attachment?.relative_path
     || attachment?.workspace_relative_path
     || ''
@@ -128,6 +129,8 @@ export function attachmentCacheKey(serverId, conversationId, path, attachment, r
     attachment?.uri,
     attachment?.file_uri,
     attachment?.path,
+    attachment?.open_in_workspace_path,
+    attachment?.preview_url,
     attachment?.name
   ].map((value) => String(value || '')).join('|');
 }

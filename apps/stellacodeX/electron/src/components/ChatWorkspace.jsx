@@ -1316,13 +1316,19 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
     };
   }), { messages: messages.length }), [messages]);
   const blocks = useMemo(() => measureChatPerf('chat.tool_group.blocks', () => toolProcessBlocks(expandedRows), { rows: expandedRows.length }), [expandedRows]);
+  const visibleTextBlocks = useMemo(() => (
+    blocks.filter((block) => block.type === 'note' && block.kind === 'text')
+  ), [blocks]);
+  const collapsedBodyBlocks = useMemo(() => (
+    blocks.filter((block) => !(block.type === 'note' && block.kind === 'text'))
+  ), [blocks]);
   const activeTail = active && !group.nextMessage;
   const lastToolBlockIndex = useMemo(() => {
-    for (let index = blocks.length - 1; index >= 0; index -= 1) {
-      if (blocks[index]?.type === 'tools') return index;
+    for (let index = collapsedBodyBlocks.length - 1; index >= 0; index -= 1) {
+      if (collapsedBodyBlocks[index]?.type === 'tools') return index;
     }
     return -1;
-  }, [blocks]);
+  }, [collapsedBodyBlocks]);
   const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
   const toolsComplete = useMemo(() => measureChatPerf('chat.tool_group.complete_check', () => {
     const toolBlocks = blocks.filter((block) => block.type === 'tools');
@@ -1391,7 +1397,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
         <div className="tool-round-body-clip">
           {bodyPresence.present && (
             <div className="tool-process-round-body">
-              {blocks.map((block, index) => {
+              {collapsedBodyBlocks.map((block, index) => {
                 if (block.type === 'tools') {
                   const cardsComplete = toolCardsAreComplete(block.cards);
                   return (
@@ -1413,6 +1419,9 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggle
           )}
         </div>
       </div>
+      {visibleTextBlocks.map((block) => (
+        <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />
+      ))}
     </section>
   );
 }
@@ -1717,6 +1726,8 @@ const MemoToolProcessSegment = memo(ToolProcessSegment, (previous, next) => (
 
 function artifactAttachmentForPath(path, attachments = []) {
   const cleanPath = String(path || '').trim();
+  const byId = attachmentForUri(cleanPath, attachments);
+  if (byId) return byId;
   const existing = attachments.find((attachment) => attachmentMatchesPath(attachment, cleanPath));
   if (existing) return existing;
   const name = fileNameFromPath(cleanPath) || cleanPath;
@@ -1729,6 +1740,21 @@ function artifactAttachmentForPath(path, attachments = []) {
   };
 }
 
+function attachmentForUri(value, attachments = []) {
+  const match = String(value || '').trim().match(/^attachment:\/\/(.+)$/i);
+  if (!match) return null;
+  const id = decodeAttachmentId(match[1]);
+  return attachments.find((attachment) => String(attachment?.id || attachment?.attachment_id || '') === id) || null;
+}
+
+function decodeAttachmentId(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function attachmentMatchesPath(attachment, path) {
   const target = normalizeArtifactPath(path);
   if (!target) return false;
@@ -1736,11 +1762,14 @@ function attachmentMatchesPath(attachment, path) {
     attachment?.path,
     attachment?.file_path,
     attachment?.workspace_path,
+    attachment?.open_in_workspace_path,
     attachment?.relative_path,
     attachment?.workspace_relative_path,
     attachment?.uri,
     attachment?.file_uri,
     attachment?.url,
+    attachment?.preview_url,
+    attachment?.download_url,
     attachment?.file?.path,
     attachment?.file?.uri
   ];
@@ -1797,6 +1826,14 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
       .map((index) => attachmentIdentity(allAttachments[index]))
       .filter(Boolean)
   );
+  const inlineAttachmentIds = attachmentUriIds(text);
+  allAttachments.forEach((attachment) => {
+    const id = String(attachment?.id || attachment?.attachment_id || '');
+    if (id && inlineAttachmentIds.has(id)) {
+      const key = attachmentIdentity(attachment);
+      if (key) inlineAttachmentKeys.add(key);
+    }
+  });
   const structuredAttachmentIndexes = new Set(
     structuredItems
       .filter((item) => item?.type === 'file' && item.attachment_index !== undefined)
@@ -1838,6 +1875,16 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   );
 }
 
+function attachmentUriIds(text) {
+  const ids = new Set();
+  const pattern = /attachment:\/\/([^\s)\]]+)/gi;
+  let match;
+  while ((match = pattern.exec(String(text || ''))) !== null) {
+    ids.add(decodeAttachmentId(match[1]));
+  }
+  return ids;
+}
+
 function attachmentIdentity(attachment) {
   if (!attachment || typeof attachment !== 'object') return '';
   const file = attachment.file && typeof attachment.file === 'object' ? attachment.file : {};
@@ -1845,11 +1892,16 @@ function attachmentIdentity(attachment) {
     attachment.uri
     || attachment.file_uri
     || attachment.url
+    || attachment.preview_url
+    || attachment.download_url
     || attachment.path
+    || attachment.open_in_workspace_path
     || file.uri
     || file.file_uri
     || file.url
     || file.path
+    || attachment.id
+    || attachment.attachment_id
     || attachment.name
     || attachment.filename
     || ''
@@ -2181,13 +2233,13 @@ export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttach
 function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
   const rawUrl = attachmentUrl(attachment);
   const resolveKey = attachmentRenderKey(attachment, 0);
-  const needsResolve = isResolvableLocalAttachmentUrl(rawUrl) || (!rawUrl && hasLocalAttachmentPath(attachment));
+  const needsResolve = isResolvableAttachmentUrl(rawUrl) || (!rawUrl && hasLocalAttachmentPath(attachment));
   const initialUrl = needsResolve ? '' : rawUrl;
   const [url, setUrl] = useState(initialUrl);
   useEffect(() => {
     let disposed = false;
     const nextRawUrl = attachmentUrl(attachment);
-    const shouldResolve = isResolvableLocalAttachmentUrl(nextRawUrl) || (!nextRawUrl && hasLocalAttachmentPath(attachment));
+    const shouldResolve = isResolvableAttachmentUrl(nextRawUrl) || (!nextRawUrl && hasLocalAttachmentPath(attachment));
     if (!shouldResolve) {
       setUrl(nextRawUrl);
       return undefined;
@@ -2213,9 +2265,12 @@ function attachmentRenderKey(attachment, index = 0) {
     attachment?.uri
     || attachment?.file_uri
     || attachment?.url
+    || attachment?.preview_url
+    || attachment?.download_url
     || attachment?.path
     || attachment?.file_path
     || attachment?.workspace_path
+    || attachment?.open_in_workspace_path
     || attachment?.relative_path
     || attachment?.workspace_relative_path
     || file.uri
@@ -2234,8 +2289,21 @@ function isResolvableLocalAttachmentUrl(value) {
   return url.startsWith('/') || /^[A-Za-z]:[\\/]/.test(url);
 }
 
+function isResolvableAttachmentUrl(value) {
+  const url = String(value || '').trim();
+  if (!url) return false;
+  if (/^https?:/i.test(url)) {
+    try {
+      return new URL(url).pathname.startsWith('/api/');
+    } catch {
+      return false;
+    }
+  }
+  return isResolvableLocalAttachmentUrl(url);
+}
+
 function hasLocalAttachmentPath(attachment) {
-  const path = String(attachment?.path || attachment?.file_path || '').trim();
+  const path = String(attachment?.open_in_workspace_path || attachment?.path || attachment?.file_path || '').trim();
   return Boolean(path && !/^(?:data:|blob:|https?:)/i.test(path));
 }
 
@@ -2245,7 +2313,7 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
   const size = formatBytes(attachment?.size_bytes || attachment?.size);
   const [loadedImageSize, setLoadedImageSize] = useState(null);
   const [imageFailed, setImageFailed] = useState(false);
-  const hasAttachmentLocation = Boolean(attachment?.path || attachment?.file_path || attachment?.uri || attachment?.file_uri || attachment?.url);
+  const hasAttachmentLocation = Boolean(attachment?.open_in_workspace_path || attachment?.path || attachment?.file_path || attachment?.uri || attachment?.file_uri || attachment?.url || attachment?.preview_url || attachment?.download_url);
   const canOpen = Boolean(onOpenAttachment && hasAttachmentLocation);
   const canDownload = Boolean(onDownloadAttachment && hasAttachmentLocation);
   const openAttachment = () => {
