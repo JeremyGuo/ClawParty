@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole};
 
+use crate::conversation_metadata::WorkdirLayout;
 use crate::logger::StellaclawLogger;
 
 use crate::channels::{
@@ -19,6 +20,7 @@ use crate::channels::{
 };
 
 use super::{
+    history::web_attachment_for_workspace_markdown_target,
     ids::{foreground_route_id_from_storage_id, foreground_session_storage_id},
     protocol,
     time_utils::now_rfc3339,
@@ -233,6 +235,7 @@ struct WebChannelMain {
     home_subscribers: Vec<Sender<Value>>,
     chat_subscribers: HashMap<WebSessionKey, Vec<Sender<Value>>>,
     live_states: HashMap<WebSessionKey, ChatLiveState>,
+    stream_renderers: HashMap<String, StreamMarkdownRenderer>,
     seen_states: HashMap<String, ConversationSeen>,
     processing_states: HashMap<String, ProcessingState>,
 }
@@ -252,6 +255,7 @@ impl WebChannelMain {
             home_subscribers: Vec::new(),
             chat_subscribers: HashMap::new(),
             live_states: HashMap::new(),
+            stream_renderers: HashMap::new(),
             seen_states: seen.seen,
             processing_states: HashMap::new(),
         }
@@ -514,6 +518,7 @@ impl WebChannelMain {
             self.publish_foreground_session_state_event(&key);
             return;
         }
+        let (rendered_event, manifests) = self.render_chat_stream_event(&key, &stream, &event_type);
         {
             let state = self.live_states.entry(key.clone()).or_default();
             state.record_session_stream(&stream.event, &event_type);
@@ -545,13 +550,81 @@ impl WebChannelMain {
         ) {
             self.publish_foreground_session_state_event(&key);
         }
+        for manifest in manifests {
+            self.publish_chat(&key, manifest);
+        }
         let payload = protocol::public_chat_stream_payload(
             &stream.conversation_id,
             &key.foreground_session_id,
             &event_type,
-            &stream.event,
+            &rendered_event,
         );
         self.publish_chat(&key, payload);
+    }
+
+    fn render_chat_stream_event(
+        &mut self,
+        key: &WebSessionKey,
+        stream: &OutgoingSessionStream,
+        event_type: &str,
+    ) -> (Value, Vec<Value>) {
+        if event_type == "turn_started"
+            || event_type == "turn_completed"
+            || event_type == "stream_error"
+        {
+            if let Some(turn_id) = stream.event.get("turn_id").and_then(Value::as_str) {
+                self.stream_renderers
+                    .retain(|renderer_key, _| !renderer_key.contains(turn_id));
+            }
+        }
+        if event_type != "stream_assistant_message_delta" {
+            return (stream.event.clone(), Vec::new());
+        }
+        let Some(message_id) = stream.event.get("message_id").and_then(Value::as_str) else {
+            return (stream.event.clone(), Vec::new());
+        };
+        let Some(delta) = stream.event.get("delta").and_then(Value::as_str) else {
+            return (stream.event.clone(), Vec::new());
+        };
+        if delta.is_empty() {
+            return (stream.event.clone(), Vec::new());
+        }
+        let turn_id = stream
+            .event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let renderer_key = format!("{}:{}:{}", key.conversation_id, turn_id, message_id);
+        let conversation_root =
+            WorkdirLayout::new(&self.workdir).conversation_root(&key.conversation_id);
+        let renderer = self.stream_renderers.entry(renderer_key).or_default();
+        let rendered = renderer.render_delta(
+            delta,
+            &key.conversation_id,
+            &key.foreground_session_id,
+            message_id,
+            &conversation_root,
+        );
+        let mut event = stream.event.clone();
+        if let Value::Object(map) = &mut event {
+            map.insert("delta".to_string(), json!(rendered.delta));
+        }
+        let manifests = rendered
+            .manifests
+            .into_iter()
+            .map(|manifest| {
+                json!({
+                    "type": "chat.attachment_manifest",
+                    "conversation_id": key.conversation_id,
+                    "foreground_session_id": key.foreground_session_id,
+                    "message_id": message_id,
+                    "next_message_id": message_id,
+                    "turn_id": turn_id,
+                    "attachments": manifest.attachments,
+                })
+            })
+            .collect();
+        (event, manifests)
     }
 }
 
@@ -559,6 +632,130 @@ impl WebChannelMain {
 pub(super) struct WebSessionKey {
     conversation_id: String,
     foreground_session_id: String,
+}
+
+#[derive(Default)]
+struct StreamMarkdownRenderer {
+    pending: String,
+    projected: HashMap<String, String>,
+    next_attachment_index: usize,
+}
+
+struct RenderedStreamDelta {
+    delta: String,
+    manifests: Vec<RenderedAttachmentManifest>,
+}
+
+struct RenderedAttachmentManifest {
+    attachments: Vec<Value>,
+}
+
+impl StreamMarkdownRenderer {
+    fn render_delta(
+        &mut self,
+        delta: &str,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        message_id: &str,
+        conversation_root: &Path,
+    ) -> RenderedStreamDelta {
+        let mut input = delta.to_string();
+        if !self.pending.is_empty() {
+            self.pending.push_str(delta);
+            input = std::mem::take(&mut self.pending);
+        }
+        let mut out = String::new();
+        let mut manifests = Vec::new();
+        let mut rest = input.as_str();
+        loop {
+            let Some(start) = find_markdown_link_start(rest) else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&rest[..start]);
+            let candidate = &rest[start..];
+            let Some(end) = candidate.find(')') else {
+                self.pending.push_str(candidate);
+                break;
+            };
+            let segment = &candidate[..=end];
+            let rendered = self.render_link_segment(
+                segment,
+                conversation_id,
+                foreground_session_id,
+                message_id,
+                conversation_root,
+                &mut manifests,
+            );
+            out.push_str(&rendered);
+            rest = &candidate[end + 1..];
+        }
+        RenderedStreamDelta {
+            delta: out,
+            manifests,
+        }
+    }
+
+    fn render_link_segment(
+        &mut self,
+        segment: &str,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        message_id: &str,
+        conversation_root: &Path,
+        manifests: &mut Vec<RenderedAttachmentManifest>,
+    ) -> String {
+        let Some(target_start) = segment.find("](").map(|index| index + 2) else {
+            return segment.to_string();
+        };
+        let target_end = segment.len().saturating_sub(1);
+        if target_start > target_end {
+            return segment.to_string();
+        }
+        let target = &segment[target_start..target_end];
+        if let Some(id) = self.projected.get(target) {
+            return format!(
+                "{}attachment://{}{}",
+                &segment[..target_start],
+                id,
+                &segment[target_end..]
+            );
+        }
+        let index = self.next_attachment_index.saturating_add(1);
+        let Some((id, attachment)) = web_attachment_for_workspace_markdown_target(
+            target,
+            index,
+            conversation_id,
+            foreground_session_id,
+            message_id,
+            conversation_root,
+        ) else {
+            return segment.to_string();
+        };
+        self.next_attachment_index = index;
+        self.projected.insert(target.to_string(), id.clone());
+        manifests.push(RenderedAttachmentManifest {
+            attachments: vec![attachment],
+        });
+        format!(
+            "{}attachment://{}{}",
+            &segment[..target_start],
+            id,
+            &segment[target_end..]
+        )
+    }
+}
+
+fn find_markdown_link_start(value: &str) -> Option<usize> {
+    let marker = value.find("](")?;
+    let open = value[..marker].rfind('[')?;
+    Some(
+        if open > 0 && value.as_bytes().get(open - 1) == Some(&b'!') {
+            open - 1
+        } else {
+            open
+        },
+    )
 }
 
 impl WebSessionKey {
@@ -1574,12 +1771,28 @@ fn item_id_if_readable(item_id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use serde_json::json;
     use stellaclaw_core::session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolCallItem,
     };
 
-    use super::{protocol::public_chat_stream_payload, ChatLiveState};
+    use super::{protocol::public_chat_stream_payload, ChatLiveState, StreamMarkdownRenderer};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("stellaclaw-web-main-{name}-{nanos}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn stream_payload_is_flat_typed_chat_event() {
@@ -1629,6 +1842,25 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn stream_renderer_buffers_and_rewrites_workspace_markdown_image() {
+        let root = temp_root("stream-attachment");
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::write(root.join("output/image.png"), b"png").unwrap();
+        let mut renderer = StreamMarkdownRenderer::default();
+
+        let first = renderer.render_delta("look ![img](output/", "c1", "main", "msg_1", &root);
+        let second = renderer.render_delta("image.png) done", "c1", "main", "msg_1", &root);
+
+        assert_eq!(first.delta, "look ");
+        assert!(first.manifests.is_empty());
+        assert!(second.delta.contains("![img](attachment://att_"));
+        assert!(second.delta.ends_with(" done"));
+        assert_eq!(second.manifests.len(), 1);
+        assert_eq!(second.manifests[0].attachments[0]["name"], "image.png");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

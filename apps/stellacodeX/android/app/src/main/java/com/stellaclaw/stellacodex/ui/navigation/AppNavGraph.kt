@@ -45,8 +45,8 @@ fun AppNavGraph(requestedConversationId: String? = null) {
                 conversationId = backStackEntry.arguments?.getString("conversationId").orEmpty(),
                 foregroundSessionId = backStackEntry.arguments?.getString("foregroundSessionId") ?: "main",
                 onBack = { navController.popBackStack() },
-                onOpenWorkspace = { conversationId ->
-                    navController.navigate(AppRoute.Workspace.create(conversationId))
+                onOpenWorkspace = { conversationId, path ->
+                    navController.navigate(AppRoute.Workspace.create(conversationId, path))
                 },
             )
         }

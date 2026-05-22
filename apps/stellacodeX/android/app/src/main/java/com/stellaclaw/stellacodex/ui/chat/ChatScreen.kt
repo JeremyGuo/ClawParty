@@ -105,7 +105,7 @@ fun ChatScreen(
     conversationId: String,
     foregroundSessionId: String = "main",
     onBack: () -> Unit,
-    onOpenWorkspace: (String) -> Unit,
+    onOpenWorkspace: (String, String) -> Unit,
 ) {
     val application = LocalContext.current.applicationContext as Application
     val viewModel: ChatViewModel = viewModel(
@@ -180,7 +180,6 @@ fun ChatScreen(
     LaunchedEffect(visibleMessages) {
         visibleMessages.forEach { message ->
             if (message.attachments.isNotEmpty()) viewModel.previewAttachments(message.attachments)
-            message.markdownImageTargets().forEach { target -> viewModel.previewMarkdownImage(message.id, target) }
         }
     }
 
@@ -219,7 +218,7 @@ fun ChatScreen(
                 progressTitle = state.progressTitle,
                 progressImportant = state.progressImportant,
                 onBack = onBack,
-                onOpenWorkspace = { onOpenWorkspace(conversationId) },
+                onOpenWorkspace = { onOpenWorkspace(conversationId, "/") },
                 onShowDetails = { showDetails = true },
             )
         },
@@ -251,6 +250,7 @@ fun ChatScreen(
                     onPreviewAttachment = viewModel::previewAttachment,
                     onDownloadAttachment = viewModel::downloadAttachment,
                     onOpenAttachment = viewModel::openAttachment,
+                    onOpenAttachmentWorkspace = { attachment -> onOpenWorkspace(conversationId, attachment.openInWorkspacePath) },
                     onRetrySend = viewModel::retrySend,
                     modifier = Modifier.weight(1f),
                 )
@@ -524,6 +524,7 @@ private fun MessageList(
     onPreviewAttachment: (MessageAttachment) -> Unit,
     onDownloadAttachment: (MessageAttachment) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachmentWorkspace: (MessageAttachment) -> Unit,
     onRetrySend: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -545,6 +546,7 @@ private fun MessageList(
                     onPreviewAttachment = onPreviewAttachment,
                     onDownloadAttachment = onDownloadAttachment,
                     onOpenAttachment = onOpenAttachment,
+                    onOpenAttachmentWorkspace = onOpenAttachmentWorkspace,
                     onRetrySend = onRetrySend,
                 )
                 is ChatTimelineItem.AgentRun -> AgentRunCard(
@@ -554,6 +556,7 @@ private fun MessageList(
                     onPreviewAttachment = onPreviewAttachment,
                     onDownloadAttachment = onDownloadAttachment,
                     onOpenAttachment = onOpenAttachment,
+                    onOpenAttachmentWorkspace = onOpenAttachmentWorkspace,
                     onRetrySend = onRetrySend,
                 )
             }
@@ -672,11 +675,16 @@ private fun AgentRunCard(
     onPreviewAttachment: (MessageAttachment) -> Unit,
     onDownloadAttachment: (MessageAttachment) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachmentWorkspace: (MessageAttachment) -> Unit,
     onRetrySend: (String) -> Unit,
 ) {
     val processMessages = run.processMessages.filterNot { it.isToolOnlyMessage() }
     val finalMessage = run.finalMessage
     val finalText = finalMessage.text.ifBlank { finalMessage.preview }
+    val fallbackText = finalMessage.items.filterIsInstance<MessageItem.Text>()
+        .joinToString("\n\n") { it.text }
+    val bodyText = finalText.ifBlank { fallbackText }
+    val visibleAttachments = finalMessage.attachments.withoutMarkdownReferences(bodyText)
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start,
@@ -705,40 +713,27 @@ private fun AgentRunCard(
                     running = run.running,
                 )
             }
-            if (finalText.isNotBlank()) {
+            if (bodyText.isNotBlank()) {
                 SelectionContainer {
                     MessageBody(
                         messageId = finalMessage.id,
-                        text = finalText,
+                        text = bodyText,
                         attachments = finalMessage.attachments,
                         previews = previews,
                         onPreviewMarkdownImage = onPreviewMarkdownImage,
                         onOpenAttachment = onOpenAttachment,
                     )
                 }
-            } else {
-                val textItems = finalMessage.items.filterIsInstance<MessageItem.Text>()
-                if (textItems.isNotEmpty()) {
-                    SelectionContainer {
-                        MessageBody(
-                            messageId = finalMessage.id,
-                            text = textItems.joinToString("\n\n") { it.text },
-                            attachments = finalMessage.attachments,
-                            previews = previews,
-                            onPreviewMarkdownImage = onPreviewMarkdownImage,
-                            onOpenAttachment = onOpenAttachment,
-                        )
-                    }
-                }
             }
-            if (finalMessage.attachments.isNotEmpty()) {
+            if (visibleAttachments.isNotEmpty()) {
                 AttachmentList(
-                    attachments = finalMessage.attachments,
+                    attachments = visibleAttachments,
                     previews = previews,
                     compact = false,
                     onPreviewAttachment = onPreviewAttachment,
                     onDownloadAttachment = onDownloadAttachment,
                     onOpenAttachment = onOpenAttachment,
+                    onOpenAttachmentWorkspace = onOpenAttachmentWorkspace,
                 )
             }
             MessageMetaRow(
@@ -761,6 +756,7 @@ private fun MessageCard(
     onPreviewAttachment: (MessageAttachment) -> Unit,
     onDownloadAttachment: (MessageAttachment) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachmentWorkspace: (MessageAttachment) -> Unit,
     onRetrySend: (String) -> Unit,
 ) {
     val isUserMessage = message.role.equals("user", ignoreCase = true)
@@ -777,6 +773,10 @@ private fun MessageCard(
     val displayText = message.text.ifBlank {
         toolExplanations.joinToString("\n\n").ifBlank { message.preview }
     }
+    val fallbackText = message.items.filterIsInstance<MessageItem.Text>()
+        .joinToString("\n\n") { it.text }
+    val bodyText = displayText.ifBlank { fallbackText }
+    val visibleAttachments = message.attachments.withoutMarkdownReferences(bodyText)
     val hasToolProcess = toolItems.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
     val processRunning = hasToolProcess && message.localState == MessageLocalState.Streaming
     Row(
@@ -841,41 +841,28 @@ private fun MessageCard(
                         running = processRunning,
                     )
                 }
-                if (displayText.isNotBlank()) {
+                if (bodyText.isNotBlank()) {
                     SelectionContainer {
                         MessageBody(
                             messageId = message.id,
-                            text = displayText,
+                            text = bodyText,
                             attachments = message.attachments,
                             previews = previews,
                             onPreviewMarkdownImage = onPreviewMarkdownImage,
                             onOpenAttachment = onOpenAttachment,
                         )
                     }
-                } else {
-                    val textItems = message.items.filterIsInstance<MessageItem.Text>()
-                    if (textItems.isNotEmpty()) {
-                        SelectionContainer {
-                            MessageBody(
-                                messageId = message.id,
-                                text = textItems.joinToString("\n\n") { it.text },
-                                attachments = message.attachments,
-                                previews = previews,
-                                onPreviewMarkdownImage = onPreviewMarkdownImage,
-                                onOpenAttachment = onOpenAttachment,
-                            )
-                        }
-                    }
                 }
             }
-            if (message.attachments.isNotEmpty()) {
+            if (visibleAttachments.isNotEmpty()) {
                 AttachmentList(
-                    attachments = message.attachments,
+                    attachments = visibleAttachments,
                     previews = previews,
                     compact = isUserMessage,
                     onPreviewAttachment = onPreviewAttachment,
                     onDownloadAttachment = onDownloadAttachment,
                     onOpenAttachment = onOpenAttachment,
+                    onOpenAttachmentWorkspace = onOpenAttachmentWorkspace,
                 )
             }
             MessageMetaRow(
@@ -1012,17 +999,20 @@ private fun MarkdownText(
         text.lines().forEach { rawLine ->
             val line = rawLine.trimEnd()
             val inlineImage = line.markdownImageAttachment(attachments)
-            val inlineImageTarget = if (inlineImage == null) line.markdownImageTarget() else null
+            val attachmentLink = line.markdownAttachmentLink(attachments)
             when {
                 inlineImage != null -> Box(modifier = Modifier.clickable { onOpenAttachment(inlineImage) }) {
-                    AttachmentPreview(previews[inlineImage.previewKey()])
+                    val preview = previews[inlineImage.previewKey()]
+                    if (preview == null) {
+                        MarkdownImageReference(path = inlineImage.name.ifBlank { inlineImage.id }, onClick = { onOpenAttachment(inlineImage) })
+                    } else {
+                        AttachmentPreview(preview)
+                    }
                 }
-                inlineImageTarget != null -> {
-                    MarkdownImageReference(
-                        path = inlineImageTarget,
-                        onClick = { onOpenAttachment(inlineImageTarget.toMarkdownImageAttachment()) },
-                    )
-                }
+                attachmentLink != null -> MarkdownImageReference(
+                    path = attachmentLink.name.ifBlank { attachmentLink.id },
+                    onClick = { onOpenAttachment(attachmentLink) },
+                )
                 line.isBlank() -> Text("", style = MaterialTheme.typography.bodySmall)
                 line.startsWith("### ") -> Text(
                     text = line.removePrefix("### "),
@@ -1055,10 +1045,20 @@ private fun MarkdownText(
 
 private fun String.markdownImageAttachment(attachments: List<MessageAttachment>): MessageAttachment? {
     val target = markdownImageTarget() ?: return null
-    val normalizedTarget = target.normalizedAttachmentTarget()
-    return attachments.firstOrNull { attachment ->
-        attachment.kind == "image" && attachment.normalizedTargets().any { it == normalizedTarget }
-    }
+    val attachmentId = target.removePrefix("attachment://").takeIf { it != target && it.isNotBlank() } ?: return null
+    return attachments.firstOrNull { attachment -> attachment.kind == "image" && attachment.id == attachmentId }
+}
+
+private fun String.markdownAttachmentLink(attachments: List<MessageAttachment>): MessageAttachment? {
+    if (MarkdownImageLinePattern.matchEntire(trim()) != null) return null
+    val target = MarkdownAttachmentLinkLinePattern.matchEntire(trim())
+        ?.groupValues
+        ?.getOrNull(2)
+        ?.trim()
+        ?.takeIf { it.startsWith("attachment://") }
+        ?: return null
+    val attachmentId = target.removePrefix("attachment://").takeIf { it != target && it.isNotBlank() } ?: return null
+    return attachments.firstOrNull { attachment -> attachment.id == attachmentId }
 }
 
 @Composable
@@ -1092,19 +1092,29 @@ private fun String.markdownImageTarget(): String? = MarkdownImageLinePattern.mat
     ?.groupValues
     ?.getOrNull(2)
     ?.trim()
-    ?.takeIf { it.isMarkdownImagePath() }
+    ?.takeIf { it.startsWith("attachment://") }
 
-private fun String.toMarkdownImageAttachment(): MessageAttachment = MessageAttachment(
-    index = -1,
-    kind = "image",
-    name = substringBefore('?').substringBefore('#').substringAfterLast('/').ifBlank { "image" },
-    mediaType = markdownImageMediaType(),
-    sizeBytes = null,
-    url = takeIf { it.contains("://") }.orEmpty(),
-    path = takeUnless { it.contains("://") }.orEmpty(),
-)
+private fun List<MessageAttachment>.withoutMarkdownReferences(text: String): List<MessageAttachment> {
+    val referencedIds = text.markdownAttachmentIds()
+    if (referencedIds.isEmpty()) return this
+    return filterNot { attachment -> attachment.id in referencedIds }
+}
 
-private fun ChatMessage.markdownImageTargets(): List<String> = emptyList()
+private fun String.markdownAttachmentIds(): Set<String> {
+    if (isBlank()) return emptySet()
+    val ids = mutableSetOf<String>()
+    fun collect(regex: Regex) {
+        regex.findAll(this).forEach { match ->
+            val target = match.groupValues.getOrNull(2)?.trim().orEmpty()
+            if (target.startsWith("attachment://")) {
+                target.removePrefix("attachment://").takeIf { it.isNotBlank() }?.let(ids::add)
+            }
+        }
+    }
+    collect(MarkdownImageLinePattern)
+    collect(MarkdownAttachmentLinkLinePattern)
+    return ids
+}
 
 private fun List<ChatMessage>.contentVersion(): Int = fold(1) { acc, message ->
     31 * acc + message.contentSignature().hashCode()
@@ -1120,33 +1130,8 @@ private fun ChatMessage.contentSignature(): String = buildString {
     append(attachments.size)
 }
 
-private fun String.isMarkdownImagePath(): Boolean {
-    if (isBlank() || startsWith("#") || startsWith("data:") || startsWith("blob:")) return false
-    val extension = substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase()
-    return extension in setOf("png", "jpg", "jpeg", "gif", "webp", "svg")
-}
-
-private fun MessageAttachment.normalizedTargets(): List<String> = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
-    .filter { it.isNotBlank() }
-    .map { it.normalizedAttachmentTarget() }
-
-private fun String.normalizedAttachmentTarget(): String = trim()
-    .substringBefore('?')
-    .substringBefore('#')
-    .removePrefix("file://")
-    .replace('\\', '/')
-    .trimStart('/')
-
-private fun String.markdownImageMediaType(): String? = when (substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase()) {
-    "png" -> "image/png"
-    "jpg", "jpeg" -> "image/jpeg"
-    "gif" -> "image/gif"
-    "webp" -> "image/webp"
-    "svg" -> "image/svg+xml"
-    else -> null
-}
-
 private val MarkdownImageLinePattern = Regex("!\\[([^\\]]*)]\\(([^)]+)\\)")
+private val MarkdownAttachmentLinkLinePattern = Regex("\\[([^\\]]*)]\\(([^)]+)\\)")
 
 @Composable
 private fun CodeBlock(block: MarkdownBlock.Code) {
@@ -1478,6 +1463,7 @@ private fun AttachmentList(
     onPreviewAttachment: (MessageAttachment) -> Unit,
     onDownloadAttachment: (MessageAttachment) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachmentWorkspace: (MessageAttachment) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         attachments.forEach { attachment ->
@@ -1488,6 +1474,7 @@ private fun AttachmentList(
                 onPreviewAttachment = onPreviewAttachment,
                 onDownloadAttachment = onDownloadAttachment,
                 onOpenAttachment = onOpenAttachment,
+                onOpenAttachmentWorkspace = onOpenAttachmentWorkspace,
             )
         }
     }
@@ -1501,6 +1488,7 @@ private fun AttachmentCard(
     onPreviewAttachment: (MessageAttachment) -> Unit,
     onDownloadAttachment: (MessageAttachment) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
+    onOpenAttachmentWorkspace: (MessageAttachment) -> Unit,
 ) {
     Card(
         modifier = Modifier
@@ -1541,6 +1529,9 @@ private fun AttachmentCard(
                     TextButton(onClick = { onPreviewAttachment(attachment) }) { Text("Preview") }
                     TextButton(onClick = { onDownloadAttachment(attachment) }) { Text("Download") }
                     TextButton(onClick = { onOpenAttachment(attachment) }) { Text("Open") }
+                    if (attachment.openInWorkspacePath.isNotBlank()) {
+                        TextButton(onClick = { onOpenAttachmentWorkspace(attachment) }) { Text("Workspace") }
+                    }
                 }
             }
         }
@@ -1587,11 +1578,11 @@ private fun AttachmentPreview(preview: AttachmentPreviewUiState?) {
     }
 }
 
-private fun MessageAttachment.previewKey(): String = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
+private fun MessageAttachment.previewKey(): String = listOf(id, previewUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
     .firstOrNull { it.isNotBlank() }
     ?: "$index:$name"
 
-private fun MessageAttachment.hasLoadTarget(): Boolean = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data)
+private fun MessageAttachment.hasLoadTarget(): Boolean = listOf(previewUrl, downloadUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data)
     .any { it.isNotBlank() }
 
 private sealed interface MarkdownBlock {

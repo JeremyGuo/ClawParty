@@ -18,8 +18,13 @@ import kotlinx.serialization.json.jsonPrimitive
 
 fun ChatMessageDto.toDomain(): ChatMessage {
     val canonicalItems = data.ifEmpty { items }
-    val derivedAttachments = canonicalItems.flatMapIndexed { index, item -> item.toAttachments(index) }
-    val allAttachments = attachments.map { it.toDomain() } + derivedAttachments
+    val projectedAttachments = attachments.map { it.toDomain() }
+    val derivedAttachments = if (projectedAttachments.isEmpty()) {
+        canonicalItems.flatMapIndexed { index, item -> item.toAttachments(index) }
+    } else {
+        emptyList()
+    }
+    val allAttachments = projectedAttachments + derivedAttachments
     val mappedItems = if (data.isNotEmpty()) {
         var fileIndex = attachments.size
         canonicalItems.mapIndexedNotNull { index, item ->
@@ -57,6 +62,7 @@ private fun MessageAttachmentDto.toDomain(): MessageAttachment {
         .ifBlank { "attachment" }
     val resolvedMediaType = mediaType ?: mimeType ?: mime ?: guessMediaType(resolvedName)
     return MessageAttachment(
+        id = id,
         index = index,
         kind = kind,
         name = resolvedName,
@@ -74,6 +80,9 @@ private fun MessageAttachmentDto.toDomain(): MessageAttachment {
         dataBase64 = dataBase64.ifBlank { base64 },
         data = data,
         encoding = encoding,
+        previewUrl = previewUrl,
+        downloadUrl = downloadUrl,
+        openInWorkspacePath = openInWorkspacePath.orEmpty(),
     )
 }
 
@@ -155,11 +164,15 @@ private fun JsonObject.toAttachment(index: Int): MessageAttachment? {
     val dataUrl = payload.string("data_url").orEmpty()
     val dataBase64 = payload.string("data_base64") ?: payload.string("base64").orEmpty()
     val data = payload.string("data").orEmpty()
-    val target = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data).firstOrNull { it.isNotBlank() }.orEmpty()
+    val previewUrl = payload.string("preview_url").orEmpty()
+    val downloadUrl = payload.string("download_url").orEmpty()
+    val openInWorkspacePath = payload.string("open_in_workspace_path").orEmpty()
+    val target = listOf(previewUrl, downloadUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data).firstOrNull { it.isNotBlank() }.orEmpty()
     if (target.isBlank()) return null
     val name = payload.string("name") ?: payload.string("filename") ?: fileNameFromPath(path.ifBlank { filePath }.ifBlank { target }).ifBlank { "attachment" }
     val mediaType = payload.string("media_type") ?: payload.string("mime_type") ?: payload.string("mime") ?: guessMediaType(name)
     return MessageAttachment(
+        id = payload.string("id").orEmpty(),
         index = index,
         kind = if (mediaType?.startsWith("image/") == true) "image" else "document",
         name = name,
@@ -177,6 +190,9 @@ private fun JsonObject.toAttachment(index: Int): MessageAttachment? {
         dataBase64 = dataBase64,
         data = data,
         encoding = payload.string("encoding").orEmpty(),
+        previewUrl = previewUrl,
+        downloadUrl = downloadUrl,
+        openInWorkspacePath = openInWorkspacePath,
     )
 }
 

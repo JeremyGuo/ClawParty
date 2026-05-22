@@ -20,6 +20,7 @@ data class ChatMessage(
 )
 
 data class MessageAttachment(
+    val id: String = "",
     val index: Int,
     val kind: String,
     val name: String,
@@ -37,6 +38,9 @@ data class MessageAttachment(
     val dataBase64: String = "",
     val data: String = "",
     val encoding: String = "",
+    val previewUrl: String = "",
+    val downloadUrl: String = "",
+    val openInWorkspacePath: String = "",
 )
 
 sealed interface MessageItem {

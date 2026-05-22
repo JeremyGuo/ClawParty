@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
+    fs,
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -31,10 +32,11 @@ use crate::{
 
 use super::{
     control::control_ingress_from_text,
-    history::{decorate_message, MessageSummary},
+    history::{decorate_message, file_path_from_file_uri, web_attachment_file, MessageSummary},
     http::{
-        parse_json, parse_optional_json, query_usize, read_http_request, split_path,
-        write_response, HttpError, HttpRequest, HttpResponse, HttpResult,
+        parse_json, parse_optional_json, percent_decode_path_segment, query_usize,
+        read_http_request, split_path, write_response, HttpError, HttpRequest, HttpResponse,
+        HttpResult,
     },
     ids::{
         default_foreground_route_id, foreground_route_id_from_storage_id,
@@ -101,7 +103,8 @@ impl WebChannel {
         if !self.authorized(&request) {
             return Err(HttpError::new(401, "unauthorized"));
         }
-        let path = split_path(&request.path);
+        let path = decode_path_segments(split_path(&request.path))?;
+        let path = path.iter().map(String::as_str).collect::<Vec<_>>();
         match (request.method.as_str(), path.as_slice()) {
             ("GET", ["api", "health"]) => Ok(HttpResponse::json(200, json!({"ok": true}))),
             ("GET", ["api", "models"]) => self.list_models(),
@@ -138,6 +141,16 @@ impl WebChannel {
                 "GET",
                 ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages", message_id],
             ) => self.message_detail(conversation_id, foreground_session_id, message_id),
+            (
+                "GET",
+                ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages", message_id, "attachments", attachment_id, action],
+            ) => self.message_attachment(
+                conversation_id,
+                foreground_session_id,
+                message_id,
+                attachment_id,
+                action,
+            ),
             (
                 "POST",
                 ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages"],
@@ -188,7 +201,9 @@ impl WebChannel {
             )?;
             return Ok(());
         }
-        let path = split_path(&request.path);
+        let path = decode_path_segments(split_path(&request.path))
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let path = path.iter().map(String::as_str).collect::<Vec<_>>();
         match path.as_slice() {
             ["api", "ws", "home"] => self.accept_home_stream(stream, &request),
             ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "ws"] => {
@@ -441,7 +456,17 @@ impl WebChannel {
         let messages = history
             .messages
             .iter()
-            .map(|record| decorate_message(&record.message, record.index))
+            .map(|record| {
+                let conversation_root =
+                    WorkdirLayout::new(&self.workdir).conversation_root(conversation_id);
+                decorate_message(
+                    &record.message,
+                    record.index,
+                    conversation_id,
+                    foreground_session_id,
+                    Some(&conversation_root),
+                )
+            })
             .collect::<Vec<_>>();
         Ok(HttpResponse::json(
             200,
@@ -485,7 +510,15 @@ impl WebChannel {
             _ => None,
         })?
         .ok_or_else(|| HttpError::new(404, "message_not_found"))?;
-        let message = decorate_message(&record.message, record.index);
+        let conversation_root =
+            WorkdirLayout::new(&self.workdir).conversation_root(conversation_id);
+        let message = decorate_message(
+            &record.message,
+            record.index,
+            conversation_id,
+            foreground_session_id,
+            Some(&conversation_root),
+        );
         Ok(HttpResponse::json(
             200,
             json!({
@@ -493,6 +526,62 @@ impl WebChannel {
                 "foreground_session_id": foreground_session_id,
                 "message": message,
             }),
+        ))
+    }
+
+    fn message_attachment(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        action: &str,
+    ) -> HttpResult {
+        if action != "preview" && action != "download" {
+            return Err(HttpError::new(404, "attachment_action_not_found"));
+        }
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("message-attachment");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryMessageDetail {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    request_id: request_id.clone(),
+                    message_id: message_id.to_string(),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let record = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::MessageDetail {
+                request_id: id,
+                record,
+            } if id == request_id => Some(record),
+            _ => None,
+        })?
+        .ok_or_else(|| HttpError::new(404, "message_not_found"))?;
+        let conversation_root =
+            WorkdirLayout::new(&self.workdir).conversation_root(conversation_id);
+        let file = web_attachment_file(
+            &record.message,
+            conversation_id,
+            Some(&conversation_root),
+            attachment_id,
+        )
+        .ok_or_else(|| HttpError::new(404, "attachment_not_found"))?;
+        if !file.uri.trim_start().starts_with("file://") {
+            return Err(HttpError::new(400, "attachment is not a materialized file"));
+        }
+        let path = contained_attachment_path(&file.uri, &conversation_root)?;
+        let body = fs::read(&path).map_err(HttpError::internal)?;
+        Ok(HttpResponse::bytes(
+            200,
+            file.media_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            body,
         ))
     }
 
@@ -984,7 +1073,17 @@ impl Channel for WebChannel {
     }
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
-        let message = decorate_message(&appended.message, appended.index);
+        let foreground_session_id = foreground_route_id_from_storage_id(&appended.session_id)
+            .unwrap_or_else(|| "main".to_string());
+        let conversation_root =
+            WorkdirLayout::new(&self.workdir).conversation_root(&appended.conversation_id);
+        let message = decorate_message(
+            &appended.message,
+            appended.index,
+            &appended.conversation_id,
+            &foreground_session_id,
+            Some(&conversation_root),
+        );
         let conversation_summary = self
             .query_conversation_metadata(&appended.conversation_id)
             .ok()
@@ -1171,4 +1270,70 @@ fn is_final_assistant_message(message: &ChatMessage) -> bool {
         ChatMessageItem::File(_) => true,
         _ => false,
     })
+}
+
+fn decode_path_segments(raw: Vec<&str>) -> HttpResult<Vec<String>> {
+    raw.into_iter()
+        .map(|segment| {
+            percent_decode_path_segment(segment)
+                .ok_or_else(|| HttpError::new(400, "invalid path encoding"))
+        })
+        .collect()
+}
+
+fn contained_attachment_path(uri: &str, conversation_root: &Path) -> HttpResult<PathBuf> {
+    let path = file_path_from_file_uri(uri)
+        .ok_or_else(|| HttpError::new(400, "attachment is not a materialized file"))?;
+    let root = fs::canonicalize(conversation_root).map_err(HttpError::internal)?;
+    let path = fs::canonicalize(path).map_err(HttpError::internal)?;
+    if path.starts_with(&root) {
+        Ok(path)
+    } else {
+        Err(HttpError::new(
+            403,
+            "attachment path is outside conversation",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_segments_are_percent_decoded_for_routes() {
+        let decoded = decode_path_segments(vec!["api", "conversations", "STS2%20Main", "a%2Bb"])
+            .expect("path decodes");
+        assert_eq!(decoded, vec!["api", "conversations", "STS2 Main", "a+b"]);
+    }
+
+    #[test]
+    fn attachment_path_must_stay_under_conversation_root() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-web-attachment-root-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "stellaclaw-web-attachment-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
+        fs::create_dir_all(root.join(".stellaclaw/output")).unwrap();
+        let inside = root.join(".stellaclaw/output/image.png");
+        fs::write(&inside, b"ok").unwrap();
+        fs::write(&outside, b"no").unwrap();
+
+        assert_eq!(
+            contained_attachment_path(&format!("file://{}", inside.display()), &root).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        let response = contained_attachment_path(&format!("file://{}", outside.display()), &root)
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status, 403);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
+    }
 }

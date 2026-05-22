@@ -169,6 +169,10 @@ pub(super) fn split_path(path: &str) -> Vec<&str> {
         .collect()
 }
 
+pub(super) fn percent_decode_path_segment(value: &str) -> Option<String> {
+    percent_decode_inner(value, false)
+}
+
 fn parse_target(target: &str) -> (String, HashMap<String, String>) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     (path.to_string(), parse_query(query))
@@ -189,6 +193,10 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 }
 
 fn percent_decode(value: &str) -> Option<String> {
+    percent_decode_inner(value, true)
+}
+
+fn percent_decode_inner(value: &str, plus_as_space: bool) -> Option<String> {
     let mut bytes = Vec::new();
     let mut chars = value.as_bytes().iter().copied();
     while let Some(byte) = chars.next() {
@@ -200,7 +208,7 @@ fn percent_decode(value: &str) -> Option<String> {
                 let text = std::str::from_utf8(&hex).ok()?;
                 bytes.push(u8::from_str_radix(text, 16).ok()?);
             }
-            b'+' => bytes.push(b' '),
+            b'+' if plus_as_space => bytes.push(b' '),
             other => bytes.push(other),
         }
     }

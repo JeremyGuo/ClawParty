@@ -250,8 +250,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
-            val workspace = state.value.conversationSummary?.workspace
-            when (val result = fetchAttachmentContent(profile, conversationId, workspace, attachment, limitBytes = AttachmentPreviewLimitBytes)) {
+            when (val result = fetchAttachmentContent(profile, attachment, forDownload = false)) {
                 is AppResult.Ok -> {
                     val mediaType = attachment.mediaType ?: result.value.mediaType.orEmpty()
                     val image = if (attachment.kind == "image" || mediaType.startsWith("image/")) {
@@ -293,16 +292,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         attachments.filter(::shouldAutoPreviewAttachment).forEach(::previewAttachment)
     }
 
-    fun previewMarkdownImage(messageId: String, path: String) {
-        Unit
-    }
-
     fun downloadAttachment(attachment: MessageAttachment) {
         viewModelScope.launch(coroutineErrorHandler) {
             mutableState.update { it.copy(realtimeState = "Downloading ${attachment.displayName()}...") }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
-            val current = state.value
-            when (val result = fetchAttachmentContent(profile, current.conversationId, current.conversationSummary?.workspace, attachment, limitBytes = AttachmentDownloadLimitBytes)) {
+            when (val result = fetchAttachmentContent(profile, attachment, forDownload = true)) {
                 is AppResult.Ok -> {
                     val saved = saveAttachmentToDownloads(attachment.displayName(), result.value.bytes, attachment.mediaType ?: result.value.mediaType ?: "application/octet-stream")
                     mutableState.update { it.copy(realtimeState = "Saved $saved") }
@@ -316,8 +310,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(coroutineErrorHandler) {
             mutableState.update { it.copy(realtimeState = "Opening ${attachment.displayName()}...") }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
-            val current = state.value
-            when (val result = fetchAttachmentContent(profile, current.conversationId, current.conversationSummary?.workspace, attachment, limitBytes = AttachmentDownloadLimitBytes)) {
+            when (val result = fetchAttachmentContent(profile, attachment, forDownload = true)) {
                 is AppResult.Ok -> {
                     val app = getApplication<Application>()
                     val mediaType = attachment.mediaType ?: result.value.mediaType ?: "application/octet-stream"
@@ -339,24 +332,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun fetchAttachmentContent(
         profile: ConnectionProfile,
-        conversationId: String,
-        workspacePath: String?,
         attachment: MessageAttachment,
-        limitBytes: Int,
+        forDownload: Boolean,
     ) = inlineAttachmentContent(attachment)
-        ?: workspaceRelativeAttachmentPath(attachment, conversationId, workspacePath)?.let { path ->
-        when (val result = api.fetchWorkspaceFile(profile, conversationId, path, limitBytes = limitBytes)) {
-            is AppResult.Ok -> {
-                val mismatch = workspaceResponseNameMismatch(path, result.value.name, result.value.path)
-                if (mismatch != null) {
-                    AppResult.Err(AppError.Decode(mismatch))
-                } else {
-                    AppResult.Ok(com.stellaclaw.stellacodex.data.api.FetchedAttachment(result.value.bytes, result.value.mediaType))
-                }
-            }
-            is AppResult.Err -> result
-        }
-    } ?: api.fetchAttachment(profile, attachment.loadUrl())
+        ?: api.fetchAttachment(profile, attachment.loadUrl(forDownload))
 
     private fun inlineAttachmentContent(attachment: MessageAttachment): AppResult.Ok<com.stellaclaw.stellacodex.data.api.FetchedAttachment>? {
         val mediaType = attachment.mediaType ?: mediaTypeFromDataUrl(attachment.dataUrl)
@@ -379,45 +358,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return null
     }
 
-    private fun workspaceRelativeAttachmentPath(
-        attachment: MessageAttachment,
-        conversationId: String,
-        workspacePath: String?,
-    ): String? {
-        listOf(attachment.workspacePath, attachment.relativePath).firstOrNull { it.isNotBlank() }?.let { return it.trimStart('/') }
-        listOf(attachment.path, attachment.filePath, attachment.src).firstOrNull { it.isNotBlank() && !it.contains("://") && !it.startsWith("/") }?.let { return it.trimStart('/') }
-        val raw = listOf(attachment.url, attachment.uri, attachment.fileUri, attachment.path, attachment.filePath, attachment.src)
-            .firstOrNull { it.startsWith("file://") } ?: return null
-        val absolute = raw.removePrefix("file://")
-        val workspace = workspacePath?.trimEnd('/')?.takeIf { it.isNotBlank() }
-        if (workspace != null && absolute.startsWith("$workspace/")) {
-            return absolute.removePrefix("$workspace/").ifBlank { null }
-        }
-        val marker = "/conversations/$conversationId/"
-        val markerIndex = absolute.indexOf(marker)
-        if (markerIndex >= 0) return absolute.substring(markerIndex + marker.length).ifBlank { null }
-        return null
+    private fun MessageAttachment.loadUrl(forDownload: Boolean): String = if (forDownload) {
+        listOf(downloadUrl, previewUrl, url, uri, fileUri, src).firstOrNull { it.isFetchableAttachmentUrl() }.orEmpty()
+    } else {
+        listOf(previewUrl, url, uri, fileUri, src).firstOrNull { it.isFetchableAttachmentUrl() }.orEmpty()
     }
 
-    private fun workspaceResponseNameMismatch(requestPath: String, responseName: String?, responsePath: String?): String? {
-        val expected = requestPath.fileNameOnly()
-        val actual = responseName?.fileNameOnly()?.takeIf { it.isNotBlank() }
-            ?: responsePath?.fileNameOnly()?.takeIf { it.isNotBlank() }
-            ?: return null
-        return if (expected.isNotBlank() && !expected.equals(actual, ignoreCase = true)) {
-            "Workspace file mismatch: requested $expected but received $actual"
-        } else {
-            null
-        }
+    private fun String.isFetchableAttachmentUrl(): Boolean {
+        if (isBlank()) return false
+        return startsWith("/") || startsWith("http://") || startsWith("https://")
     }
-
-    private fun String.fileNameOnly(): String = substringBefore('?')
-        .substringBefore('#')
-        .trimEnd('/')
-        .substringAfterLast('/')
-        .substringAfterLast('\\')
-
-    private fun MessageAttachment.loadUrl(): String = listOf(url, uri, fileUri, src).firstOrNull { it.isNotBlank() }.orEmpty()
 
     private fun shouldAutoPreviewAttachment(attachment: MessageAttachment): Boolean {
         val mediaType = attachment.mediaType.orEmpty()
@@ -431,15 +381,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ?.substringBefore(';')
         ?.substringBefore(',')
         ?.takeIf { it.isNotBlank() }
-
-    private fun mediaTypeFromFileName(value: String): String? = when (value.substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase()) {
-        "png" -> "image/png"
-        "jpg", "jpeg" -> "image/jpeg"
-        "gif" -> "image/gif"
-        "webp" -> "image/webp"
-        "svg" -> "image/svg+xml"
-        else -> null
-    }
 
     private fun saveAttachmentToDownloads(fileName: String, bytes: ByteArray, mediaType: String): String {
         val app = getApplication<Application>()
@@ -493,7 +434,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(
                             isLoading = false,
                             messages = mergeMessages(it.messages, result.value.messages),
-                            loadedOffset = result.value.offset,
+                            loadedOffset = mergedLoadedOffset(it.messages, it.loadedOffset, result.value),
                             totalMessages = result.value.total,
                             error = null,
                         )
@@ -962,6 +903,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return byId.values.sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
     }
 
+    private fun mergedLoadedOffset(currentMessages: List<ChatMessage>, currentOffset: Int, page: MessagePage): Int = when {
+        page.messages.isEmpty() -> currentOffset
+        currentMessages.isEmpty() -> page.offset
+        else -> min(currentOffset, page.offset)
+    }
+
     private suspend fun updateConversationTitle(profile: ConnectionProfile, conversationId: String) {
         when (val result = api.loadConversations(profile, limit = 200)) {
             is AppResult.Ok -> {
@@ -1171,7 +1118,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun nextLocalIndex(messages: List<ChatMessage>): Int =
         (messages.maxOfOrNull { it.index } ?: -1) + 1
 
-    private fun MessageAttachment.previewKey(): String = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
+    private fun MessageAttachment.previewKey(): String = listOf(id, previewUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl)
         .firstOrNull { it.isNotBlank() }
         ?: "$index:$name"
 
@@ -1286,6 +1233,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 payloadType == "chat.user_message_queued" || payloadType == "chat.user_message_started" -> {
                     mutableState.update { it.copy(realtimeState = "Message accepted") }
                 }
+                payloadType == "chat.attachment_manifest" -> {
+                    sawActiveTurnProgress = true
+                    applyStreamAttachmentManifest(payload)
+                }
                 streamType == "stream_turn_start" -> {
                     sawActiveTurnProgress = true
                     mutableState.update {
@@ -1356,7 +1307,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     reconnectAttempt = 0
                     mutableState.update {
                         it.copy(
-                            loadedOffset = page.offset,
+                            loadedOffset = mergedLoadedOffset(
+                                currentMessages = it.messages,
+                                currentOffset = it.loadedOffset,
+                                page = MessagePage(page.offset, page.limit, page.total, messages),
+                            ),
                             totalMessages = page.total,
                             realtimeState = "Realtime connected · ${page.offset + messages.size}/${page.total}",
                         )
@@ -1487,6 +1442,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun applyStreamAttachmentManifest(event: JsonObject) {
+        val attachments = event["attachments"]?.let { value ->
+            runCatching {
+                value.jsonArray.mapIndexedNotNull { index, element ->
+                    (element as? JsonObject)?.toMessageAttachment(index)
+                }
+            }.getOrNull()
+        }.orEmpty()
+        if (attachments.isEmpty()) return
+        val id = event.streamMessageId().ifBlank { return }
+        mutableState.update { current ->
+            val messages = upsertStreamingMessage(current.messages, event, id) { existing ->
+                val base = existing ?: newStreamingMessage(current.messages, event, id)
+                val merged = base.attachments + attachments.filterNot { incoming ->
+                    base.attachments.any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
+                }
+                base.copy(attachments = merged, attachmentCount = merged.size)
+            }
+            current.copy(messages = messages, realtimeState = "Attachment ready", progressTitle = "Agent running")
+        }
+        previewAttachments(attachments)
+    }
+
     private fun streamToolResultFiles(result: JsonObject?, resultObject: JsonObject): List<MessageAttachment> {
         val files = result?.get("files") ?: resultObject.get("files") ?: return emptyList()
         return runCatching {
@@ -1508,11 +1486,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val dataUrl = string("data_url").orEmpty()
         val dataBase64 = string("data_base64") ?: string("base64").orEmpty()
         val data = string("data").orEmpty()
-        val target = listOf(url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data).firstOrNull { it.isNotBlank() }.orEmpty()
+        val previewUrl = string("preview_url").orEmpty()
+        val downloadUrl = string("download_url").orEmpty()
+        val openInWorkspacePath = string("open_in_workspace_path").orEmpty()
+        val target = listOf(previewUrl, downloadUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data).firstOrNull { it.isNotBlank() }.orEmpty()
         if (target.isBlank()) return null
         val name = string("name") ?: string("filename") ?: target.substringBefore('?').trimEnd('/').substringAfterLast('/').ifBlank { "attachment-$index" }
         val mediaType = string("media_type") ?: string("mime_type") ?: string("mime")
         return MessageAttachment(
+            id = string("id").orEmpty(),
             index = index,
             kind = if (mediaType?.startsWith("image/") == true) "image" else "document",
             name = name,
@@ -1530,6 +1512,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             dataBase64 = dataBase64,
             data = data,
             encoding = string("encoding").orEmpty(),
+            previewUrl = previewUrl,
+            downloadUrl = downloadUrl,
+            openInWorkspacePath = openInWorkspacePath,
         )
     }
 

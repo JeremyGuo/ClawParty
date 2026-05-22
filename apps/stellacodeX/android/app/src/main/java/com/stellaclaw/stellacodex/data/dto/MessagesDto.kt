@@ -44,6 +44,7 @@ data class ChatMessageDto(
 
 @Serializable
 data class MessageAttachmentDto(
+    val id: String = "",
     val index: Int = 0,
     val kind: String = "document",
     val name: String = "",
@@ -66,6 +67,9 @@ data class MessageAttachmentDto(
     val base64: String = "",
     val data: String = "",
     val encoding: String = "",
+    @SerialName("preview_url") val previewUrl: String = "",
+    @SerialName("download_url") val downloadUrl: String = "",
+    @SerialName("open_in_workspace_path") val openInWorkspacePath: String? = null,
 )
 
 @Serializable
