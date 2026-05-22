@@ -7,8 +7,7 @@ use serde_json::{json, Map, Value};
 
 use super::super::{
     schema::{file_tool_schema, properties},
-    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolExecutionMode,
-    ToolRemoteMode,
+    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolRemoteMode,
 };
 use crate::session_actor::{
     tool_binary::ensure_tool_binary,
@@ -103,9 +102,7 @@ impl ApplyPatchTool {
                 ]),
                 &["patch"],
                 &self.remote_mode,
-            ),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
+            ),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }

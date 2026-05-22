@@ -23,7 +23,7 @@ use crate::{
         LocalToolError, ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool,
         ShellWriteStdinTool, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog,
         ToolCatalogError, ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry,
-        ToolExecutionMode, ToolResultContent, ToolSet,
+        ToolResultContent, ToolSet,
     },
 };
 
@@ -665,9 +665,7 @@ impl ExtTool for CodexExecCommandTool {
                 },
                 "required": ["cmd"],
                 "additionalProperties": false
-            }),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            }),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -712,9 +710,7 @@ impl ExtTool for CodexWriteStdinTool {
                 },
                 "required": ["session_id"],
                 "additionalProperties": false
-            }),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            }),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -756,9 +752,7 @@ impl ExtTool for CodexExecStopTool {
                 },
                 "required": ["session_id"],
                 "additionalProperties": false
-            }),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
+            }),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -800,9 +794,7 @@ impl ExtTool for CodexExecMakeVisibleTool {
                 },
                 "required": ["path"],
                 "additionalProperties": false
-            }),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            }),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -835,9 +827,7 @@ impl ExtTool for CodexApplyPatchTool {
                 },
                 "required": ["patch"],
                 "additionalProperties": false
-            }),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
+            }),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }

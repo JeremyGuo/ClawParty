@@ -6,7 +6,7 @@ use super::{bridge_tool, call_bridge_tool};
 use crate::session_actor::{
     tool_catalog::{
         schema::{object_schema, properties},
-        BaseTool, ToolCallContext, ToolDefinition, ToolEntry, ToolExecutionMode,
+        BaseTool, ToolCallContext, ToolDefinition, ToolEntry,
     },
     tool_runtime::LocalToolError,
     ToolResultContent,
@@ -83,9 +83,7 @@ fn subagent_start_tool_definition() -> ToolDefinition {
         object_schema(
             properties([("description", json!({"type": "string"}))]),
             &["description"],
-        ),
-        ToolExecutionMode::Immediate,
-    )
+        ),    )
 }
 
 fn subagent_kill_tool_definition() -> ToolDefinition {
@@ -96,7 +94,6 @@ fn subagent_kill_tool_definition() -> ToolDefinition {
             properties([("agent_id", json!({"type": "string"}))]),
             &["agent_id"],
         ),
-        ToolExecutionMode::Immediate,
     )
 }
 
@@ -110,7 +107,5 @@ fn subagent_join_tool_definition() -> ToolDefinition {
                 ("timeout_seconds", json!({"type": "number"})),
             ]),
             &["agent_id"],
-        ),
-        ToolExecutionMode::Interruptible,
-    )
+        ),    )
 }

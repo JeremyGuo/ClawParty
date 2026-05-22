@@ -13,7 +13,7 @@ use super::common::{
 use crate::session_actor::{
     tool_catalog::{
         schema::{object_schema, properties},
-        BaseTool, ToolBackend, ToolCallContext, ToolDefinition, ToolExecutionMode,
+        BaseTool, ToolBackend, ToolCallContext, ToolDefinition,
     },
     tool_runtime::{f64_arg_with_default, string_arg, usize_arg_with_default, LocalToolError},
     ToolResultContent,
@@ -38,9 +38,7 @@ impl WebFetchTool {
                     ("headers", json!({"type": "object", "additionalProperties": {"type": "string"}})),
                 ]),
                 &["url"],
-            ),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            ),            ToolBackend::Local,
         )
     }
 

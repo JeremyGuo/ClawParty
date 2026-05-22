@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 use super::{
     schema::{add_remote_property, object_schema, properties},
     BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolEntry,
-    ToolExecutionMode, ToolRemoteMode,
+    ToolRemoteMode,
 };
 use crate::session_actor::{
     tool_binary::ensure_tool_binary,
@@ -550,9 +550,7 @@ impl ShellExecTool {
         ToolDefinition::new(
             "shell_exec",
             "Execute a command as a fresh process. By default tty=false, stdin is closed, stdout/stderr are captured separately, no hidden shell is reused, and yield_time_ms defaults to 10000. If still running after yield_time_ms, the result includes process_id for shell_write_stdin polling or shell_stop. max_output_tokens controls model-visible output truncation; set tty=true only for interactive terminal sessions.",
-            object_schema(exec_properties, &["command"]),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            object_schema(exec_properties, &["command"]),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -638,9 +636,7 @@ impl ShellWriteStdinTool {
         ToolDefinition::new(
             "shell_write_stdin",
             "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. With empty chars, a single poll can wait up to 300000ms. Empty polling waits at least 5000ms unless the process exits or produces output earlier. Non-empty chars against tty=false returns stdin_closed.",
-            object_schema(write_properties, &["process_id"]),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            object_schema(write_properties, &["process_id"]),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -705,7 +701,6 @@ impl ShellStopTool {
             "shell_stop",
             "Stop a running shell process by process_id. signal defaults to terminate.",
             object_schema(stop_properties, &["process_id"]),
-            ToolExecutionMode::Immediate,
             ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)

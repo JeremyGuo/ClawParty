@@ -21,7 +21,7 @@ use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
     BaseTool, BuiltinToolCatalogOptions, ProviderBackedToolKind, ProviderNativeTool,
     ProviderNativeToolKind, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition,
-    ToolEntry, ToolExecutionMode,
+    ToolEntry,
 };
 use crate::{
     model_config::ModelConfig,
@@ -525,9 +525,7 @@ fn image_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefini
     ToolDefinition::new(
         "image_view",
         "View a local image file in the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_view more than 3 times in the same assistant tool-call batch; excess image_view calls in that batch will fail. View more images after inspecting the first batch.",
-        media_view_schema("path", remote_mode),
-        ToolExecutionMode::Immediate,
-        ToolBackend::Local,
+        media_view_schema("path", remote_mode),        ToolBackend::Local,
     )
 }
 
@@ -535,9 +533,7 @@ fn pdf_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefiniti
     ToolDefinition::new(
         "pdf_view",
         "View a local PDF file in the next model request for direct inspection by the current model. Returns immediately.",
-        media_view_schema("path", remote_mode),
-        ToolExecutionMode::Immediate,
-        ToolBackend::Local,
+        media_view_schema("path", remote_mode),        ToolBackend::Local,
     )
 }
 
@@ -545,9 +541,7 @@ fn audio_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefini
     ToolDefinition::new(
         "audio_view",
         "View a local audio file in the next model request for direct inspection by the current model. Returns immediately.",
-        media_view_schema("path", remote_mode),
-        ToolExecutionMode::Immediate,
-        ToolBackend::Local,
+        media_view_schema("path", remote_mode),        ToolBackend::Local,
     )
 }
 
@@ -556,7 +550,6 @@ fn native_image_generation_tool_definition() -> ToolDefinition {
         "image_generation",
         "Generate an image using the current model's native image generation tool.",
         object_schema(Map::new(), &[]),
-        ToolExecutionMode::Immediate,
         ToolBackend::ProviderNative {
             kind: ProviderNativeToolKind::ImageGeneration,
         },
@@ -605,9 +598,7 @@ fn provider_image_generation_tool_definition(
     ToolDefinition::new(
         "image_generation",
         "Generate or edit an image using the configured generation model. First call with prompt and output_dir starts a job and returns an id; include images for edit/inpaint and optional mask_path for inpainting. Call again with generation_id to wait or observe.",
-        object_schema(schema_properties, &[]),
-        ToolExecutionMode::Interruptible,
-        ToolBackend::ProviderBacked {
+        object_schema(schema_properties, &[]),        ToolBackend::ProviderBacked {
             kind: ProviderBackedToolKind::ImageGeneration,
         },
     )
@@ -638,7 +629,6 @@ fn analysis_tool_definition(
         name,
         description,
         object_schema(schema_properties, &[]),
-        ToolExecutionMode::Interruptible,
         ToolBackend::ProviderBacked { kind },
     )
 }
@@ -661,7 +651,6 @@ fn stop_tool_definition(name: &str, id_field: &str, description: &str) -> ToolDe
             },
             &[id_field],
         ),
-        ToolExecutionMode::Immediate,
         ToolBackend::Local,
     )
     .with_concurrency(ToolConcurrency::Serial)

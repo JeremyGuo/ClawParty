@@ -1535,6 +1535,14 @@ fn handle_service_response(
             pending_service_responses.remove(response_id);
             return Ok(true);
         }
+        ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+            addr: ctx.addr.clone(),
+            label: "stale_service_response".to_string(),
+            detail: serde_json::json!({
+                "response_id": response_id,
+            }),
+        }))?;
+        return Ok(true);
     }
 
     if let Ok(response) = memory::decode_response(payload.clone()) {
@@ -4164,6 +4172,73 @@ mod tests {
         assert!(output_rx.try_iter().any(|output| matches!(
             output,
             ServiceOutput::Status(ServiceStatusUpdate { label, .. }) if label == "cron_bridge_resolved"
+        )));
+    }
+
+    #[test]
+    fn stale_service_response_with_response_id_does_not_fallback_to_fifo() {
+        let (ctx, output_rx) = test_run_context("stale_tool_binary_response");
+        let mut runner = None;
+        let mut pending_memory_requests = VecDeque::new();
+        let mut pending_skill_requests = VecDeque::new();
+        let mut pending_tool_binary_requests = VecDeque::from([PendingBridgeRequest {
+            service_request_id: "svc_next".to_string(),
+            request: ConversationBridgeRequest {
+                request_id: "req_next".to_string(),
+                tool_call_id: "call_next".to_string(),
+                tool_name: "tool_binary_ensure".to_string(),
+                action: "tool_binary_ensure".to_string(),
+                payload: serde_json::json!({}),
+            },
+        }]);
+        let mut pending_cron_requests = VecDeque::new();
+        let mut pending_child_starts = VecDeque::new();
+        let mut pending_service_responses = BTreeMap::new();
+        pending_service_responses.insert(
+            "svc_next".to_string(),
+            PendingServiceResponseKind::ToolBinary,
+        );
+        let mut state = AgentSessionRuntimeState::new(
+            AgentSessionKind::Foreground,
+            AgentSessionBinding {
+                event_sink: crate::conversation_new::ServiceAddr::channel_id("scratch"),
+                parent_addr: None,
+            },
+        );
+
+        let handled = handle_service_response(
+            &ctx,
+            &mut runner,
+            &mut pending_memory_requests,
+            &mut pending_skill_requests,
+            &mut pending_tool_binary_requests,
+            &mut pending_cron_requests,
+            &mut pending_child_starts,
+            &mut pending_service_responses,
+            &mut state,
+            Some("svc_old"),
+            tool_binary::encode_response(ToolBinaryResponse::Ready {
+                tool: "stellaclaw-fs-tool".to_string(),
+                version: "0.2.1".to_string(),
+                platform: Some("linux-x86_64".to_string()),
+                local_path: None,
+                remote_path: Some("/tmp/stellaclaw-fs-tool".to_string()),
+                path_dir: Some("/tmp".to_string()),
+            })
+            .expect("tool binary response encodes"),
+        )
+        .expect("stale response should be handled");
+
+        assert!(handled);
+        assert_eq!(pending_tool_binary_requests.len(), 1);
+        assert_eq!(
+            pending_tool_binary_requests[0].service_request_id,
+            "svc_next"
+        );
+        assert!(pending_service_responses.contains_key("svc_next"));
+        assert!(output_rx.try_iter().any(|output| matches!(
+            output,
+            ServiceOutput::Status(ServiceStatusUpdate { label, .. }) if label == "stale_service_response"
         )));
     }
 

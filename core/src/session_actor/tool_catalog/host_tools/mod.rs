@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use super::{
     execute_bridge_tool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolEntry,
-    ToolExecutionMode,
 };
 use crate::session_actor::{tool_runtime::LocalToolError, ToolResultContent};
 
@@ -90,17 +89,11 @@ pub(crate) fn host_tool_entries(scope: HostToolScope, enable_memory_tools: bool)
     entries
 }
 
-fn bridge_tool(
-    name: &'static str,
-    description: &'static str,
-    parameters: Value,
-    execution_mode: ToolExecutionMode,
-) -> ToolDefinition {
+fn bridge_tool(name: &'static str, description: &'static str, parameters: Value) -> ToolDefinition {
     ToolDefinition::new(
         name,
         description,
         parameters,
-        execution_mode,
         ToolBackend::ConversationBridge {
             action: name.to_string(),
         },

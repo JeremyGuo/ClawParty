@@ -798,7 +798,7 @@ mod tests {
             WebSearchOptions,
         },
         ChatMessageItem, ContextItem, ConversationBridgeRequest, ConversationBridgeResponse,
-        ShellExecTool, ToolBackend, ToolCallItem, ToolDefinition, ToolExecutionMode,
+        ShellExecTool, ToolBackend, ToolCallItem, ToolDefinition,
     };
 
     use super::*;
@@ -894,7 +894,6 @@ mod tests {
                     "properties": {},
                     "additionalProperties": true
                 }),
-                ToolExecutionMode::Immediate,
                 ToolBackend::ConversationBridge {
                     action: self.name.clone(),
                 },
@@ -990,7 +989,6 @@ mod tests {
                         "required": ["message"],
                         "additionalProperties": false
                     }),
-                    ToolExecutionMode::Interruptible,
                     ToolBackend::Local,
                 )
             }

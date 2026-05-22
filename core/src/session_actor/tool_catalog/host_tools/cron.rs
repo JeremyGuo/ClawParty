@@ -6,7 +6,7 @@ use super::{bridge_tool, call_bridge_tool};
 use crate::session_actor::{
     tool_catalog::{
         schema::{object_schema, properties},
-        BaseTool, ToolCallContext, ToolDefinition, ToolEntry, ToolExecutionMode,
+        BaseTool, ToolCallContext, ToolDefinition, ToolEntry,
     },
     tool_runtime::LocalToolError,
     ToolResultContent,
@@ -63,7 +63,6 @@ fn cron_tasks_list_tool_definition() -> ToolDefinition {
         "cron_tasks_list",
         "List configured cron tasks. Returns summaries including enabled state and next_run_at.",
         object_schema(properties([]), &[]),
-        ToolExecutionMode::Immediate,
     )
 }
 
@@ -72,7 +71,6 @@ fn cron_task_get_tool_definition() -> ToolDefinition {
         "cron_task_get",
         "Get full details for a cron task by id.",
         object_schema(properties([("id", json!({"type": "string"}))]), &["id"]),
-        ToolExecutionMode::Immediate,
     )
 }
 
@@ -80,18 +78,14 @@ fn cron_task_create_tool_definition() -> ToolDefinition {
     bridge_tool(
         "cron_task_create",
         "Create a persisted cron task owned by this session. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. task launches a background agent with that prompt.",
-        cron_create_schema(),
-        ToolExecutionMode::Immediate,
-    )
+        cron_create_schema(),    )
 }
 
 fn cron_task_update_tool_definition() -> ToolDefinition {
     bridge_tool(
         "cron_task_update",
         "Update a cron task owned by this session. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Use timezone to change the IANA timezone and enabled to pause or resume it. Setting task changes the background-agent prompt.",
-        cron_update_schema(),
-        ToolExecutionMode::Immediate,
-    )
+        cron_update_schema(),    )
 }
 
 fn cron_task_remove_tool_definition() -> ToolDefinition {
@@ -99,7 +93,6 @@ fn cron_task_remove_tool_definition() -> ToolDefinition {
         "cron_task_remove",
         "Remove a cron task permanently.",
         object_schema(properties([("id", json!({"type": "string"}))]), &["id"]),
-        ToolExecutionMode::Immediate,
     )
 }
 

@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use super::super::{
     schema::{object_schema, properties},
-    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+    BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition,
 };
 use crate::session_actor::{
     tool_runtime::{
@@ -82,9 +82,7 @@ impl ShellMakeVisibleTool {
                     ("timeout_seconds", json!({"type": "number"})),
                 ]),
                 &["path"],
-            ),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            ),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -130,9 +128,7 @@ impl AttachmentMakeVisibleTool {
                     ("timeout_seconds", json!({"type": "number"})),
                 ]),
                 &["path"],
-            ),
-            ToolExecutionMode::Interruptible,
-            ToolBackend::Local,
+            ),            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }

@@ -408,13 +408,6 @@ fn subagent_join_cancel_request(request: &ConversationBridgeRequest) -> Conversa
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolExecutionMode {
-    Immediate,
-    Interruptible,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolConcurrency {
@@ -452,7 +445,6 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-    pub execution_mode: ToolExecutionMode,
     pub concurrency: ToolConcurrency,
     pub backend: ToolBackend,
     #[serde(default, skip_serializing, skip_deserializing)]
@@ -464,14 +456,12 @@ impl ToolDefinition {
         name: impl Into<String>,
         description: impl Into<String>,
         parameters: Value,
-        execution_mode: ToolExecutionMode,
         backend: ToolBackend,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             parameters,
-            execution_mode,
             concurrency: ToolConcurrency::Parallel,
             backend,
             disabled_provider_types: Vec::new(),
@@ -506,7 +496,7 @@ impl ToolDefinition {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description_with_execution_mode(),
+                "description": self.description_with_concurrency(),
                 "parameters": self.parameters,
             }
         })
@@ -523,7 +513,7 @@ impl ToolDefinition {
             _ => json!({
                 "type": "function",
                 "name": self.name,
-                "description": self.description_with_execution_mode(),
+                "description": self.description_with_concurrency(),
                 "parameters": self.parameters,
             }),
         }
@@ -532,20 +522,12 @@ impl ToolDefinition {
     pub fn claude_tool_schema(&self) -> Value {
         json!({
             "name": self.name,
-            "description": self.description_with_execution_mode(),
+            "description": self.description_with_concurrency(),
             "input_schema": self.parameters,
         })
     }
 
-    fn description_with_execution_mode(&self) -> String {
-        let execution_guidance = match self.execution_mode {
-            ToolExecutionMode::Immediate => {
-                "Execution mode: immediate. This tool returns promptly and still runs through the ToolBatchExecutor thread."
-            }
-            ToolExecutionMode::Interruptible => {
-                "Execution mode: interruptible. This tool may wait, but the ToolBatchExecutor can interrupt the current batch and return a stable result."
-            }
-        };
+    fn description_with_concurrency(&self) -> String {
         let concurrency_guidance = match self.concurrency {
             ToolConcurrency::Parallel => {
                 "Execution concurrency: parallel. The batch executor may run this tool at the same time as other parallel tools in the same tool-call batch."
@@ -555,10 +537,7 @@ impl ToolDefinition {
             }
         };
 
-        format!(
-            "{execution_guidance} {concurrency_guidance} {}",
-            self.description
-        )
+        format!("{concurrency_guidance} {}", self.description)
     }
 }
 
@@ -1043,7 +1022,6 @@ mod tests {
         assert!(!catalog.contains("ls"));
 
         let shell = catalog.get("shell_exec").unwrap();
-        assert_eq!(shell.execution_mode, ToolExecutionMode::Interruptible);
         assert!(shell.parameters["properties"]
             .get("yield_time_ms")
             .is_some());
@@ -1090,7 +1068,6 @@ mod tests {
                         "required": ["cmd"],
                         "additionalProperties": false
                     }),
-                    ToolExecutionMode::Interruptible,
                     ToolBackend::Local,
                 )
             }
@@ -1154,7 +1131,6 @@ mod tests {
                         "required": ["path"],
                         "additionalProperties": false
                     }),
-                    ToolExecutionMode::Interruptible,
                     ToolBackend::Local,
                 )
             }

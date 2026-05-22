@@ -54,7 +54,7 @@ pub use tool_catalog::{
     process_tool_definitions, skill_tool_definitions, web_tool_definitions,
     BuiltinToolCatalogOptions, BuiltinToolSet, HostToolScope, ProviderBackedToolKind,
     ProviderNativeToolKind, ToolBackend, ToolCatalog, ToolCatalogError, ToolConcurrency,
-    ToolDefinition, ToolEnablementEnv, ToolExecutionMode, ToolSet,
+    ToolDefinition, ToolEnablementEnv, ToolSet,
 };
 pub(crate) use tool_catalog::{
     builtin_tool_entry, media_tool_entries, ApplyPatchTool, ExtTool, ShellExecTool,

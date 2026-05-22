@@ -4,7 +4,7 @@ use crate::session_actor::{
     tool_catalog::{
         execute_bridge_tool,
         schema::{object_schema, properties},
-        BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+        BaseTool, ToolBackend, ToolCallContext, ToolConcurrency, ToolDefinition,
     },
     tool_runtime::LocalToolError,
     ToolResultContent,
@@ -40,9 +40,7 @@ pub(super) fn skill_create_tool_definition() -> ToolDefinition {
         object_schema(
             properties([("skill_name", serde_json::json!({"type": "string"}))]),
             &["skill_name"],
-        ),
-        ToolExecutionMode::Immediate,
-        ToolBackend::ConversationBridge {
+        ),        ToolBackend::ConversationBridge {
             action: "skill_create".to_string(),
         },
     )

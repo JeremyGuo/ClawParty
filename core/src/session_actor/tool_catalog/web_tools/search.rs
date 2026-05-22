@@ -10,7 +10,7 @@ use crate::{
     session_actor::{
         tool_catalog::{
             schema::{add_images_property, object_schema, properties},
-            BaseTool, ToolBackend, ToolCallContext, ToolDefinition, ToolExecutionMode,
+            BaseTool, ToolBackend, ToolCallContext, ToolDefinition,
         },
         tool_runtime::{
             bool_arg_with_default, f64_arg_with_default, string_arg, usize_arg_with_default,
@@ -51,7 +51,6 @@ impl WebSearchTool {
             "web_search",
             &web_search_description(self.options),
             object_schema(schema_properties, &["query", "timeout_seconds"]),
-            ToolExecutionMode::Interruptible,
             ToolBackend::Local,
         )
     }

@@ -4,7 +4,7 @@ use super::{bridge_tool, call_bridge_tool};
 use crate::session_actor::{
     tool_catalog::{
         schema::{object_schema, properties},
-        BaseTool, ToolCallContext, ToolDefinition, ToolExecutionMode,
+        BaseTool, ToolCallContext, ToolDefinition,
     },
     tool_runtime::LocalToolError,
     ToolResultContent,
@@ -54,6 +54,5 @@ pub(super) fn update_plan_tool_definition() -> ToolDefinition {
             ]),
             &["plan"],
         ),
-        ToolExecutionMode::Immediate,
     )
 }

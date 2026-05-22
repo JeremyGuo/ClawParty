@@ -6,7 +6,7 @@ use super::{bridge_tool, call_bridge_tool};
 use crate::session_actor::{
     tool_catalog::{
         schema::{object_schema, properties},
-        BaseTool, ToolCallContext, ToolDefinition, ToolEntry, ToolExecutionMode,
+        BaseTool, ToolCallContext, ToolDefinition, ToolEntry,
     },
     tool_runtime::LocalToolError,
     ToolResultContent,
@@ -80,7 +80,6 @@ fn memory_search_tool_definition() -> ToolDefinition {
             ]),
             &["query"],
         ),
-        ToolExecutionMode::Immediate,
     )
 }
 
@@ -103,9 +102,7 @@ fn memory_write_tool_definition() -> ToolDefinition {
                 ("tags", json!({"type": "array", "items": {"type": "string"}, "description": "Optional compact tags."})),
             ]),
             &["scope", "text"],
-        ),
-        ToolExecutionMode::Immediate,
-    )
+        ),    )
 }
 
 fn memory_update_tool_definition() -> ToolDefinition {
@@ -119,7 +116,6 @@ fn memory_update_tool_definition() -> ToolDefinition {
             ]),
             &["memory_id", "text"],
         ),
-        ToolExecutionMode::Immediate,
     )
 }
 
@@ -131,6 +127,5 @@ fn memory_delete_tool_definition() -> ToolDefinition {
             properties([("memory_id", json!({"type": "string"}))]),
             &["memory_id"],
         ),
-        ToolExecutionMode::Immediate,
     )
 }
