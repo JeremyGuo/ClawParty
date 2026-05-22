@@ -518,10 +518,10 @@ impl WebChannelMain {
             self.publish_foreground_session_state_event(&key);
             return;
         }
-        let (rendered_event, manifests) = self.render_chat_stream_event(&key, &stream, &event_type);
+        let rendered_event = self.render_chat_stream_event(&key, &stream, &event_type);
         {
             let state = self.live_states.entry(key.clone()).or_default();
-            state.record_session_stream(&rendered_event, &event_type);
+            state.record_session_stream(&stream.event, &event_type);
         }
         if should_log_chat_stream_event(&event_type, &stream.event) {
             let state = self.live_states.get(&key).cloned().unwrap_or_default();
@@ -550,9 +550,6 @@ impl WebChannelMain {
         ) {
             self.publish_foreground_session_state_event(&key);
         }
-        for manifest in manifests {
-            self.publish_chat(&key, manifest);
-        }
         for pending_event in self.drain_stream_renderer_pending(&key, &stream, &event_type) {
             self.publish_chat(&key, pending_event);
         }
@@ -570,18 +567,18 @@ impl WebChannelMain {
         key: &WebSessionKey,
         stream: &OutgoingSessionStream,
         event_type: &str,
-    ) -> (Value, Vec<Value>) {
+    ) -> Value {
         if event_type != "stream_assistant_message_delta" {
-            return (stream.event.clone(), Vec::new());
+            return stream.event.clone();
         }
         let Some(message_id) = stream.event.get("message_id").and_then(Value::as_str) else {
-            return (stream.event.clone(), Vec::new());
+            return stream.event.clone();
         };
         let Some(delta) = stream.event.get("delta").and_then(Value::as_str) else {
-            return (stream.event.clone(), Vec::new());
+            return stream.event.clone();
         };
         if delta.is_empty() {
-            return (stream.event.clone(), Vec::new());
+            return stream.event.clone();
         }
         let turn_id = stream
             .event
@@ -607,23 +604,11 @@ impl WebChannelMain {
         let mut event = stream.event.clone();
         if let Value::Object(map) = &mut event {
             map.insert("delta".to_string(), json!(rendered.delta));
+            if !rendered.attachments.is_empty() {
+                map.insert("attachments".to_string(), json!(rendered.attachments));
+            }
         }
-        let manifests = rendered
-            .manifests
-            .into_iter()
-            .map(|manifest| {
-                json!({
-                    "type": "chat.attachment_manifest",
-                    "conversation_id": key.conversation_id,
-                    "foreground_session_id": key.foreground_session_id,
-                    "message_id": message_id,
-                    "next_message_id": message_id,
-                    "turn_id": turn_id,
-                    "attachments": manifest.attachments,
-                })
-            })
-            .collect();
-        (event, manifests)
+        event
     }
 
     fn drain_stream_renderer_pending(
@@ -632,16 +617,10 @@ impl WebChannelMain {
         stream: &OutgoingSessionStream,
         event_type: &str,
     ) -> Vec<Value> {
-        if event_type == "turn_started" {
-            let conversation_id = &key.conversation_id;
-            let foreground_session_id = &key.foreground_session_id;
-            self.stream_renderers.retain(|renderer_key, _| {
-                renderer_key.conversation_id != *conversation_id
-                    || renderer_key.foreground_session_id != *foreground_session_id
-            });
-            return Vec::new();
-        }
-        if event_type != "turn_completed" && event_type != "stream_error" {
+        if event_type != "turn_started"
+            && event_type != "turn_completed"
+            && event_type != "stream_error"
+        {
             return Vec::new();
         }
         let turn_id = stream
@@ -655,7 +634,9 @@ impl WebChannelMain {
             .filter(|renderer_key| {
                 renderer_key.conversation_id == key.conversation_id
                     && renderer_key.foreground_session_id == key.foreground_session_id
-                    && (turn_id.is_empty() || renderer_key.turn_id == turn_id)
+                    && (event_type == "turn_started"
+                        || turn_id.is_empty()
+                        || renderer_key.turn_id == turn_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -668,16 +649,17 @@ impl WebChannelMain {
                     return None;
                 }
                 let event = json!({
-                    "type": "stream_assistant_message_delta",
+                    "type": "stream_assistant_message_flush",
                     "message_id": renderer_key.message_id,
                     "next_message_id": renderer_key.message_id,
                     "turn_id": renderer_key.turn_id,
                     "delta": pending,
+                    "synthetic": true,
                 });
                 Some(protocol::public_chat_stream_payload(
                     &key.conversation_id,
                     &key.foreground_session_id,
-                    "stream_assistant_message_delta",
+                    "stream_assistant_message_flush",
                     &event,
                 ))
             })
@@ -700,20 +682,18 @@ struct StreamRendererKey {
 }
 
 const STREAM_MARKDOWN_PENDING_LIMIT: usize = 2048;
+const STREAM_MARKDOWN_PENDING_CHUNK_LIMIT: u8 = 2;
 
 #[derive(Default)]
 struct StreamMarkdownRenderer {
     pending: String,
+    pending_chunks: u8,
     projected: HashMap<String, String>,
     next_attachment_index: usize,
 }
 
 struct RenderedStreamDelta {
     delta: String,
-    manifests: Vec<RenderedAttachmentManifest>,
-}
-
-struct RenderedAttachmentManifest {
     attachments: Vec<Value>,
 }
 
@@ -732,7 +712,7 @@ impl StreamMarkdownRenderer {
             input = std::mem::take(&mut self.pending);
         }
         let mut out = String::new();
-        let mut manifests = Vec::new();
+        let mut attachments = Vec::new();
         let mut rest = input.as_str();
         loop {
             let Some(start) = find_markdown_link_start(rest) else {
@@ -741,29 +721,34 @@ impl StreamMarkdownRenderer {
             };
             out.push_str(&rest[..start]);
             let candidate = &rest[start..];
-            let Some(end) = candidate.find(')') else {
-                if candidate.len() > STREAM_MARKDOWN_PENDING_LIMIT {
+            let Some(end) = find_markdown_link_end(candidate) else {
+                if candidate.len() > STREAM_MARKDOWN_PENDING_LIMIT
+                    || self.pending_chunks.saturating_add(1) >= STREAM_MARKDOWN_PENDING_CHUNK_LIMIT
+                {
                     out.push_str(candidate);
+                    self.pending_chunks = 0;
                 } else {
                     self.pending.push_str(candidate);
+                    self.pending_chunks = self.pending_chunks.saturating_add(1);
                 }
                 break;
             };
             let segment = &candidate[..=end];
+            self.pending_chunks = 0;
             let rendered = self.render_link_segment(
                 segment,
                 conversation_id,
                 foreground_session_id,
                 message_id,
                 conversation_root,
-                &mut manifests,
+                &mut attachments,
             );
             out.push_str(&rendered);
             rest = &candidate[end + 1..];
         }
         RenderedStreamDelta {
             delta: out,
-            manifests,
+            attachments,
         }
     }
 
@@ -774,16 +759,11 @@ impl StreamMarkdownRenderer {
         foreground_session_id: &str,
         message_id: &str,
         conversation_root: &Path,
-        manifests: &mut Vec<RenderedAttachmentManifest>,
+        attachments: &mut Vec<Value>,
     ) -> String {
-        let Some(target_start) = segment.find("](").map(|index| index + 2) else {
+        let Some((target_start, target_end, target)) = markdown_link_target(segment) else {
             return segment.to_string();
         };
-        let target_end = segment.len().saturating_sub(1);
-        if target_start > target_end {
-            return segment.to_string();
-        }
-        let target = &segment[target_start..target_end];
         if let Some(id) = self.projected.get(target) {
             return format!(
                 "{}attachment://{}{}",
@@ -805,9 +785,7 @@ impl StreamMarkdownRenderer {
         };
         self.next_attachment_index = index;
         self.projected.insert(target.to_string(), id.clone());
-        manifests.push(RenderedAttachmentManifest {
-            attachments: vec![attachment],
-        });
+        attachments.push(attachment);
         format!(
             "{}attachment://{}{}",
             &segment[..target_start],
@@ -817,20 +795,110 @@ impl StreamMarkdownRenderer {
     }
 
     fn take_pending(&mut self) -> String {
+        self.pending_chunks = 0;
         std::mem::take(&mut self.pending)
     }
 }
 
 fn find_markdown_link_start(value: &str) -> Option<usize> {
-    let marker = value.find("](")?;
-    let open = value[..marker].rfind('[')?;
-    Some(
-        if open > 0 && value.as_bytes().get(open - 1) == Some(&b'!') {
-            open - 1
-        } else {
-            open
-        },
-    )
+    let mut in_fence = false;
+    let mut in_code_span = false;
+    let mut at_line_start = true;
+    let mut index = 0;
+    while index < value.len() {
+        let rest = &value[index..];
+        if at_line_start && rest.starts_with("```") {
+            in_fence = !in_fence;
+            index += 3;
+            at_line_start = false;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else { break };
+        if !in_fence && ch == '`' {
+            in_code_span = !in_code_span;
+            index += ch.len_utf8();
+            at_line_start = false;
+            continue;
+        }
+        if !in_fence && !in_code_span && rest.starts_with("](") {
+            if let Some(open) = value[..index].rfind('[') {
+                return Some(
+                    if open > 0 && value.as_bytes().get(open - 1) == Some(&b'!') {
+                        open - 1
+                    } else {
+                        open
+                    },
+                );
+            }
+        }
+        at_line_start = ch == '\n';
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn find_markdown_link_end(segment: &str) -> Option<usize> {
+    let (_, target_start, _) = segment.find("](").map(|marker| (marker, marker + 2, ()))?;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    for (index, ch) in segment[target_start..].char_indices() {
+        let absolute = target_start + index;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' if paren_depth == 0 => return Some(absolute),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn markdown_link_target(segment: &str) -> Option<(usize, usize, &str)> {
+    let target_start = segment.find("](")? + 2;
+    let close = find_markdown_link_end(segment)?;
+    let raw = segment[target_start..close].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('<') {
+        let end = raw.find('>')?;
+        let offset = segment[target_start..close].find('<')? + 1;
+        return Some((
+            target_start + offset,
+            target_start + offset + end - 1,
+            &raw[1..end],
+        ));
+    }
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut len = raw.len();
+    for (index, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ch if depth == 0 && ch.is_whitespace() => {
+                len = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let offset = segment[target_start..close].find(raw)?;
+    Some((
+        target_start + offset,
+        target_start + offset + len,
+        &raw[..len],
+    ))
 }
 
 impl WebSessionKey {
@@ -1933,11 +2001,11 @@ mod tests {
         let second = renderer.render_delta("image.png) done", "c1", "main", "msg_1", &root);
 
         assert_eq!(first.delta, "look ");
-        assert!(first.manifests.is_empty());
+        assert!(first.attachments.is_empty());
         assert!(second.delta.contains("![img](attachment://att_"));
         assert!(second.delta.ends_with(" done"));
-        assert_eq!(second.manifests.len(), 1);
-        assert_eq!(second.manifests[0].attachments[0]["name"], "image.png");
+        assert_eq!(second.attachments.len(), 1);
+        assert_eq!(second.attachments[0]["name"], "image.png");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1958,6 +2026,44 @@ mod tests {
         assert!(rendered.delta.starts_with("before [link]("));
         assert!(rendered.delta.ends_with(&target));
         assert!(renderer.take_pending().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_renderer_releases_incomplete_link_after_two_chunks() {
+        let root = temp_root("stream-link-chunks");
+        let mut renderer = StreamMarkdownRenderer::default();
+
+        let first = renderer.render_delta("before [link](out", "c1", "main", "msg_1", &root);
+        let second = renderer.render_delta("put/file", "c1", "main", "msg_1", &root);
+
+        assert_eq!(first.delta, "before ");
+        assert_eq!(second.delta, "[link](output/file");
+        assert!(renderer.take_pending().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_renderer_skips_code_and_handles_titles() {
+        let root = temp_root("stream-markdown-parser");
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::write(root.join("output/image(1).png"), b"png").unwrap();
+        let mut renderer = StreamMarkdownRenderer::default();
+
+        let code =
+            renderer.render_delta("`![x](output/image(1).png)` ", "c1", "main", "msg_1", &root);
+        let image = renderer.render_delta(
+            "![x](output/image(1).png \"title\")",
+            "c1",
+            "main",
+            "msg_1",
+            &root,
+        );
+
+        assert_eq!(code.delta, "`![x](output/image(1).png)` ");
+        assert!(code.attachments.is_empty());
+        assert!(image.delta.contains("attachment://att_"));
+        assert_eq!(image.attachments.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

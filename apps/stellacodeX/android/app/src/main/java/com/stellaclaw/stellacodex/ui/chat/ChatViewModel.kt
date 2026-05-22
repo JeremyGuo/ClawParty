@@ -1387,11 +1387,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val id = event.streamMessageId().ifBlank { return messages }
         if (messages.any { it.localState != MessageLocalState.Streaming && it.id == id }) return messages
         val delta = event.streamDeltaText().ifBlank { return messages }
-        val pendingAttachments = pendingStreamAttachments.remove(id).orEmpty()
+        val attachmentKey = event.streamAttachmentKey(id)
+        val incomingAttachments = streamAttachments(event) + pendingStreamAttachments.remove(attachmentKey).orEmpty()
         return upsertStreamingMessage(messages, event, id) { existing ->
             val text = existing?.text.orEmpty() + delta
             val baseAttachments = existing?.attachments.orEmpty()
-            val mergedAttachments = baseAttachments + pendingAttachments.filterNot { incoming ->
+            val mergedAttachments = baseAttachments + incomingAttachments.filterNot { incoming ->
                 baseAttachments.any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
             }
             (existing ?: newStreamingMessage(messages, event, id)).copy(
@@ -1455,22 +1456,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun applyStreamAttachmentManifest(event: JsonObject) {
-        val attachments = event["attachments"]?.let { value ->
+        val attachments = streamAttachments(event)
+        if (attachments.isEmpty()) return
+        val id = event.streamMessageId().ifBlank { return }
+        val attachmentKey = event.streamAttachmentKey(id)
+        pendingStreamAttachments[attachmentKey] = pendingStreamAttachments[attachmentKey].orEmpty() + attachments.filterNot { incoming ->
+            pendingStreamAttachments[attachmentKey].orEmpty().any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
+        }
+        mutableState.update { current ->
+            current.copy(realtimeState = "Attachment ready", progressTitle = "Agent running")
+        }
+        previewAttachments(attachments)
+    }
+
+    private fun streamAttachments(event: JsonObject): List<MessageAttachment> {
+        return event["attachments"]?.let { value ->
             runCatching {
                 value.jsonArray.mapIndexedNotNull { index, element ->
                     (element as? JsonObject)?.toMessageAttachment(index)
                 }
             }.getOrNull()
         }.orEmpty()
-        if (attachments.isEmpty()) return
-        val id = event.streamMessageId().ifBlank { return }
-        pendingStreamAttachments[id] = pendingStreamAttachments[id].orEmpty() + attachments.filterNot { incoming ->
-            pendingStreamAttachments[id].orEmpty().any { it.id == incoming.id || it.previewKey() == incoming.previewKey() }
-        }
-        mutableState.update { current ->
-            current.copy(realtimeState = "Attachment ready", progressTitle = "Agent running")
-        }
-        previewAttachments(attachments)
     }
 
     private fun streamToolResultFiles(result: JsonObject?, resultObject: JsonObject): List<MessageAttachment> {
@@ -1812,6 +1818,7 @@ private data class PendingSend(
 
 private val StreamDeltaTypes = setOf(
     "stream_assistant_message_delta",
+    "stream_assistant_message_flush",
     "stream_tool_call_delta",
     "stream_tool_result_done",
     "stream_reasoning_summary_delta",
@@ -1850,6 +1857,13 @@ private fun JsonObject.streamDeltaText(): String =
 
 private fun JsonObject.turnId(): String =
     (string("turn_id") ?: string("turnId")).orEmpty().trim()
+
+private fun JsonObject.streamAttachmentKey(messageId: String = streamMessageId()): String = listOf(
+    string("conversation_id").orEmpty().trim(),
+    string("foreground_session_id").orEmpty().trim(),
+    turnId(),
+    messageId.trim(),
+).joinToString(":")
 
 private fun JsonObject.messageIndex(): Int? =
     intValue("message_index") ?: intValue("messageIndex") ?: intValue("index")
