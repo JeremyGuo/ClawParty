@@ -2427,6 +2427,24 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[test]
+    fn managed_rg_path_dir_surfaces_tool_binary_failure_reason() {
+        let workspace = test_workspace("shell-rg-failure");
+        let bridge = Arc::new(FailingToolBinaryBridge);
+        let bridge_dyn: Arc<dyn ConversationBridge + Send + Sync> = bridge;
+        let remote_mode = ToolRemoteMode::Selectable;
+        let context = test_tool_context(&workspace, &remote_mode, Some(&bridge_dyn));
+
+        let error =
+            managed_rg_path_dir(&context, &ShellBinding::Local).expect_err("ensure should fail");
+
+        assert!(
+            format!("{error:#}").contains("download failed for ripgrep"),
+            "{error:#}"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     struct RecordingToolBinaryBridge {
         path_dir: String,
         remote_path: Option<String>,
@@ -2474,6 +2492,28 @@ mod tests {
                     tool_name: "tool_binary_ensure".to_string(),
                     result: ToolResultContent::from_text(
                         serde_json::to_string(&response).expect("encode tool response"),
+                    ),
+                },
+            })
+        }
+    }
+
+    struct FailingToolBinaryBridge;
+
+    impl ConversationBridge for FailingToolBinaryBridge {
+        fn call(
+            &self,
+            request: ConversationBridgeRequest,
+        ) -> Result<ConversationBridgeResponse, ToolBatchError> {
+            Ok(ConversationBridgeResponse {
+                request_id: request.request_id,
+                tool_call_id: request.tool_call_id,
+                tool_name: request.tool_name,
+                result: ToolResultItem {
+                    tool_call_id: "tool_binary_ensure".to_string(),
+                    tool_name: "tool_binary_ensure".to_string(),
+                    result: ToolResultContent::from_text(
+                        r#"{"status":"failure","reason":"download failed for ripgrep"}"#,
                     ),
                 },
             })

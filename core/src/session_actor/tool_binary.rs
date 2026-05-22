@@ -146,7 +146,19 @@ fn parse_tool_binary_ensure_response(
             "tool binary response missing result".to_string(),
         ));
     }
-    let parsed: ToolBinaryEnsureResponse = serde_json::from_str(&text).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        LocalToolError::Bridge(format!(
+            "failed to parse tool binary response: {error}: {text}"
+        ))
+    })?;
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("success") {
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(text.as_str());
+        return Err(LocalToolError::Bridge(reason.to_string()));
+    }
+    let parsed: ToolBinaryEnsureResponse = serde_json::from_value(value).map_err(|error| {
         LocalToolError::Bridge(format!(
             "failed to parse tool binary response: {error}: {text}"
         ))

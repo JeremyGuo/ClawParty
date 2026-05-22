@@ -57,7 +57,7 @@ impl ConversationService for ToolBinaryService {
                             let response = match response {
                                 Ok(response) => response,
                                 Err(error) => ToolBinaryResponse::Failure {
-                                    reason: error.to_string(),
+                                    reason: format!("{error:#}"),
                                 },
                             };
                             ctx.outbox.send(ServiceOutput::Call(reply(
