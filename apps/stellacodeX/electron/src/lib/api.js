@@ -122,6 +122,14 @@ export function selectedForegroundSessionId(selected) {
   return selected?.foregroundSessionId || selected?.sessionId || 'main';
 }
 
+function conversationPath(conversationId) {
+  return `/api/conversations/${encodeURIComponent(conversationId)}`;
+}
+
+function foregroundSessionPath(conversationId, foregroundSessionId = 'main') {
+  return `${conversationPath(conversationId)}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}`;
+}
+
 export async function api(serverId, path, options = {}) {
   return window.stellacode2.request({
     serverId,
@@ -141,7 +149,7 @@ export async function loadConversations(serverId) {
 }
 
 export async function markConversationSeen(serverId, conversationId, lastSeenMessageId, foregroundSessionId = 'main') {
-  const response = await api(serverId, `/api/conversations/${conversationId}/seen`, {
+  const response = await api(serverId, `${conversationPath(conversationId)}/seen`, {
     method: 'POST',
     body: {
       last_seen_message_id: String(lastSeenMessageId),
@@ -214,7 +222,7 @@ export async function createConversation(serverId, options = {}) {
 }
 
 export async function renameConversation(serverId, conversationId, nickname) {
-  const response = await api(serverId, `/api/conversations/${conversationId}`, {
+  const response = await api(serverId, conversationPath(conversationId), {
     method: 'PATCH',
     body: { nickname }
   });
@@ -222,7 +230,7 @@ export async function renameConversation(serverId, conversationId, nickname) {
 }
 
 export async function deleteConversation(serverId, conversationId) {
-  return api(serverId, `/api/conversations/${conversationId}`, {
+  return api(serverId, conversationPath(conversationId), {
     method: 'DELETE'
   });
 }
@@ -239,7 +247,7 @@ export async function createForegroundSession(serverId, conversationId, options 
   const nickname = String(options.nickname || '').trim();
   if (sessionId) body.session_id = sessionId;
   if (nickname) body.nickname = nickname;
-  const response = await api(serverId, `/api/conversations/${conversationId}/foreground_sessions`, {
+  const response = await api(serverId, `${conversationPath(conversationId)}/foreground_sessions`, {
     method: 'POST',
     body
   });
@@ -247,7 +255,7 @@ export async function createForegroundSession(serverId, conversationId, options 
 }
 
 export async function renameForegroundSession(serverId, conversationId, foregroundSessionId, nickname) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}`, {
+  const response = await api(serverId, foregroundSessionPath(conversationId, foregroundSessionId), {
     method: 'PATCH',
     body: { nickname }
   });
@@ -255,7 +263,7 @@ export async function renameForegroundSession(serverId, conversationId, foregrou
 }
 
 export async function deleteForegroundSession(serverId, conversationId, foregroundSessionId) {
-  return api(serverId, `/api/conversations/${conversationId}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}`, {
+  return api(serverId, foregroundSessionPath(conversationId, foregroundSessionId), {
     method: 'DELETE'
   });
 }
@@ -266,13 +274,13 @@ export async function loadMessages(serverId, conversationId, options = {}) {
   const foregroundSessionId = options.foregroundSessionId || options.sessionId || 'main';
   const response = await api(
     serverId,
-    `/api/conversations/${conversationId}/foreground_sessions/${encodeURIComponent(foregroundSessionId)}/messages?offset=${encodeURIComponent(offset)}&limit=${encodeURIComponent(limit)}`
+    `${foregroundSessionPath(conversationId, foregroundSessionId)}/messages?offset=${encodeURIComponent(offset)}&limit=${encodeURIComponent(limit)}`
   );
   return response.data?.messages || [];
 }
 
 export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = [], selectionReferences = [], foregroundSessionId = 'main', clientMessageId = '') {
-  return api(serverId, `/api/conversations/${conversationId}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}/messages`, {
+  return api(serverId, `${foregroundSessionPath(conversationId, foregroundSessionId)}/messages`, {
     method: 'POST',
     body: {
       client_message_id: String(clientMessageId || '').trim() || undefined,
@@ -298,7 +306,7 @@ export async function loadModels(serverId) {
 export async function loadWorkspace(serverId, conversationId, path = '', limit = 300) {
   const response = await api(
     serverId,
-    `/api/conversations/${conversationId}/workspace?path=${encodeURIComponent(path || '')}&limit=${encodeURIComponent(limit)}`
+    `${conversationPath(conversationId)}/workspace?path=${encodeURIComponent(path || '')}&limit=${encodeURIComponent(limit)}`
   );
   return response.data;
 }
@@ -306,18 +314,18 @@ export async function loadWorkspace(serverId, conversationId, path = '', limit =
 export async function loadWorkspaceFile(serverId, conversationId, path, limitBytes = 2_000_000) {
   const response = await api(
     serverId,
-    `/api/conversations/${conversationId}/workspace/file?path=${encodeURIComponent(path || '')}&offset=0&limit_bytes=${encodeURIComponent(limitBytes)}`
+    `${conversationPath(conversationId)}/workspace/file?path=${encodeURIComponent(path || '')}&offset=0&limit_bytes=${encodeURIComponent(limitBytes)}`
   );
   return response.data;
 }
 
 export async function listTerminals(serverId, conversationId) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/terminals`);
+  const response = await api(serverId, `${conversationPath(conversationId)}/terminals`);
   return response.data?.terminals || [];
 }
 
 export async function createTerminal(serverId, conversationId, options = {}) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/terminals`, {
+  const response = await api(serverId, `${conversationPath(conversationId)}/terminals`, {
     method: 'POST',
     body: options
   });
@@ -325,7 +333,7 @@ export async function createTerminal(serverId, conversationId, options = {}) {
 }
 
 export async function terminateTerminal(serverId, conversationId, terminalId) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/terminals/${terminalId}`, {
+  const response = await api(serverId, `${conversationPath(conversationId)}/terminals/${encodeURIComponent(terminalId)}`, {
     method: 'DELETE'
   });
   return response.data;
@@ -334,7 +342,7 @@ export async function terminateTerminal(serverId, conversationId, terminalId) {
 export async function terminalStreamUrl(serverId, conversationId, terminalId, offset = 0) {
   const info = await connectionInfo(serverId);
   const url = new URL(
-    `/api/conversations/${encodeURIComponent(conversationId)}/terminals/${encodeURIComponent(terminalId)}/ws`,
+    `${conversationPath(conversationId)}/terminals/${encodeURIComponent(terminalId)}/ws`,
     info.baseUrl
   );
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';

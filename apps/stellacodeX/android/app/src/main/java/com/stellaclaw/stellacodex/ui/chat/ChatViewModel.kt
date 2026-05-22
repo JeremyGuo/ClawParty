@@ -824,6 +824,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             syncJob = null
             pendingSyncReason = null
             realtimeSyncInFlight = false
+            pendingStreamAttachments.clear()
         }
         webSocket?.close(1000, "conversation changed")
         webSocket = null
