@@ -153,14 +153,14 @@ class StellaclawApi(
         nickname: String,
     ): AppResult<ConversationSummary?> = patch(
         profile = profile,
-        path = "/api/conversations/$conversationId",
+        path = "/api/conversations/${urlEncode(conversationId)}",
         body = json.encodeToString(RenameConversationRequestDto(nickname = nickname)),
         retryPolicy = RetryPolicy.Default,
     ) { body -> json.decodeFromString<RenameConversationResponseDto>(body).conversation?.toDomain() }
 
     suspend fun deleteConversation(profile: ConnectionProfile, conversationId: String): AppResult<Unit> = delete(
         profile = profile,
-        path = "/api/conversations/$conversationId",
+        path = "/api/conversations/${urlEncode(conversationId)}",
     ) { Unit }
 
     suspend fun createForegroundSession(
@@ -170,7 +170,7 @@ class StellaclawApi(
         nickname: String? = null,
     ): AppResult<Unit> = post(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions",
         body = json.encodeToString(CreateForegroundSessionRequestDto(sessionId = sessionId, nickname = nickname)),
         retryPolicy = RetryPolicy.Default,
     ) { json.decodeFromString<ForegroundSessionResponseDto>(it); Unit }
@@ -182,7 +182,7 @@ class StellaclawApi(
         nickname: String,
     ): AppResult<Unit> = patch(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}",
         body = json.encodeToString(RenameForegroundSessionRequestDto(nickname = nickname)),
         retryPolicy = RetryPolicy.Default,
     ) { json.decodeFromString<ForegroundSessionResponseDto>(it); Unit }
@@ -193,7 +193,7 @@ class StellaclawApi(
         foregroundSessionId: String,
     ): AppResult<Unit> = delete(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}",
     ) { Unit }
 
     suspend fun loadMessagePage(
@@ -204,7 +204,7 @@ class StellaclawApi(
         limit: Int = 80,
     ): AppResult<MessagePage> = get(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}/messages?offset=$offset&limit=$limit",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}/messages?offset=$offset&limit=$limit",
     ) { body ->
         val page = json.decodeFromString<MessagesResponseDto>(body)
         MessagePage(
@@ -236,7 +236,7 @@ class StellaclawApi(
         messageId: String,
     ): AppResult<ChatMessage> = get(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}/messages/${urlEncode(messageId)}",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}/messages/${urlEncode(messageId)}",
     ) { body -> json.decodeFromString<MessageDetailResponseDto>(body).message.toDomain() }
 
     suspend fun markConversationSeen(
@@ -246,7 +246,7 @@ class StellaclawApi(
         foregroundSessionId: String = "main",
     ): AppResult<Unit> = post(
         profile = profile,
-        path = "/api/conversations/$conversationId/seen",
+        path = "/api/conversations/${urlEncode(conversationId)}/seen",
         body = json.encodeToString(MarkConversationSeenRequestDto(lastSeenMessageId = lastSeenMessageId, foregroundSessionId = foregroundSessionId)),
         retryPolicy = RetryPolicy.Default,
     ) { Unit }
@@ -262,7 +262,7 @@ class StellaclawApi(
         messageTime: String = Instant.now().toString(),
     ): AppResult<Unit> = post(
         profile = profile,
-        path = "/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}/messages",
+        path = "/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}/messages",
         body = json.encodeToString(
             SendMessageRequestDto(
                 clientMessageId = remoteMessageId,
@@ -295,7 +295,7 @@ class StellaclawApi(
         limitBytes: Int = 2_000_000,
     ): AppResult<WorkspaceFileContent> = get(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace/file?path=${urlEncode(path)}&offset=0&limit_bytes=$limitBytes",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace/file?path=${urlEncode(path)}&offset=0&limit_bytes=$limitBytes",
     ) { body ->
         val payload = json.decodeFromString<JsonObject>(body)
         val encoding = payload["encoding"]?.jsonPrimitive?.content.orEmpty()
@@ -318,7 +318,7 @@ class StellaclawApi(
         limit: Int = 300,
     ): AppResult<WorkspaceListing> = get(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace?path=${urlEncode(path.trimStart('/'))}&limit=$limit",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace?path=${urlEncode(path.trimStart('/'))}&limit=$limit",
     ) { body -> json.decodeFromString<WorkspaceListingDto>(body).toDomain() }
 
     suspend fun deleteWorkspacePath(
@@ -327,7 +327,7 @@ class StellaclawApi(
         path: String,
     ): AppResult<Unit> = delete(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace?path=${urlEncode(path.trimStart('/'))}",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace?path=${urlEncode(path.trimStart('/'))}",
     ) { Unit }
 
     suspend fun moveWorkspacePath(
@@ -337,7 +337,7 @@ class StellaclawApi(
         newPath: String,
     ): AppResult<Unit> = patch(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace",
         body = json.encodeToString(MoveWorkspacePathRequestDto(path = path.trimStart('/'), newPath = newPath.trimStart('/'))),
         retryPolicy = RetryPolicy.Default,
     ) { Unit }
@@ -348,7 +348,7 @@ class StellaclawApi(
         path: String,
     ): AppResult<WorkspaceFileContent> = requestBytes(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace/download?path=${urlEncode(path.trimStart('/'))}",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace/download?path=${urlEncode(path.trimStart('/'))}",
         method = "GET",
         body = null,
         retryPolicy = RetryPolicy.Default,
@@ -361,7 +361,7 @@ class StellaclawApi(
         bytes: ByteArray,
     ): AppResult<Unit> = requestBytes(
         profile = profile,
-        path = "/api/conversations/$conversationId/workspace/upload?path=${urlEncode(path.trimStart('/'))}",
+        path = "/api/conversations/${urlEncode(conversationId)}/workspace/upload?path=${urlEncode(path.trimStart('/'))}",
         method = "POST",
         body = bytes,
         retryPolicy = RetryPolicy.Default,
@@ -463,7 +463,7 @@ class StellaclawApi(
             try {
                 val baseUrl = resolveBaseUrl(profile, forceRefreshTunnel)
                 val httpUrl = baseUrl
-                    .plus("/api/conversations/$conversationId/foreground_sessions/${urlEncode(foregroundSessionId)}/ws")
+                    .plus("/api/conversations/${urlEncode(conversationId)}/foreground_sessions/${urlEncode(foregroundSessionId)}/ws")
                     .toHttpUrlOrNull()
                     ?: return@withContext AppResult.Err(AppError.Network("Invalid WebSocket URL"))
                 val httpUrlWithToken = httpUrl.newBuilder()
@@ -654,7 +654,7 @@ class StellaclawApi(
         }
     }
 
-    private fun urlEncode(value: String): String = java.net.URLEncoder.encode(value, Charsets.UTF_8.name())
+    private fun urlEncode(value: String): String = java.net.URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
 
     private fun guessMediaType(name: String): String? = when (name.substringAfterLast('.', "").lowercase()) {
         "png" -> "image/png"

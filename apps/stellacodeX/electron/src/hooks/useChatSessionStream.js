@@ -3,6 +3,7 @@ import { conversationKey, foregroundSessions, loadMessages } from '../lib/api';
 import { addUsageTotals, firstMessageIndexGap, mergeMessages } from '../lib/messageUtils';
 import {
   applyStreamErrorToMessages,
+  applyStreamAttachmentManifest,
   createStreamBufferStore,
   createStreamIndexTracker,
   markQueuedUserMessage,
@@ -563,6 +564,12 @@ export function useChatSessionStream({
         setSessionActivity('用户消息已落盘');
       } else if (payloadType === 'chat.message_appended') {
         applyIncomingMessages(payload.message ? [payload.message] : []);
+      } else if (payloadType === 'chat.attachment_manifest') {
+        setMessages((current) => {
+          const next = applyStreamAttachmentManifest(current, payload);
+          messagesRef.current = next;
+          return next;
+        });
       } else if (
         payloadType.startsWith('chat.stream_')
         || nestedStreamType.startsWith('stream_')

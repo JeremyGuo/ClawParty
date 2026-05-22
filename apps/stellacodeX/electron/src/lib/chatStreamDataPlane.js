@@ -579,6 +579,70 @@ export function appendStreamToolResultDone(current, event) {
   return next;
 }
 
+function attachmentIdentity(attachment) {
+  if (!attachment || typeof attachment !== 'object') return '';
+  return String(
+    attachment.id
+    || attachment.attachment_id
+    || attachment.preview_url
+    || attachment.download_url
+    || attachment.uri
+    || attachment.file_uri
+    || attachment.url
+    || attachment.path
+    || attachment.open_in_workspace_path
+    || attachment.name
+    || attachment.filename
+    || ''
+  ).trim();
+}
+
+export function applyStreamAttachmentManifest(current, event) {
+  const id = streamMessageId(event);
+  const attachments = Array.isArray(event?.attachments) ? event.attachments : [];
+  if (!id || attachments.length === 0) return current;
+  if (hasCommittedMessage(current, id)) return current;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const existingAttachments = Array.isArray(existing.attachments) ? existing.attachments : [];
+    const seen = new Set(existingAttachments.map(attachmentIdentity).filter(Boolean));
+    const merged = [...existingAttachments];
+    for (const attachment of attachments) {
+      const key = attachmentIdentity(attachment);
+      if (key && seen.has(key)) continue;
+      if (key) seen.add(key);
+      merged.push(attachment);
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: existing.text || existing.preview || '',
+      preview: existing.preview || existing.text || '',
+      content: existing.content || existing.text || existing.preview || '',
+      text_with_attachment_markers: existing.text_with_attachment_markers || existing.text || existing.preview || '',
+      items: Array.isArray(existing.items) ? existing.items : [],
+      attachments: merged,
+      attachment_count: merged.length,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streaming: true
+    };
+  };
+  return upsertStreamingMessage(current, id, turnId, buildMessage);
+}
+
 export function markQueuedUserMessage(current, clientMessageId) {
   const id = String(clientMessageId || '').trim();
   if (!id) return current;

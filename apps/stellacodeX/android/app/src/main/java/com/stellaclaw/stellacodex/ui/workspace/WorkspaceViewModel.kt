@@ -88,7 +88,7 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
             when (result) {
                 is AppResult.Ok -> {
                     val fileName = if (entry.isDirectory) "${entry.name.ifBlank { "workspace" }}.tar.gz" else entry.name.ifBlank { "workspace-file" }
-                    val saved = saveToDownloads(fileName, result.value.bytes, result.value.mediaType ?: "application/octet-stream")
+                    val saved = saveToDownloads(fileName.safeFileName(), result.value.bytes, result.value.mediaType ?: "application/octet-stream")
                     mutableState.update { it.copy(isWorking = false, status = "Saved $saved") }
                 }
                 is AppResult.Err -> mutableState.update { it.copy(isWorking = false, error = result.error.userMessage(), status = null) }
@@ -153,19 +153,29 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun saveToDownloads(fileName: String, bytes: ByteArray, mediaType: String): String {
         val resolver = getApplication<Application>().contentResolver
+        val safeName = fileName.safeFileName()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(MediaStore.Downloads.DISPLAY_NAME, safeName)
                 put(MediaStore.Downloads.MIME_TYPE, mediaType)
                 put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/StellacodeX")
             }
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("Unable to create download")
             resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: error("Unable to write download")
-            return "Downloads/StellacodeX/$fileName"
+            return "Downloads/StellacodeX/$safeName"
         }
         val dir = File(getApplication<Application>().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "StellacodeX").apply { mkdirs() }
-        File(dir, fileName).writeBytes(bytes)
-        return File(dir, fileName).absolutePath
+        File(dir, safeName).writeBytes(bytes)
+        return File(dir, safeName).absolutePath
+    }
+
+    private fun String.safeFileName(): String {
+        val cleaned = replace(Regex("[\\\\/:*?\"<>|]"), "_").replace(Regex("\\s+"), " ").trim().ifBlank { "workspace-file" }
+        if (cleaned.length <= 120) return cleaned
+        val extension = cleaned.substringAfterLast('.', missingDelimiterValue = "").takeIf { it.length in 1..12 }
+        val stemLimit = if (extension == null) 120 else 119 - extension.length
+        val stem = cleaned.substringBeforeLast('.', cleaned).take(stemLimit).trimEnd('.', ' ')
+        return if (extension == null) stem else "$stem.$extension"
     }
 
     private fun displayName(uri: Uri, resolver: ContentResolver): String {
