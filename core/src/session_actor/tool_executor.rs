@@ -828,6 +828,7 @@ mod tests {
         builtin_tool_catalog(BuiltinToolCatalogOptions {
             web_search: WebSearchOptions {
                 enabled: true,
+                web: true,
                 ..WebSearchOptions::default()
             },
             enable_native_image_view: true,
@@ -1666,21 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_web_search_with_configured_json_endpoint() {
-        let mut server = mockito::Server::new();
-        let _mock = server
-            .mock("GET", "/search")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"query":"demo","results":[{"title":"Demo","url":"https://example.com"}]}"#,
-            )
-            .create();
-        std::env::set_var(
-            "STELLACLAW_WEB_SEARCH_URL",
-            format!("{}/search", server.url()),
-        );
+    fn web_search_requires_configured_provider() {
         let workspace = temp_workspace();
         let executor = test_executor(&workspace);
         let message = start_and_wait(
@@ -1693,9 +1680,8 @@ mod tests {
                 )],
             ),
         );
-        std::env::remove_var("STELLACLAW_WEB_SEARCH_URL");
 
-        assert!(result_text(&message, 0).contains("https://example.com"));
+        assert!(result_text(&message, 0).contains("requires a configured search provider"));
     }
 
     #[test]

@@ -1,16 +1,11 @@
-use std::{thread, time::Duration};
+use std::thread;
 
 use crossbeam_channel::select;
-use regex::Regex;
 use serde_json::{json, Map, Value};
-use url::Url;
 
-use super::{
-    common::{html_unescape, strip_html},
-    WebSearchOptions,
-};
+use super::WebSearchOptions;
 use crate::{
-    model_config::{ModelCapability, ModelConfig, ProviderType},
+    model_config::{ModelCapability, ModelConfig},
     providers::{global_provider_fork_server, ProviderError, ProviderRequestOwned},
     session_actor::{
         tool_catalog::{
@@ -25,6 +20,8 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::model_config::ProviderType;
 #[cfg(test)]
 use crate::providers::{
     BraveSearchImageProvider, BraveSearchNewsProvider, BraveSearchProvider,
@@ -74,57 +71,20 @@ impl WebSearchTool {
         }
         let max_results = usize_arg_with_default(arguments, "max_results", 5)?;
         let vertical = requested_search_vertical(arguments)?;
-        if vertical != SearchVertical::Web {
-            let Some(search_tool_models) = search_tool_models else {
-                return Err(LocalToolError::InvalidArguments(format!(
-                    "web_search {} results require a configured provider",
-                    vertical.name()
-                )));
-            };
-            return search_with_vertical_provider(
-                search_tool_models,
-                vertical,
-                &query,
-                context,
-                timeout_seconds,
-                max_results,
-            );
-        }
-        if let Some(search_tool_model) = search_tool_models.and_then(|models| models.web.as_ref()) {
-            return search_with_provider(
-                search_tool_model,
-                arguments,
-                &query,
-                context,
-                timeout_seconds,
-                max_results.clamp(1, 20),
-            );
-        }
-        let max_results = max_results.clamp(1, 10);
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs_f64(timeout_seconds))
-            .user_agent("stellaclaw-core/0.1")
-            .build()
-            .map_err(|error| LocalToolError::Io(format!("failed to build web client: {error}")))?;
-
-        if let Ok(base_url) = std::env::var("STELLACLAW_WEB_SEARCH_URL") {
-            return web_search_json_endpoint(&client, &base_url, &query, max_results);
-        }
-
-        let body = client
-            .get("https://duckduckgo.com/html/")
-            .query(&[("q", query.as_str())])
-            .send()
-            .map_err(|error| LocalToolError::Io(format!("web_search request failed: {error}")))?
-            .text()
-            .map_err(|error| {
-                LocalToolError::Io(format!("failed to read web_search body: {error}"))
-            })?;
-        Ok(json!({
-            "query": query,
-            "results": parse_duckduckgo_html_results(&body, max_results),
-        }))
+        let Some(search_tool_models) = search_tool_models else {
+            return Err(LocalToolError::InvalidArguments(
+                "web_search requires a configured search provider".to_string(),
+            ));
+        };
+        search_with_provider(
+            search_tool_models,
+            vertical,
+            arguments,
+            &query,
+            context,
+            timeout_seconds,
+            max_results,
+        )
     }
 }
 
@@ -149,7 +109,10 @@ impl BaseTool for WebSearchTool {
 }
 
 fn web_search_description(options: WebSearchOptions) -> String {
-    let mut supported = vec!["web"];
+    let mut supported = Vec::new();
+    if options.web {
+        supported.push("web");
+    }
     if options.image {
         supported.push("image");
     }
@@ -160,6 +123,7 @@ fn web_search_description(options: WebSearchOptions) -> String {
         supported.push("news");
     }
     let unsupported = [
+        (!options.web).then_some("plain web search"),
         (!options.image).then_some("image=true"),
         (!options.video).then_some("video=true"),
         (!options.news).then_some("news=true"),
@@ -173,8 +137,13 @@ fn web_search_description(options: WebSearchOptions) -> String {
     } else {
         format!(" This session does not support: {unsupported}.")
     };
+    let mode_guidance = if options.web {
+        "Set at most one of image=true, video=true, or news=true; omit them for normal web results."
+    } else {
+        "Set exactly one supported mode flag such as image=true, video=true, or news=true."
+    };
     format!(
-        "Search using the configured provider and return structured results plus citations. Supported result types: {}. Set at most one of image=true, video=true, or news=true; omit them for normal web results.{} If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
+        "Search using the configured provider and return structured results plus citations. Supported result types: {}. {mode_guidance}{} If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
         supported.join(", "),
         unsupported
     )
@@ -190,18 +159,14 @@ fn object_arguments(args: Value) -> Result<Map<String, Value>, LocalToolError> {
 }
 
 fn search_with_provider(
-    model_config: &ModelConfig,
+    models: &SearchToolModels,
+    vertical: SearchVertical,
     arguments: &Map<String, Value>,
     query: &str,
     context: Option<&ToolExecutionContext<'_>>,
     timeout_seconds: f64,
     max_results: usize,
 ) -> Result<Value, LocalToolError> {
-    if !model_config.supports(ModelCapability::WebSearch) {
-        return Err(LocalToolError::InvalidArguments(
-            "the configured search provider does not have web_search capability".to_string(),
-        ));
-    }
     if arguments
         .get("images")
         .and_then(Value::as_array)
@@ -212,12 +177,29 @@ fn search_with_provider(
         ));
     }
 
-    if model_config.provider_type != ProviderType::BraveSearch {
+    let model_config = match vertical {
+        SearchVertical::Web => models.web.as_ref(),
+        SearchVertical::Image => models.image.as_ref(),
+        SearchVertical::Video => models.video.as_ref(),
+        SearchVertical::News => models.news.as_ref(),
+    }
+    .ok_or_else(|| {
+        LocalToolError::InvalidArguments(format!(
+            "web_search {} results are not configured in this session",
+            vertical.name()
+        ))
+    })?;
+    if !model_config.supports(ModelCapability::WebSearch) {
         return Err(LocalToolError::InvalidArguments(format!(
-            "unsupported web_search provider {:?}",
-            model_config.provider_type
+            "the configured {} search provider does not have web_search capability",
+            vertical.name()
         )));
     }
+    let max_results = match vertical {
+        SearchVertical::Web => max_results.clamp(1, 20),
+        SearchVertical::Image => max_results.clamp(1, 200),
+        SearchVertical::Video | SearchVertical::News => max_results.clamp(1, 50),
+    };
     let mut model_config = model_config.clone();
     model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
     search_with_provider_worker(&model_config, query, max_results, context)
@@ -266,49 +248,6 @@ fn requested_search_vertical(
     } else {
         SearchVertical::Web
     })
-}
-
-fn search_with_vertical_provider(
-    models: &SearchToolModels,
-    vertical: SearchVertical,
-    query: &str,
-    context: Option<&ToolExecutionContext<'_>>,
-    timeout_seconds: f64,
-    max_results: usize,
-) -> Result<Value, LocalToolError> {
-    let model_config = match vertical {
-        SearchVertical::Web => models.web.as_ref(),
-        SearchVertical::Image => models.image.as_ref(),
-        SearchVertical::Video => models.video.as_ref(),
-        SearchVertical::News => models.news.as_ref(),
-    }
-    .ok_or_else(|| {
-        LocalToolError::InvalidArguments(format!(
-            "web_search {} results are not configured in this session",
-            vertical.name()
-        ))
-    })?;
-    if !model_config.supports(ModelCapability::WebSearch) {
-        return Err(LocalToolError::InvalidArguments(format!(
-            "the configured {} search provider does not have web_search capability",
-            vertical.name()
-        )));
-    }
-    let max_results = match (vertical, &model_config.provider_type) {
-        (SearchVertical::Image, ProviderType::BraveSearchImage) => max_results.clamp(1, 200),
-        (SearchVertical::Video, ProviderType::BraveSearchVideo) => max_results.clamp(1, 50),
-        (SearchVertical::News, ProviderType::BraveSearchNews) => max_results.clamp(1, 50),
-        _ => {
-            return Err(LocalToolError::InvalidArguments(format!(
-                "unsupported web_search {} provider {:?}",
-                vertical.name(),
-                model_config.provider_type,
-            )))
-        }
-    };
-    let mut model_config = model_config.clone();
-    model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
-    search_with_provider_worker(&model_config, query, max_results, context)
 }
 
 fn search_with_provider_worker(
@@ -362,17 +301,11 @@ fn search_with_provider_worker(
     select! {
         recv(result_rx) -> result => provider_worker_result_to_value(result),
         recv(cancel_rx) -> _ => {
-            if let Ok(result) = result_rx.try_recv() {
-                return provider_worker_result_to_value(Ok(result));
-            }
             let _ = abort_handle.abort();
-            match result_rx.recv() {
-                Ok(Ok(message)) => provider_message_to_json_value(message),
-                Ok(Err(_)) | Err(_) => Ok(json!({
-                    "status": "interrupted",
-                    "reason": "tool_interrupted",
-                })),
-            }
+            Ok(json!({
+                "status": "interrupted",
+                "reason": "tool_interrupted",
+            }))
         }
     }
 }
@@ -444,80 +377,4 @@ fn provider_error_to_local_tool_error(error: ProviderError) -> LocalToolError {
         )),
         error => LocalToolError::Io(format!("web_search provider request failed: {error}")),
     }
-}
-
-fn web_search_json_endpoint(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Value, LocalToolError> {
-    let mut url = Url::parse(base_url).map_err(|error| {
-        LocalToolError::InvalidArguments(format!("invalid web search URL: {error}"))
-    })?;
-    url.query_pairs_mut()
-        .append_pair("q", query)
-        .append_pair("query", query)
-        .append_pair("max_results", &max_results.to_string());
-    let value = client
-        .get(url)
-        .send()
-        .map_err(|error| LocalToolError::Io(format!("web_search request failed: {error}")))?
-        .json::<Value>()
-        .map_err(|error| LocalToolError::Io(format!("failed to parse web_search JSON: {error}")))?;
-    Ok(value)
-}
-
-fn parse_duckduckgo_html_results(body: &str, max_results: usize) -> Vec<Value> {
-    let Ok(anchor_regex) =
-        Regex::new(r#"(?s)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
-    else {
-        return Vec::new();
-    };
-    let snippet_regex =
-        Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#).ok();
-    let snippets = snippet_regex
-        .as_ref()
-        .map(|regex| {
-            regex
-                .captures_iter(body)
-                .filter_map(|cap| cap.get(1).map(|value| strip_html(value.as_str())))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    anchor_regex
-        .captures_iter(body)
-        .take(max_results)
-        .enumerate()
-        .map(|(index, cap)| {
-            let url = cap
-                .get(1)
-                .map(|value| html_unescape(value.as_str()))
-                .unwrap_or_default();
-            let title = cap
-                .get(2)
-                .map(|value| strip_html(value.as_str()))
-                .unwrap_or_default();
-            json!({
-                "title": title,
-                "url": normalize_duckduckgo_url(&url),
-                "snippet": snippets.get(index).cloned().unwrap_or_default(),
-            })
-        })
-        .collect()
-}
-
-fn normalize_duckduckgo_url(url: &str) -> String {
-    if let Ok(parsed) = Url::parse(url) {
-        if parsed.domain() == Some("duckduckgo.com") {
-            if let Some(target) = parsed
-                .query_pairs()
-                .find_map(|(key, value)| (key == "uddg").then(|| value.to_string()))
-            {
-                return target;
-            }
-        }
-    }
-    url.to_string()
 }

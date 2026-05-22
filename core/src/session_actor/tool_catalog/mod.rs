@@ -576,10 +576,7 @@ impl ToolCatalog {
     pub fn from_model_config(model_config: &ModelConfig) -> Result<Self, ToolCatalogError> {
         let options = BuiltinToolCatalogOptions {
             remote_mode: ToolRemoteMode::Selectable,
-            web_search: WebSearchOptions {
-                enabled: model_config.supports(ModelCapability::WebSearch),
-                ..WebSearchOptions::default()
-            },
+            web_search: web_search_options_for_single_model(model_config),
             enable_native_image_view: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_view: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_view: model_config.supports(ModelCapability::AudioIn),
@@ -601,10 +598,7 @@ impl ToolCatalog {
     ) -> Result<Self, ToolCatalogError> {
         let options = BuiltinToolCatalogOptions {
             remote_mode: ToolRemoteMode::Selectable,
-            web_search: WebSearchOptions {
-                enabled: model_config.supports(ModelCapability::WebSearch),
-                ..WebSearchOptions::default()
-            },
+            web_search: web_search_options_for_single_model(model_config),
             enable_native_image_view: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_view: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_view: model_config.supports(ModelCapability::AudioIn),
@@ -638,27 +632,9 @@ impl ToolCatalog {
         let audio_tool = selected_media_tool(model_config, initial.audio_tool_model.as_ref());
         let generation_tool =
             selected_media_tool(model_config, initial.image_generation_tool_model.as_ref());
-        let search_tool = selected_media_tool(model_config, initial.search_tool_model.as_ref());
         let options = BuiltinToolCatalogOptions {
             remote_mode: initial.tool_remote_mode.clone(),
-            web_search: WebSearchOptions {
-                enabled: search_tool.model_supports(ModelCapability::WebSearch)
-                    || initial.search_image_tool_model.is_some()
-                    || initial.search_video_tool_model.is_some()
-                    || initial.search_news_tool_model.is_some(),
-                image: initial
-                    .search_image_tool_model
-                    .as_ref()
-                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
-                video: initial
-                    .search_video_tool_model
-                    .as_ref()
-                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
-                news: initial
-                    .search_news_tool_model
-                    .as_ref()
-                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
-            },
+            web_search: web_search_options_for_initial(initial),
             enable_native_image_view: image_tool.self_model
                 && image_tool.model_supports(ModelCapability::ImageIn),
             enable_native_pdf_view: pdf_tool.self_model
@@ -826,6 +802,33 @@ fn selected_media_tool<'a>(
     }
 }
 
+fn web_search_options_for_single_model(model_config: &ModelConfig) -> WebSearchOptions {
+    let web = model_config.supports(ModelCapability::WebSearch);
+    WebSearchOptions {
+        enabled: web,
+        web,
+        ..WebSearchOptions::default()
+    }
+}
+
+fn web_search_options_for_initial(initial: &SessionInitial) -> WebSearchOptions {
+    let web = optional_model_supports_web_search(initial.search_tool_model.as_ref());
+    let image = optional_model_supports_web_search(initial.search_image_tool_model.as_ref());
+    let video = optional_model_supports_web_search(initial.search_video_tool_model.as_ref());
+    let news = optional_model_supports_web_search(initial.search_news_tool_model.as_ref());
+    WebSearchOptions {
+        enabled: web || image || video || news,
+        web,
+        image,
+        video,
+        news,
+    }
+}
+
+fn optional_model_supports_web_search(model_config: Option<&ModelConfig>) -> bool {
+    model_config.is_some_and(|model_config| model_config.supports(ModelCapability::WebSearch))
+}
+
 impl From<SessionType> for HostToolScope {
     fn from(value: SessionType) -> Self {
         match value {
@@ -989,6 +992,7 @@ mod tests {
             remote_mode: ToolRemoteMode::Selectable,
             web_search: WebSearchOptions {
                 enabled: true,
+                web: true,
                 image: true,
                 video: true,
                 news: true,
@@ -1391,6 +1395,35 @@ mod tests {
             ToolCatalog::from_model_config_and_initial(&primary, &initial).expect("catalog");
 
         assert!(catalog.contains("web_search"));
+    }
+
+    #[test]
+    fn initial_without_search_tool_model_hides_web_search() {
+        let primary = ModelConfig {
+            provider_type: ProviderType::OpenRouterCompletion,
+            model_name: "text-model".to_string(),
+            url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::WebSearch],
+            token_max_context: 128_000,
+            max_tokens: 0,
+            cache_timeout: 300,
+            conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let initial = SessionInitial::new("session_1", SessionType::Foreground);
+
+        let catalog =
+            ToolCatalog::from_model_config_and_initial(&primary, &initial).expect("catalog");
+
+        assert!(!catalog.contains("web_search"));
     }
 
     #[test]

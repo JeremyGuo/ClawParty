@@ -9,6 +9,7 @@ use super::{ToolDefinition, ToolEntry};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WebSearchOptions {
     pub enabled: bool,
+    pub web: bool,
     pub image: bool,
     pub video: bool,
     pub news: bool,
