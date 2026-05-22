@@ -1,5 +1,10 @@
-version: 1.31.3
+version: 1.31.4
 ---
+
+# 1.31.4
+
+- 修复 StellaCodeX Electron Conversation 未读红点清除：
+  Conversation Bar 和 home unread 判断统一只使用 `last_final_message_id > last_seen_message_id`，不再用仍在变化的 `last_message_id` 参与红点状态；Chat 消息区会在稳定消息进入可见区域时上报 `markConversationSeen`，避免打开已有未读会话但没有新的 websocket message event 时已读状态无法持久化。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.3
 

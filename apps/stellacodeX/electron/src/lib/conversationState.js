@@ -210,6 +210,8 @@ export function applyConversationStreamEvent(current, payload) {
       message_count: payload.message_count ?? payload.conversation?.message_count,
       last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id,
       last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time,
+      last_final_message_id: payload.last_final_message_id ?? payload.conversation?.last_final_message_id,
+      last_final_message_time: payload.last_final_message_time ?? payload.conversation?.last_final_message_time,
       last_seen_message_id: payload.last_seen_message_id ?? payload.conversation?.last_seen_message_id,
       last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at
     };
@@ -277,6 +279,6 @@ export function applyConversationStreamEvent(current, payload) {
 
 export function hasUnreadConversation(conversation) {
   return foregroundSessions(conversation).some((session) => (
-    compareMessageIds(session?.last_final_message_id || session?.last_message_id, session?.last_seen_message_id) > 0
+    compareMessageIds(session?.last_final_message_id, session?.last_seen_message_id) > 0
   ));
 }

@@ -393,14 +393,37 @@ function App() {
         item.conversation_id === currentSelected?.conversationId
       ));
       const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
-      if (!currentSelected || !session?.last_message_id) return;
+      if (!currentSelected || !session?.last_final_message_id) return;
       markConversationRead(
         currentSelected.serverId,
         currentSelected.conversationId,
         sessionId,
-        session.last_message_id
+        session.last_final_message_id
       );
     }, 240);
+  }, [markConversationRead]);
+
+  const markVisibleMessageRead = useCallback((messageId) => {
+    if (!appForegroundRef.current) return;
+    const currentSelected = selectedRef.current;
+    if (!currentSelected) return;
+    const seen = String(messageId || '').trim();
+    const visibleOrder = messageOrderFromId(seen);
+    if (visibleOrder === undefined) return;
+    const sessionId = selectedForegroundSessionId(currentSelected);
+    const conversation = conversationsRef.current.find((item) => (
+      item.conversation_id === currentSelected.conversationId
+    ));
+    const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+    const finalOrder = messageOrderFromId(session?.last_final_message_id);
+    const seenOrder = messageOrderFromId(session?.last_seen_message_id) ?? -1;
+    if (finalOrder === undefined || visibleOrder > finalOrder || visibleOrder <= seenOrder) return;
+    markConversationRead(
+      currentSelected.serverId,
+      currentSelected.conversationId,
+      sessionId,
+      seen
+    );
   }, [markConversationRead]);
 
   useEffect(() => {
@@ -1208,6 +1231,7 @@ function App() {
           onDownloadAttachment={downloadMessageAttachment}
           onResolveAttachmentUrl={resolveMessageAttachmentUrl}
           onOpenLocalLink={openChatLocalLink}
+          onVisibleMessageRead={markVisibleMessageRead}
         />
       </main>
       <OverviewPanel

@@ -10,7 +10,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, fileNameFromPath, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, messageOrderFromId, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 import { measureChatPerf, recordChatPerf } from '../lib/chatPerfMetrics';
 import { ChatPerfPopover } from './chat/ChatPerfPopover';
 import { composerAttachmentFromFile, isImageFileObject, outgoingAttachmentPayload, selectionSummary } from './chat/composerAttachments';
@@ -42,7 +42,7 @@ const REASONING_EFFORTS = [
 const datePartFormatters = new Map();
 const clockFormatters = new Map();
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
   const renderStartedAt = renderCommitStart();
   const currentActivity = (runningActivities || []).at(-1) || null;
   const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
@@ -95,6 +95,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const contentRef = useRef(null);
   const virtualHeightsRef = useRef(new Map());
   const previousCountRef = useRef(0);
+  const visibleReadIdRef = useRef('');
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
@@ -335,6 +336,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
 
   useEffect(() => {
     previousCountRef.current = 0;
+    visibleReadIdRef.current = '';
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
     stickToBottomRef.current = true;
@@ -418,6 +420,72 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       loadOlderPreservingViewport();
     }
   };
+
+  const reportVisibleReadMessages = useCallback((nodes) => {
+    if (!onVisibleMessageRead) return;
+    let bestId = '';
+    let bestOrder = -1;
+    nodes.forEach((node) => {
+      const id = String(node?.getAttribute?.('data-message-id') || '').trim();
+      const order = messageOrderFromId(id);
+      if (order !== undefined && order > bestOrder) {
+        bestId = id;
+        bestOrder = order;
+      }
+    });
+    if (!bestId) return;
+    const previousOrder = messageOrderFromId(visibleReadIdRef.current) ?? -1;
+    if (bestOrder <= previousOrder) return;
+    visibleReadIdRef.current = bestId;
+    onVisibleMessageRead(bestId);
+  }, [onVisibleMessageRead]);
+
+  useEffect(() => {
+    if (!messagesReady || !onVisibleMessageRead) return undefined;
+    const list = scrollRef.current;
+    const content = contentRef.current;
+    if (!list || !content || typeof IntersectionObserver === 'undefined') return undefined;
+    const nodes = Array.from(content.querySelectorAll('[data-message-id]'));
+    if (!nodes.length) return undefined;
+    const visibleNodes = new Set();
+    let frame = 0;
+    const scheduleReport = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        reportVisibleReadMessages(visibleNodes);
+      });
+    };
+    const listRect = list.getBoundingClientRect();
+    nodes.forEach((node) => {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom > listRect.top && rect.top < listRect.bottom) {
+        visibleNodes.add(node);
+      }
+    });
+    scheduleReport();
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) visibleNodes.add(entry.target);
+        else visibleNodes.delete(entry.target);
+      });
+      scheduleReport();
+    }, { root: list, threshold: 0.01 });
+    nodes.forEach((node) => observer.observe(node));
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [
+    activeMessageScope,
+    messagesReady,
+    onVisibleMessageRead,
+    reportVisibleReadMessages,
+    virtualWindow.start,
+    virtualWindow.end,
+    virtualWindow.virtualized,
+    newestMessageKey
+  ]);
 
   const addComposerFiles = async (files, source = 'file') => {
     const values = Array.from(files || []).filter(Boolean);
@@ -918,6 +986,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
   const className = messageArticleClassName(message);
   const roleName = String(message.role || '').toLowerCase();
   const auxiliaryMessages = Array.isArray(message._auxiliary) ? message._auxiliary : [];
+  const visibleMessageId = durableVisibleMessageId(message);
   useRenderCommitPerf('chat.message.render_commit', renderStartedAt, () => ({
       role: roleName,
       streaming: Boolean(message?._streaming),
@@ -925,7 +994,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
       items: messageItems(message).length
   }));
   return (
-    <article className={className}>
+    <article className={className} data-message-id={visibleMessageId || undefined}>
       {auxiliaryMessages.length > 0 && (
         <div className="message-role">
           <span>{role}</span>
@@ -941,6 +1010,12 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
       {message.error && <div className="message-status error">{message.error}</div>}
     </article>
   );
+}
+
+function durableVisibleMessageId(message) {
+  if (!message || message._optimistic || message.pending || message._streaming) return '';
+  const id = String(message.id ?? message.message_id ?? '').trim();
+  return messageOrderFromId(id) === undefined ? '' : id;
 }
 
 function MessageActionBar({ message, role, usage }) {
