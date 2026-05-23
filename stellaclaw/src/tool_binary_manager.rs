@@ -223,7 +223,8 @@ fn helper_executable_path() -> Result<PathBuf> {
     if current_exe.is_file() {
         return Ok(current_exe);
     }
-    if let Some(path) = strip_deleted_executable_marker(&current_exe).filter(|path| path.is_file()) {
+    if let Some(path) = strip_deleted_executable_marker(&current_exe).filter(|path| path.is_file())
+    {
         return Ok(path);
     }
     if let Some(path) = invocation_executable_path().filter(|path| path.is_file()) {
@@ -833,7 +834,10 @@ mod tests {
             strip_deleted_executable_marker(Path::new("/tmp/stellaclaw (deleted)")),
             Some(PathBuf::from("/tmp/stellaclaw"))
         );
-        assert_eq!(strip_deleted_executable_marker(Path::new("/tmp/stellaclaw")), None);
+        assert_eq!(
+            strip_deleted_executable_marker(Path::new("/tmp/stellaclaw")),
+            None
+        );
     }
 
     #[test]
