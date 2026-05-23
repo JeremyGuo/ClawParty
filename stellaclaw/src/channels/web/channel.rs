@@ -713,7 +713,7 @@ impl WebChannel {
             .map(str::to_string);
         let client_message_id = client_message_id.unwrap_or_else(ChatMessage::new_message_id);
         let message = ChatMessage::new(ChatRole::User, items)
-            .with_message_id(client_message_id.clone())
+            .with_client_message_id(client_message_id.clone())
             .with_user_name_option(request.user_name)
             .with_message_time(now_rfc3339());
         self.conversation_runtime

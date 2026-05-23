@@ -365,6 +365,7 @@ fn normalize_compaction_for_generic_provider(messages: &[ChatMessage]) -> Vec<Ch
                 .collect::<Vec<_>>();
             (!data.is_empty()).then(|| ChatMessage {
                 message_id: message.message_id.clone(),
+                client_message_id: message.client_message_id.clone(),
                 role: ChatRole::User,
                 user_name: message.user_name.clone(),
                 message_time: message.message_time.clone(),

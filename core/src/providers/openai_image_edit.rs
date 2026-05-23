@@ -359,6 +359,7 @@ fn convert_image_response(
 
     Ok(ChatMessage {
         message_id: ChatMessage::new_message_id(),
+        client_message_id: None,
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,

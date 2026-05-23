@@ -9,6 +9,7 @@ The Rust definitions live in `core/src/session_actor/chat_message.rs`.
 ```rust
 pub struct ChatMessage {
     pub message_id: String,
+    pub client_message_id: Option<String>,
     pub role: ChatRole,
     pub user_name: Option<String>,
     pub message_time: Option<String>,
@@ -20,6 +21,10 @@ pub struct ChatMessage {
 ### `message_id`
 
 Stable provider-neutral local ID for this persisted message. It is generated before a new message is appended and is used by stream events, Web queries, and seen state. Old histories are upgraded by assigning missing IDs.
+
+### `client_message_id`
+
+Optional channel/client-provided correlation ID for the originating user message. Unlike `message_id`, this is not the persisted conversation-order ID and must not be used for history ordering, message detail URLs, or seen state. Channels can use it to reconcile local optimistic UI messages with the durable message after `message_id` is assigned or rewritten by the session actor.
 
 ### `role`
 

@@ -635,6 +635,7 @@ fn sanitize_message_for_compression_request(
 
     Some(ChatMessage {
         message_id: message.message_id.clone(),
+        client_message_id: message.client_message_id.clone(),
         role: message.role.clone(),
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
@@ -810,6 +811,7 @@ fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) ->
             }
             Some(ChatMessage {
                 message_id: message.message_id.clone(),
+                client_message_id: message.client_message_id.clone(),
                 role: message.role.clone(),
                 user_name: message.user_name.clone(),
                 message_time: message.message_time.clone(),

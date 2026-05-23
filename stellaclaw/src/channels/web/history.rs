@@ -610,6 +610,17 @@ mod tests {
     }
 
     #[test]
+    fn decorate_message_preserves_client_message_id() {
+        let message =
+            context_message("hello", Vec::new()).with_client_message_id("local-attachment-send-1");
+
+        let value = decorate_message(&message, 9, "c1", "main", None);
+
+        assert_eq!(value["id"], "msg_1");
+        assert_eq!(value["client_message_id"], "local-attachment-send-1");
+    }
+
+    #[test]
     fn markdown_rewrite_leaves_ambiguous_basename_unchanged() {
         let first = image_file(
             "file:///workdir/conversations/c1/a/output.png",

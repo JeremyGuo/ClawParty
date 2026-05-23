@@ -34,6 +34,8 @@ pub struct TokenUsageCost {
 pub struct ChatMessage {
     #[serde(default, alias = "id", skip_serializing_if = "String::is_empty")]
     pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     pub role: ChatRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
@@ -48,6 +50,7 @@ impl ChatMessage {
     pub fn new(role: ChatRole, data: Vec<ChatMessageItem>) -> Self {
         Self {
             message_id: Self::new_message_id(),
+            client_message_id: None,
             role,
             user_name: None,
             message_time: None,
@@ -72,6 +75,13 @@ impl ChatMessage {
 
     pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
         self.message_id = message_id.into();
+        self
+    }
+
+    pub fn with_client_message_id(mut self, client_message_id: impl Into<String>) -> Self {
+        let client_message_id = client_message_id.into().trim().to_string();
+        self.client_message_id =
+            (!client_message_id.trim().is_empty()).then_some(client_message_id);
         self
     }
 
