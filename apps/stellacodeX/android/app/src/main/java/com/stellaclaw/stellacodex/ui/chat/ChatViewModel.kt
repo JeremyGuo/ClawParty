@@ -361,8 +361,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return AppResult.Ok(com.stellaclaw.stellacodex.data.api.FetchedAttachment(bytes, mediaType))
         }
         if (attachment.uri.startsWith("content://") || attachment.uri.startsWith("file://")) {
+            val maxInlineBytes = 32L * 1024L * 1024L
+            val size = attachment.sizeBytes ?: 0L
+            if (size > maxInlineBytes) return null
             val app = getApplication<Application>()
-            val bytes = app.contentResolver.openInputStream(Uri.parse(attachment.uri))?.use { it.readBytes() }
+            val bytes = app.contentResolver.openInputStream(Uri.parse(attachment.uri))?.use { stream ->
+                stream.readBytesLimited(maxInlineBytes)
+            }
             if (bytes != null) return AppResult.Ok(com.stellaclaw.stellacodex.data.api.FetchedAttachment(bytes, mediaType))
         }
         return null
@@ -391,6 +396,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun MessageAttachment.inlinePreviewSourceAvailable(): Boolean =
         dataUrl.isNotBlank() || dataBase64.isNotBlank() || data.isNotBlank() || uri.startsWith("content://") || uri.startsWith("file://")
+
+    private fun java.io.InputStream.readBytesLimited(maxBytes: Long): ByteArray? {
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        var total = 0L
+        while (true) {
+            val read = read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) return null
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    }
 
     private fun mediaTypeFromDataUrl(value: String): String? = value
         .takeIf { it.startsWith("data:") }
@@ -934,17 +953,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (local.clientMessageId.isNotBlank() && local.clientMessageId == remote.clientMessageId) return true
         if (local.id.isNotBlank() && local.id == remote.clientMessageId) return true
         if (local.clientMessageId.isNotBlank() && local.clientMessageId == remote.id) return true
-        if (!local.role.equals(remote.role, ignoreCase = true)) return false
-        if (local.text != remote.text || local.userName.orEmpty() != remote.userName.orEmpty()) return false
-        if (local.messageTime.orEmpty().isNotBlank() && local.messageTime == remote.messageTime) return true
-        return local.id.isBlank()
+        return false
     }
 
     private fun ChatMessage.withOptimisticAttachmentFallback(local: ChatMessage): ChatMessage {
-        if (attachments.any { it.hasPreviewSource() } || local.attachments.isEmpty()) return this
+        if (local.attachments.isEmpty()) return this
+        val canonical = attachments
+        if (canonical.isEmpty()) {
+            return copy(attachments = local.attachments, attachmentCount = maxOf(attachmentCount, local.attachments.size))
+        }
+        val merged = canonical.mapIndexed { index, attachment ->
+            if (attachment.hasPreviewSource()) {
+                attachment
+            } else {
+                val localAttachment = local.attachments.getOrNull(index)
+                    ?: local.attachments.firstOrNull { it.name == attachment.name && it.mediaType == attachment.mediaType }
+                attachment.withPreviewSourceFrom(localAttachment)
+            }
+        }
+        return copy(attachments = merged, attachmentCount = maxOf(attachmentCount, merged.size))
+    }
+
+    private fun MessageAttachment.withPreviewSourceFrom(local: MessageAttachment?): MessageAttachment {
+        if (local == null || !local.hasPreviewSource()) return this
         return copy(
-            attachments = local.attachments,
-            attachmentCount = maxOf(attachmentCount, local.attachments.size),
+            uri = uri.ifBlank { local.uri },
+            fileUri = fileUri.ifBlank { local.fileUri },
+            dataUrl = dataUrl.ifBlank { local.dataUrl },
+            dataBase64 = dataBase64.ifBlank { local.dataBase64 },
+            data = data.ifBlank { local.data },
+            encoding = encoding.ifBlank { local.encoding },
         )
     }
 

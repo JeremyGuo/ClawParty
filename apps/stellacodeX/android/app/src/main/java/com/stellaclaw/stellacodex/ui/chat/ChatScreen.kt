@@ -1363,7 +1363,7 @@ private fun MessageItem.ToolCall.toDisplayItem(id: String, results: List<Message
     }.ifBlank { "[no tool detail]" }
     return ToolDisplayItem(
         id = id,
-        title = listOfNotNull(if (completed) "已运行 $name" else "正在运行 $name", summary.takeIf { it.isNotBlank() }).joinToString(" · "),
+        title = if (completed) "已运行 $name" else "正在运行 $name",
         body = body,
         completed = completed,
         summary = summary,
@@ -1382,7 +1382,7 @@ private fun MessageItem.ToolResult.toDisplayItem(id: String, results: List<Messa
     }.ifBlank { "[no textual result]" }
     return ToolDisplayItem(
         id = id,
-        title = listOfNotNull("已运行 $name", summary.takeIf { it.isNotBlank() }).joinToString(" · "),
+        title = "已运行 $name",
         body = body,
         completed = true,
         summary = summary,
@@ -1442,12 +1442,14 @@ private fun ToolCard(
                         contentDescription = null,
                         tint = CodeHeaderText,
                     )
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = title,
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.Bold,
                             color = CodeHeaderText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                         if (!expanded && summary.isNotBlank()) {
                             Text(
