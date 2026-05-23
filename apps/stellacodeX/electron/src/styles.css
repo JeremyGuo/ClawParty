@@ -1430,6 +1430,7 @@ button {
   display: flex;
   min-height: 0;
   flex-direction: column;
+  overflow-anchor: none;
   overflow-x: hidden;
   overflow-y: auto;
   padding: calc(var(--topbar-height) + 18px) max(24px, calc((100% - 920px) / 2)) calc(var(--composer-wrap-height, 156px) + var(--progress-height, 0px) + 18px);

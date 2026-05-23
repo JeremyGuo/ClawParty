@@ -1,4 +1,4 @@
-const LOCAL_CACHE_MAX_BYTES = 1_500_000;
+const LOCAL_CACHE_MAX_BYTES = 2_500_000;
 const LOCAL_CACHE_PREFIX = 'stellacode.cache.v1';
 
 export function localCacheKey(kind, parts) {
@@ -18,13 +18,15 @@ export function readLocalCache(kind, parts) {
 }
 
 export function writeLocalCache(kind, parts, value) {
-  if (typeof window === 'undefined' || !window.localStorage) return;
+  if (typeof window === 'undefined' || !window.localStorage) return false;
   try {
     const raw = JSON.stringify({ saved_at: Date.now(), value });
-    if (raw.length > LOCAL_CACHE_MAX_BYTES) return;
+    if (raw.length > LOCAL_CACHE_MAX_BYTES) return false;
     window.localStorage.setItem(localCacheKey(kind, parts), raw);
+    return true;
   } catch {
     // Cache writes are opportunistic.
+    return false;
   }
 }
 

@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { conversationKey, foregroundSessions, loadMessages } from '../lib/api';
-import { addUsageTotals, firstMessageIndexGap, mergeMessages } from '../lib/messageUtils';
+import { addUsageTotals, firstMessageIndexGap, mergeMessages, messageIndex, messageOrderFromId } from '../lib/messageUtils';
 import {
   applyStreamErrorToMessages,
   applyStreamAttachmentManifest,
@@ -40,6 +40,48 @@ import {
 } from '../lib/chatDebugSummaries';
 import { patchConversationForegroundSession } from '../lib/conversationState';
 
+function sortedFiniteMessages(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => {
+      const index = messageIndex(message);
+      return Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER;
+    })
+    .sort((left, right) => messageIndex(left) - messageIndex(right));
+}
+
+function recentContiguousSuffix(messages) {
+  const sorted = sortedFiniteMessages(messages);
+  if (!sorted.length) return [];
+  let start = sorted.length - 1;
+  while (start > 0 && messageIndex(sorted[start - 1]) + 1 === messageIndex(sorted[start])) {
+    start -= 1;
+  }
+  return sorted.slice(start);
+}
+
+function cachedMessagesForRecentSession(messages, session) {
+  const suffix = recentContiguousSuffix(messages);
+  if (!suffix.length) return [];
+  const latestCachedIndex = messageIndex(suffix.at(-1));
+  const latestSessionIndex = messageOrderFromId(session?.last_message_id)
+    ?? Number(session?.last_committed_message_index ?? session?.last_message_index);
+  if (Number.isFinite(latestSessionIndex) && latestCachedIndex < latestSessionIndex - 240) {
+    return [];
+  }
+  return suffix;
+}
+
+function rangesOverlapOrTouch(leftMessages, rightMessages) {
+  const left = sortedFiniteMessages(leftMessages);
+  const right = sortedFiniteMessages(rightMessages);
+  if (!left.length || !right.length) return false;
+  const leftStart = messageIndex(left[0]);
+  const leftEnd = messageIndex(left.at(-1));
+  const rightStart = messageIndex(right[0]);
+  const rightEnd = messageIndex(right.at(-1));
+  return leftStart <= rightEnd + 1 && rightStart <= leftEnd + 1;
+}
+
 export function useChatSessionStream({
   selectedServerId,
   selectedConversationId,
@@ -75,6 +117,11 @@ export function useChatSessionStream({
 
     const clearMessageCache = () => {
       removeMessageCache(serverId, conversationId, sessionId);
+    };
+
+    const selectedSessionSummary = () => {
+      const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
+      return foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
     };
 
     const recordProtocol = (kind, details = {}) => {
@@ -177,6 +224,12 @@ export function useChatSessionStream({
       updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
       if (patch.activity) setSessionActivity(patch.activity);
     };
+
+    const mergeOrReplaceRecentMessages = (current, incoming) => (
+      current.length && rangesOverlapOrTouch(current, incoming)
+        ? mergeMessages(current, incoming)
+        : incoming
+    );
 
     const fillFirstMessageGap = async () => {
       let gap = firstMessageIndexGap(messagesRef.current);
@@ -447,8 +500,7 @@ export function useChatSessionStream({
     };
 
     const loadInitialMessagePage = async () => {
-      const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
-      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+      const session = selectedSessionSummary();
       const initial = await loadMessages(
         serverId,
         conversationId,
@@ -457,7 +509,7 @@ export function useChatSessionStream({
       if (disposed || websocketKeyRef.current !== key) return;
       streamFrameQueue?.flushNow?.();
       setMessages((current) => {
-        const next = current.length ? mergeMessages(current, initial) : initial;
+        const next = mergeOrReplaceRecentMessages(current, initial);
         messagesRef.current = next;
         cacheMessages(next);
         return next;
@@ -586,8 +638,7 @@ export function useChatSessionStream({
     };
 
     const loadFallbackMessagePage = () => {
-      const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
-      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+      const session = selectedSessionSummary();
       loadMessages(serverId, conversationId, {
         ...recentMessagePageParams(session),
         foregroundSessionId: sessionId
@@ -596,7 +647,7 @@ export function useChatSessionStream({
           if (disposed || websocketKeyRef.current !== key) return;
           streamFrameQueue?.flushNow?.();
           setMessages((current) => {
-            const next = current.length ? mergeMessages(current, initial) : initial;
+            const next = mergeOrReplaceRecentMessages(current, initial);
             messagesRef.current = next;
             cacheMessages(next);
             return next;
@@ -614,11 +665,13 @@ export function useChatSessionStream({
 
     socketClient?.close();
     websocketKeyRef.current = key;
-    const cachedMessages = readMessageCache(serverId, conversationId, sessionId);
+    const cachedMessages = cachedMessagesForRecentSession(
+      readMessageCache(serverId, conversationId, sessionId),
+      selectedSessionSummary()
+    );
     messagesRef.current = cachedMessages;
     setMessages(cachedMessages);
     setMessagesReady(cachedMessages.length > 0);
-    if (cachedMessages.length > 0) fillFirstMessageGap().catch(() => {});
     setSessionActivity('');
     setChatSessionState({ scopeKey: key, state: 'idle' });
     setRunningActivities([]);
