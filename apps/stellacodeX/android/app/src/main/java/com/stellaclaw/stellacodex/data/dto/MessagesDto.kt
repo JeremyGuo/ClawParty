@@ -25,6 +25,7 @@ data class MessageDetailResponseDto(
 data class ChatMessageDto(
     val id: String = "",
     @SerialName("message_id") val messageId: String = "",
+    @SerialName("client_message_id") val clientMessageId: String = "",
     val index: Int = 0,
     val role: String = "",
     val text: String = "",

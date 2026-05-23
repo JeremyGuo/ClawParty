@@ -17,6 +17,7 @@ data class ChatMessage(
     val localState: MessageLocalState = MessageLocalState.Synced,
     val streamTurnId: String? = null,
     val syntheticStream: Boolean = false,
+    val clientMessageId: String = "",
 )
 
 data class MessageAttachment(

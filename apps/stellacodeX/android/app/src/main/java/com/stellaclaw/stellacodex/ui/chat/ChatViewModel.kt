@@ -335,8 +335,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         profile: ConnectionProfile,
         attachment: MessageAttachment,
         forDownload: Boolean,
-    ) = inlineAttachmentContent(attachment)
-        ?: api.fetchAttachment(profile, attachment.loadUrl(forDownload))
+    ): AppResult<com.stellaclaw.stellacodex.data.api.FetchedAttachment> {
+        inlineAttachmentContent(attachment)?.let { return it }
+        val url = attachment.loadUrl(forDownload)
+        if (url.isBlank()) return AppResult.Err(AppError.Network("附件没有可预览内容"))
+        return api.fetchAttachment(profile, url)
+    }
 
     private fun inlineAttachmentContent(attachment: MessageAttachment): AppResult.Ok<com.stellaclaw.stellacodex.data.api.FetchedAttachment>? {
         val mediaType = attachment.mediaType ?: mediaTypeFromDataUrl(attachment.dataUrl)
@@ -356,6 +360,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val bytes = if (attachment.encoding.equals("base64", ignoreCase = true)) Base64.decode(it, Base64.DEFAULT) else it.toByteArray(Charsets.UTF_8)
             return AppResult.Ok(com.stellaclaw.stellacodex.data.api.FetchedAttachment(bytes, mediaType))
         }
+        if (attachment.uri.startsWith("content://") || attachment.uri.startsWith("file://")) {
+            val app = getApplication<Application>()
+            val bytes = app.contentResolver.openInputStream(Uri.parse(attachment.uri))?.use { it.readBytes() }
+            if (bytes != null) return AppResult.Ok(com.stellaclaw.stellacodex.data.api.FetchedAttachment(bytes, mediaType))
+        }
         return null
     }
 
@@ -371,10 +380,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun shouldAutoPreviewAttachment(attachment: MessageAttachment): Boolean {
+        if (!attachment.hasPreviewSource()) return false
         val mediaType = attachment.mediaType.orEmpty()
         val size = attachment.sizeBytes ?: 0L
         return attachment.kind == "image" || mediaType.startsWith("image/") || isTextAttachment(mediaType, attachment.name, size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
     }
+
+    private fun MessageAttachment.hasPreviewSource(): Boolean =
+        inlinePreviewSourceAvailable() || loadUrl(forDownload = false).isNotBlank()
+
+    private fun MessageAttachment.inlinePreviewSourceAvailable(): Boolean =
+        dataUrl.isNotBlank() || dataBase64.isNotBlank() || data.isNotBlank() || uri.startsWith("content://") || uri.startsWith("file://")
 
     private fun mediaTypeFromDataUrl(value: String): String? = value
         .takeIf { it.startsWith("data:") }
@@ -591,11 +607,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             userName = senderName,
             messageTime = clientMessageTime,
             attachmentCount = attachments.size,
-            attachments = emptyList(),
+            attachments = attachments.toOptimisticAttachments(localId),
             items = emptyList(),
             hasAttachmentErrors = false,
             hasTokenUsage = false,
             localState = MessageLocalState.Sending,
+            clientMessageId = remoteMessageId,
         )
         mutableState.update {
             it.copy(
@@ -895,20 +912,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             remote.copy(localState = MessageLocalState.Synced)
         }
         val byId = linkedMapOf<String, ChatMessage>()
+        val sendingMatches = syncedIncoming.associateWith { remote ->
+            existing.firstOrNull { local ->
+                local.localState == MessageLocalState.Sending && shouldDropSendingForCanonical(local, remote)
+            }
+        }
         existing.filterNot { local ->
             local.localState == MessageLocalState.Streaming && syncedIncoming.any { remote -> remote.id == local.id || shouldDropStreamingForCanonical(local, remote) } ||
                 local.localState == MessageLocalState.Sending && syncedIncoming.any { remote -> shouldDropSendingForCanonical(local, remote) }
         }.forEach { byId[it.id] = it }
-        syncedIncoming.forEach { byId[it.id] = it }
+        syncedIncoming.forEach { remote ->
+            val local = sendingMatches[remote]
+            val merged = if (local != null) remote.withOptimisticAttachmentFallback(local) else remote
+            byId[merged.id] = merged
+        }
         return byId.values.sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
     }
 
     private fun shouldDropSendingForCanonical(local: ChatMessage, remote: ChatMessage): Boolean {
         if (local.id.isNotBlank() && local.id == remote.id) return true
+        if (local.clientMessageId.isNotBlank() && local.clientMessageId == remote.clientMessageId) return true
+        if (local.id.isNotBlank() && local.id == remote.clientMessageId) return true
+        if (local.clientMessageId.isNotBlank() && local.clientMessageId == remote.id) return true
         if (!local.role.equals(remote.role, ignoreCase = true)) return false
         if (local.text != remote.text || local.userName.orEmpty() != remote.userName.orEmpty()) return false
         if (local.messageTime.orEmpty().isNotBlank() && local.messageTime == remote.messageTime) return true
         return local.id.isBlank()
+    }
+
+    private fun ChatMessage.withOptimisticAttachmentFallback(local: ChatMessage): ChatMessage {
+        if (attachments.any { it.hasPreviewSource() } || local.attachments.isEmpty()) return this
+        return copy(
+            attachments = local.attachments,
+            attachmentCount = maxOf(attachmentCount, local.attachments.size),
+        )
+    }
+
+    private fun List<PendingAttachmentUiState>.toOptimisticAttachments(messageId: String): List<MessageAttachment> = mapIndexed { index, attachment ->
+        MessageAttachment(
+            id = "$messageId-att-$index",
+            index = index,
+            kind = if (attachment.mediaType?.startsWith("image/") == true) "image" else "document",
+            name = attachment.name.ifBlank { "attachment-${index + 1}" },
+            mediaType = attachment.mediaType,
+            sizeBytes = attachment.sizeBytes,
+            url = "",
+            uri = attachment.uri,
+        )
     }
 
     private fun mergedLoadedOffset(currentMessages: List<ChatMessage>, currentOffset: Int, page: MessagePage): Int = when {

@@ -53,6 +53,7 @@ fun ChatMessageDto.toDomain(): ChatMessage {
         hasAttachmentErrors = hasAttachmentErrors,
         hasTokenUsage = hasTokenUsage || tokenUsage != null,
         tokenUsage = tokenUsage?.toDomain(),
+        clientMessageId = clientMessageId,
     )
 }
 

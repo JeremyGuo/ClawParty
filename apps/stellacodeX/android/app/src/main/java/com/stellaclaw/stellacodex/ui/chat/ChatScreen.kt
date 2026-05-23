@@ -1204,6 +1204,7 @@ private fun ToolItemList(items: List<MessageItem>) {
                 title = item.title,
                 body = item.body,
                 isResult = item.completed,
+                summary = item.summary,
             )
         }
     }
@@ -1307,6 +1308,7 @@ private data class ToolDisplayItem(
     val title: String,
     val body: String,
     val completed: Boolean,
+    val summary: String = "",
 )
 
 private fun buildToolDisplayItems(items: List<MessageItem>): List<ToolDisplayItem> {
@@ -1349,6 +1351,7 @@ private fun List<MessageItem>.hasOpenToolCall(): Boolean {
 
 private fun MessageItem.ToolCall.toDisplayItem(id: String, results: List<MessageItem.ToolResult>): ToolDisplayItem {
     val name = toolName.ifBlank { toolCallId.ifBlank { "tool" } }
+    val summary = arguments.firstMeaningfulLine()
     val completed = results.isNotEmpty()
     val body = buildString {
         appendToolSection("参数", arguments)
@@ -1360,14 +1363,16 @@ private fun MessageItem.ToolCall.toDisplayItem(id: String, results: List<Message
     }.ifBlank { "[no tool detail]" }
     return ToolDisplayItem(
         id = id,
-        title = if (completed) "已运行 $name" else "正在运行 $name",
+        title = listOfNotNull(if (completed) "已运行 $name" else "正在运行 $name", summary.takeIf { it.isNotBlank() }).joinToString(" · "),
         body = body,
         completed = completed,
+        summary = summary,
     )
 }
 
 private fun MessageItem.ToolResult.toDisplayItem(id: String, results: List<MessageItem.ToolResult>): ToolDisplayItem {
     val name = toolName.ifBlank { toolCallId.ifBlank { "tool" } }
+    val summary = results.firstOrNull()?.context.orEmpty().firstMeaningfulLine()
     val body = buildString {
         results.forEachIndexed { index, result ->
             if (isNotBlank()) append("\n\n")
@@ -1375,8 +1380,17 @@ private fun MessageItem.ToolResult.toDisplayItem(id: String, results: List<Messa
             result.fileAttachmentIndex?.let { append("\n文件: #$it") }
         }
     }.ifBlank { "[no textual result]" }
-    return ToolDisplayItem(id = id, title = "已运行 $name", body = body, completed = true)
+    return ToolDisplayItem(
+        id = id,
+        title = listOfNotNull("已运行 $name", summary.takeIf { it.isNotBlank() }).joinToString(" · "),
+        body = body,
+        completed = true,
+        summary = summary,
+    )
 }
+
+private fun String.firstMeaningfulLine(): String =
+    lineSequence().map { it.trim() }.firstOrNull { it.isNotBlank() }.orEmpty().take(80)
 
 private fun StringBuilder.appendToolSection(title: String, raw: String) {
     append(title)
@@ -1400,6 +1414,7 @@ private fun ToolCard(
     title: String,
     body: String,
     isResult: Boolean,
+    summary: String = "",
 ) {
     var expanded by remember(title, body) { mutableStateOf(false) }
     Surface(
@@ -1427,12 +1442,23 @@ private fun ToolCard(
                         contentDescription = null,
                         tint = CodeHeaderText,
                     )
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = CodeHeaderText,
-                    )
+                    Column {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = CodeHeaderText,
+                        )
+                        if (!expanded && summary.isNotBlank()) {
+                            Text(
+                                text = summary,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MutedText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
                 }
                 Icon(
                     if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
@@ -1584,8 +1610,9 @@ private fun MessageAttachment.previewKey(): String = listOf(id, previewUrl, url,
     .firstOrNull { it.isNotBlank() }
     ?: "$index:$name"
 
-private fun MessageAttachment.hasLoadTarget(): Boolean = listOf(previewUrl, downloadUrl, url, uri, fileUri, path, filePath, workspacePath, relativePath, src, dataUrl, dataBase64, data)
-    .any { it.isNotBlank() }
+private fun MessageAttachment.hasLoadTarget(): Boolean =
+    dataUrl.isNotBlank() || dataBase64.isNotBlank() || data.isNotBlank() || uri.startsWith("content://") || uri.startsWith("file://") ||
+        listOf(previewUrl, downloadUrl, url, uri, fileUri, src).any { it.startsWith("/") || it.startsWith("http://") || it.startsWith("https://") }
 
 private sealed interface MarkdownBlock {
     data class Text(val text: String) : MarkdownBlock
