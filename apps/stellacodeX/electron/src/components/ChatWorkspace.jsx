@@ -63,6 +63,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     renderEntries,
     entryKeys,
     latestAssistantTurnIndex,
+    activeAssistantTurnVisible,
     pendingAssistantVisible,
     responseSpacerVisible
   } = renderModel;
@@ -726,6 +727,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           contentRef={contentRef}
           sessionRunning={sessionRunning}
           latestAssistantTurnIndex={latestAssistantTurnIndex}
+          activeAssistantTurnVisible={sessionRunning && activeAssistantTurnVisible}
           pendingAssistantVisible={pendingAssistantVisible}
           inlineActivity={inlineActivity}
           turnStoppedAfterTool={turnStoppedAfterTool}
@@ -952,6 +954,7 @@ function MessageStreamView({
   contentRef,
   sessionRunning,
   latestAssistantTurnIndex,
+  activeAssistantTurnVisible,
   pendingAssistantVisible,
   inlineActivity,
   turnStoppedAfterTool,
@@ -1020,7 +1023,7 @@ function MessageStreamView({
         <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
       )}
       {pendingAssistantVisible && <PendingAssistantPlaceholder />}
-      {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
+      {inlineActivity && !activeAssistantTurnVisible && <InlineActivityStatus activity={inlineActivity} />}
       {turnStoppedAfterTool && (
         <div className="turn-continuation-notice">
           <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
@@ -1048,6 +1051,7 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.contentRef === next.contentRef
     && previous.sessionRunning === next.sessionRunning
     && previous.latestAssistantTurnIndex === next.latestAssistantTurnIndex
+    && previous.activeAssistantTurnVisible === next.activeAssistantTurnVisible
     && previous.pendingAssistantVisible === next.pendingAssistantVisible
     && previous.inlineActivity === next.inlineActivity
     && previous.turnStoppedAfterTool === next.turnStoppedAfterTool

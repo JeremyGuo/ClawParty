@@ -12,6 +12,7 @@ export function buildChatRenderModel({
   const renderEntries = measureChatPerf('chat.render_model.assistant_turn_entries', () => assistantTurnEntries(renderedMessages), { renderedMessages: renderedMessages.length });
   const entryKeys = measureChatPerf('chat.render_model.entry_keys', () => renderEntries.map((entry, index) => chatRenderEntryKey(entry, index)), { entries: renderEntries.length });
   const latestAssistantTurnIndex = latestAssistantTurnEntryIndex(renderEntries);
+  const activeAssistantTurnVisible = measureChatPerf('chat.render_model.active_assistant_turn', () => hasAssistantTurnAfterLastUser(renderEntries), { entries: renderEntries.length });
   const pendingAssistantVisible = measureChatPerf('chat.render_model.pending_assistant', () => shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing), { entries: renderEntries.length });
   const responseSpacerVisible = Boolean(pendingAssistantVisible && renderedMessages.length > 0 && !modelSelectionPending);
   return {
@@ -19,6 +20,7 @@ export function buildChatRenderModel({
     renderEntries,
     entryKeys,
     latestAssistantTurnIndex,
+    activeAssistantTurnVisible,
     pendingAssistantVisible,
     responseSpacerVisible
   };
@@ -57,15 +59,19 @@ export function latestAssistantTurnEntryIndex(entries) {
   return -1;
 }
 
+export function hasAssistantTurnAfterLastUser(entries) {
+  const lastUserIndex = findLastUserEntryIndex(entries);
+  if (lastUserIndex < 0) return false;
+  return entries.slice(lastUserIndex + 1).some((entry) => entry?.type === 'assistantTurn');
+}
+
 export function shouldShowPendingAssistant(entries, currentActivity, sending, processing) {
   const state = String(currentActivity?.state || '').toLowerCase();
   const activityId = String(currentActivity?.id || '').trim();
   const active = Boolean(sending || processing || (currentActivity && state !== 'done' && state !== 'failed'));
   if (!active) return false;
   if (activityId.startsWith('stream-assistant-') || activityId.startsWith('stream-reasoning-') || activityId.startsWith('stream-tool-')) return false;
-  const lastUserIndex = findLastEntryIndex(entries, (entry) => (
-    entry?.type === 'message' && String(entry.message?.role || '').toLowerCase() === 'user'
-  ));
+  const lastUserIndex = findLastUserEntryIndex(entries);
   if (lastUserIndex < 0) return false;
   const hasAssistantAfterUser = entries.slice(lastUserIndex + 1).some((entry) => {
     if (entry?.type === 'assistantTurn') return true;
@@ -73,6 +79,12 @@ export function shouldShowPendingAssistant(entries, currentActivity, sending, pr
     return String(entry.message?.role || '').toLowerCase() === 'assistant';
   });
   return !hasAssistantAfterUser;
+}
+
+function findLastUserEntryIndex(entries) {
+  return findLastEntryIndex(entries, (entry) => (
+    entry?.type === 'message' && String(entry.message?.role || '').toLowerCase() === 'user'
+  ));
 }
 
 function findLastEntryIndex(entries, predicate) {
