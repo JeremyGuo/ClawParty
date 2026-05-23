@@ -594,7 +594,9 @@ private sealed interface ChatTimelineItem {
         val processItems: List<MessageItem> = messages.flatMap { it.items }.filter { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
         val startedAt: String? = messages.firstOrNull()?.messageTime
         val endedAt: String? = finalMessage.messageTime
-        val running: Boolean = !closedByUser && (forceRunning || messages.any { it.localState == MessageLocalState.Streaming })
+        val hasStreamingMessage: Boolean = messages.any { it.localState == MessageLocalState.Streaming }
+        val hasOpenToolCall: Boolean = processItems.hasOpenToolCall()
+        val running: Boolean = !closedByUser && (forceRunning || hasStreamingMessage || hasOpenToolCall)
     }
 }
 
@@ -631,7 +633,7 @@ private fun buildChatTimeline(messages: List<ChatMessage>, latestAgentActive: Bo
 }
 
 private fun isAgentProcessing(progressTitle: String?, realtimeState: String): Boolean {
-    val title = progressTitle.orEmpty()
+    val title = progressTitle.orEmpty().trim()
     if (title.isNotBlank() && !title.equals("Done", ignoreCase = true) && !title.equals("Failed", ignoreCase = true)) {
         return true
     }

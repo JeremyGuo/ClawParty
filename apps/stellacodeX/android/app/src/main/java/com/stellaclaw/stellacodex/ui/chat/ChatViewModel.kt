@@ -897,12 +897,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val byId = linkedMapOf<String, ChatMessage>()
         existing.filterNot { local ->
             local.localState == MessageLocalState.Streaming && syncedIncoming.any { remote -> remote.id == local.id || shouldDropStreamingForCanonical(local, remote) } ||
-                local.localState == MessageLocalState.Sending && syncedIncoming.any { remote ->
-                    remote.role == local.role && remote.text == local.text && remote.userName == local.userName
-                }
+                local.localState == MessageLocalState.Sending && syncedIncoming.any { remote -> shouldDropSendingForCanonical(local, remote) }
         }.forEach { byId[it.id] = it }
         syncedIncoming.forEach { byId[it.id] = it }
         return byId.values.sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
+    }
+
+    private fun shouldDropSendingForCanonical(local: ChatMessage, remote: ChatMessage): Boolean {
+        if (local.id.isNotBlank() && local.id == remote.id) return true
+        if (!local.role.equals(remote.role, ignoreCase = true)) return false
+        if (local.text != remote.text || local.userName.orEmpty() != remote.userName.orEmpty()) return false
+        if (local.messageTime.orEmpty().isNotBlank() && local.messageTime == remote.messageTime) return true
+        return local.id.isBlank()
     }
 
     private fun mergedLoadedOffset(currentMessages: List<ChatMessage>, currentOffset: Int, page: MessagePage): Int = when {
