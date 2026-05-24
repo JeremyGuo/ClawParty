@@ -48,6 +48,8 @@ const CHAT_SCROLL_MEMORY_LIMIT = 80;
 const USER_SCROLL_ACTIVE_MS = 900;
 const USER_SCROLL_IDLE_MS = 180;
 const STREAM_TEXT_STABLE_CHARS = 1800;
+const ANCHOR_RESTORE_MAX_ATTEMPTS = 4;
+const ANCHOR_RESTORE_MIN_DELTA_PX = 4;
 const markdownRemarkPlugins = [remarkGfm, remarkMath];
 const markdownRehypePlugins = [cachedRehypeHighlight, rehypeKatex];
 
@@ -145,6 +147,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const lastScopeRef = useRef(activeMessageScope);
   const restoringScrollRef = useRef(false);
   const pendingScrollRestoreRef = useRef(null);
+  const pendingAnchorRestoreRef = useRef(null);
+  const anchorRestoreFrameRef = useRef(0);
   const lastScrollStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, stickToBottom: true });
@@ -316,7 +320,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       }, { visible: virtualWindow.items.length });
       if (changed) {
         setVirtualHeightVersion((value) => value + 1);
-        requestAnimationFrame(() => reconcileScrollAfterContentChange(SCROLL_CHANGE.VirtualMeasure, lastScrollStateRef.current));
+        requestAnimationFrame(() => {
+          retryPendingAnchorRestore();
+          reconcileScrollAfterContentChange(SCROLL_CHANGE.VirtualMeasure, lastScrollStateRef.current);
+        });
       }
     };
     const scheduleMeasure = () => {
@@ -400,12 +407,70 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     return state;
   };
 
+  const finishProgrammaticScrollRestore = () => {
+    requestAnimationFrame(() => {
+      restoringScrollRef.current = false;
+      syncViewport();
+    });
+  };
+
+  const schedulePendingAnchorRestore = () => {
+    if (anchorRestoreFrameRef.current) return;
+    anchorRestoreFrameRef.current = requestAnimationFrame(() => {
+      anchorRestoreFrameRef.current = 0;
+      retryPendingAnchorRestore();
+    });
+  };
+
+  const clearPendingAnchorRestore = () => {
+    pendingAnchorRestoreRef.current = null;
+    if (anchorRestoreFrameRef.current) {
+      cancelAnimationFrame(anchorRestoreFrameRef.current);
+      anchorRestoreFrameRef.current = 0;
+    }
+  };
+
+  const retryPendingAnchorRestore = () => {
+    const pending = pendingAnchorRestoreRef.current;
+    const list = scrollRef.current;
+    if (!pending || !list) return false;
+    const { state } = pending;
+    const anchorKey = state?.anchor?.key;
+    if (!anchorKey) {
+      clearPendingAnchorRestore();
+      return false;
+    }
+    const node = list.querySelector(`[data-virtual-key="${CSS.escape(anchorKey)}"]`);
+    if (!node) {
+      const attempts = Number(pending.attempts || 0) + 1;
+      if (attempts >= ANCHOR_RESTORE_MAX_ATTEMPTS) {
+        clearPendingAnchorRestore();
+        finishProgrammaticScrollRestore();
+        return false;
+      }
+      pendingAnchorRestoreRef.current = { state, attempts };
+      schedulePendingAnchorRestore();
+      return false;
+    }
+    restoringScrollRef.current = true;
+    const listRect = list.getBoundingClientRect();
+    const nodeTop = node.getBoundingClientRect().top - listRect.top;
+    const delta = nodeTop - Number(state.anchor.offsetTop || 0);
+    if (Math.abs(delta) >= ANCHOR_RESTORE_MIN_DELTA_PX) {
+      list.scrollTop = boundedScrollTop(list, list.scrollTop + delta);
+    }
+    clearPendingAnchorRestore();
+    finishProgrammaticScrollRestore();
+    return true;
+  };
+
   const restoreScrollState = (state) => {
     const list = scrollRef.current;
     if (!list || !state) return false;
     restoringScrollRef.current = true;
     try {
       if (state.stickToBottom) {
+        clearPendingAnchorRestore();
         list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
         return true;
       }
@@ -415,16 +480,19 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           const listRect = list.getBoundingClientRect();
           const nodeTop = node.getBoundingClientRect().top - listRect.top;
           list.scrollTop = boundedScrollTop(list, list.scrollTop + nodeTop - Number(state.anchor.offsetTop || 0));
+          clearPendingAnchorRestore();
           return true;
         }
+        list.scrollTop = boundedScrollTop(list, state.scrollTop);
+        pendingAnchorRestoreRef.current = { state, attempts: 0 };
+        schedulePendingAnchorRestore();
+        return false;
       }
+      clearPendingAnchorRestore();
       list.scrollTop = boundedScrollTop(list, state.scrollTop);
       return true;
     } finally {
-      requestAnimationFrame(() => {
-        restoringScrollRef.current = false;
-        syncViewport();
-      });
+      finishProgrammaticScrollRestore();
     }
   };
 
@@ -500,6 +568,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     stickToBottomRef.current = remembered ? Boolean(remembered.stickToBottom) : true;
     stickyScrollPausedUntilRef.current = 0;
     userScrollIntentUntilRef.current = 0;
+    clearPendingAnchorRestore();
     if (userScrollIdleTimerRef.current) {
       window.clearTimeout(userScrollIdleTimerRef.current);
       userScrollIdleTimerRef.current = 0;
@@ -536,6 +605,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
 
   useEffect(() => () => {
     rememberChatScroll(lastScopeRef.current, captureScrollState());
+    clearPendingAnchorRestore();
     if (stickyAnchorRestoreTimerRef.current) {
       window.clearTimeout(stickyAnchorRestoreTimerRef.current);
       stickyAnchorRestoreTimerRef.current = 0;
@@ -588,6 +658,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const handleScroll = () => {
     const list = scrollRef.current;
     if (!list) return;
+    if (!restoringScrollRef.current) clearPendingAnchorRestore();
     extendUserScrollIntentFromScroll();
     syncViewport();
     stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
