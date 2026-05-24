@@ -1,4 +1,4 @@
-import { displayMessages, isFinalAssistantMessage, messageKey } from '../../lib/messageUtils';
+import { displayMessages, isAssistantResponseMessage, messageKey } from '../../lib/messageUtils';
 import { measureChatPerf } from '../../lib/chatPerfMetrics';
 
 export function buildChatRenderModel({
@@ -12,7 +12,6 @@ export function buildChatRenderModel({
   const renderEntries = measureChatPerf('chat.render_model.assistant_turn_entries', () => assistantTurnEntries(renderedMessages), { renderedMessages: renderedMessages.length });
   const entryKeys = measureChatPerf('chat.render_model.entry_keys', () => renderEntries.map((entry, index) => chatRenderEntryKey(entry, index)), { entries: renderEntries.length });
   const latestAssistantTurnIndex = latestAssistantTurnEntryIndex(renderEntries);
-  const activeAssistantTurnVisible = measureChatPerf('chat.render_model.active_assistant_turn', () => hasAssistantTurnAfterLastUser(renderEntries), { entries: renderEntries.length });
   const pendingAssistantVisible = measureChatPerf('chat.render_model.pending_assistant', () => shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing), { entries: renderEntries.length });
   const responseSpacerVisible = Boolean(pendingAssistantVisible && renderedMessages.length > 0 && !modelSelectionPending);
   return {
@@ -20,7 +19,6 @@ export function buildChatRenderModel({
     renderEntries,
     entryKeys,
     latestAssistantTurnIndex,
-    activeAssistantTurnVisible,
     pendingAssistantVisible,
     responseSpacerVisible
   };
@@ -35,7 +33,7 @@ export function assistantTurnEntries(renderedMessages) {
       continue;
     }
     const nextMessage = renderedMessages[index + 1];
-    const finalMessage = isFinalAssistantMessage(nextMessage) ? nextMessage : null;
+    const finalMessage = isAssistantResponseMessage(nextMessage) ? nextMessage : null;
     entries.push({
       type: 'assistantTurn',
       id: `turn-${message.id || messageKey(message.messages?.[0], index)}`,
@@ -59,11 +57,6 @@ export function latestAssistantTurnEntryIndex(entries) {
   return -1;
 }
 
-export function hasAssistantTurnAfterLastUser(entries) {
-  const lastUserIndex = findLastUserEntryIndex(entries);
-  if (lastUserIndex < 0) return false;
-  return entries.slice(lastUserIndex + 1).some((entry) => entry?.type === 'assistantTurn');
-}
 
 export function shouldShowPendingAssistant(entries, currentActivity, sending, processing) {
   const state = String(currentActivity?.state || '').toLowerCase();

@@ -159,10 +159,14 @@ export function isExecutionMessage(message) {
   return hasToolItems(message) || parseToolTextBlocks(messageText(message)).length > 0;
 }
 
+export function isAssistantResponseMessage(message) {
+  if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
+  return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || item.text_with_attachment_markers || '').trim()));
+}
+
 export function isFinalAssistantMessage(message) {
   if (message?._streaming) return false;
-  if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
-  return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || '').trim()));
+  return isAssistantResponseMessage(message);
 }
 
 function hasVisibleMessageContent(message) {
@@ -1067,14 +1071,14 @@ export function displayMessages(messages) {
       let cursor = index;
       while (cursor < source.length) {
         const current = source[cursor];
-        if (cursor > index && isFinalAssistantMessage(current)) break;
+        if (cursor > index && isAssistantResponseMessage(current)) break;
         if (cursor > index && !isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
         group.push(current);
         cursor += 1;
       }
       const nextMessage = source[cursor];
       result.push({ type: 'toolGroup', id: `tools-${messageKey(group[0], index)}`, messages: group, nextMessage });
-      forceSeparateNext = Boolean(isFinalAssistantMessage(nextMessage));
+      forceSeparateNext = Boolean(isAssistantResponseMessage(nextMessage));
       index = cursor - 1;
       continue;
     }
@@ -1096,7 +1100,7 @@ function startsToolRound(source, index) {
   if (String(message?.role || '').toLowerCase() !== 'assistant') return false;
   for (let cursor = index + 1; cursor < source.length; cursor += 1) {
     const current = source[cursor];
-    if (isFinalAssistantMessage(current)) return false;
+    if (isAssistantResponseMessage(current)) return false;
     if (isExecutionMessage(current)) return true;
     if (!isRoundInterstitialMessage(current)) return false;
   }

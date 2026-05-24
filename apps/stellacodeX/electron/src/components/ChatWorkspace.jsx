@@ -14,7 +14,7 @@ import { measureChatPerf, recordChatPerf } from '../lib/chatPerfMetrics';
 import { ChatPerfPopover } from './chat/ChatPerfPopover';
 import { composerAttachmentFromFile, isImageFileObject, outgoingAttachmentPayload, selectionSummary } from './chat/composerAttachments';
 import { cachedRehypeHighlight } from './chat/cachedRehypeHighlight';
-import { InlineActivityStatus, LiveActivityStack, shouldShowInlineActivity } from './chat/LiveActivity';
+import { LiveActivityStack } from './chat/LiveActivity';
 import { renderCommitStart, useRenderCommitPerf } from './chat/perfHooks';
 import { buildChatRenderModel } from './chat/renderModel';
 import { importantToolFields, parseToolDetailPayload, payloadToModelText, payloadToRawText } from './chat/toolDetailFormatters';
@@ -81,7 +81,7 @@ function viewportScrollTopForMemory(state) {
   return state.stickToBottom ? Number.MAX_SAFE_INTEGER : Number(state.scrollTop || 0);
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, showInlineActivityStatus = true, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
   const renderStartedAt = renderCommitStart();
   const currentActivity = (runningActivities || []).at(-1) || null;
   const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
@@ -96,7 +96,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     renderEntries,
     entryKeys,
     latestAssistantTurnIndex,
-    activeAssistantTurnVisible,
     pendingAssistantVisible,
     responseSpacerVisible
   } = renderModel;
@@ -150,7 +149,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, stickToBottom: true });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
-  const inlineActivity = showInlineActivityStatus && shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
   const virtualWindow = useMemo(() => measureChatPerf('chat.virtual_window', () => virtualWindowForEntries({
@@ -795,9 +793,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           contentRef={contentRef}
           sessionRunning={sessionRunning}
           latestAssistantTurnIndex={latestAssistantTurnIndex}
-          activeAssistantTurnVisible={sessionRunning && activeAssistantTurnVisible}
           pendingAssistantVisible={pendingAssistantVisible}
-          inlineActivity={inlineActivity}
           turnStoppedAfterTool={turnStoppedAfterTool}
           onContinue={continueTurn}
           sending={sending}
@@ -1022,9 +1018,7 @@ function MessageStreamView({
   contentRef,
   sessionRunning,
   latestAssistantTurnIndex,
-  activeAssistantTurnVisible,
   pendingAssistantVisible,
-  inlineActivity,
   turnStoppedAfterTool,
   onContinue,
   sending,
@@ -1091,7 +1085,6 @@ function MessageStreamView({
         <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
       )}
       {pendingAssistantVisible && <PendingAssistantPlaceholder />}
-      {inlineActivity && !activeAssistantTurnVisible && !pendingAssistantVisible && <InlineActivityStatus activity={inlineActivity} />}
       {turnStoppedAfterTool && (
         <div className="turn-continuation-notice">
           <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
@@ -1119,9 +1112,7 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.contentRef === next.contentRef
     && previous.sessionRunning === next.sessionRunning
     && previous.latestAssistantTurnIndex === next.latestAssistantTurnIndex
-    && previous.activeAssistantTurnVisible === next.activeAssistantTurnVisible
     && previous.pendingAssistantVisible === next.pendingAssistantVisible
-    && previous.inlineActivity === next.inlineActivity
     && previous.turnStoppedAfterTool === next.turnStoppedAfterTool
     && previous.onContinue === next.onContinue
     && previous.sending === next.sending
@@ -1594,7 +1585,7 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
     }
     return -1;
   }, [blocks]);
-  const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
+  const hasFinalMessage = Boolean(group.nextMessage);
   const toolsComplete = useMemo(() => measureChatPerf('chat.tool_group.complete_check', () => {
     const toolBlocks = blocks.filter((block) => block.type === 'tools');
     return toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards));
@@ -1604,6 +1595,7 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
   const [open, setOpen] = useState(() => !hasFinalMessage);
   const bodyPresence = useCollapsePresence(open, 190);
   const captureToggleAnchor = useStableToggleAnchor(open);
+  const manualToggleRef = useRef(false);
   const wasActiveTailRef = useRef(activeTail);
   const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
@@ -1614,10 +1606,16 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
   }, [activeTail]);
   useLayoutEffect(() => {
     if (!hadFinalMessageRef.current && hasFinalMessage) {
+      manualToggleRef.current = false;
       setOpen(false);
     }
     hadFinalMessageRef.current = hasFinalMessage;
   }, [hasFinalMessage]);
+  useLayoutEffect(() => {
+    if (!active && !activeTail && !manualToggleRef.current) {
+      setOpen(false);
+    }
+  }, [active, activeTail]);
   useEffect(() => {
     if (!active) return undefined;
     setLocalElapsedTickMs(Date.now());
@@ -1626,7 +1624,6 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
   }, [active]);
   const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? localElapsedTickMs : undefined);
   const summary = useMemo(() => measureChatPerf('chat.tool_group.summary', () => toolRoundSummary(blocks), { blocks: blocks.length }), [blocks]);
-  const compactPresence = useCollapsePresence(!open && summary.total > 0, 150);
   const title = toolRoundTitle(elapsed, complete, summary);
   useRenderCommitPerf('chat.tool_group.render_commit', renderStartedAt, () => ({
     messages: messages.length,
@@ -1635,13 +1632,14 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
     open
   }));
   return (
-    <section className={`tool-process-group${open ? ' open' : ''}${bodyPresence.present || compactPresence.present ? ' layout-active' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
+    <section className={`tool-process-group${open ? ' open' : ''}${bodyPresence.present ? ' layout-active' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
       <button
         className="tool-round-toggle"
         type="button"
         onClick={(event) => {
           captureToggleAnchor(event.currentTarget);
           onToggleInteraction?.();
+          manualToggleRef.current = true;
           setOpen((value) => !value);
         }}
       >
@@ -1649,20 +1647,6 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
         {summary.total > 0 && <em>{summary.label}</em>}
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
-      {summary.total > 0 && (
-        <div className={`tool-round-compact-shell${compactPresence.visible ? ' body-open' : ''}`} aria-hidden={open}>
-          <div className="tool-round-compact-clip">
-            {compactPresence.present && (
-              <div className="tool-round-compact">
-                {summary.names.slice(0, 4).map((name, index) => (
-                  <code key={`${name}-${index}`}>{name}</code>
-                ))}
-                {summary.extra > 0 && <code>+{summary.extra}</code>}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
       <div className="tool-round-separator" aria-hidden="true" />
       <div className={`tool-round-body-shell${bodyPresence.visible ? ' body-open' : ''}`} aria-hidden={!open}>
         <div className="tool-round-body-clip">
@@ -1808,8 +1792,6 @@ function toolRoundStartMs(messages) {
 function toolRoundTitle(elapsed, complete, summary = {}) {
   const prefix = complete ? '已处理' : '处理中';
   const detail = elapsed ? ` ${elapsed}` : '';
-  if (summary.reasoning > 0 && summary.tools === 0) return `${prefix}${detail} · 思考`;
-  if (summary.tools > 0) return `${prefix}${detail} · 工具`;
   return `${prefix}${detail}`;
 }
 

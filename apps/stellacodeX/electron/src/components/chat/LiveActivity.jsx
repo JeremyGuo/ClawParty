@@ -12,27 +12,6 @@ export function LiveActivityStack({ activities, progressRef }) {
   );
 }
 
-export function InlineActivityStatus({ activity }) {
-  const state = String(activity?.state || 'running').toLowerCase();
-  const title = String(activity?.title || '').trim();
-  const detail = String(activity?.detail || activity?.activity || activity?.model || '').trim();
-  const label = title || (state === 'failed' ? '执行失败' : state === 'done' ? '已完成' : '正在思考');
-  return (
-    <div className={`chat-activity-status ${state}`}>
-      <i className="chat-activity-icon" aria-hidden="true" />
-      <span>{label}</span>
-      {detail && <code>{detail}</code>}
-    </div>
-  );
-}
-
-export function shouldShowInlineActivity(activity) {
-  if (!activity) return false;
-  const state = String(activity?.state || 'running').toLowerCase();
-  if (state === 'failed') return true;
-  return state !== 'done';
-}
-
 function normalizeActivityPlan(rawPlan) {
   const items = Array.isArray(rawPlan)
     ? rawPlan
