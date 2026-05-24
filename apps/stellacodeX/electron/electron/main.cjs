@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Notification, shell } = require('electron');
+const { app, BrowserWindow, contentTracing, dialog, ipcMain, Notification, shell } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
@@ -15,6 +15,16 @@ const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
 const WORKSPACE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const TRACE_CATEGORIES = [
+  'devtools.timeline',
+  'v8',
+  'blink',
+  'cc',
+  'toplevel',
+  'disabled-by-default-v8.cpu_profiler',
+  'disabled-by-default-devtools.timeline',
+  'disabled-by-default-devtools.timeline.stack'
+];
 const DEFAULT_THEME_COLORS = {
   light: {
     accent: '#339CFF',
@@ -36,6 +46,7 @@ let updateCheckTimer = null;
 let updaterState = { state: app.isPackaged ? 'idle' : 'disabled' };
 let sshUpdaterState = { state: 'idle', channel: 'stable' };
 const tunnels = new Map();
+let chatTraceState = { state: 'idle', startedAt: null, filePath: '', error: '' };
 
 function appIconPath() {
   return path.join(__dirname, '..', 'build', 'icon.png');
@@ -176,6 +187,55 @@ async function revealProtocolLog() {
   await fs.appendFile(filePath, '', 'utf8');
   shell.showItemInFolder(filePath);
   return { path: filePath };
+}
+
+function traceOutputPath() {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, '-');
+  return path.join(app.getPath('userData'), 'traces', `chat-trace-${stamp}.json`);
+}
+
+async function startChatTrace() {
+  if (chatTraceState.state === 'recording') return chatTraceState;
+  chatTraceState = { state: 'recording', startedAt: new Date().toISOString(), filePath: '', error: '' };
+  try {
+    await contentTracing.startRecording({
+      included_categories: TRACE_CATEGORIES,
+      excluded_categories: ['disabled-by-default-memory-infra'],
+      recording_mode: 'record-continuously',
+      trace_buffer_size_in_kb: 160 * 1024
+    });
+    return chatTraceState;
+  } catch (error) {
+    chatTraceState = { state: 'error', startedAt: null, filePath: '', error: error?.message || String(error) };
+    return chatTraceState;
+  }
+}
+
+async function stopChatTrace() {
+  if (chatTraceState.state !== 'recording') return chatTraceState;
+  const filePath = traceOutputPath();
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const savedPath = await contentTracing.stopRecording(filePath);
+    chatTraceState = { state: 'saved', startedAt: null, filePath: savedPath || filePath, error: '' };
+    return chatTraceState;
+  } catch (error) {
+    chatTraceState = { state: 'error', startedAt: null, filePath: '', error: error?.message || String(error) };
+    return chatTraceState;
+  }
+}
+
+function chatTraceStatus() {
+  return chatTraceState;
+}
+
+function revealChatTrace(_event, filePath) {
+  const target = String(filePath || chatTraceState.filePath || '').trim();
+  if (!target) return { revealed: false };
+  shell.showItemInFolder(target);
+  return { revealed: true, filePath: target };
 }
 
 function normalizeSettings(value) {
@@ -1056,6 +1116,10 @@ app.whenReady().then(() => {
   ipcMain.handle('diagnostics:appendProtocolLog', appendProtocolLog);
   ipcMain.handle('diagnostics:protocolLogPath', () => protocolLogPath());
   ipcMain.handle('diagnostics:revealProtocolLog', revealProtocolLog);
+  ipcMain.handle('diagnostics:chatTraceStatus', chatTraceStatus);
+  ipcMain.handle('diagnostics:startChatTrace', startChatTrace);
+  ipcMain.handle('diagnostics:stopChatTrace', stopChatTrace);
+  ipcMain.handle('diagnostics:revealChatTrace', revealChatTrace);
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);

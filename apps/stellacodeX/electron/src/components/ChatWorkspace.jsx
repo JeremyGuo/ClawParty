@@ -1,6 +1,5 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -14,6 +13,7 @@ import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivi
 import { measureChatPerf, recordChatPerf } from '../lib/chatPerfMetrics';
 import { ChatPerfPopover } from './chat/ChatPerfPopover';
 import { composerAttachmentFromFile, isImageFileObject, outgoingAttachmentPayload, selectionSummary } from './chat/composerAttachments';
+import { cachedRehypeHighlight } from './chat/cachedRehypeHighlight';
 import { InlineActivityStatus, LiveActivityStack, shouldShowInlineActivity } from './chat/LiveActivity';
 import { renderCommitStart, useRenderCommitPerf } from './chat/perfHooks';
 import { buildChatRenderModel } from './chat/renderModel';
@@ -47,6 +47,9 @@ const chatScrollMemory = new Map();
 const CHAT_SCROLL_MEMORY_LIMIT = 80;
 const USER_SCROLL_ACTIVE_MS = 900;
 const USER_SCROLL_IDLE_MS = 180;
+const STREAM_TEXT_STABLE_CHARS = 1800;
+const markdownRemarkPlugins = [remarkGfm, remarkMath];
+const markdownRehypePlugins = [cachedRehypeHighlight, rehypeKatex];
 
 const SCROLL_CHANGE = Object.freeze({
   SessionRestore: 'session-restore',
@@ -1331,7 +1334,7 @@ function messageArticleClassName(message) {
 }
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
-  if (previous.message !== next.message) return false;
+  if (messageArticleRenderSignature(previous.message) !== messageArticleRenderSignature(next.message)) return false;
   if (previous.showStreamingThinking !== next.showStreamingThinking) return false;
   if (
     previous.onOpenAttachment !== next.onOpenAttachment
@@ -1341,6 +1344,72 @@ const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
   ) return false;
   return true;
 });
+
+function messageArticleRenderSignature(message) {
+  if (!message) return '';
+  const auxiliary = Array.isArray(message._auxiliary) ? message._auxiliary.length : 0;
+  return [
+    messageKey(message, 0),
+    message.role || '',
+    message.user_name || '',
+    message._streaming ? 'streaming' : '',
+    messageText(message),
+    messageItems(message).map(messageItemRenderSignature).join('\u001f'),
+    tokenUsageSignature(tokenUsage(message)),
+    auxiliary,
+    attachmentListSignature(message.attachments),
+    attachmentListSignature(message.files),
+    message.status || '',
+    message.tool_name || '',
+    Number(message.attachment_count || 0)
+  ].join('\u001e');
+}
+
+function messageItemRenderSignature(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '';
+  return [
+    item.type || '',
+    item.text || '',
+    item.text_with_attachment_markers || '',
+    item.content || '',
+    item.tool_name || '',
+    item.tool_call_id || '',
+    item.arguments ? stableStringifyForSignature(item.arguments) : '',
+    item.structured ? stableStringifyForSignature(item.structured) : '',
+    item.context_with_attachment_markers || '',
+    item.context || '',
+    item.result || '',
+    item.attachment_index ?? '',
+    item.index ?? ''
+  ].join('\u001d');
+}
+
+function tokenUsageSignature(usage) {
+  if (!usage) return '';
+  return [
+    usage.input || 0,
+    usage.output || 0,
+    usage.cacheRead || 0,
+    usage.cacheWrite || 0,
+    usage.total || 0
+  ].join(':');
+}
+
+function attachmentListSignature(attachments = []) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return '';
+  return attachments.map(attachmentIdentity).join('\u001d');
+}
+
+function stableStringifyForSignature(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value !== 'object') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
 
 export function AuxiliaryDots({ messages }) {
   return (
@@ -2243,7 +2312,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   if (plain) {
     return (
       <div className={`${className} plain-stream-text`}>
-        <PlainTextBlock text={value} />
+        <StreamingPlainText text={value} />
       </div>
     );
   }
@@ -2282,7 +2351,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
 
 const MemoMarkdownContent = memo(MarkdownContent, (previous, next) => (
   previous.text === next.text
-  && previous.attachments === next.attachments
+  && sameAttachmentList(previous.attachments, next.attachments)
   && previous.className === next.className
   && previous.plain === next.plain
   && previous.onOpenAttachment === next.onOpenAttachment
@@ -2290,6 +2359,101 @@ const MemoMarkdownContent = memo(MarkdownContent, (previous, next) => (
   && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
   && previous.onOpenLocalLink === next.onOpenLocalLink
 ));
+
+function sameAttachmentList(left = [], right = []) {
+  if (left === right) return true;
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] === right[index]) continue;
+    if (attachmentIdentity(left[index]) !== attachmentIdentity(right[index])) return false;
+  }
+  return true;
+}
+
+function StreamingPlainText({ text }) {
+  const blocks = useStreamingStableTextBlocks(text);
+  if (blocks.length <= 1) return <PlainTextBlock text={String(text || '')} />;
+  return (
+    <>
+      {blocks.map((block) => (
+        block.stable
+          ? <MemoPlainTextStableBlock key={block.key} text={block.text} />
+          : <PlainTextBlock key={block.key} text={block.text} />
+      ))}
+    </>
+  );
+}
+
+function useStreamingStableTextBlocks(text) {
+  const value = String(text || '');
+  const stableBlocksRef = useRef([]);
+  return useMemo(() => {
+    let blocks = stableBlocksRef.current;
+    while (blocks.length > 0 && (value.length < stableBlocksLength(blocks) || !value.startsWith(stableBlocksText(blocks)))) {
+      blocks = blocks.slice(0, -1);
+    }
+    let stableLength = stableBlocksLength(blocks);
+    let mutable = value.slice(stableLength);
+    while (mutable.length >= STREAM_TEXT_STABLE_CHARS) {
+      const splitAt = streamTextSplitIndex(mutable);
+      if (splitAt <= 0) break;
+      const blockText = mutable.slice(0, splitAt);
+      blocks = blocks.concat({
+        key: `stable-${stableLength}-${blockText.length}-${hashText(blockText)}`,
+        text: blockText,
+        stable: true
+      });
+      stableLength += blockText.length;
+      mutable = value.slice(stableLength);
+    }
+    stableBlocksRef.current = blocks;
+    return blocks.concat({
+      key: `mutable-${stableLength}`,
+      text: mutable,
+      stable: false
+    });
+  }, [value]);
+}
+
+function stableBlocksLength(blocks) {
+  return blocks.reduce((sum, block) => sum + block.text.length, 0);
+}
+
+function stableBlocksText(blocks) {
+  return blocks.map((block) => block.text).join('');
+}
+
+function streamTextSplitIndex(text) {
+  const target = Math.min(String(text || '').length, STREAM_TEXT_STABLE_CHARS);
+  const search = String(text || '').slice(0, target);
+  const paragraph = search.lastIndexOf('\n\n');
+  if (paragraph >= Math.floor(STREAM_TEXT_STABLE_CHARS * 0.55)) return paragraph + 2;
+  const line = search.lastIndexOf('\n');
+  if (line >= Math.floor(STREAM_TEXT_STABLE_CHARS * 0.7)) return line + 1;
+  const sentence = Math.max(
+    search.lastIndexOf('。'),
+    search.lastIndexOf('. '),
+    search.lastIndexOf('! '),
+    search.lastIndexOf('? ')
+  );
+  if (sentence >= Math.floor(STREAM_TEXT_STABLE_CHARS * 0.75)) return sentence + 1;
+  return target;
+}
+
+function hashText(text) {
+  const value = String(text || '');
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+const MemoPlainTextStableBlock = memo(function PlainTextStableBlock({ text }) {
+  return <span>{text}</span>;
+}, (previous, next) => previous.text === next.text);
 
 function PlainTextBlock({ text }) {
   const value = String(text || '');
@@ -2373,8 +2537,8 @@ export function MarkdownBlock({ text, attachments = [], onOpenAttachment, onDown
   const markdownText = useMemo(() => normalizeTexMathDelimiters(text), [text]);
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeHighlight, rehypeKatex]}
+      remarkPlugins={markdownRemarkPlugins}
+      rehypePlugins={markdownRehypePlugins}
       components={{
         a: ({ node, ...props }) => {
           const href = String(props.href || '');

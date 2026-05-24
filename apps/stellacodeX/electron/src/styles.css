@@ -1343,6 +1343,69 @@ button {
   border-color: color-mix(in srgb, var(--accent), transparent 50%);
 }
 
+.chat-perf-actions button:disabled,
+.chat-trace-controls button:disabled {
+  cursor: default;
+  opacity: .48;
+}
+
+.chat-trace-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 32%);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel), transparent 18%);
+}
+
+.chat-trace-controls > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.chat-trace-controls strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.chat-trace-controls span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-trace-controls.recording {
+  border-color: color-mix(in srgb, var(--accent), transparent 54%);
+  background: color-mix(in srgb, var(--accent), transparent 90%);
+}
+
+.chat-trace-controls.error {
+  border-color: color-mix(in srgb, #ff7a7a, transparent 42%);
+  background: color-mix(in srgb, #ff7a7a, transparent 90%);
+}
+
+.chat-trace-controls button {
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel), transparent 16%);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-trace-controls button:not(:disabled):hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent), transparent 50%);
+}
+
 .chat-perf-table {
   display: grid;
   min-height: 0;

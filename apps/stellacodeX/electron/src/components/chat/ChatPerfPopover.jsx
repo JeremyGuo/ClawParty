@@ -7,10 +7,26 @@ export function ChatPerfPopover() {
   const [open, setOpen] = useState(false);
   const [snapshot, setSnapshot] = useState(() => snapshotChatPerf());
   const [copied, setCopied] = useState(false);
+  const [traceStatus, setTraceStatus] = useState({ state: 'idle' });
+  const [traceBusy, setTraceBusy] = useState(false);
+  const traceApiAvailable = Boolean(
+    window.stellacode2?.startChatTrace
+    && window.stellacode2?.stopChatTrace
+    && window.stellacode2?.chatTraceStatus
+  );
   useEffect(() => {
     setChatPerfDetailedEnabled(open);
     if (!open) return () => setChatPerfDetailedEnabled(false);
     setSnapshot(snapshotChatPerf());
+    if (traceApiAvailable) {
+      window.stellacode2.chatTraceStatus()
+        .then((status) => {
+          if (status) setTraceStatus(status);
+        })
+        .catch((error) => setTraceStatus(traceErrorStatus(error)));
+    } else {
+      setTraceStatus({ state: 'unavailable', error: 'Trace API 未加载；重启 Electron 后生效。' });
+    }
     const stopProbe = startChatFrameProbe(true);
     const timer = window.setInterval(() => {
       setSnapshot(snapshotChatPerf());
@@ -20,7 +36,7 @@ export function ChatPerfPopover() {
       stopProbe?.();
       window.clearInterval(timer);
     };
-  }, [open]);
+  }, [open, traceApiAvailable]);
   const rows = snapshot.rows || [];
   const total = rows.reduce((sum, row) => sum + Number(row.totalMs || 0), 0);
   const copySnapshot = async () => {
@@ -36,6 +52,47 @@ export function ChatPerfPopover() {
     clearChatPerf();
     setSnapshot(snapshotChatPerf());
   };
+  const startTrace = async () => {
+    if (traceBusy) return;
+    if (!traceApiAvailable) {
+      setTraceStatus({ state: 'unavailable', error: 'Trace API 未加载；重启 Electron 后生效。' });
+      return;
+    }
+    setTraceBusy(true);
+    try {
+      const status = await window.stellacode2.startChatTrace();
+      if (status) setTraceStatus(status);
+      else setTraceStatus({ state: 'error', error: 'Trace API 没有返回状态。' });
+    } catch (error) {
+      setTraceStatus(traceErrorStatus(error));
+    } finally {
+      setTraceBusy(false);
+    }
+  };
+  const stopTrace = async () => {
+    if (traceBusy) return;
+    if (!traceApiAvailable) {
+      setTraceStatus({ state: 'unavailable', error: 'Trace API 未加载；重启 Electron 后生效。' });
+      return;
+    }
+    setTraceBusy(true);
+    try {
+      const status = await window.stellacode2.stopChatTrace();
+      if (status) setTraceStatus(status);
+      else setTraceStatus({ state: 'error', error: 'Trace API 没有返回状态。' });
+    } catch (error) {
+      setTraceStatus(traceErrorStatus(error));
+    } finally {
+      setTraceBusy(false);
+    }
+  };
+  const revealTrace = () => {
+    const filePath = traceStatus?.filePath;
+    if (!filePath) return;
+    window.stellacode2?.revealChatTrace?.(filePath).catch(() => {});
+  };
+  const traceRecording = traceStatus?.state === 'recording';
+  const traceSaved = Boolean(traceStatus?.filePath);
   return (
     <Popover.Root open={open} onOpenChange={setOpen}>
       <Popover.Trigger asChild>
@@ -55,6 +112,21 @@ export function ChatPerfPopover() {
           <div className="chat-perf-actions">
             <button type="button" onClick={copySnapshot}>{copied ? '已复制' : '复制'}</button>
             <button type="button" onClick={reset}>清空</button>
+          </div>
+          <div className={`chat-trace-controls ${traceRecording ? 'recording' : ''}${traceStatus?.state === 'error' || traceStatus?.state === 'unavailable' ? ' error' : ''}`}>
+            <div>
+              <strong>Trace</strong>
+              <span>{traceLabel(traceStatus)}</span>
+            </div>
+            <button type="button" onClick={startTrace} disabled={traceBusy || traceRecording}>
+              开始 Trace
+            </button>
+            <button type="button" onClick={stopTrace} disabled={traceBusy || !traceRecording}>
+              停止保存
+            </button>
+            <button type="button" onClick={revealTrace} disabled={!traceSaved}>
+              显示文件
+            </button>
           </div>
           <div className="chat-perf-table" role="table" aria-label="Chat performance metrics">
             <div className="chat-perf-row head" role="row">
@@ -91,6 +163,22 @@ export function ChatPerfPopover() {
       </Popover.Portal>
     </Popover.Root>
   );
+}
+
+function traceLabel(status) {
+  const state = status?.state || 'idle';
+  if (state === 'recording') return `录制中${status.startedAt ? ` · ${status.startedAt}` : ''}`;
+  if (state === 'saved') return status.filePath || 'Trace 已保存';
+  if (state === 'unavailable') return status.error || 'Trace API 不可用';
+  if (state === 'error') return `Trace 失败：${status.error || 'unknown error'}`;
+  return '未录制';
+}
+
+function traceErrorStatus(error) {
+  return {
+    state: 'error',
+    error: error?.message || String(error || 'unknown error')
+  };
 }
 
 function formatPerfMs(value) {

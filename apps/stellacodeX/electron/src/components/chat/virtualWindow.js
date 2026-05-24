@@ -2,7 +2,8 @@ import { chatRenderEntryKey } from './renderModel';
 
 export const VIRTUALIZE_ENTRY_THRESHOLD = 80;
 const VIRTUAL_ENTRY_ESTIMATE = 150;
-const VIRTUAL_OVERSCAN_PX = 1100;
+const VIRTUAL_OVERSCAN_MIN_PX = 360;
+const VIRTUAL_OVERSCAN_MAX_PX = 760;
 
 export function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
   const count = entries.length;
@@ -22,8 +23,14 @@ export function virtualWindowForEntries({ entries, keys, heightCache, viewport, 
   for (let index = 0; index < count; index += 1) {
     offsets[index + 1] = offsets[index] + heights[index];
   }
-  const top = Math.max(0, Number(viewport.scrollTop || 0) - VIRTUAL_OVERSCAN_PX);
-  const bottom = Math.max(top, Number(viewport.scrollTop || 0) + Number(viewport.clientHeight || 0) + VIRTUAL_OVERSCAN_PX);
+  const scrollTop = Number(viewport.scrollTop || 0);
+  const clientHeight = Number(viewport.clientHeight || 0);
+  const overscan = Math.min(
+    VIRTUAL_OVERSCAN_MAX_PX,
+    Math.max(VIRTUAL_OVERSCAN_MIN_PX, clientHeight * 0.55)
+  );
+  const top = Math.max(0, scrollTop - overscan);
+  const bottom = Math.max(top, scrollTop + clientHeight + overscan);
   let start = 0;
   while (start < count - 1 && offsets[start + 1] < top) start += 1;
   let end = start;

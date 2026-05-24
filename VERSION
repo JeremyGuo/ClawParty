@@ -1,5 +1,14 @@
-version: 1.31.6
+version: 1.31.7
 ---
+
+# 1.31.7
+
+- 优化 StellaCodeX Electron 长对话滚动：
+  聊天虚拟列表 overscan 改为按视口动态计算并降低上限，减少长对话滚动时同时 mount/commit 的 Markdown 条目数；静态消息渲染 memo 改为基于内容签名和附件身份比较，避免上层 store 生成新对象时整批可见 Markdown 重新 commit；streaming plain text 会把稳定前缀冻结成 memoized blocks，只更新尾部正在增长的块；Markdown 代码块高亮改为模块级 lowlight 实例和 LRU 高亮结果缓存，避免相同代码块反复注册语言和重新高亮。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增强 StellaCodeX Electron Chat 性能诊断：
+  Chat 性能面板新增 Electron content tracing 控制，可开始/停止 Chromium trace 并保存 JSON 文件，用 Perfetto 或 `chrome://tracing` 查看主线程 flame chart、layout、paint、V8 和 React commit 相关耗时。本次不改变 `config` schema，不改变 `workdir` schema。
+- 优化 foreground session 回复格式提示：
+  foreground system prompt 新增最终回复格式偏好：除非确实需要展示代码，否则避免使用 code block，优先使用 Markdown 原生列表、表格和普通段落，让回复更贴近日常可读文本。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.6
 

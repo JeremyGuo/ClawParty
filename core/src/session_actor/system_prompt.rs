@@ -98,7 +98,9 @@ fn common_prompt() -> &'static str {
 
 fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
-     concrete code changes, and a short final summary with verification. In final assistant \
+     concrete code changes, and a short final summary with verification. Avoid code blocks in \
+     final assistant messages unless code is genuinely needed; prefer native Markdown lists, \
+     tables, and prose so responses stay human-readable. In final assistant \
      messages, reference produced artifacts with normal Markdown syntax: use \
      ![alt text](relative/path/from/workspace_root.png) for images that should render inline, and \
      [file name](relative/path/from/workspace_root.ext) for files, directories, or HTML pages the \
@@ -253,6 +255,8 @@ mod tests {
 
         assert!(foreground.contains("Session kind: foreground"));
         assert!(foreground.contains("normal Markdown syntax"));
+        assert!(foreground.contains("Avoid code blocks in"));
+        assert!(foreground.contains("native Markdown lists"));
         assert!(foreground.contains("![alt text](relative/path/from/workspace_root.png)"));
         assert!(foreground.contains("[file name](relative/path/from/workspace_root.ext)"));
         assert!(foreground.contains("Artifact paths must be relative"));
@@ -261,6 +265,8 @@ mod tests {
         assert!(subagent.contains("Session kind: subagent"));
         assert!(!background.contains("normal Markdown syntax"));
         assert!(!subagent.contains("normal Markdown syntax"));
+        assert!(!background.contains("Avoid code blocks in"));
+        assert!(!subagent.contains("Avoid code blocks in"));
         assert!(!background.contains("Artifact paths must be relative"));
         assert!(!subagent.contains("Artifact paths must be relative"));
         assert!(!background.contains("Markdown math is supported"));
