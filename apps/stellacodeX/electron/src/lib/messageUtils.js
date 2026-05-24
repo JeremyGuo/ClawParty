@@ -1062,18 +1062,14 @@ export function displayMessages(messages) {
   let forceSeparateNext = false;
   for (let index = 0; index < source.length; index += 1) {
     const message = source[index];
-    if (isExecutionMessage(message)) {
+    if (isExecutionMessage(message) || startsToolRound(source, index)) {
       const group = [];
       let cursor = index;
-      let sawProcess = false;
       while (cursor < source.length) {
         const current = source[cursor];
         if (cursor > index && isFinalAssistantMessage(current)) break;
-        const currentHasProcess = hasAssistantProcessItems(current) || isExecutionMessage(current);
-        if (cursor > index && sawProcess && isStreamingAssistantTextOnlyMessage(current)) break;
-        if (cursor > index && !currentHasProcess && !isRoundInterstitialMessage(current)) break;
+        if (cursor > index && !isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
         group.push(current);
-        sawProcess = sawProcess || currentHasProcess;
         cursor += 1;
       }
       const nextMessage = source[cursor];
@@ -1094,14 +1090,21 @@ function isRoundInterstitialMessage(message) {
   return role === 'assistant' && !isFinalAssistantMessage(message);
 }
 
-function isStreamingAssistantMessage(message) {
-  return Boolean(message?._streaming) && String(message?.role || '').toLowerCase() === 'assistant';
+function startsToolRound(source, index) {
+  const message = source[index];
+  if (isStreamingAssistantMessage(message) && hasAssistantProcessItems(message)) return true;
+  if (String(message?.role || '').toLowerCase() !== 'assistant') return false;
+  for (let cursor = index + 1; cursor < source.length; cursor += 1) {
+    const current = source[cursor];
+    if (isFinalAssistantMessage(current)) return false;
+    if (isExecutionMessage(current)) return true;
+    if (!isRoundInterstitialMessage(current)) return false;
+  }
+  return false;
 }
 
-function isStreamingAssistantTextOnlyMessage(message) {
-  return isStreamingAssistantMessage(message)
-    && !hasAssistantProcessItems(message)
-    && Boolean(topLevelMessageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || item.text_with_attachment_markers || '').trim()));
+function isStreamingAssistantMessage(message) {
+  return Boolean(message?._streaming) && String(message?.role || '').toLowerCase() === 'assistant';
 }
 
 function hasAssistantProcessItems(message) {
