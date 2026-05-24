@@ -45,9 +45,10 @@ export function useAppLayout({ settings, setSettings, saveSettings, selectedKey 
   const layoutValues = useMemo(() => {
     const globalLayoutValues = settings?.layout || {};
     const conversationLayoutValues = conversationLayout || globalLayoutValues;
+    const sidebarExpandedWidth = clamp(globalLayoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
     const sidebarWidth = sidebarMode === 'collapsed'
       ? SIDEBAR_COLLAPSED
-      : clamp(globalLayoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
+      : sidebarExpandedWidth;
     const overviewPanelWidth = clamp(conversationLayoutValues.inspector, 320, 760) || 420;
     const workspacePanelWidth = clamp(conversationLayoutValues.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
     const previewPanelWidth = clamp(conversationLayoutValues.preview, 320, 820) || 480;
@@ -60,6 +61,7 @@ export function useAppLayout({ settings, setSettings, saveSettings, selectedKey 
       + (previewPanelOpen ? previewPanelWidth : 0);
     return {
       sidebarWidth,
+      sidebarExpandedWidth,
       overviewPanelWidth,
       workspacePanelWidth,
       previewPanelWidth,

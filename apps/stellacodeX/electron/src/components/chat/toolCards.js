@@ -32,6 +32,9 @@ function sameToolCard(left, right) {
     && left.kind === right.kind
     && left.name === right.name
     && left.payload === right.payload
+    && left.modelPayload === right.modelPayload
+    && left.resultPayload === right.resultPayload
+    && left.resultModelPayload === right.resultModelPayload
     && left.sourceRowId === right.sourceRowId
     && sameUsage(left.sourceRowUsage, right.sourceRowUsage)
     && sameUsage(left.usage, right.usage);
@@ -90,6 +93,7 @@ export function mergedToolCards(cards) {
       payload: displayCard?.payload ?? detailCard?.payload ?? '',
       callPayload: call?.payload,
       resultPayload: result?.payload,
+      resultModelPayload: result?.modelPayload ?? result?.resultModelPayload,
       usage: usageByMergedRow.get(row) || null,
       running: Boolean(call && !result)
     };

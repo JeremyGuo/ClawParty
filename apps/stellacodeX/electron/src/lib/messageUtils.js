@@ -258,6 +258,12 @@ export function splitMessageForDisplay(message) {
       pendingNotes.push({ kind, text: value });
     };
     const addCard = (item) => {
+      const resultPayload = item.type === 'tool_result'
+        ? (item.structured || item.context_with_attachment_markers || item.context || '')
+        : undefined;
+      const resultModelPayload = item.type === 'tool_result'
+        ? (item.context_with_attachment_markers || item.context || '')
+        : undefined;
       if (!currentSegment) {
         currentSegment = { notes: pendingNotes, cards: [] };
         pendingNotes = [];
@@ -266,9 +272,9 @@ export function splitMessageForDisplay(message) {
         id: item.tool_call_id || '',
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
-        payload: item.type === 'tool_result'
-          ? (item.structured || item.context_with_attachment_markers || item.context || '')
-          : (item.arguments || ''),
+        payload: item.type === 'tool_result' ? resultPayload : (item.arguments || ''),
+        resultPayload,
+        resultModelPayload,
         usage
       });
     };

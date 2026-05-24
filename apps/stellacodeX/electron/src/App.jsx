@@ -374,6 +374,7 @@ function App() {
     setTerminalOpen,
     setConversationLayout,
     sidebarWidth,
+    sidebarExpandedWidth,
     overviewPanelWidth,
     workspacePanelWidth,
     previewPanelWidth,
@@ -1202,6 +1203,10 @@ function App() {
     ].slice(-8));
   }, []);
 
+  const removeSelectionReference = useCallback((id) => {
+    setSelectionReferences((current) => current.filter((item) => item.id !== id));
+  }, []);
+
   const title = activeConversation
     ? displayForegroundSessionName(activeForegroundSession, activeConversation)
     : 'Stellacode';
@@ -1217,6 +1222,7 @@ function App() {
       style={{
         ...themeVariables,
         '--sidebar-width': `${sidebarWidth}px`,
+        '--sidebar-expanded-width': `${sidebarExpandedWidth}px`,
         '--overview-panel-width': `${overviewPanelWidth}px`,
         '--overview-panel-right': `${overviewPanelRight}px`,
         '--workspace-panel-width': `${workspacePanelWidth}px`,
@@ -1292,7 +1298,7 @@ function App() {
           processing={selectedProcessing}
           runningActivities={runningActivities}
           selectionReferences={selectionReferences}
-          onRemoveSelectionReference={(id) => setSelectionReferences((current) => current.filter((item) => item.id !== id))}
+          onRemoveSelectionReference={removeSelectionReference}
           onOpenAttachment={openMessageAttachment}
           onDownloadAttachment={downloadMessageAttachment}
           onResolveAttachmentUrl={resolveMessageAttachmentUrl}

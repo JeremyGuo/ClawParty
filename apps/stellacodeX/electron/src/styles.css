@@ -4,7 +4,9 @@
   --font-mono: "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
   --topbar-height: 54px;
   --sidebar-width: 286px;
+  --sidebar-expanded-width: 286px;
   --sidebar-collapsed-width: 0px;
+  --layout-toggle-duration: 380ms;
   --app-font-size: 12px;
   --right-panel-width: 360px;
   --overview-panel-width: 420px;
@@ -230,6 +232,14 @@ body,
   overflow: hidden;
 }
 
+html[data-platform="darwin"],
+html[data-platform="darwin"] body,
+html[data-platform="darwin"] #root {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
 body {
   font-family: var(--font-ui);
   font-size: var(--app-font-size);
@@ -296,7 +306,7 @@ button {
   border-top-left-radius: var(--content-corner-radius);
   content: "";
   pointer-events: none;
-  transition: left 190ms cubic-bezier(.2, .8, .2, 1);
+  transition: left var(--layout-toggle-duration) cubic-bezier(.2, .8, .2, 1);
 }
 
 .window-chrome::after {
@@ -311,17 +321,16 @@ button {
   border-top-left-radius: var(--content-corner-radius);
   content: "";
   pointer-events: none;
-  transition: left 190ms cubic-bezier(.2, .8, .2, 1);
+  transition: left var(--layout-toggle-duration) cubic-bezier(.2, .8, .2, 1);
 }
 
 .sidebar-chrome-fill {
   position: fixed;
   z-index: 90;
   inset: 0 auto 0 0;
-  width: var(--sidebar-width);
+  width: var(--sidebar-expanded-width);
   background: var(--sidebar);
   pointer-events: none;
-  transition: width 190ms cubic-bezier(.2, .8, .2, 1);
 }
 
 .sidebar-collapsed .sidebar-chrome-fill {
@@ -417,8 +426,8 @@ button {
   gap: 8px;
   padding-left: 24px;
   transition:
-    left 190ms cubic-bezier(.2, .8, .2, 1),
-    right 190ms cubic-bezier(.2, .8, .2, 1);
+    left var(--layout-toggle-duration) cubic-bezier(.2, .8, .2, 1),
+    right var(--layout-toggle-duration) cubic-bezier(.2, .8, .2, 1);
   -webkit-app-region: no-drag;
 }
 
@@ -854,12 +863,11 @@ button {
   position: fixed;
   z-index: 100;
   inset: 0 auto 0 0;
-  width: var(--sidebar-width);
+  width: var(--sidebar-expanded-width);
   display: grid;
   grid-template-rows: var(--topbar-height) auto auto minmax(0, 1fr);
   overflow: hidden;
   background: transparent;
-  transition: width 190ms cubic-bezier(.2, .8, .2, 1);
 }
 
 .sidebar-collapsed .conversation-bar {
@@ -875,8 +883,8 @@ button {
   gap: 6px;
   padding: 10px 12px 18px;
   transition:
-    opacity 110ms ease 80ms,
-    transform 160ms cubic-bezier(.2, .8, .2, 1) 40ms,
+    opacity 180ms ease 80ms,
+    transform 220ms cubic-bezier(.2, .8, .2, 1) 40ms,
     visibility 0ms linear 80ms;
 }
 
@@ -910,8 +918,11 @@ button {
   opacity: 0;
   pointer-events: none;
   transform: translateX(-8px);
-  transition-delay: 0ms;
   visibility: hidden;
+  transition:
+    opacity 300ms ease,
+    transform 340ms cubic-bezier(.18, .78, .2, 1),
+    visibility 0ms linear 300ms;
 }
 
 .sidebar-collapsed .conversation-row strong,
@@ -933,8 +944,8 @@ button {
   color: var(--muted);
   font-size: 11px;
   transition:
-    opacity 110ms ease 80ms,
-    transform 160ms cubic-bezier(.2, .8, .2, 1) 40ms,
+    opacity 180ms ease 80ms,
+    transform 220ms cubic-bezier(.2, .8, .2, 1) 40ms,
     visibility 0ms linear 80ms;
 }
 
@@ -962,8 +973,8 @@ button {
   scrollbar-gutter: stable;
   padding: 0 10px 48px;
   transition:
-    opacity 110ms ease 80ms,
-    transform 160ms cubic-bezier(.2, .8, .2, 1) 40ms,
+    opacity 180ms ease 80ms,
+    transform 220ms cubic-bezier(.2, .8, .2, 1) 40ms,
     visibility 0ms linear 80ms;
 }
 
@@ -1203,11 +1214,6 @@ button {
   padding: 0;
 }
 
-.sidebar-collapsed .conversation-row.session-row,
-.sidebar-collapsed .conversation-folder-row {
-  display: none;
-}
-
 .sidebar-footer-note {
   position: absolute;
   bottom: 16px;
@@ -1215,24 +1221,27 @@ button {
   color: var(--faint);
   font-size: 11px;
   transition:
-    opacity 110ms ease 80ms,
-    transform 160ms cubic-bezier(.2, .8, .2, 1) 40ms,
+    opacity 180ms ease 80ms,
+    transform 220ms cubic-bezier(.2, .8, .2, 1) 40ms,
     visibility 0ms linear 80ms;
 }
 
 .content-area {
   position: fixed;
-  inset: 0 var(--content-right) var(--content-bottom) var(--content-left);
+  z-index: 120;
+  top: 0;
+  right: var(--content-right);
+  bottom: var(--content-bottom);
+  left: var(--content-left);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  max-width: calc(100vw - var(--content-left) - var(--content-right));
   border-top-left-radius: var(--content-corner-radius);
   background: var(--panel);
   transition:
-    left 190ms cubic-bezier(.2, .8, .2, 1),
-    right 190ms cubic-bezier(.2, .8, .2, 1),
-    bottom 190ms cubic-bezier(.2, .8, .2, 1);
+    left var(--layout-toggle-duration) cubic-bezier(.18, .78, .2, 1),
+    right var(--layout-toggle-duration) cubic-bezier(.18, .78, .2, 1),
+    bottom var(--layout-toggle-duration) cubic-bezier(.18, .78, .2, 1);
 }
 
 .chat-workspace {
@@ -1243,7 +1252,7 @@ button {
   min-width: 0;
   overflow: hidden;
   grid-template-rows: minmax(0, 1fr);
-  --chat-column-width: min(920px, calc(100vw - var(--content-left) - var(--content-right) - 48px));
+  --chat-column-width: min(920px, calc(100% - 48px));
   container-type: inline-size;
 }
 
@@ -1425,6 +1434,7 @@ button {
   overflow-y: auto;
   padding: calc(var(--topbar-height) + 18px) max(24px, calc((100% - 920px) / 2)) calc(var(--composer-wrap-height, 156px) + var(--progress-height, 0px) + 18px);
   scroll-padding-top: calc(var(--topbar-height) + 18px);
+  scrollbar-gutter: stable;
   --response-spacer-height: 0px;
 }
 
@@ -1677,6 +1687,38 @@ button {
 .message.assistant:focus-within .message-actions.assistant {
   opacity: 1;
   pointer-events: auto;
+}
+
+.message-actions.assistant.streaming-thinking {
+  opacity: 1;
+  pointer-events: none;
+}
+
+.streaming-thinking-text {
+  display: inline-block;
+  min-width: 0;
+  overflow: hidden;
+  background: linear-gradient(
+    100deg,
+    var(--muted) 0%,
+    var(--muted) 44%,
+    var(--text-shimmer-highlight) 50%,
+    var(--muted) 56%,
+    var(--muted) 100%
+  );
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: text-shimmer 2.6s linear infinite;
 }
 
 .message-action-button {
@@ -2573,7 +2615,7 @@ button {
   width: 100%;
   max-width: var(--chat-column-width);
   min-width: 0;
-  gap: 6px;
+  gap: 4px;
   margin: 0 auto 14px;
   color: var(--muted);
   content-visibility: auto;
@@ -2585,10 +2627,10 @@ button {
   width: min(100%, fit-content);
   max-width: 100%;
   min-width: 0;
-  min-height: 28px;
+  min-height: 24px;
   align-items: center;
   gap: 7px;
-  padding: 2px 0;
+  padding: 1px 0;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -2725,6 +2767,12 @@ button {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+.tool-round-waiting {
+  display: flex;
+  min-width: 0;
+  margin-top: 2px;
 }
 
 .tool-process-segment {
@@ -3171,6 +3219,49 @@ button {
   color: var(--muted);
   font-size: 11px;
   font-weight: 650;
+}
+
+.tool-detail-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tool-detail-head > strong {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.tool-detail-tabs {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 22%);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel), transparent 34%);
+}
+
+.tool-detail-tabs button {
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.tool-detail-tabs button:hover,
+.tool-detail-tabs button.active {
+  background: color-mix(in srgb, var(--accent), transparent 84%);
+  color: var(--text);
 }
 
 .tool-detail dl {
@@ -5706,18 +5797,30 @@ button {
 
 .terminal-dock {
   position: fixed;
-  z-index: 90;
+  z-index: 130;
   right: 0;
   bottom: 0;
   left: var(--content-left);
   height: var(--terminal-height-live, var(--terminal-height));
   border-top: 1px solid var(--border);
   background: #181818;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(0, 100%, 0);
   transition:
-    left 190ms cubic-bezier(.2, .8, .2, 1),
-    height 160ms cubic-bezier(.2, .8, .2, 1);
+    left var(--layout-toggle-duration) cubic-bezier(.18, .78, .2, 1),
+    height 160ms cubic-bezier(.2, .8, .2, 1),
+    opacity 180ms ease,
+    transform 260ms cubic-bezier(.2, .8, .2, 1);
   display: grid;
   grid-template-rows: minmax(0, 1fr);
+  will-change: transform, opacity;
+}
+
+.terminal-dock.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate3d(0, 0, 0);
 }
 
 .terminal-height-handle {

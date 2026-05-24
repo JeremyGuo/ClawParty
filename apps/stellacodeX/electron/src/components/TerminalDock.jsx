@@ -41,6 +41,8 @@ function decodeTerminalPayload(message) {
 
 export function TerminalDock({ open, serverId, conversationId, fontSize = 13, onResizeHeight, onResizeList }) {
   const terminalFontSize = Math.min(22, Math.max(11, Math.round(Number(fontSize) || 13)));
+  const [present, setPresent] = useState(open);
+  const [visible, setVisible] = useState(open);
   const [terminals, setTerminals] = useState([]);
   const [activeTerminalId, setActiveTerminalId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -56,6 +58,26 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
   const inputQueueRef = useRef([]);
   const loadSeqRef = useRef(0);
   const activeRunningRef = useRef(true);
+
+  useEffect(() => {
+    let raf = 0;
+    if (open) {
+      setPresent(true);
+      setVisible(false);
+      raf = window.requestAnimationFrame(() => {
+        raf = window.requestAnimationFrame(() => setVisible(true));
+      });
+      return () => {
+        if (raf) window.cancelAnimationFrame(raf);
+      };
+    }
+    setVisible(false);
+    const timer = window.setTimeout(() => setPresent(false), 260);
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      window.clearTimeout(timer);
+    };
+  }, [open]);
 
   const activeTerminal = useMemo(
     () => terminals.find((terminal) => terminal.terminal_id === activeTerminalId) || null,
@@ -159,7 +181,7 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
   }, []);
 
   useEffect(() => {
-    if (!open || !serverId || !conversationId) {
+    if (!present || !serverId || !conversationId) {
       setTerminals([]);
       setActiveTerminalId('');
       setError('');
@@ -167,10 +189,10 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
       return;
     }
     refreshTerminals({ ensure: true }).catch(() => {});
-  }, [open, serverId, conversationId, refreshTerminals]);
+  }, [present, serverId, conversationId, refreshTerminals]);
 
   useEffect(() => {
-    if (!open || !activeTerminalId || !terminalHostRef.current) return undefined;
+    if (!present || !activeTerminalId || !terminalHostRef.current) return undefined;
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
@@ -231,10 +253,10 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
       if (terminalRef.current === terminal) terminalRef.current = null;
       if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
     };
-  }, [open, activeTerminalId, terminalFontSize, sendInput, sendResize]);
+  }, [present, activeTerminalId, terminalFontSize, sendInput, sendResize]);
 
   useEffect(() => {
-    if (!open || !serverId || !conversationId || !activeTerminalId || !terminalRef.current) {
+    if (!present || !serverId || !conversationId || !activeTerminalId || !terminalRef.current) {
       socketRef.current?.close();
       socketRef.current = null;
       setConnected(false);
@@ -336,12 +358,12 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
       }
       setConnected(false);
     };
-  }, [open, serverId, conversationId, activeTerminalId, flushInputQueue, updateTerminal]);
+  }, [present, serverId, conversationId, activeTerminalId, flushInputQueue, updateTerminal]);
 
-  if (!open) return null;
+  if (!present) return null;
 
   return (
-    <section className="terminal-dock">
+    <section className={`terminal-dock${visible ? ' open' : ' closing'}`}>
       <button
         className="terminal-height-handle"
         type="button"

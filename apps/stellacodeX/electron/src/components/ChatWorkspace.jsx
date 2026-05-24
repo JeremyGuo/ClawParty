@@ -17,6 +17,7 @@ import { composerAttachmentFromFile, isImageFileObject, outgoingAttachmentPayloa
 import { InlineActivityStatus, LiveActivityStack, shouldShowInlineActivity } from './chat/LiveActivity';
 import { renderCommitStart, useRenderCommitPerf } from './chat/perfHooks';
 import { buildChatRenderModel } from './chat/renderModel';
+import { importantToolFields, parseToolDetailPayload, payloadToModelText, payloadToRawText } from './chat/toolDetailFormatters';
 import { mergedToolCards, sameToolBlock, sameUsage, toolCardsAreComplete, toolGroupSummary } from './chat/toolCards';
 import { VIRTUALIZE_ENTRY_THRESHOLD, virtualWindowForEntries } from './chat/virtualWindow';
 
@@ -41,6 +42,7 @@ const REASONING_EFFORTS = [
 
 const datePartFormatters = new Map();
 const clockFormatters = new Map();
+const resolvedAttachmentUrlCache = new Map();
 const chatScrollMemory = new Map();
 const CHAT_SCROLL_MEMORY_LIMIT = 80;
 
@@ -728,6 +730,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           onResolveAttachmentUrl={onResolveAttachmentUrl}
           onOpenLocalLink={onOpenLocalLink}
           onToolToggleInteraction={pauseStickyAutoScroll}
+          onVisibleMessageRead={onVisibleMessageRead}
         />
       </div>
       <ChatPerfPopover />
@@ -952,7 +955,8 @@ function MessageStreamView({
   onDownloadAttachment,
   onResolveAttachmentUrl,
   onOpenLocalLink,
-  onToolToggleInteraction
+  onToolToggleInteraction,
+  onVisibleMessageRead
 }) {
   if (modelSelectionPending) {
     return (
@@ -997,6 +1001,7 @@ function MessageStreamView({
             : (
               <MemoMessageArticle
                 message={entry.message}
+                showStreamingThinking={shouldShowStreamingThinkingFooter(entry.message, sessionRunning)}
                 onOpenAttachment={onOpenAttachment}
                 onDownloadAttachment={onDownloadAttachment}
                 onResolveAttachmentUrl={onResolveAttachmentUrl}
@@ -1046,7 +1051,8 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.onDownloadAttachment === next.onDownloadAttachment
     && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
     && previous.onOpenLocalLink === next.onOpenLocalLink
-    && previous.onToolToggleInteraction === next.onToolToggleInteraction;
+    && previous.onToolToggleInteraction === next.onToolToggleInteraction
+    && previous.onVisibleMessageRead === next.onVisibleMessageRead;
 });
 
 function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }) {
@@ -1085,7 +1091,7 @@ function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
   );
 }
 
-export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function MessageArticle({ message, showStreamingThinking = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const renderStartedAt = renderCommitStart();
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
@@ -1111,6 +1117,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
       {(roleName === 'user' || (roleName === 'assistant' && !message._streaming)) && (
         <MessageActionBar message={message} role={roleName} usage={usage} />
       )}
+      {showStreamingThinking && <StreamingAssistantFooter />}
       {message.pending && <div className="message-status">正在发送...</div>}
       {!message.pending && message.queued && <div className="message-status">已排队</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
@@ -1151,6 +1158,20 @@ function MessageActionBar({ message, role, usage }) {
       {showUsage && <TokenUsage usage={usage} />}
     </div>
   );
+}
+
+function StreamingAssistantFooter() {
+  return (
+    <div className="message-actions assistant streaming-thinking" aria-live="polite">
+      <span className="streaming-thinking-text">正在思考</span>
+    </div>
+  );
+}
+
+function shouldShowStreamingThinkingFooter(message, sessionRunning) {
+  if (!sessionRunning || !message?._streaming) return false;
+  if (String(message.role || '').toLowerCase() !== 'assistant') return false;
+  return !messageItems(message).some((item) => item?.type === 'tool_call' || item?.type === 'tool_result');
 }
 
 function formatMessageTime(value) {
@@ -1248,6 +1269,7 @@ function messageArticleClassName(message) {
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
   if (previous.message !== next.message) return false;
+  if (previous.showStreamingThinking !== next.showStreamingThinking) return false;
   if (
     previous.onOpenAttachment !== next.onOpenAttachment
     || previous.onDownloadAttachment !== next.onDownloadAttachment
@@ -1525,7 +1547,6 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
                   ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
                   : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
               })}
-              {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
             </div>
           )}
         </div>
@@ -1533,6 +1554,11 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
       {visibleTextBlocks.map((block) => (
         <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />
       ))}
+      {waitingForNextItem && (
+        <div className="tool-round-waiting">
+          <PendingAssistantPlaceholder compact label="正在思考" />
+        </div>
+      )}
     </section>
   );
 }
@@ -1814,6 +1840,7 @@ function ToolProcessSegment({ block, complete, running = false, onToggleInteract
                   payload={card.payload}
                   callPayload={card.callPayload}
                   resultPayload={card.resultPayload}
+                  resultModelPayload={card.resultModelPayload}
                   usage={card.usage}
                   running={card.running}
                   onToggleInteraction={onToggleInteraction}
@@ -2054,6 +2081,8 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
             kind={item.type === 'tool_result' ? 'result' : 'call'}
             name={item.tool_name || 'tool'}
             payload={item.arguments || item.structured || item.context_with_attachment_markers || item.context || item.result || ''}
+            resultPayload={item.type === 'tool_result' ? (item.structured || item.context_with_attachment_markers || item.context || item.result || '') : undefined}
+            resultModelPayload={item.type === 'tool_result' ? (item.context_with_attachment_markers || item.context || '') : undefined}
           />
         );
       }
@@ -2328,7 +2357,7 @@ export function MarkdownBlock({ text, attachments = [], onOpenAttachment, onDown
               />
             );
           }
-          return <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />;
+          return <img {...props} className="message-inline-image" loading="eager" decoding="async" alt={props.alt || ''} />;
         }
       }}
     >
@@ -2350,24 +2379,35 @@ export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttach
 function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
   const rawUrl = attachmentUrl(attachment);
   const resolveKey = attachmentRenderKey(attachment, 0);
+  const cacheKey = `${resolveKey}\n${rawUrl}`;
   const needsResolve = isResolvableAttachmentUrl(rawUrl) || (!rawUrl && hasLocalAttachmentPath(attachment));
-  const initialUrl = needsResolve ? '' : rawUrl;
+  const initialUrl = needsResolve ? (resolvedAttachmentUrlCache.get(cacheKey) || '') : rawUrl;
   const [url, setUrl] = useState(initialUrl);
   useEffect(() => {
     let disposed = false;
     const nextRawUrl = attachmentUrl(attachment);
+    const nextCacheKey = `${resolveKey}\n${nextRawUrl}`;
     const shouldResolve = isResolvableAttachmentUrl(nextRawUrl) || (!nextRawUrl && hasLocalAttachmentPath(attachment));
     if (!shouldResolve) {
+      if (nextRawUrl) resolvedAttachmentUrlCache.set(nextCacheKey, nextRawUrl);
       setUrl(nextRawUrl);
       return undefined;
+    }
+    const cached = resolvedAttachmentUrlCache.get(nextCacheKey);
+    if (cached) {
+      setUrl((current) => (current === cached ? current : cached));
     }
     if (!onResolveAttachmentUrl) return undefined;
     Promise.resolve(onResolveAttachmentUrl(attachment, nextRawUrl))
       .then((resolvedUrl) => {
-        if (!disposed) setUrl(resolvedUrl || nextRawUrl || '');
+        const nextUrl = resolvedUrl || nextRawUrl || '';
+        if (nextUrl) resolvedAttachmentUrlCache.set(nextCacheKey, nextUrl);
+        if (!disposed) setUrl((current) => (current === nextUrl ? current : nextUrl));
       })
       .catch(() => {
-        if (!disposed) setUrl(nextRawUrl || '');
+        const nextUrl = nextRawUrl || '';
+        if (nextUrl) resolvedAttachmentUrlCache.set(nextCacheKey, nextUrl);
+        if (!disposed) setUrl((current) => (current === nextUrl ? current : nextUrl));
       });
     return () => {
       disposed = true;
@@ -2463,7 +2503,8 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
           <img
             src={url}
             alt={name}
-            loading="lazy"
+            loading="eager"
+            decoding="async"
             onLoad={(event) => {
               const image = event.currentTarget;
               if (image.naturalWidth > 0 && image.naturalHeight > 0) {
@@ -2840,18 +2881,23 @@ function lightToolPayload(payload) {
   return result;
 }
 
-function ToolDetail({ title, name, payload }) {
-  const data = parseToolPayload(payload);
+function ToolDetail({ title, name, payload, mode = 'call' }) {
+  const data = parseToolDetailPayload(payload);
   const patchText = editPatchText(name, data);
   if (patchText) {
     return <EditDiffDetail title={title} data={data} patchText={patchText} />;
   }
-  const entries = Object.entries(data).filter(([, value]) => value !== undefined && value !== null && value !== '');
-  if (entries.length === 1 && entries[0][0] === 'text') {
+  const importantEntries = importantToolFields(name, data, mode);
+  const entries = importantEntries.length > 0
+    ? importantEntries
+    : Object.entries(data)
+      .filter(([, value]) => value !== undefined && value !== null && value !== '')
+      .map(([label, value]) => ({ label, value: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }));
+  if (entries.length === 1 && entries[0].label === 'text') {
     return (
       <div className="tool-detail">
         <strong>{title}</strong>
-        <pre><code>{entries[0][1]}</code></pre>
+        <pre><code>{entries[0].value}</code></pre>
       </div>
     );
   }
@@ -2860,15 +2906,65 @@ function ToolDetail({ title, name, payload }) {
       <strong>{title}</strong>
       {entries.length > 0 ? (
         <dl>
-          {entries.map(([key, value]) => (
-            <div key={key}>
-              <dt>{key}</dt>
-              <dd>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</dd>
+          {entries.map(({ label, value }) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{value}</dd>
             </div>
           ))}
         </dl>
       ) : (
         <span className="muted">没有详细内容</span>
+      )}
+    </div>
+  );
+}
+
+function ToolObservationDetail({ name, payload, modelPayload }) {
+  const [tab, setTab] = useState('important');
+  const data = useMemo(() => parseToolDetailPayload(payload), [payload]);
+  const entries = useMemo(() => importantToolFields(name, data, 'result'), [name, data]);
+  const rawText = useMemo(() => payloadToRawText(payload), [payload]);
+  const modelText = useMemo(() => payloadToModelText(modelPayload, payload), [modelPayload, payload]);
+  const tabs = [
+    { value: 'important', label: '重点' },
+    { value: 'raw', label: 'Raw' },
+    { value: 'model', label: '模型看到' }
+  ];
+  return (
+    <div className="tool-detail tool-observation-detail">
+      <div className="tool-detail-head">
+        <strong>工具结果</strong>
+        <div className="tool-detail-tabs" role="tablist" aria-label="工具结果视图">
+          {tabs.map((item) => (
+            <button
+              key={item.value}
+              type="button"
+              className={tab === item.value ? 'active' : ''}
+              onClick={() => setTab(item.value)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {tab === 'important' ? (
+        entries.length > 0 ? (
+          <dl>
+            {entries.map(({ label, value }) => (
+              <div key={label}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : (
+          <span className="muted">没有可提取的重点字段</span>
+        )
+      ) : tab === 'raw' ? (
+        rawText ? <pre><code>{rawText}</code></pre> : <span className="muted">没有 Raw 内容</span>
+      ) : (
+        modelText ? <pre><code>{modelText}</code></pre> : <span className="muted">没有模型可见内容</span>
       )}
     </div>
   );
@@ -3195,7 +3291,7 @@ function diffMarker(type) {
   return ' ';
 }
 
-export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false, onToggleInteraction }) {
+export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, resultModelPayload, usage, running = false, onToggleInteraction }) {
   const renderStartedAt = renderCommitStart();
   const [open, setOpen] = useState(false);
   const detailPresence = useCollapsePresence(open, 170);
@@ -3214,11 +3310,13 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
       payloadChars: typeof payload === 'string' ? payload.length : 0
   }));
   const detail = hasMergedPayload ? (
-    <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} running={running} />
+    <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} resultModelPayload={resultModelPayload} running={running} />
   ) : (
     running
       ? <StreamingToolPayloadDetail title={display.detailTitle} payload={payload} />
-      : <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+      : kind === 'result'
+        ? <ToolObservationDetail name={name} payload={resultPayload ?? payload} modelPayload={resultModelPayload} />
+        : <ToolDetail title={display.detailTitle} name={name} payload={payload} mode="call" />
   );
   return (
     <details
@@ -3257,20 +3355,21 @@ const MemoToolInlineCard = memo(ToolInlineCard, (previous, next) => (
   && previous.payload === next.payload
   && previous.callPayload === next.callPayload
   && previous.resultPayload === next.resultPayload
+  && previous.resultModelPayload === next.resultModelPayload
   && previous.running === next.running
   && previous.onToggleInteraction === next.onToggleInteraction
   && sameUsage(previous.usage, next.usage)
 ));
 
-function MergedToolDetail({ name, callPayload, resultPayload, running = false }) {
+function MergedToolDetail({ name, callPayload, resultPayload, resultModelPayload, running = false }) {
   return (
     <div className="merged-tool-detail">
       {callPayload !== undefined ? (
         running && resultPayload === undefined
           ? <StreamingToolPayloadDetail title="调用参数" payload={callPayload} />
-          : <ToolDetail title="调用参数" name={name} payload={callPayload} />
+          : <ToolDetail title="调用参数" name={name} payload={callPayload} mode="call" />
       ) : null}
-      {resultPayload !== undefined ? <ToolDetail title="工具结果" name={name} payload={resultPayload} /> : null}
+      {resultPayload !== undefined ? <ToolObservationDetail name={name} payload={resultPayload} modelPayload={resultModelPayload} /> : null}
     </div>
   );
 }

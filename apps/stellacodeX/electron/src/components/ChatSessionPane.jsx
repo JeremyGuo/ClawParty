@@ -1,8 +1,9 @@
+import { memo } from 'react';
 import { ChatWorkspace } from './ChatWorkspace';
 import { useChatRuntimeSnapshot } from '../lib/chatRuntimeStore';
 import { hasOlderMessages } from '../lib/messageUtils';
 
-export function ChatSessionPane(props) {
+function ChatSessionPaneComponent(props) {
   const { messages, messagesReady, sending } = useChatRuntimeSnapshot();
   return (
     <ChatWorkspace
@@ -14,3 +15,5 @@ export function ChatSessionPane(props) {
     />
   );
 }
+
+export const ChatSessionPane = memo(ChatSessionPaneComponent);
