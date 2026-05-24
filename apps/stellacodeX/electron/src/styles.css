@@ -6701,6 +6701,38 @@ button {
   accent-color: var(--accent);
 }
 
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel), transparent 8%);
+}
+
+.settings-toggle-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.settings-toggle-row strong {
+  font-size: 12px;
+}
+
+.settings-toggle-row small {
+  color: var(--muted);
+}
+
+.settings-toggle-row input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
 .theme-color-panel {
   display: grid;
   gap: 12px;

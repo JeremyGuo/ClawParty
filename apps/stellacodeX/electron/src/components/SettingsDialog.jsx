@@ -431,6 +431,23 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                       ))}
                     </div>
                   </div>
+                  <label className="settings-toggle-row">
+                    <span>
+                      <strong>底部运行状态</strong>
+                      <small>在消息列表底部显示带 spinner 的当前运行状态。</small>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={draft?.conversationListUi?.showInlineActivityStatus !== false}
+                      onChange={(event) => setDraft((current) => ({
+                        ...current,
+                        conversationListUi: {
+                          ...(current?.conversationListUi || {}),
+                          showInlineActivityStatus: event.target.checked
+                        }
+                      }))}
+                    />
+                  </label>
                 </div>
               )}
               {tab === 'servers' && (

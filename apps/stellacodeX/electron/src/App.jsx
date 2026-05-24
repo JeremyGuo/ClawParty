@@ -1292,6 +1292,7 @@ function App() {
           conversationKey={selectedKey}
           modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
           mode={composerMode}
+          showInlineActivityStatus={settings?.conversationListUi?.showInlineActivityStatus !== false}
           onLoadOlder={loadOlderMessages}
           onSend={sendMessage}
           onLoadModels={loadAvailableModels}

@@ -1,5 +1,10 @@
-version: 1.31.5
+version: 1.31.6
 ---
+
+# 1.31.6
+
+- 修复 StellaCodeX Electron session 切换和 streaming 工具顺序：
+  切换 Chat session 时不再恢复旧滚动位置，进入 session 后默认贴到底部；streaming 期间 tool process group 遇到新的 assistant 文本流会切分为新的 round，active tail 中的 assistant 文本也会按原始 block 顺序和工具块交错渲染，避免流式过程中出现多个 assistant 消息先显示、多个工具组堆到后面的临时错序；设置中新增底部运行状态开关，可隐藏消息列表底部带 spinner 的当前 activity 行。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.5
 
