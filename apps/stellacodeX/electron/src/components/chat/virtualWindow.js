@@ -29,6 +29,22 @@ export function virtualWindowForEntries({ entries, keys, heightCache, viewport, 
     VIRTUAL_OVERSCAN_MAX_PX,
     Math.max(VIRTUAL_OVERSCAN_MIN_PX, clientHeight * 0.55)
   );
+  if (viewport.stickToBottom) {
+    let start = Math.max(0, count - 1);
+    const tailTop = Math.max(0, offsets[count] - clientHeight - overscan);
+    while (start > 0 && offsets[start] > tailTop) start -= 1;
+    return {
+      virtualized: true,
+      start,
+      end: count - 1,
+      topPadding: offsets[start],
+      bottomPadding: 0,
+      items: entries.slice(start).map((entry, offset) => {
+        const index = start + offset;
+        return { entry, index, key: keys[index] || chatRenderEntryKey(entry, index) };
+      })
+    };
+  }
   const top = Math.max(0, scrollTop - overscan);
   const bottom = Math.max(top, scrollTop + clientHeight + overscan);
   let start = 0;

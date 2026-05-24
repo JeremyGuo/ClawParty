@@ -148,7 +148,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const pendingScrollRestoreRef = useRef(null);
   const lastScrollStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
-  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
+  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, stickToBottom: true });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
   const inlineActivity = showInlineActivityStatus && shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
@@ -159,8 +159,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     heightCache: virtualHeightsRef.current,
     heightVersion: virtualHeightVersion,
     viewport,
-    activeIndex: latestAssistantTurnIndex
-  }), { entries: renderEntries.length, virtualized: renderEntries.length > VIRTUALIZE_ENTRY_THRESHOLD }), [renderEntries, entryKeys, virtualHeightVersion, viewport, latestAssistantTurnIndex]);
+    activeIndex: sessionRunning ? latestAssistantTurnIndex : -1
+  }), { entries: renderEntries.length, virtualized: renderEntries.length > VIRTUALIZE_ENTRY_THRESHOLD }), [renderEntries, entryKeys, virtualHeightVersion, viewport, sessionRunning, latestAssistantTurnIndex]);
   const toolStopNoticeCandidate = useMemo(() => {
     if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
@@ -368,6 +368,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     };
     lastScrollStateRef.current = state;
     rememberChatScroll(activeMessageScope, state);
+    requestAnimationFrame(syncViewport);
   };
 
   const visibleScrollAnchor = () => {
@@ -448,10 +449,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!list) return;
     const next = {
       scrollTop: list.scrollTop,
-      clientHeight: list.clientHeight
+      clientHeight: list.clientHeight,
+      stickToBottom: list.scrollHeight - list.scrollTop - list.clientHeight < 80
     };
     setViewport((current) => (
-      Math.abs(current.scrollTop - next.scrollTop) < 1 && Math.abs(current.clientHeight - next.clientHeight) < 1
+      Math.abs(current.scrollTop - next.scrollTop) < 1
+        && Math.abs(current.clientHeight - next.clientHeight) < 1
+        && Boolean(current.stickToBottom) === Boolean(next.stickToBottom)
         ? current
         : next
     ));
@@ -510,7 +514,11 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     lastScopeRef.current = activeMessageScope;
     lastScrollStateRef.current = remembered;
     pendingScrollRestoreRef.current = remembered;
-    setViewport({ scrollTop: viewportScrollTopForMemory(remembered), clientHeight: scrollRef.current?.clientHeight || remembered?.clientHeight || 0 });
+    setViewport({
+      scrollTop: viewportScrollTopForMemory(remembered),
+      clientHeight: scrollRef.current?.clientHeight || remembered?.clientHeight || 0,
+      stickToBottom: remembered ? Boolean(remembered.stickToBottom) : true
+    });
     requestAnimationFrame(() => {
       if (remembered) reconcileScrollAfterContentChange(SCROLL_CHANGE.SessionRestore, remembered);
       else scrollToBottom({ force: true });

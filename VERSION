@@ -1,5 +1,10 @@
-version: 1.31.8
+version: 1.31.9
 ---
+
+# 1.31.9
+
+- 修复 StellaCodeX Electron 长对话贴底恢复：
+  虚拟列表在 `stickToBottom` 模式下直接锚定并渲染尾部窗口，不再依赖未测量 Markdown 条目的高度估算来决定可见范围；旧 assistant tool turn 只在 session 运行中参与虚拟窗口扩展，避免切回已结束长对话底部时因为中段条目被强行挂载导致 scrollTop 看起来落到中间。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.8
 
