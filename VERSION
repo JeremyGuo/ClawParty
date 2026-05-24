@@ -1,5 +1,10 @@
-version: 1.31.7
+version: 1.31.8
 ---
+
+# 1.31.8
+
+- 修复 StellaCodeX Electron Session 滚动位置恢复：
+  Chat session 切换时不再通过 effect cleanup 从可能已经切换过内容的 DOM 捕获旧 session 滚动位置；程序性贴底会立即把当前 session 记为 `stickToBottom=true`，避免长对话切走前在底部、切回后恢复到中间位置。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.7
 

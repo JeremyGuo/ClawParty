@@ -358,6 +358,16 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const list = scrollRef.current;
     if (!list) return;
     list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    stickToBottomRef.current = true;
+    const state = {
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      stickToBottom: true,
+      anchor: visibleScrollAnchor()
+    };
+    lastScrollStateRef.current = state;
+    rememberChatScroll(activeMessageScope, state);
   };
 
   const visibleScrollAnchor = () => {
@@ -451,6 +461,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const list = scrollRef.current;
     if (!list) return;
     if (lastScopeRef.current !== activeMessageScope) {
+      rememberChatScroll(lastScopeRef.current, lastScrollStateRef.current);
       const remembered = readChatScrollMemory(activeMessageScope);
       lastScopeRef.current = activeMessageScope;
       lastScrollStateRef.current = remembered;
@@ -477,13 +488,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     }
     previousCountRef.current = renderedMessages.length;
   }, [activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature]);
-
-  useLayoutEffect(() => {
-    const scope = activeMessageScope;
-    return () => {
-      rememberChatScroll(scope, captureScrollState());
-    };
-  }, [activeMessageScope]);
 
   useEffect(() => {
     const remembered = readChatScrollMemory(activeMessageScope);
