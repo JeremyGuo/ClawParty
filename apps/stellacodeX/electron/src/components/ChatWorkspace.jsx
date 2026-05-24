@@ -149,6 +149,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const pendingScrollRestoreRef = useRef(null);
   const pendingAnchorRestoreRef = useRef(null);
   const anchorRestoreFrameRef = useRef(0);
+  const pendingVirtualMeasureRestoreRef = useRef(null);
   const lastScrollStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, stickToBottom: true });
@@ -171,7 +172,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
 
   const stickyAutoScrollEnabled = useCallback(() => (
-    stickToBottomRef.current && Date.now() >= stickyScrollPausedUntilRef.current
+    stickToBottomRef.current
+      && Date.now() >= stickyScrollPausedUntilRef.current
+      && Date.now() >= userScrollIntentUntilRef.current
   ), []);
 
   const pauseStickyAutoScroll = useCallback((durationMs = 420) => {
@@ -302,8 +305,19 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const content = contentRef.current;
     if (!content || !virtualWindow.virtualized) return undefined;
     let frame = 0;
+    let idleTimer = 0;
     const measure = () => {
       frame = 0;
+      if (userScrollInProgress() && !stickToBottomRef.current) {
+        if (!idleTimer) {
+          idleTimer = window.setTimeout(() => {
+            idleTimer = 0;
+            scheduleMeasure();
+          }, USER_SCROLL_IDLE_MS + 40);
+        }
+        return;
+      }
+      const restoreState = captureScrollState();
       const changed = measureChatPerf('chat.virtual_measure.visible_entries', () => {
         let didChange = false;
         content.querySelectorAll('[data-virtual-key]').forEach((node) => {
@@ -319,11 +333,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
         return didChange;
       }, { visible: virtualWindow.items.length });
       if (changed) {
+        pendingVirtualMeasureRestoreRef.current = restoreState && !restoreState.stickToBottom
+          ? restoreState
+          : null;
         setVirtualHeightVersion((value) => value + 1);
-        requestAnimationFrame(() => {
-          retryPendingAnchorRestore();
-          reconcileScrollAfterContentChange(SCROLL_CHANGE.VirtualMeasure, lastScrollStateRef.current);
-        });
       }
     };
     const scheduleMeasure = () => {
@@ -335,9 +348,17 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     content.querySelectorAll('[data-virtual-key]').forEach((node) => observer.observe(node));
     return () => {
       if (frame) cancelAnimationFrame(frame);
+      if (idleTimer) window.clearTimeout(idleTimer);
       observer.disconnect();
     };
-  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature]);
+  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature, userScrollInProgress]);
+
+  useLayoutEffect(() => {
+    const pending = pendingVirtualMeasureRestoreRef.current;
+    if (!pending) return;
+    pendingVirtualMeasureRestoreRef.current = null;
+    restoreScrollState(pending);
+  }, [activeMessageScope, virtualHeightVersion, virtualWindow.start, virtualWindow.end]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;

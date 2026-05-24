@@ -1,5 +1,25 @@
-version: 1.31.9
+version: 1.31.13
 ---
+
+# 1.31.13
+
+- 改进 StellaCodeX Electron 虚拟列表高度估算：
+  未测量的 chat entry 不再统一按 150px 估算，而是根据消息文本长度、换行、附件数量和 tool group 规模预估高度，减少长 Markdown 对话滚动到新区域时真实测量高度与初始虚拟高度差距过大造成的 scrollbar thumb 跳动。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.31.12
+
+- 修复 StellaCodeX Electron 滚动中虚拟高度更新跳动：
+  用户 wheel/trackpad 滚动仍处于活跃状态且已离开底部时，虚拟条目高度测量只排队不立即写入高度缓存，也不触发虚拟窗口重算；等滚动 idle 后再统一测量并同步恢复当前 anchor，避免滚动过程中 top spacer 被连续修正导致内容真实向上跳动。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.31.11
+
+- 修复 StellaCodeX Electron 虚拟列表滚动测量跳动：
+  虚拟条目高度测量更新前会先捕获当前可见 anchor，触发虚拟窗口重算后在 layout effect 中同步恢复该 anchor，不再把补偿延后到下一帧，避免用户从底部向上滚动时因为 top spacer 高度修正而看到向上瞬移。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.31.10
+
+- 修复 StellaCodeX Electron 手动滚动瞬移：
+  用户正在滚动时 sticky auto-scroll 不再继续触发，避免从底部向上滚动时被 ResizeObserver 或虚拟测量回调拉回底部；虚拟条目高度重新测量或内容 resize 时，如果用户已经离开底部，会用当前可见 anchor 做补偿，减少 Markdown 高度估算修正造成的滚动条瞬移。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.9
 
