@@ -1,5 +1,10 @@
-version: 1.31.4
+version: 1.31.5
 ---
+
+# 1.31.5
+
+- 修复 Codex subscription `exec_command` remote schema：
+  `exec_command` 是 `shell_exec` 的 Codex 兼容 facade，现在在 Selectable remote mode 下和 `shell_exec` 一样暴露 `remote` 参数，Fixed SSH mode 下继续隐藏该参数并使用固定远端目标。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.4
 

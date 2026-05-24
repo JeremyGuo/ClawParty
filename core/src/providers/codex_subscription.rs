@@ -23,7 +23,7 @@ use crate::{
         LocalToolError, ReasoningItem, ShellExecTool, ShellMakeVisibleTool, ShellStopTool,
         ShellWriteStdinTool, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog,
         ToolCatalogError, ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry,
-        ToolResultContent, ToolSet,
+        ToolRemoteMode, ToolResultContent, ToolSet,
     },
 };
 
@@ -576,7 +576,12 @@ impl ToolSet for CodexSubscriptionToolSet {
             add_builtin_base_tool(catalog, env, tool)?;
         }
         add_image_generation_tools(catalog, env)?;
-        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecCommandTool)), env)?;
+        catalog.add_enabled_tool_entry(
+            ToolEntry::Ext(Arc::new(CodexExecCommandTool {
+                remote_mode: env.options.remote_mode.clone(),
+            })),
+            env,
+        )?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexWriteStdinTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecStopTool)), env)?;
         catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecMakeVisibleTool)), env)?;
@@ -644,28 +649,65 @@ fn add_image_generation_tools(
     Ok(())
 }
 
-struct CodexExecCommandTool;
+struct CodexExecCommandTool {
+    remote_mode: ToolRemoteMode,
+}
 
 impl ExtTool for CodexExecCommandTool {
     fn definition(&self) -> ToolDefinition {
+        let mut properties = Map::from_iter([
+            (
+                "cmd".to_string(),
+                json!({"type": "string", "description": "Shell command to execute."}),
+            ),
+            (
+                "workdir".to_string(),
+                json!({"type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd."}),
+            ),
+            (
+                "shell".to_string(),
+                json!({"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."}),
+            ),
+            (
+                "login".to_string(),
+                json!({"type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to false."}),
+            ),
+            (
+                "tty".to_string(),
+                json!({"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."}),
+            ),
+            (
+                "yield_time_ms".to_string(),
+                json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."}),
+            ),
+            (
+                "timeout_ms".to_string(),
+                json!({"type": "integer", "minimum": 0, "maximum": 86400000}),
+            ),
+            (
+                "max_output_tokens".to_string(),
+                json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}),
+            ),
+        ]);
+        if matches!(self.remote_mode, ToolRemoteMode::Selectable) {
+            properties.insert(
+                "remote".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Execution target: SSH Host alias from ~/.ssh/config. Omit for local work."
+                }),
+            );
+        }
         ToolDefinition::new(
             "exec_command",
             "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
             json!({
                 "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "description": "Shell command to execute."},
-                    "workdir": {"type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd."},
-                    "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
-                    "login": {"type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to false."},
-                    "tty": {"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."},
-                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."},
-                    "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
-                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum number of tokens to return. Excess output will be truncated."}
-                },
+                "properties": properties,
                 "required": ["cmd"],
                 "additionalProperties": false
-            }),            ToolBackend::Local,
+            }),
+            ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial)
     }
@@ -3970,6 +4012,11 @@ mod tests {
         assert!(!catalog.contains("shell_write_stdin"));
         assert!(!catalog.contains("shell_stop"));
 
+        let exec_command = catalog.get("exec_command").expect("exec_command exists");
+        assert!(exec_command.parameters["properties"]
+            .get("remote")
+            .is_some());
+
         let write_stdin = catalog.get("write_stdin").expect("write_stdin exists");
         assert_eq!(
             write_stdin.parameters["properties"]["yield_time_ms"]["maximum"],
@@ -4107,6 +4154,10 @@ mod tests {
         assert!(catalog.contains("exec_make_visible"));
         assert!(!catalog.contains("shell_make_visible"));
         assert!(catalog.contains("attachment_make_visible"));
+        let exec_command = catalog.get("exec_command").expect("exec_command exists");
+        assert!(exec_command.parameters["properties"]
+            .get("remote")
+            .is_none());
     }
 
     fn fake_jwt(payload: &str) -> String {
