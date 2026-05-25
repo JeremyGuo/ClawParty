@@ -89,6 +89,8 @@ pub struct TokenUsage {
     pub cache_write: u64,
     pub uncache_input: u64,
     pub output: u64,
+    pub provider_type: Option<ProviderType>,
+    pub model_name: Option<String>,
     pub cost_usd: Option<TokenUsageCost>,
 }
 ```
@@ -99,9 +101,11 @@ Fields:
 - `cache_write`: input tokens written into provider cache.
 - `uncache_input`: input tokens not served from cache.
 - `output`: output tokens.
+- `provider_type`: provider that reported this usage, when known.
+- `model_name`: model that reported this usage, when known.
 - `cost_usd`: optional computed USD cost for the same buckets.
 
-`cost_usd` is omitted when absent. Costs are computed by pricing logic from `ModelConfig` and `TokenUsage`; providers should not invent cost values from provider-specific fields.
+`provider_type`, `model_name`, and `cost_usd` are omitted when absent. Costs are computed by pricing logic from `ModelConfig` and `TokenUsage`; providers should not invent cost values from provider-specific fields. Current in-memory history may clear `provider_type` / `model_name` after compression so token estimation does not reuse a pre-compression provider prefix against a rewritten context; durable `all_messages` should keep the original usage metadata.
 
 ## TokenUsageCost
 

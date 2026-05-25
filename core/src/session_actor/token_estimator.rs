@@ -70,13 +70,20 @@ impl TokenEstimator {
 
     pub fn estimate(&self, messages: &[ChatMessage]) -> Result<TokenEstimate, TokenEstimatorError> {
         let normalized_messages = normalize_messages_for_model(messages, &self.model_config);
-        let rendered = self.backend.estimate_text(&normalized_messages)?;
+        self.estimate_normalized(&normalized_messages)
+    }
+
+    pub fn estimate_normalized(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<TokenEstimate, TokenEstimatorError> {
+        let rendered = self.backend.estimate_text(messages)?;
         let text_tokens = rendered.text_tokens;
         let mut multimodal_tokens = 0;
         for file in &rendered.files {
             multimodal_tokens += self.multimodal_strategy.estimate(file)?;
         }
-        let reasoning_tokens = estimate_codex_encrypted_reasoning_tokens(&normalized_messages);
+        let reasoning_tokens = estimate_codex_encrypted_reasoning_tokens(messages);
 
         Ok(TokenEstimate {
             text_tokens,
@@ -925,6 +932,8 @@ mod tests {
             cache_write: 0,
             uncache_input: 0,
             output: 2,
+            provider_type: None,
+            model_name: None,
             cost_usd: None,
         })];
 

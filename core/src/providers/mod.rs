@@ -517,9 +517,16 @@ pub enum ProviderStreamEvent {
 
 #[derive(Debug)]
 enum ProviderCommand {
-    Start {
-        request_id: String,
+    Set {
         request: ProviderRequestOwned,
+        response_tx: mpsc::Sender<Result<(), ProviderError>>,
+    },
+    Append {
+        messages: Vec<ChatMessage>,
+        response_tx: mpsc::Sender<Result<(), ProviderError>>,
+    },
+    StartCurrent {
+        request_id: String,
     },
     Compact {
         request: ProviderRequestOwned,
@@ -640,16 +647,35 @@ impl ProviderSession {
         }
     }
 
-    pub fn start(
-        &self,
-        request_id: String,
-        request: ProviderRequestOwned,
-    ) -> Result<(), ProviderError> {
+    pub fn set(&self, request: ProviderRequestOwned) -> Result<(), ProviderError> {
+        let (response_tx, response_rx) = mpsc::channel();
         self.command_tx
-            .send(ProviderCommand::Start {
-                request_id,
+            .send(ProviderCommand::Set {
                 request,
+                response_tx,
             })
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))?;
+        response_rx.recv().map_err(|_| {
+            ProviderError::Subprocess("provider context set disconnected".to_string())
+        })?
+    }
+
+    pub fn append(&self, messages: Vec<ChatMessage>) -> Result<(), ProviderError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(ProviderCommand::Append {
+                messages,
+                response_tx,
+            })
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))?;
+        response_rx.recv().map_err(|_| {
+            ProviderError::Subprocess("provider context append disconnected".to_string())
+        })?
+    }
+
+    pub fn start_current(&self, request_id: String) -> Result<(), ProviderError> {
+        self.command_tx
+            .send(ProviderCommand::StartCurrent { request_id })
             .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))
     }
 
@@ -775,6 +801,7 @@ fn direct_provider_session_loop(
 ) {
     let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
     let mut active: Option<ProviderActiveRequest> = None;
+    let mut current_context: Option<ProviderRequestOwned> = None;
 
     loop {
         select! {
@@ -783,7 +810,33 @@ fn direct_provider_session_loop(
                     break;
                 };
                 match command {
-                    ProviderCommand::Start { request_id, request } => {
+                    ProviderCommand::Set { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            current_context = Some(request);
+                            Ok(())
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::Append { messages, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else if let Some(context) = current_context.as_mut() {
+                            context.messages.extend(messages);
+                            Ok(())
+                        } else {
+                            Err(ProviderError::Subprocess(
+                                "provider context is not set".to_string(),
+                            ))
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::StartCurrent { request_id } => {
                         if active.is_some() {
                             let _ = event_tx.send(ProviderEvent::Result {
                                 request_id,
@@ -793,6 +846,15 @@ fn direct_provider_session_loop(
                             });
                             continue;
                         }
+                        let Some(request) = current_context.clone() else {
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider context is not set".to_string(),
+                                )),
+                            });
+                            continue;
+                        };
                         match start_provider_session_request(
                             provider.clone(),
                             request_id.clone(),
@@ -866,6 +928,7 @@ fn fork_server_provider_session_loop(
     let (fork_server_event_tx, fork_server_event_rx) = crossbeam_channel::unbounded();
     let mut worker: Option<ProviderWorkerBinding> = None;
     let mut active: Option<ProviderActiveRequest> = None;
+    let mut current_context: Option<ProviderRequestOwned> = None;
 
     loop {
         select! {
@@ -874,7 +937,33 @@ fn fork_server_provider_session_loop(
                     break;
                 };
                 match command {
-                    ProviderCommand::Start { request_id, request } => {
+                    ProviderCommand::Set { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            current_context = Some(request);
+                            Ok(())
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::Append { messages, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else if let Some(context) = current_context.as_mut() {
+                            context.messages.extend(messages);
+                            Ok(())
+                        } else {
+                            Err(ProviderError::Subprocess(
+                                "provider context is not set".to_string(),
+                            ))
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::StartCurrent { request_id } => {
                         if active.is_some() {
                             let _ = event_tx.send(ProviderEvent::Result {
                                 request_id,
@@ -884,6 +973,15 @@ fn fork_server_provider_session_loop(
                             });
                             continue;
                         }
+                        let Some(request) = current_context.clone() else {
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider context is not set".to_string(),
+                                )),
+                            });
+                            continue;
+                        };
                         match start_fork_server_session_request(
                             &model_config,
                             &fork_server,
@@ -1415,6 +1513,12 @@ pub(crate) fn request_too_large_text(message: &str) -> bool {
         || message.contains("request too large")
         || message.contains("request exceeds the maximum size")
         || message.contains("exceeds the maximum size")
+        || message.contains("payload too large")
+        || message.contains("message too big")
+        || message.contains("close_code=size")
+        || message.contains("close code: size")
+        || message.contains("closecode::size")
+        || message.contains("1009")
         || message.contains("context_length_exceeded")
         || message.contains("maximum context length")
         || message.contains("context window")

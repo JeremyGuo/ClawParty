@@ -2534,6 +2534,8 @@ mod tests {
             cache_write: 2,
             uncache_input: 3,
             output: 4,
+            provider_type: None,
+            model_name: None,
             cost_usd: None,
         });
 

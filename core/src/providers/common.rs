@@ -153,6 +153,8 @@ pub(crate) fn token_usage_from_value(
         cache_write,
         uncache_input: input.saturating_sub(cache_read.saturating_add(cache_write)),
         output,
+        provider_type: Some(model_config.provider_type.clone()),
+        model_name: Some(model_config.model_name.clone()),
         cost_usd: None,
     };
     PriceManager::attach_cost(model_config, &mut token_usage);

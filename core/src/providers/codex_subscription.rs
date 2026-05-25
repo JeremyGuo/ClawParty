@@ -29,8 +29,8 @@ use crate::{
 
 use super::{
     common::{
-        account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
-        provider_error_kind, provider_error_message, token_usage_from_value,
+        account_id_from_access_token, is_image_file, nonce, provider_error_kind,
+        provider_error_message, token_usage_from_value,
     },
     OutputPersistor, ProviderBackend, ProviderCompactionMode, ProviderError, ProviderRequest,
     ProviderStreamEvent,
@@ -42,6 +42,7 @@ const CHATGPT_REFRESH_TOKEN_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OV
 const CODEX_MODELS_URL_OVERRIDE_ENV: &str = "STELLACLAW_CODEX_MODELS_URL";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+const CODEX_WEBSOCKET_MAX_PAYLOAD_BYTES: u64 = 15 * 1024 * 1024;
 const CODEX_PRAGMATIC_PERSONALITY_PROMPT: &str = r#"# Personality
 
 You are a deeply pragmatic, effective software engineer. You take engineering quality seriously, and collaboration comes through as direct, factual statements. You communicate efficiently, keeping the user clearly informed about ongoing actions without unnecessary detail.
@@ -64,6 +65,7 @@ pub struct CodexSubscriptionProvider {
     output_persistor: OutputPersistor,
     auth_manager: CodexSubscriptionAuthManager,
     socket: Mutex<Option<CachedCodexSocket>>,
+    incremental_context: Mutex<Option<CodexIncrementalContext>>,
     models_cache: Mutex<Option<CachedCodexModels>>,
     session_id: String,
     installation_id: String,
@@ -72,6 +74,13 @@ pub struct CodexSubscriptionProvider {
 struct CachedCodexSocket {
     window_id: String,
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexIncrementalContext {
+    request_without_input: Value,
+    baseline_input: Vec<Value>,
+    response_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -284,6 +293,7 @@ impl CodexSubscriptionProvider {
         initial_socket: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
         on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<Value, ProviderError> {
+        let request_payload = self.incremental_response_create_payload(payload.clone());
         let mut socket = initial_socket;
         let mut retried_transport_error = false;
 
@@ -301,7 +311,7 @@ impl CodexSubscriptionProvider {
             let attempt = if retried_transport_error { 2 } else { 1 };
             let response = send_response_create(
                 &mut active_socket,
-                payload.clone(),
+                request_payload.clone(),
                 model_config,
                 attempt,
                 2,
@@ -322,6 +332,10 @@ impl CodexSubscriptionProvider {
                 continue;
             }
 
+            if let Ok(response) = &response {
+                self.record_incremental_response_context(&payload, response);
+            }
+
             return response;
         }
     }
@@ -329,6 +343,64 @@ impl CodexSubscriptionProvider {
     fn clear_socket(&self) {
         let mut cached = self.socket.lock().expect("mutex poisoned");
         *cached = None;
+    }
+
+    fn incremental_response_create_payload(
+        &self,
+        payload: Map<String, Value>,
+    ) -> Map<String, Value> {
+        let Some(input) = response_create_input_items(&payload) else {
+            return payload;
+        };
+        let request_without_input = response_create_request_without_input(&payload);
+        let Some(context) = self
+            .incremental_context
+            .lock()
+            .expect("mutex poisoned")
+            .clone()
+        else {
+            return payload;
+        };
+        if context.request_without_input != request_without_input {
+            return payload;
+        }
+        if !value_slice_starts_with(&input, &context.baseline_input) {
+            return payload;
+        }
+
+        let mut incremental = payload;
+        incremental.insert(
+            "input".to_string(),
+            Value::Array(input[context.baseline_input.len()..].to_vec()),
+        );
+        incremental.insert(
+            "previous_response_id".to_string(),
+            Value::String(context.response_id),
+        );
+        incremental
+    }
+
+    fn record_incremental_response_context(&self, payload: &Map<String, Value>, response: &Value) {
+        let Some(response_id) = response_id_from_event(response) else {
+            *self.incremental_context.lock().expect("mutex poisoned") = None;
+            return;
+        };
+        let Some(mut baseline_input) = response_create_input_items(payload) else {
+            *self.incremental_context.lock().expect("mutex poisoned") = None;
+            return;
+        };
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            baseline_input.extend(
+                output
+                    .iter()
+                    .filter_map(canonical_response_output_item_for_input),
+            );
+        }
+        *self.incremental_context.lock().expect("mutex poisoned") = Some(CodexIncrementalContext {
+            request_without_input: response_create_request_without_input(payload),
+            baseline_input,
+            response_id,
+        });
     }
 
     fn compact_history_once(
@@ -491,6 +563,7 @@ impl Default for CodexSubscriptionProvider {
             output_persistor: OutputPersistor,
             auth_manager: CodexSubscriptionAuthManager::default(),
             socket: Mutex::new(None),
+            incremental_context: Mutex::new(None),
             models_cache: Mutex::new(None),
             session_id,
             installation_id,
@@ -1090,7 +1163,7 @@ fn send_response_create(
     request.extend(payload);
 
     let body = Value::Object(request).to_string();
-    ensure_request_payload_size(model_config, "codex_subscription websocket", body.len())?;
+    ensure_codex_websocket_payload_size(model_config, body.len())?;
     let mut diagnostics = CodexWebSocketDiagnostics::new(&body, attempt, max_attempts);
 
     socket.send(Message::Text(body.into())).map_err(|error| {
@@ -1266,6 +1339,105 @@ fn send_response_create(
             )));
         }
     }
+}
+
+fn ensure_codex_websocket_payload_size(
+    model_config: &ModelConfig,
+    payload_bytes: usize,
+) -> Result<(), ProviderError> {
+    let websocket_limit = model_config
+        .max_request_size_bytes()
+        .min(CODEX_WEBSOCKET_MAX_PAYLOAD_BYTES);
+    if payload_bytes as u64 <= websocket_limit {
+        return Ok(());
+    }
+    let message = format!(
+        "codex_subscription websocket request payload too large before send: serialized payload is {payload_bytes} bytes, websocket max is {websocket_limit} bytes"
+    );
+    Err(ProviderError::ProviderFailure {
+        kind: super::ProviderFailureKind::RequestTooLarge,
+        message: message.clone(),
+        body: message,
+    })
+}
+
+fn response_create_input_items(payload: &Map<String, Value>) -> Option<Vec<Value>> {
+    payload.get("input")?.as_array().cloned()
+}
+
+fn response_create_request_without_input(payload: &Map<String, Value>) -> Value {
+    let mut request = payload.clone();
+    request.remove("input");
+    Value::Object(request)
+}
+
+fn canonical_response_output_item_for_input(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str)? {
+        "message" if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(canonical_assistant_content_item_for_input)
+                .collect::<Vec<_>>();
+            (!content.is_empty()).then(|| {
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content,
+                })
+            })
+        }
+        "reasoning" => {
+            let encrypted_content = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|content| !content.is_empty())?;
+            Some(json!({
+                "type": "reasoning",
+                "summary": item.get("summary").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+                "encrypted_content": encrypted_content,
+            }))
+        }
+        "function_call" => {
+            let mut output = Map::new();
+            output.insert(
+                "type".to_string(),
+                Value::String("function_call".to_string()),
+            );
+            for field in ["name", "arguments", "call_id", "id"] {
+                if let Some(value) = item.get(field) {
+                    output.insert(field.to_string(), value.clone());
+                }
+            }
+            Some(Value::Object(output))
+        }
+        _ => Some(item.clone()),
+    }
+}
+
+fn canonical_assistant_content_item_for_input(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str)? {
+        "output_text" | "text" | "refusal" => {
+            let text = item.get("text").and_then(Value::as_str)?;
+            (!text.is_empty()).then(|| {
+                json!({
+                    "type": "output_text",
+                    "text": text,
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+fn value_slice_starts_with(values: &[Value], prefix: &[Value]) -> bool {
+    values.len() >= prefix.len()
+        && values
+            .iter()
+            .zip(prefix.iter())
+            .take(prefix.len())
+            .all(|(value, expected)| value == expected)
 }
 
 #[derive(Debug)]
@@ -3342,6 +3514,73 @@ mod tests {
         assert!(message.contains("last_response_id=resp_1"));
         assert!(message.contains("last_item_id=item_1"));
         assert!(message.contains("close_reason=<empty>"));
+    }
+
+    #[test]
+    fn websocket_size_close_is_request_too_large() {
+        let error = ProviderError::WebSocket(
+            "codex websocket closed before response.completed; close_code=Size; payload_bytes=16844770"
+                .to_string(),
+        );
+
+        assert!(error.is_request_too_large());
+    }
+
+    #[test]
+    fn codex_incremental_payload_sends_only_suffix_after_response_id() {
+        let provider = CodexSubscriptionProvider::default();
+        let first_input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        })];
+        let assistant_output = json!({
+            "type": "message",
+            "role": "assistant",
+            "id": "msg_1",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi"}],
+        });
+        let canonical_assistant_output = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        });
+        let mut first_payload = Map::new();
+        first_payload.insert("model".to_string(), Value::String("gpt-test".to_string()));
+        first_payload.insert("input".to_string(), Value::Array(first_input.clone()));
+        first_payload.insert("stream".to_string(), Value::Bool(true));
+        provider.record_incremental_response_context(
+            &first_payload,
+            &json!({
+                "id": "resp_1",
+                "output": [assistant_output.clone()],
+            }),
+        );
+
+        let suffix = json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "ok",
+        });
+        let mut second_input = first_input;
+        second_input.push(canonical_assistant_output);
+        second_input.push(suffix.clone());
+        let mut second_payload = first_payload;
+        second_payload.insert("input".to_string(), Value::Array(second_input));
+
+        let incremental = provider.incremental_response_create_payload(second_payload);
+
+        assert_eq!(
+            incremental
+                .get("previous_response_id")
+                .and_then(Value::as_str),
+            Some("resp_1")
+        );
+        assert_eq!(
+            incremental.get("input").and_then(Value::as_array),
+            Some(&vec![suffix])
+        );
     }
 
     #[test]

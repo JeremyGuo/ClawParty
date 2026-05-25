@@ -19,7 +19,34 @@ pub struct TokenUsage {
     pub uncache_input: u64,
     pub output: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<ProviderType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<TokenUsageCost>,
+}
+
+impl TokenUsage {
+    pub fn context_tokens(&self) -> u64 {
+        self.cache_read
+            .saturating_add(self.cache_write)
+            .saturating_add(self.uncache_input)
+            .saturating_add(self.output)
+    }
+
+    pub(crate) fn matches_model_config(
+        &self,
+        provider_type: &ProviderType,
+        model_name: &str,
+    ) -> bool {
+        self.provider_type.as_ref() == Some(provider_type)
+            && self.model_name.as_deref() == Some(model_name)
+    }
+
+    pub(crate) fn clear_context_model(&mut self) {
+        self.provider_type = None;
+        self.model_name = None;
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -772,6 +799,8 @@ mod tests {
             cache_write: 2,
             uncache_input: 20,
             output: 30,
+            provider_type: Some(ProviderType::CodexSubscription),
+            model_name: Some("gpt-test".to_string()),
             cost_usd: Some(TokenUsageCost {
                 cache_read: 0.001,
                 cache_write: 0.002,
@@ -786,6 +815,8 @@ mod tests {
         assert!(json.get("user_name").is_none());
         assert!(json.get("message_time").is_none());
         assert_eq!(json["token_usage"]["cache_read"], 10);
+        assert_eq!(json["token_usage"]["provider_type"], "codex_subscription");
+        assert_eq!(json["token_usage"]["model_name"], "gpt-test");
         assert_eq!(json["token_usage"]["cost_usd"]["output"], 0.004);
         assert_eq!(json["data"][1]["type"], "tool_result");
         assert_eq!(

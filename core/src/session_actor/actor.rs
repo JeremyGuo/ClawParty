@@ -14,7 +14,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     huggingface::HuggingFaceFileResolver,
-    model_config::ModelConfig,
+    model_config::{ModelConfig, ProviderType},
     providers::{
         request_too_large_text, Provider, ProviderError, ProviderEvent, ProviderFailureKind,
         ProviderRequestOwned, ProviderSession, ProviderStreamEvent,
@@ -75,6 +75,7 @@ pub struct SessionActor {
     tool_catalog: ToolCatalog,
     history: Vec<ChatMessage>,
     all_messages: Vec<ChatMessage>,
+    provider_context: Option<ProviderRequestOwned>,
     initial: Option<SessionInitial>,
     active_provider_request: Option<ActiveProviderRequest>,
     active_tool_batch: Option<ActiveToolBatch>,
@@ -264,6 +265,7 @@ impl SessionActor {
             tool_catalog,
             history: Vec::new(),
             all_messages: Vec::new(),
+            provider_context: None,
             initial: None,
             active_provider_request: None,
             active_tool_batch: None,
@@ -671,6 +673,7 @@ impl SessionActor {
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
+            clear_context_model_token_usage(&mut self.history);
             self.persist_state_if_history_closed("manual_compaction")?;
         }
         self.log_info(
@@ -1323,6 +1326,14 @@ impl SessionActor {
                 )? {
                     continue;
                 }
+                if self.prune_history_after_request_too_large(
+                    "provider_request_preflight",
+                    Some(&turn_id),
+                    Some(step_index),
+                    &error,
+                )? {
+                    continue;
+                }
                 return Err(SessionActorError::provider_preflight(error));
             }
 
@@ -1342,8 +1353,9 @@ impl SessionActor {
                 image_edit_mask: None,
                 image_size: None,
             };
+            self.sync_provider_context(request)?;
             self.provider
-                .start(request_id.clone(), request)
+                .start_current(request_id.clone())
                 .map_err(SessionActorError::from_provider_error)?;
             let now = Instant::now();
             self.last_provider_request_started_at = Some(now);
@@ -1743,6 +1755,18 @@ impl SessionActor {
                     {
                         let next_attempt = active.request_too_large_attempts.saturating_add(1);
                         if self.compact_history_after_request_too_large(
+                            "provider_request",
+                            Some(&active.turn_id),
+                            Some(active.step_index),
+                            &error.to_string(),
+                        )? {
+                            self.start_provider_request(
+                                active.turn_id,
+                                active.turn_number,
+                                active.step_index,
+                                next_attempt,
+                            )?;
+                        } else if self.prune_history_after_request_too_large(
                             "provider_request",
                             Some(&active.turn_id),
                             Some(active.step_index),
@@ -2167,6 +2191,7 @@ impl SessionActor {
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
+            clear_context_model_token_usage(&mut self.history);
         }
         self.persist_state_if_history_closed(phase)?;
         self.log_info(
@@ -2611,6 +2636,7 @@ impl SessionActor {
                 if report.compressed {
                     self.runtime_metadata_state
                         .promote_notified_components_to_system_snapshot();
+                    clear_context_model_token_usage(&mut self.history);
                     self.persist_state_if_history_closed("request_too_large_compaction")?;
                 }
                 self.emit(SessionEvent::CompactCompleted {
@@ -2654,10 +2680,44 @@ impl SessionActor {
         let Some(estimator) = self.token_estimator.as_ref() else {
             return Ok(None);
         };
+        if let Some(cached_estimate) = cached_context_token_estimate(
+            messages,
+            &self.model_config.provider_type,
+            &self.model_config.model_name,
+            estimator,
+        )? {
+            return Ok(Some(cached_estimate));
+        }
         let estimate = estimator
-            .estimate(messages)
+            .estimate_normalized(messages)
             .map_err(|error| SessionActorError::Compression(error.to_string()))?;
         Ok(Some(estimate))
+    }
+
+    fn sync_provider_context(
+        &mut self,
+        request: ProviderRequestOwned,
+    ) -> Result<(), SessionActorError> {
+        if let Some(existing) = self.provider_context.as_ref() {
+            if provider_request_envelope_matches(existing, &request)
+                && request.messages.starts_with(&existing.messages)
+            {
+                let appended = request.messages[existing.messages.len()..].to_vec();
+                if !appended.is_empty() {
+                    self.provider
+                        .append(appended)
+                        .map_err(SessionActorError::from_provider_error)?;
+                }
+                self.provider_context = Some(request);
+                return Ok(());
+            }
+        }
+
+        self.provider
+            .set(request.clone())
+            .map_err(SessionActorError::from_provider_error)?;
+        self.provider_context = Some(request);
+        Ok(())
     }
 
     fn log_info(&self, event: &str, data: serde_json::Value) {
@@ -3247,6 +3307,59 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn compression_error_is_request_too_large(error: &CompressionError) -> bool {
     request_too_large_text(&error.to_string())
+}
+
+fn cached_context_token_estimate(
+    messages: &[ChatMessage],
+    provider_type: &ProviderType,
+    model_name: &str,
+    estimator: &TokenEstimator,
+) -> Result<Option<TokenEstimate>, SessionActorError> {
+    let Some((last_usage_index, token_usage)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let usage = message.token_usage.as_ref()?;
+                usage
+                    .matches_model_config(provider_type, model_name)
+                    .then_some((index, usage))
+            })
+    else {
+        return Ok(None);
+    };
+    let suffix = messages.get(last_usage_index + 1..).unwrap_or(&[]);
+    let suffix_estimate = estimator
+        .estimate_normalized(suffix)
+        .map_err(|error| SessionActorError::Compression(error.to_string()))?;
+    let total_tokens = token_usage
+        .context_tokens()
+        .saturating_add(suffix_estimate.total_tokens);
+    Ok(Some(TokenEstimate {
+        text_tokens: total_tokens,
+        multimodal_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens,
+    }))
+}
+
+fn provider_request_envelope_matches(
+    left: &ProviderRequestOwned,
+    right: &ProviderRequestOwned,
+) -> bool {
+    left.system_prompt == right.system_prompt
+        && left.tools == right.tools
+        && left.image_edit_mask == right.image_edit_mask
+        && left.image_size == right.image_size
+}
+
+fn clear_context_model_token_usage(messages: &mut [ChatMessage]) {
+    for message in messages {
+        if let Some(token_usage) = message.token_usage.as_mut() {
+            token_usage.clear_context_model();
+        }
+    }
 }
 
 fn append_phase_should_defer_compression(phase: &str) -> bool {

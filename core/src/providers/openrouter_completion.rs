@@ -730,6 +730,8 @@ fn convert_openrouter_response(
             cache_write: 0,
             uncache_input: usage.prompt_tokens.saturating_sub(cached),
             output: usage.completion_tokens,
+            provider_type: Some(model_config.provider_type.clone()),
+            model_name: Some(model_config.model_name.clone()),
             cost_usd: None,
         };
         PriceManager::attach_cost(model_config, &mut token_usage);
