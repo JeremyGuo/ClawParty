@@ -3,6 +3,9 @@ version: 1.31.17
 
 # 1.31.17
 
+- 重构 StellaCodeX Electron chat transcript 渲染：
+  Chat 面板移除基于估算高度的虚拟窗口和可见条目测量缓存，改为稳定的完整 transcript DOM 流；滚动逻辑只保留会话恢复、加载更早消息时的 prepend 补偿、贴底和用户滚动保护，避免长 Markdown / 工具卡高度修正导致 scrollbar 和内容跳动。随后针对长页面滚动性能做补偿优化：历史消息操作回调改为稳定引用，durable message render signature 增加缓存，`displayMessages` 的展示 clone 保持对象身份稳定，并把滚动位置记忆合并到 animation frame；切换 session 前会 flush 当前 session 的待写滚动状态，恢复目标 session 时等消息内容足够高再消费 pending scroll restore，避免过早 clamp 到底部。整体减少 streaming / 状态更新时历史 Markdown 重新解析和 scroll handler 开销。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 改进 provider 上下文和 Codex subscription 增量请求：
   `ProviderSession` 现在维护 current context，支持 `set` 覆盖上下文、`append` 追加消息和 `start_current` 启动当前上下文；`SessionActor` 在初始化、压缩后或上下文不再是前缀时走 `set`，普通 provider history 前缀增长时只追加 suffix。Codex subscription backend 会维护上次成功响应的 `response_id` 和输入基线，后续请求可通过 `previous_response_id` 只发送新增 input，worker 丢失或上下文不匹配时自动回到全量发送。Codex websocket payload 预检按 15MiB 上限提前转成 `request_too_large`，WebSocket `close_code=Size` 也会归类为 request-too-large；request-too-large 重试会先压缩，压缩不可用或无效时再从当前上下文前部裁剪闭合消息后重试。`TokenUsage` 记录报告它的 provider/model，当前上下文估算可从最后一个同 provider/model usage 加增量估计开始；压缩后的 current history 会清掉这些 provider/model 标记，避免误用压缩前基线。本次不改变 `config` schema，不改变 `workdir` schema。
 

@@ -1517,18 +1517,12 @@ button {
   flex-direction: column;
 }
 
-.virtual-entry {
+.transcript-entry {
   display: flex;
   width: 100%;
   min-width: 0;
   flex: 0 0 auto;
   flex-direction: column;
-}
-
-.virtual-transcript-spacer {
-  flex: 0 0 auto;
-  min-height: 0;
-  pointer-events: none;
 }
 
 .empty-chat {
@@ -1646,11 +1640,11 @@ button {
   margin-top: 4px;
 }
 
-.virtual-entry:has(> .message.user):has(+ .pending-assistant-placeholder) > .message.user {
+.transcript-entry:has(> .message.user):has(+ .pending-assistant-placeholder) > .message.user {
   margin-bottom: 10px;
 }
 
-.virtual-entry:has(> .message.user):has(+ .pending-assistant-placeholder) .message-actions.user {
+.transcript-entry:has(> .message.user):has(+ .pending-assistant-placeholder) .message-actions.user {
   margin-top: 4px;
 }
 

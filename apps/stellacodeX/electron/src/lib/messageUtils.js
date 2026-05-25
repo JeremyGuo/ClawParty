@@ -3,6 +3,8 @@ import { messageText } from './fileUtils';
 const messageItemsCache = new WeakMap();
 const splitMessageForDisplayCache = new WeakMap();
 const tokenUsageCache = new WeakMap();
+const auxiliaryDisplayMessageCache = new WeakMap();
+const forceSeparateDisplayMessageCache = new WeakMap();
 
 export function markerIndexes(value) {
   const indexes = new Set();
@@ -1050,7 +1052,7 @@ export function attachAuxiliaryMessages(messages) {
       return;
     }
     if (String(message?.role || '').toLowerCase() === 'user' && aux.length) {
-      result.push({ ...message, _auxiliary: aux });
+      result.push(auxiliaryDisplayMessage(message, aux));
       aux = [];
       return;
     }
@@ -1058,6 +1060,25 @@ export function attachAuxiliaryMessages(messages) {
   });
   result.push(...aux);
   return result;
+}
+
+function auxiliaryDisplayMessage(message, aux) {
+  if (!message || typeof message !== 'object') return { ...message, _auxiliary: aux };
+  const auxKey = aux.map((item, auxIndex) => messageKey(item, auxIndex)).join('\u001f');
+  const cached = auxiliaryDisplayMessageCache.get(message);
+  if (cached?.auxKey === auxKey) return cached.message;
+  const clone = { ...message, _auxiliary: aux };
+  auxiliaryDisplayMessageCache.set(message, { auxKey, message: clone });
+  return clone;
+}
+
+function forceSeparateDisplayMessage(message) {
+  if (!message || typeof message !== 'object') return { ...message, _forceSeparate: true };
+  const cached = forceSeparateDisplayMessageCache.get(message);
+  if (cached) return cached;
+  const clone = { ...message, _forceSeparate: true };
+  forceSeparateDisplayMessageCache.set(message, clone);
+  return clone;
 }
 
 export function displayMessages(messages) {
@@ -1082,7 +1103,7 @@ export function displayMessages(messages) {
       index = cursor - 1;
       continue;
     }
-    result.push(forceSeparateNext ? { ...message, _forceSeparate: true } : message);
+    result.push(forceSeparateNext ? forceSeparateDisplayMessage(message) : message);
     forceSeparateNext = false;
   }
   return result;
