@@ -345,6 +345,82 @@ impl Provider for RequestTooLargeThenOkProvider {
     }
 }
 
+struct RepeatedRequestTooLargeProvider {
+    model_config: ModelConfig,
+    normal_calls: Mutex<usize>,
+    compression_calls: Mutex<usize>,
+    normal_message_counts: Mutex<Vec<usize>>,
+}
+
+impl RepeatedRequestTooLargeProvider {
+    fn new() -> Self {
+        Self {
+            model_config: test_model_config(),
+            normal_calls: Mutex::new(0),
+            compression_calls: Mutex::new(0),
+            normal_message_counts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Provider for RepeatedRequestTooLargeProvider {
+    fn model_config(&self) -> &ModelConfig {
+        &self.model_config
+    }
+
+    fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
+        if provider_request_contains_text(&request, "Return strict JSON only") {
+            *self.compression_calls.lock().unwrap() += 1;
+            return Ok(ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: compression_response("compressed once"),
+                })],
+            ));
+        }
+
+        self.normal_message_counts
+            .lock()
+            .unwrap()
+            .push(request.messages.len());
+        let mut normal_calls = self.normal_calls.lock().unwrap();
+        *normal_calls += 1;
+        if *normal_calls <= 2 {
+            return Err(ProviderError::HttpStatus {
+                url: "https://example.invalid/chat".to_string(),
+                status: 413,
+                body: r#"{"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#
+                    .to_string(),
+            });
+        }
+
+        Ok(ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "recovered after pruning".to_string(),
+            })],
+        ))
+    }
+}
+
+fn provider_request_contains_text(request: &ProviderRequest<'_>, needle: &str) -> bool {
+    request.messages.iter().any(|message| {
+        message.data.iter().any(|item| match item {
+            ChatMessageItem::Context(context) => context.text.contains(needle),
+            ChatMessageItem::ToolCall(tool_call) => tool_call.arguments.text.contains(needle),
+            ChatMessageItem::ToolResult(tool_result) => {
+                tool_result_text(tool_result).contains(needle)
+            }
+            ChatMessageItem::Compaction(compaction) => compaction
+                .generic_summary_text()
+                .is_some_and(|text| text.contains(needle)),
+            ChatMessageItem::File(_)
+            | ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::SelectionReference(_) => false,
+        })
+    })
+}
+
 struct TransientThenOkProvider {
     model_config: ModelConfig,
     failures_remaining: Mutex<usize>,
@@ -1206,6 +1282,65 @@ fn request_too_large_provider_error_compacts_history_and_retries() {
         event,
         SessionEvent::CompactCompleted { compressed, .. } if *compressed
     )));
+    assert!(matches!(
+        events.events.lock().unwrap().last(),
+        Some(SessionEvent::TurnCompleted { .. })
+    ));
+}
+
+#[test]
+fn repeated_request_too_large_prunes_after_one_compaction_attempt() {
+    let _cwd = temp_cwd("actor-request-too-large-prune-after-compact");
+    let (inbox, mailbox) = test_inbox();
+    let mut initial = SessionInitial::new(
+        test_session_id("session_request_too_large_prune"),
+        super::super::SessionType::Foreground,
+    );
+    initial.compression_threshold_tokens = Some(32);
+    initial.compression_retain_recent_tokens = Some(4);
+    mailbox.append(
+        SessionMailboxKind::Control,
+        SessionRequest::Initial { initial },
+    );
+    let events = Arc::new(MemoryEventSink::default());
+    let provider = Arc::new(RepeatedRequestTooLargeProvider::new());
+    let tools = Arc::new(EchoToolExecutor::new());
+    let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+    let mut actor = SessionActor::new(
+        test_model_config(),
+        provider.clone(),
+        tools,
+        inbox,
+        events.clone(),
+        catalog,
+    );
+    actor.run_until_idle(2).expect("initial should apply");
+    actor.history = (0..12)
+        .map(|index| {
+            let role = if index % 2 == 0 {
+                ChatRole::User
+            } else {
+                ChatRole::Assistant
+            };
+            text_message(role, &format!("message {index}"))
+        })
+        .collect();
+    actor.all_messages = actor.history.clone();
+    let original_len = actor.history.len();
+
+    actor
+        .start_provider_request("turn_retry".to_string(), 1, 0, 0)
+        .expect("request too large should start provider request");
+    actor
+        .run_until_idle(8)
+        .expect("repeated request too large should recover by pruning");
+
+    assert_eq!(*provider.compression_calls.lock().unwrap(), 1);
+    assert_eq!(*provider.normal_calls.lock().unwrap(), 3);
+    assert!(
+        actor.history().len() < original_len,
+        "history should be pruned after compression does not make the request acceptable"
+    );
     assert!(matches!(
         events.events.lock().unwrap().last(),
         Some(SessionEvent::TurnCompleted { .. })
@@ -2215,7 +2350,7 @@ fn newer_user_message_interrupts_active_tool_batch_and_runs_next_turn() {
         .unwrap()
         .iter()
         .filter_map(|event| match event {
-            SessionEvent::TurnCompleted { message } => Some(message_text_for_test(message)),
+            SessionEvent::TurnCompleted { message, .. } => Some(message_text_for_test(message)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2392,7 +2527,7 @@ fn failed_tool_batch_closes_tool_calls_before_continuing_model_loop() {
         .unwrap()
         .iter()
         .filter_map(|event| match event {
-            SessionEvent::TurnCompleted { message } => Some(message_text_for_test(message)),
+            SessionEvent::TurnCompleted { message, .. } => Some(message_text_for_test(message)),
             _ => None,
         })
         .collect::<Vec<_>>();

@@ -1319,17 +1319,20 @@ impl SessionActor {
                         self.model_config.token_max_context
                     )));
                 }
+                let should_try_compaction = request_too_large_attempts == 0;
                 request_too_large_attempts += 1;
                 let error = format!(
                     "estimated provider request tokens {estimated_tokens} exceed model context {}",
                     self.model_config.token_max_context
                 );
-                if self.compact_history_after_request_too_large(
-                    "provider_request_preflight",
-                    Some(&turn_id),
-                    Some(step_index),
-                    &error,
-                )? {
+                if should_try_compaction
+                    && self.compact_history_after_request_too_large(
+                        "provider_request_preflight",
+                        Some(&turn_id),
+                        Some(step_index),
+                        &error,
+                    )?
+                {
                     continue;
                 }
                 if self.prune_history_after_request_too_large(
@@ -1802,12 +1805,14 @@ impl SessionActor {
                                 < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
                     {
                         let next_attempt = active.request_too_large_attempts.saturating_add(1);
-                        if self.compact_history_after_request_too_large(
-                            "provider_request",
-                            Some(&active.turn_id),
-                            Some(active.step_index),
-                            &error.to_string(),
-                        )? {
+                        if active.request_too_large_attempts == 0
+                            && self.compact_history_after_request_too_large(
+                                "provider_request",
+                                Some(&active.turn_id),
+                                Some(active.step_index),
+                                &error.to_string(),
+                            )?
+                        {
                             self.start_provider_request(
                                 active.turn_id,
                                 active.turn_number,
