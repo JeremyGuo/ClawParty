@@ -1,30 +1,43 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::Sender;
+use base64::{engine::general_purpose, Engine as _};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use reqwest::blocking::Client;
+use reqwest::blocking::{multipart, Client};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use stellaclaw_core::session_actor::{
-    ChatMessage, ChatMessageItem, ChatRole, FileItem, FileState, ToolCallItem,
+    ChatMessage, ChatMessageItem, ChatMessagePart, ChatRole, FileItem, FileState,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLogger};
+use crate::{
+    conversation_host::ConversationHostRuntime,
+    conversation_id_manager::ConversationIdManager,
+    conversation_metadata::WorkdirLayout,
+    logger::StellaclawLogger,
+    service_protos::{
+        channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
+        workspace::{WorkspaceFileEncoding, WorkspaceRequest, WorkspaceResponse, WorkspaceTarget},
+    },
+};
 
 use super::{
     types::{
         parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError,
-        OutgoingMessageAppended, OutgoingOptions, ProcessingState,
+        OutgoingMessageAppended, OutgoingOptions, OutgoingSessionStream, ProcessingState,
     },
     Channel,
 };
@@ -61,12 +74,16 @@ pub struct TelegramChannel {
     poll_interval_ms: u64,
     client: Client,
     workdir: PathBuf,
+    conversation_runtime: Option<Arc<ConversationHostRuntime>>,
+    progress_panels: Mutex<BTreeMap<String, TelegramProgressPanel>>,
     security_path: PathBuf,
     security: Mutex<SecurityState>,
 }
 
 impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
+    const MAX_OUTGOING_FILE_BYTES: usize = 48 * 1024 * 1024;
+    const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_millis(900);
 
     pub fn new(
         id: String,
@@ -76,6 +93,7 @@ impl TelegramChannel {
         poll_interval_ms: u64,
         admin_user_ids: Vec<i64>,
         workdir: &Path,
+        conversation_runtime: Arc<ConversationHostRuntime>,
     ) -> Result<Self> {
         let dir = workdir.join(".stellaclaw").join("channels").join(&id);
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -112,6 +130,8 @@ impl TelegramChannel {
             poll_interval_ms,
             client,
             workdir: workdir.to_path_buf(),
+            conversation_runtime: Some(conversation_runtime),
+            progress_panels: Mutex::new(BTreeMap::new()),
             security_path,
             security: Mutex::new(security),
         };
@@ -580,6 +600,390 @@ impl TelegramChannel {
         Ok(())
     }
 
+    fn send_progress_panel(&self, platform_chat_id: &str, text: &str) -> Result<i64> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        let payload = build_send_text_payload(platform_chat_id, rendered, None)?;
+        let message: TelegramSentMessage = self.call_api("sendMessage", &payload)?;
+        Ok(message.message_id)
+    }
+
+    fn edit_progress_panel(
+        &self,
+        platform_chat_id: &str,
+        message_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        let mut payload = json!({
+            "chat_id": platform_chat_id,
+            "message_id": message_id,
+            "text": rendered.text,
+            "disable_web_page_preview": true,
+        });
+        if !rendered.entities.is_empty() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "entities".to_string(),
+                    serde_json::to_value(rendered.entities)
+                        .context("failed to encode telegram entities")?,
+                );
+            }
+        }
+        let _: Value = self.call_api("editMessageText", &payload)?;
+        Ok(())
+    }
+
+    fn handle_progress_stream(&self, stream: &OutgoingSessionStream) -> Result<()> {
+        let event_type = stream.event.get("type").and_then(Value::as_str);
+        match event_type {
+            Some("turn_started") => self.start_progress_panel(stream),
+            Some("plan_updated") => self.update_progress_panel(
+                stream,
+                TelegramProgressUpdate {
+                    status: TelegramProgressStatus::Running,
+                    activity: Some("计划已更新".to_string()),
+                    plan: stream.event.get("plan").cloned(),
+                    force_edit: true,
+                    terminal: false,
+                },
+            ),
+            Some("stream_assistant_message_delta") => self.update_progress_panel(
+                stream,
+                TelegramProgressUpdate {
+                    status: TelegramProgressStatus::Running,
+                    activity: Some("正在整理回复".to_string()),
+                    plan: None,
+                    force_edit: false,
+                    terminal: false,
+                },
+            ),
+            Some("stream_tool_call_delta") => self.update_progress_panel(
+                stream,
+                TelegramProgressUpdate {
+                    status: TelegramProgressStatus::Running,
+                    activity: Some(render_tool_activity(&stream.event, "正在准备工具")),
+                    plan: None,
+                    force_edit: false,
+                    terminal: false,
+                },
+            ),
+            Some("stream_tool_result_done") => self.update_progress_panel(
+                stream,
+                TelegramProgressUpdate {
+                    status: TelegramProgressStatus::Running,
+                    activity: Some(render_tool_result_activity(&stream.event)),
+                    plan: None,
+                    force_edit: true,
+                    terminal: false,
+                },
+            ),
+            Some("turn_completed") => self.update_progress_panel(
+                stream,
+                TelegramProgressUpdate {
+                    status: TelegramProgressStatus::Completed,
+                    activity: Some("结果已生成".to_string()),
+                    plan: None,
+                    force_edit: true,
+                    terminal: true,
+                },
+            ),
+            Some("stream_error") => {
+                let terminal =
+                    stream.event.get("scope").and_then(Value::as_str) == Some("turn_failed");
+                self.update_progress_panel(
+                    stream,
+                    TelegramProgressUpdate {
+                        status: if terminal {
+                            TelegramProgressStatus::Failed
+                        } else {
+                            TelegramProgressStatus::Running
+                        },
+                        activity: stream
+                            .event
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(|error| format!("遇到错误: {error}")),
+                        plan: None,
+                        force_edit: true,
+                        terminal,
+                    },
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn start_progress_panel(&self, stream: &OutgoingSessionStream) -> Result<()> {
+        let Some(turn_id) = stream.event.get("turn_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let key = progress_panel_key(stream, turn_id);
+        let mut panel = TelegramProgressPanel {
+            message_id: 0,
+            started_at: Instant::now(),
+            last_edit_at: Instant::now(),
+            status: TelegramProgressStatus::Running,
+            activity: "开始处理当前 round".to_string(),
+            plan: stream.event.get("plan").cloned(),
+            last_rendered: String::new(),
+        };
+        let text = render_progress_panel(&panel);
+        let message_id = self.send_progress_panel(&stream.platform_chat_id, &text)?;
+        panel.message_id = message_id;
+        panel.last_rendered = text;
+        self.progress_panels
+            .lock()
+            .map_err(|_| anyhow!("telegram progress panel lock poisoned"))?
+            .insert(key, panel);
+        Ok(())
+    }
+
+    fn update_progress_panel(
+        &self,
+        stream: &OutgoingSessionStream,
+        update: TelegramProgressUpdate,
+    ) -> Result<()> {
+        let mut panels = self
+            .progress_panels
+            .lock()
+            .map_err(|_| anyhow!("telegram progress panel lock poisoned"))?;
+        let Some(key) = progress_panel_key_for_event(stream).or_else(|| {
+            let prefix = progress_panel_session_prefix(stream);
+            panels.keys().find(|key| key.starts_with(&prefix)).cloned()
+        }) else {
+            return Ok(());
+        };
+        let Some(panel) = panels.get_mut(&key) else {
+            return Ok(());
+        };
+        panel.status = update.status;
+        if let Some(activity) = update.activity {
+            if !activity.trim().is_empty() {
+                panel.activity = activity;
+            }
+        }
+        if update.plan.is_some() {
+            panel.plan = update.plan;
+        }
+        let now = Instant::now();
+        if !update.force_edit
+            && now.duration_since(panel.last_edit_at) < Self::MIN_PROGRESS_EDIT_INTERVAL
+        {
+            return Ok(());
+        }
+        let text = render_progress_panel(panel);
+        if text == panel.last_rendered {
+            return Ok(());
+        }
+        let message_id = panel.message_id;
+        panel.last_rendered = text.clone();
+        panel.last_edit_at = now;
+        if update.terminal {
+            panels.remove(&key);
+        }
+        drop(panels);
+        self.edit_progress_panel(&stream.platform_chat_id, message_id, &text)
+    }
+
+    fn send_attachment(
+        &self,
+        platform_chat_id: &str,
+        attachment: TelegramOutgoingAttachment,
+    ) -> Result<()> {
+        let field = if attachment
+            .media_type
+            .as_deref()
+            .is_some_and(|media_type| media_type.starts_with("image/"))
+        {
+            "photo"
+        } else {
+            "document"
+        };
+        let method = if field == "photo" {
+            "sendPhoto"
+        } else {
+            "sendDocument"
+        };
+        let mut part = multipart::Part::bytes(attachment.bytes).file_name(attachment.name);
+        if let Some(media_type) = attachment.media_type.as_deref() {
+            part = part
+                .mime_str(media_type)
+                .with_context(|| format!("invalid telegram attachment media type {media_type}"))?;
+        }
+        let form = multipart::Form::new()
+            .text("chat_id", platform_chat_id.to_string())
+            .part(field.to_string(), part);
+        let _: serde_json::Value = self.call_api_multipart(method, form)?;
+        Ok(())
+    }
+
+    fn collect_outgoing_attachments(
+        &self,
+        appended: &OutgoingMessageAppended,
+    ) -> Vec<TelegramOutgoingAttachment> {
+        let mut attachments = Vec::new();
+        let mut seen = Vec::<String>::new();
+        for item in &appended.message.data {
+            match item {
+                ChatMessageItem::Context(context) => {
+                    for target in markdown_link_targets(&context.text) {
+                        let key = format!("markdown:{target}");
+                        if seen.iter().any(|value| value == &key) {
+                            continue;
+                        }
+                        if let Some(attachment) =
+                            self.workspace_attachment_from_markdown_target(appended, &target)
+                        {
+                            seen.push(key);
+                            attachments.push(attachment);
+                        }
+                    }
+                }
+                ChatMessageItem::File(file) => {
+                    let key = format!("file:{}", file.uri);
+                    if seen.iter().any(|value| value == &key) {
+                        continue;
+                    }
+                    if let Some(attachment) =
+                        self.workspace_attachment_from_file_item(appended, file)
+                    {
+                        seen.push(key);
+                        attachments.push(attachment);
+                    }
+                }
+                ChatMessageItem::Compaction(_)
+                | ChatMessageItem::SelectionReference(_)
+                | ChatMessageItem::Reasoning(_)
+                | ChatMessageItem::ToolCall(_)
+                | ChatMessageItem::ToolResult(_) => {}
+            }
+        }
+        attachments
+    }
+
+    fn workspace_attachment_from_markdown_target(
+        &self,
+        appended: &OutgoingMessageAppended,
+        target: &str,
+    ) -> Option<TelegramOutgoingAttachment> {
+        let target = normalize_markdown_path(target);
+        if target.is_empty() || target.starts_with("attachment://") || has_external_scheme(&target)
+        {
+            return None;
+        }
+        let relative_path = safe_relative_path(&target)?;
+        let path = path_to_slash_string(&relative_path)?;
+        self.read_workspace_attachment(
+            &appended.conversation_id,
+            &path,
+            WorkspaceTarget::Auto,
+            None,
+        )
+    }
+
+    fn workspace_attachment_from_file_item(
+        &self,
+        appended: &OutgoingMessageAppended,
+        file: &FileItem,
+    ) -> Option<TelegramOutgoingAttachment> {
+        if file.state.is_some() {
+            return None;
+        }
+        let path = file_path_from_uri(&file.uri)?;
+        let root = WorkdirLayout::new(&self.workdir).conversation_root(&appended.conversation_id);
+        let root = fs::canonicalize(root).ok()?;
+        let path = fs::canonicalize(path).ok()?;
+        if !path.starts_with(&root) {
+            return None;
+        }
+        let relative_path = path.strip_prefix(&root).ok()?;
+        let relative = path_to_slash_string(relative_path)?;
+        let target = if is_local_overlay_path(relative_path) {
+            WorkspaceTarget::LocalOverlay
+        } else {
+            WorkspaceTarget::Auto
+        };
+        self.read_workspace_attachment(
+            &appended.conversation_id,
+            &relative,
+            target,
+            file.media_type.clone(),
+        )
+    }
+
+    fn read_workspace_attachment(
+        &self,
+        conversation_id: &str,
+        path: &str,
+        target: WorkspaceTarget,
+        media_type: Option<String>,
+    ) -> Option<TelegramOutgoingAttachment> {
+        let response = self.workspace_response_value(
+            conversation_id,
+            WorkspaceRequest::ReadFile {
+                path: path.to_string(),
+                target,
+                offset: None,
+                limit_bytes: Some(Self::MAX_OUTGOING_FILE_BYTES.saturating_add(1)),
+            },
+        )?;
+        let WorkspaceResponse::File {
+            name,
+            returned_bytes,
+            truncated,
+            encoding,
+            data,
+            ..
+        } = response
+        else {
+            return None;
+        };
+        if truncated || returned_bytes > Self::MAX_OUTGOING_FILE_BYTES {
+            return None;
+        }
+        let bytes = match encoding {
+            WorkspaceFileEncoding::Utf8 => data.into_bytes(),
+            WorkspaceFileEncoding::Base64 => general_purpose::STANDARD.decode(data).ok()?,
+        };
+        Some(TelegramOutgoingAttachment {
+            media_type: media_type.or_else(|| infer_media_type(Path::new(&name))),
+            name,
+            bytes,
+        })
+    }
+
+    fn workspace_response_value(
+        &self,
+        conversation_id: &str,
+        request: WorkspaceRequest,
+    ) -> Option<WorkspaceResponse> {
+        let runtime = self.conversation_runtime.as_ref()?;
+        runtime.ensure_conversation_started(conversation_id).ok()?;
+        let request_id = telegram_request_id();
+        let rx = runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::Workspace {
+                    request_id: request_id.clone(),
+                    request,
+                },
+            )
+            .ok()?;
+        wait_workspace_response(&rx, Duration::from_secs(30), &request_id).ok()
+    }
+
     fn save_security_state(&self) -> Result<()> {
         let security = self
             .security
@@ -711,6 +1115,34 @@ impl TelegramChannel {
             .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
     }
 
+    fn call_api_multipart<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        form: multipart::Form,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(self.method_url(method))
+            .multipart(form)
+            .send()
+            .with_context(|| format!("telegram API call {method} failed"))?;
+        let envelope = response
+            .json::<TelegramEnvelope<T>>()
+            .with_context(|| format!("telegram API {method} returned invalid JSON"))?;
+        if !envelope.ok {
+            return Err(anyhow!(
+                "telegram API {} failed: {}",
+                method,
+                envelope
+                    .description
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        envelope
+            .result
+            .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
+    }
+
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base_url, self.bot_token, method)
     }
@@ -748,14 +1180,25 @@ impl Channel for TelegramChannel {
     }
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
-        if appended.message.role != ChatRole::Assistant {
+        if !is_visible_telegram_assistant_message(appended) {
             return Ok(());
         }
         let text = render_chat_message(&appended.message);
-        if text.trim().is_empty() {
+        let attachments = self.collect_outgoing_attachments(appended);
+        if text.trim().is_empty() && attachments.is_empty() {
             return Ok(());
         }
-        self.send_text(&appended.platform_chat_id, &text, None)
+        if !text.trim().is_empty() {
+            self.send_text(&appended.platform_chat_id, &text, None)?;
+        }
+        for attachment in attachments {
+            self.send_attachment(&appended.platform_chat_id, attachment)?;
+        }
+        Ok(())
+    }
+
+    fn session_stream(&self, stream: &OutgoingSessionStream) -> Result<()> {
+        self.handle_progress_stream(stream)
     }
 
     fn spawn_ingress(
@@ -786,6 +1229,37 @@ struct TelegramAttachment {
     media_type: Option<String>,
 }
 
+struct TelegramOutgoingAttachment {
+    name: String,
+    media_type: Option<String>,
+    bytes: Vec<u8>,
+}
+
+struct TelegramProgressPanel {
+    message_id: i64,
+    started_at: Instant,
+    last_edit_at: Instant,
+    status: TelegramProgressStatus,
+    activity: String,
+    plan: Option<Value>,
+    last_rendered: String,
+}
+
+struct TelegramProgressUpdate {
+    status: TelegramProgressStatus,
+    activity: Option<String>,
+    plan: Option<Value>,
+    force_edit: bool,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramProgressStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
 impl TelegramAttachment {
     fn file_name(&self) -> String {
         if let Some(name) = self
@@ -811,6 +1285,11 @@ struct TelegramEnvelope<T> {
     result: Option<T>,
     #[serde(default)]
     description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSentMessage {
+    message_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,34 +1411,11 @@ fn render_chat_message(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.clone()),
-            ChatMessageItem::Compaction(compaction) => {
-                if let Some(text) = compaction.generic_summary_text() {
-                    parts.push(text.to_string());
-                }
-            }
-            ChatMessageItem::SelectionReference(selection) => {
-                parts.push(selection.to_prompt_text());
-            }
             ChatMessageItem::File(file) => parts.push(render_file_item(file)),
-            ChatMessageItem::Reasoning(_) => {}
-            ChatMessageItem::ToolCall(ToolCallItem {
-                tool_name,
-                arguments,
-                ..
-            }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
-            ChatMessageItem::ToolResult(tool_result) => {
-                let mut line = format!("[tool_result {}]", tool_result.tool_name);
-                let text = stellaclaw_core::session_actor::tool_result_text(tool_result);
-                if !text.trim().is_empty() {
-                    line.push('\n');
-                    line.push_str(&text);
-                }
-                for file in &tool_result.result.files {
-                    line.push('\n');
-                    line.push_str(&render_file_item(file));
-                }
-                parts.push(line);
-            }
+            ChatMessageItem::Compaction(_)
+            | ChatMessageItem::SelectionReference(_)
+            | ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::ToolCall(_) | ChatMessageItem::ToolResult(_) => {}
         }
     }
     if parts.is_empty() {
@@ -967,6 +1423,282 @@ fn render_chat_message(message: &ChatMessage) -> String {
     } else {
         parts.join("\n\n")
     }
+}
+
+fn is_visible_telegram_assistant_message(appended: &OutgoingMessageAppended) -> bool {
+    if appended.message.role != ChatRole::Assistant {
+        return false;
+    }
+    let message_part = appended
+        .message_part
+        .as_ref()
+        .or(appended.message.message_part.as_ref());
+    message_part == Some(&ChatMessagePart::FinalResponse)
+}
+
+fn progress_panel_key(stream: &OutgoingSessionStream, turn_id: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        stream.conversation_id, stream.session_id, turn_id
+    )
+}
+
+fn progress_panel_session_prefix(stream: &OutgoingSessionStream) -> String {
+    format!("{}:{}:", stream.conversation_id, stream.session_id)
+}
+
+fn progress_panel_key_for_event(stream: &OutgoingSessionStream) -> Option<String> {
+    if let Some(turn_id) = stream.event.get("turn_id").and_then(Value::as_str) {
+        return Some(progress_panel_key(stream, turn_id));
+    }
+    None
+}
+
+fn render_progress_panel(panel: &TelegramProgressPanel) -> String {
+    let mut lines = Vec::new();
+    match panel.status {
+        TelegramProgressStatus::Running => lines.push("**Stellaclaw 正在处理**".to_string()),
+        TelegramProgressStatus::Completed => lines.push("**Stellaclaw 已完成**".to_string()),
+        TelegramProgressStatus::Failed => lines.push("**Stellaclaw 处理失败**".to_string()),
+    }
+    lines.push(format!("状态: {}", progress_status_label(panel.status)));
+    lines.push(format!(
+        "耗时: {}",
+        format_elapsed(panel.started_at.elapsed())
+    ));
+    if !panel.activity.trim().is_empty() {
+        lines.push(format!("当前: {}", panel.activity.trim()));
+    }
+    if let Some(plan) = panel.plan.as_ref().and_then(render_plan_lines) {
+        lines.push(String::new());
+        lines.push("**计划**".to_string());
+        lines.extend(plan);
+    }
+    lines.join("\n")
+}
+
+fn progress_status_label(status: TelegramProgressStatus) -> &'static str {
+    match status {
+        TelegramProgressStatus::Running => "运行中",
+        TelegramProgressStatus::Completed => "完成",
+        TelegramProgressStatus::Failed => "失败",
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {seconds:02}s");
+    }
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    format!("{hours}h {minutes:02}m")
+}
+
+fn render_plan_lines(plan: &Value) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(explanation) = plan
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(explanation.to_string());
+    }
+    let items = plan.get("plan").and_then(Value::as_array)?;
+    for item in items.iter().take(8) {
+        let step = item
+            .get("step")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("未命名步骤");
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        lines.push(format!("{} {}", plan_status_marker(status), step));
+    }
+    if items.len() > 8 {
+        lines.push(format!("... 还有 {} 步", items.len().saturating_sub(8)));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
+}
+
+fn plan_status_marker(status: &str) -> &'static str {
+    match status {
+        "completed" => "[x]",
+        "in_progress" => "[>]",
+        _ => "[ ]",
+    }
+}
+
+fn render_tool_activity(event: &Value, prefix: &str) -> String {
+    event
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|tool| format!("{prefix}: {tool}"))
+        .unwrap_or_else(|| prefix.to_string())
+}
+
+fn render_tool_result_activity(event: &Value) -> String {
+    event
+        .get("tool_result")
+        .and_then(|value| value.get("tool_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|tool| format!("工具已返回: {tool}"))
+        .unwrap_or_else(|| "工具已返回".to_string())
+}
+
+fn wait_workspace_response(
+    rx: &Receiver<KernelChannelEvent>,
+    timeout: Duration,
+    request_id: &str,
+) -> Result<WorkspaceResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!("workspace request timed out"));
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(KernelChannelEvent::Workspace {
+                request_id: id,
+                response,
+            }) if id == request_id => return Ok(response),
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => return Err(anyhow!("workspace request timed out")),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("conversation event stream closed"));
+            }
+        }
+    }
+}
+
+fn telegram_request_id() -> String {
+    static NEXT_TELEGRAM_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT_TELEGRAM_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("telegram-workspace-{nanos:032x}{counter:016x}")
+}
+
+fn markdown_link_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("](") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        targets.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    targets
+}
+
+fn normalize_markdown_path(value: &str) -> String {
+    let value = value
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .split('?')
+        .next()
+        .unwrap_or(value)
+        .trim();
+    percent_decode(value)
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .replace("//", "/")
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn has_external_scheme(value: &str) -> bool {
+    let Some(index) = value.find(':') else {
+        return false;
+    };
+    value[..index]
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn safe_relative_path(value: &str) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn path_to_slash_string(path: &Path) -> Option<String> {
+    Some(path.to_string_lossy().replace('\\', "/")).filter(|value| !value.trim().is_empty())
+}
+
+fn is_local_overlay_path(path: &Path) -> bool {
+    path.components().next().is_some_and(
+        |component| matches!(component, Component::Normal(value) if value == ".stellaclaw"),
+    )
+}
+
+fn file_path_from_uri(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://")
+        .map(percent_decode)
+        .map(PathBuf::from)
 }
 
 fn render_file_item(file: &FileItem) -> String {
@@ -2695,14 +3427,42 @@ fn kind_label(kind: OutgoingAttachmentKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_send_text_payload, parse_conversation_control, parse_markdown_to_rich_document,
-        render_markdown_chunks_to_telegram_entities, render_rich_document_to_telegram_entities,
-        telegram_text_len, ChatAuthorization, SecurityState, TelegramChannel, TelegramChat,
-        TelegramMessage, TelegramMessageEntity, TelegramRenderedText, TelegramUser,
+        build_send_text_payload, is_visible_telegram_assistant_message, markdown_link_targets,
+        normalize_markdown_path, parse_conversation_control, parse_markdown_to_rich_document,
+        render_chat_message, render_markdown_chunks_to_telegram_entities, render_progress_panel,
+        render_rich_document_to_telegram_entities, safe_relative_path, telegram_text_len,
+        ChatAuthorization, SecurityState, TelegramChannel, TelegramChat, TelegramMessage,
+        TelegramMessageEntity, TelegramProgressPanel, TelegramProgressStatus, TelegramRenderedText,
+        TelegramUser,
     };
-    use crate::channels::types::{ConversationControl, OutgoingOption, OutgoingOptions};
+    use crate::channels::types::{
+        ConversationControl, OutgoingMessageAppended, OutgoingOption, OutgoingOptions,
+    };
     use crate::config::SandboxMode;
-    use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+    use stellaclaw_core::session_actor::{
+        ChatMessage, ChatMessageItem, ChatMessagePart, ChatRole, ContextItem, ToolCallItem,
+        ToolResultContent, ToolResultItem,
+    };
+
+    fn appended(message: ChatMessage) -> OutgoingMessageAppended {
+        OutgoingMessageAppended {
+            channel_id: "telegram-main".to_string(),
+            platform_chat_id: "42".to_string(),
+            conversation_id: "conversation".to_string(),
+            session_id: "main".to_string(),
+            index: 0,
+            turn_id: message.turn_id.clone(),
+            step_index: message.step_index,
+            message_part: message.message_part.clone(),
+            message,
+        }
+    }
 
     #[test]
     fn parses_model_control_commands() {
@@ -2782,6 +3542,8 @@ mod tests {
             poll_interval_ms: 250,
             client: reqwest::blocking::Client::new(),
             workdir: PathBuf::from("."),
+            conversation_runtime: None,
+            progress_panels: Mutex::new(BTreeMap::new()),
             security_path: PathBuf::from("/tmp/unused-security.json"),
             security: Mutex::new(SecurityState {
                 admin_user_ids: Vec::new(),
@@ -2819,6 +3581,122 @@ mod tests {
         assert!(bootstrapped);
         assert_eq!(channel.effective_admin_user_ids().unwrap(), vec![42]);
         assert!(channel.is_admin_private_chat(&message, 42));
+    }
+
+    #[test]
+    fn telegram_only_displays_final_assistant_messages() {
+        let final_message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "done".to_string(),
+            })],
+        )
+        .with_turn_metadata("turn_1", 1, ChatMessagePart::FinalResponse);
+        let preamble_message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Context(ContextItem {
+                    text: "I will inspect the project first.".to_string(),
+                }),
+                ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell_exec".to_string(),
+                    arguments: ContextItem {
+                        text: "{\"command\":\"rg foo\"}".to_string(),
+                    },
+                }),
+            ],
+        )
+        .with_turn_metadata("turn_1", 0, ChatMessagePart::ModelResponse);
+
+        assert!(is_visible_telegram_assistant_message(&appended(
+            final_message
+        )));
+        assert!(!is_visible_telegram_assistant_message(&appended(
+            preamble_message
+        )));
+    }
+
+    #[test]
+    fn telegram_render_omits_internal_tool_items() {
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Context(ContextItem {
+                    text: "final text".to_string(),
+                }),
+                ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell_exec".to_string(),
+                    arguments: ContextItem {
+                        text: "{\"command\":\"pwd\"}".to_string(),
+                    },
+                }),
+                ChatMessageItem::ToolResult(ToolResultItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell_exec".to_string(),
+                    result: ToolResultContent {
+                        structured: Some(serde_json::json!({
+                            "kind": "text_result",
+                            "text": "/tmp/work",
+                        })),
+                        files: Vec::new(),
+                    },
+                }),
+            ],
+        );
+
+        assert_eq!(render_chat_message(&message), "final text");
+    }
+
+    #[test]
+    fn telegram_extracts_local_markdown_attachment_targets() {
+        let targets = markdown_link_targets(
+            "see [report](./reports/final%20report.pdf) and ![plot](images/chart.png?raw=1)",
+        );
+
+        assert_eq!(
+            targets,
+            vec!["./reports/final%20report.pdf", "images/chart.png?raw=1"]
+        );
+        assert_eq!(
+            normalize_markdown_path(&targets[0]),
+            "reports/final report.pdf"
+        );
+        assert_eq!(normalize_markdown_path(&targets[1]), "images/chart.png");
+        assert!(safe_relative_path(&normalize_markdown_path(&targets[0])).is_some());
+        assert!(safe_relative_path("../secret.txt").is_none());
+    }
+
+    #[test]
+    fn telegram_progress_panel_renders_status_elapsed_and_plan() {
+        let panel = TelegramProgressPanel {
+            message_id: 1,
+            started_at: Instant::now() - Duration::from_secs(75),
+            last_edit_at: Instant::now(),
+            status: TelegramProgressStatus::Running,
+            activity: "正在准备工具: shell_exec".to_string(),
+            plan: Some(serde_json::json!({
+                "explanation": "先确认当前状态。",
+                "plan": [
+                    {"step": "Inspect event flow", "status": "completed"},
+                    {"step": "Restore Telegram progress panel", "status": "in_progress"},
+                    {"step": "Run focused tests", "status": "pending"}
+                ]
+            })),
+            last_rendered: String::new(),
+        };
+
+        let rendered = render_progress_panel(&panel);
+
+        assert!(rendered.contains("**Stellaclaw 正在处理**"));
+        assert!(rendered.contains("耗时: 1m"));
+        assert!(rendered.contains("当前: 正在准备工具: shell_exec"));
+        assert!(rendered.contains("[x] Inspect event flow"));
+        assert!(rendered.contains("[>] Restore Telegram progress panel"));
+        assert!(rendered.contains("[ ] Run focused tests"));
     }
 
     #[test]

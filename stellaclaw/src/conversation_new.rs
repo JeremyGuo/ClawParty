@@ -1756,6 +1756,9 @@ mod tests {
             ServiceAddr::channel_id("scratch"),
             AgentSessionEvent::MessageAppended {
                 index: 7,
+                turn_id: None,
+                step_index: None,
+                message_part: None,
                 message: agent_session::text_message(ChatRole::Assistant, "hello from session"),
             },
         )
@@ -2463,6 +2466,9 @@ mod tests {
             ServiceAddr::channel_id("scratch"),
             AgentSessionEvent::MessageAppended {
                 index: 1,
+                turn_id: None,
+                step_index: None,
+                message_part: None,
                 message: agent_session::text_message(ChatRole::Assistant, "wrong channel"),
             },
         )

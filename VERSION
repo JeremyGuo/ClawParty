@@ -1,10 +1,13 @@
-version: 1.31.20
+version: 1.31.21
 ---
 
-# 1.31.20
+# 1.31.21
 
 - 修复 provider 请求过大后的恢复循环：
   request-too-large 恢复现在对同一个 oversized provider request 只尝试一次上下文压缩；如果压缩后的重试仍然超过请求体限制，会立即走已有的闭合消息前缀裁剪兜底，避免压缩摘要反复追加导致 history / payload 越压越大，最终让会话看起来卡死。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Telegram channel 的 assistant 输出投影：
+  Telegram 不再展示中间 `ModelResponse` / preamble / tool call / tool result，只发送最终 `FinalResponse`；当前 round 会恢复为一条可编辑进度面板，显示运行状态、耗时、当前 activity 和 plan checklist，完成或失败后同一条面板会更新为最终耗时；最终回复中的本地 Markdown 图片/附件和 `FileItem` 会通过 Workspace service 读取数据，并按图片或文档发送到 Telegram。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.19
 

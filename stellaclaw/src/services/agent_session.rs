@@ -3647,6 +3647,9 @@ mod tests {
     #[test]
     fn maps_core_session_event_to_agent_session_event() {
         let event = CoreSessionEvent::TurnCompleted {
+            turn_id: "turn_1".to_string(),
+            final_message_id: None,
+            final_message_index: None,
             message: text_message(ChatRole::Assistant, "done"),
         };
 
@@ -3707,6 +3710,9 @@ mod tests {
             &mut current_plan,
             &CoreSessionEvent::MessageAppended {
                 index: 3,
+                turn_id: None,
+                step_index: None,
+                message_part: None,
                 message: text_message(ChatRole::Assistant, "hello"),
             },
         );
@@ -3748,6 +3754,9 @@ mod tests {
             &mut state,
             &mut current_plan,
             &CoreSessionEvent::TurnCompleted {
+                turn_id: "turn_1".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "done"),
             },
         );
@@ -3830,6 +3839,9 @@ mod tests {
             &mut state,
             &mut current_plan,
             &CoreSessionEvent::TurnCompleted {
+                turn_id: "turn_1".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "done"),
             },
         );
@@ -4537,6 +4549,9 @@ mod tests {
             &mut state,
             subagent_addr.clone(),
             AgentSessionEvent::TurnCompleted {
+                turn_id: "turn_1".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "done"),
             },
         )
@@ -4594,6 +4609,9 @@ mod tests {
             &mut state,
             background_addr.clone(),
             AgentSessionEvent::TurnCompleted {
+                turn_id: "turn_1".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "build passed"),
             },
         )
@@ -4773,6 +4791,9 @@ mod tests {
             &mut state,
             subagent_addr.clone(),
             AgentSessionEvent::TurnCompleted {
+                turn_id: "turn_1".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "done"),
             },
         )
@@ -4784,6 +4805,9 @@ mod tests {
             &mut state,
             subagent_addr.clone(),
             AgentSessionEvent::TurnCompleted {
+                turn_id: "turn_2".to_string(),
+                final_message_id: None,
+                final_message_index: None,
                 message: text_message(ChatRole::Assistant, "done again"),
             },
         )
