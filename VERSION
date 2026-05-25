@@ -1,5 +1,13 @@
-version: 1.31.18
+version: 1.31.19
 ---
+
+# 1.31.19
+
+- 修复 Codex subscription 增量上下文和图片 detail：
+  provider context 现在按 user turn 隔离复用，同一 turn 内继续 append 增量输入，跨 turn 或上下文 reset 时会清空底层 `previous_response_id` 状态；如果 Codex backend 返回 “Previous response ... not found”，会清空增量状态并用全量 payload 重试一次。Responses / OpenRouter 图片输入统一显式发送 `detail: "high"`，`image_view` 继续保持无质量参数，图片 token 估算沿用 Codex/OpenAI high-detail tile-grid 默认公式。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 发送消息和 Session 切换时的滚动跳转：
+  Chat 面板现在只在 Session restore 路径恢复历史 scrollTop，普通 stream/content/composer 更新不再复用过期坐标；发送消息会明确进入贴底模式并清除未完成的 pending restore，避免按回车后 scrollbar 跳到很靠前的位置。恢复非贴底 Session 时，如果目标位置暂时超出当前已加载内容高度，会先停在当前内容尾部并保留 pending restore，等历史内容补齐后再恢复精确位置。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.18
 

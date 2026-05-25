@@ -189,10 +189,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     markUserScrollIntent();
   }, [markUserScrollIntent]);
 
-  const userScrollInProgress = useCallback(() => (
-    Date.now() < userScrollIntentUntilRef.current
-  ), []);
-
   useRenderCommitPerf('chat.workspace.render_commit', renderStartedAt, () => ({
       messages: messages?.length || 0,
       entries: renderEntries.length,
@@ -297,16 +293,33 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!force && !stickyAutoScrollEnabled()) return;
     const list = scrollRef.current;
     if (!list) return;
-    list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    restoringScrollRef.current = true;
+    try {
+      list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      stickToBottomRef.current = true;
+      const state = {
+        scrollTop: list.scrollTop,
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        stickToBottom: true
+      };
+      lastScrollStateRef.current = state;
+      rememberChatScroll(activeMessageScope, state);
+    } finally {
+      finishProgrammaticScrollRestore();
+    }
+  };
+
+  const forceStickToBottomForOutgoingMessage = () => {
+    pendingScrollRestoreRef.current = null;
+    stickyScrollPausedUntilRef.current = 0;
+    userScrollIntentUntilRef.current = 0;
     stickToBottomRef.current = true;
-    const state = {
-      scrollTop: list.scrollTop,
-      scrollHeight: list.scrollHeight,
-      clientHeight: list.clientHeight,
-      stickToBottom: true
-    };
-    lastScrollStateRef.current = state;
-    rememberChatScroll(activeMessageScope, state);
+    scrollToBottom({ force: true });
+    requestAnimationFrame(() => {
+      scrollToBottom({ force: true });
+      requestAnimationFrame(() => scrollToBottom({ force: true }));
+    });
   };
 
   const captureScrollState = () => {
@@ -360,15 +373,24 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!list || !state) return false;
     const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
     if (!state.stickToBottom && Number(state.scrollTop || 0) > maxScrollTop + CHAT_BOTTOM_THRESHOLD_PX) {
+      restoringScrollRef.current = true;
+      try {
+        list.scrollTop = maxScrollTop;
+        stickToBottomRef.current = false;
+      } finally {
+        finishProgrammaticScrollRestore();
+      }
       return false;
     }
     restoringScrollRef.current = true;
     try {
       if (state.stickToBottom) {
         list.scrollTop = maxScrollTop;
+        stickToBottomRef.current = true;
         return true;
       }
       list.scrollTop = boundedScrollTop(list, state.scrollTop);
+      stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < CHAT_BOTTOM_THRESHOLD_PX;
       return true;
     } finally {
       finishProgrammaticScrollRestore();
@@ -383,10 +405,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       scrollToBottom({ force: true });
       return true;
     }
-    if (userScrollInProgress()) {
-      return false;
-    }
-    return restoreScrollState(state);
+    return false;
   };
 
   useLayoutEffect(() => {
@@ -506,8 +525,11 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const handleScroll = () => {
     const list = scrollRef.current;
     if (!list) return;
-    extendUserScrollIntentFromScroll();
     stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < CHAT_BOTTOM_THRESHOLD_PX;
+    if (restoringScrollRef.current || pendingScrollRestoreRef.current) {
+      return;
+    }
+    extendUserScrollIntentFromScroll();
     if (!restoringScrollRef.current) {
       rememberCurrentScrollSoon(activeMessageScope, captureScrollState());
     }
@@ -607,6 +629,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const value = draft;
     const attachments = composerAttachments;
     const selections = selectionReferences;
+    forceStickToBottomForOutgoingMessage();
     setDraft('');
     setComposerAttachments([]);
     const sent = await onSend?.(value, attachments.map(outgoingAttachmentPayload), selections);
@@ -617,6 +640,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       attachments.forEach((attachment) => {
         if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
       });
+      forceStickToBottomForOutgoingMessage();
     }
   };
 
