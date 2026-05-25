@@ -518,7 +518,7 @@ fn project_channel_event(
                     event: serde_json::to_value(event)?,
                 }));
             }
-            AgentSessionEvent::TurnCompleted { message, .. } => {
+            ref event @ AgentSessionEvent::TurnCompleted { ref message, .. } => {
                 events.push(ChannelEvent::Processing(OutgoingProcessing {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
@@ -543,12 +543,7 @@ fn project_channel_event(
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
                     session_id: service_addr_storage_component(&session_addr),
-                    event: serde_json::to_value(AgentSessionEvent::TurnCompleted {
-                        turn_id: String::new(),
-                        final_message_id: Some(message.message_id.clone()),
-                        final_message_index: None,
-                        message,
-                    })?,
+                    event: serde_json::to_value(event)?,
                 }));
             }
             AgentSessionEvent::TurnFailed {

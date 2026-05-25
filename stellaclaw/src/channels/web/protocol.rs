@@ -493,6 +493,12 @@ pub enum ChatEvent {
         foreground_session_id: String,
         message_index: usize,
         message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
         committed: bool,
         message: ChatMessage,
     },
@@ -506,12 +512,20 @@ pub enum ChatEvent {
         message: ChatMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
     },
     #[serde(rename = "chat.stream_tool_result_done")]
     StreamToolResultDone {
         conversation_id: String,
         foreground_session_id: String,
         turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
         batch_id: String,
         tool_result: ToolResultItem,
     },
@@ -532,6 +546,10 @@ pub enum ChatEvent {
         turn_id: String,
         in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         delta: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,6 +563,10 @@ pub enum ChatEvent {
         next_message_id: String,
         turn_id: String,
         in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -561,6 +583,10 @@ pub enum ChatEvent {
         turn_id: String,
         in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
     },
@@ -572,6 +598,10 @@ pub enum ChatEvent {
         next_message_id: String,
         turn_id: String,
         in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -586,6 +616,10 @@ pub enum ChatEvent {
         turn_id: String,
         in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_part: Option<ChatMessagePart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_index: Option<usize>,
@@ -596,6 +630,11 @@ pub enum ChatEvent {
     StreamTurnDone {
         conversation_id: String,
         foreground_session_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_message_index: Option<usize>,
         message: ChatMessage,
     },
     #[serde(rename = "chat.plan_updated")]
