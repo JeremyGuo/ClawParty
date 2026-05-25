@@ -178,6 +178,7 @@ export function isExecutionMessage(message) {
 export function isAssistantResponseMessage(message) {
   const part = messagePart(message);
   if (part) return part === 'final_response';
+  if (message?._streaming) return false;
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
   return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || item.text_with_attachment_markers || '').trim()));
 }
