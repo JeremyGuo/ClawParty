@@ -1,5 +1,20 @@
-version: 1.31.13
+version: 1.31.16
 ---
+
+# 1.31.16
+
+- 增强 Codex subscription websocket 失败诊断：
+  websocket send/read/close/timeout 错误现在会带上重试次数、elapsed、payload bytes、模型、input/tool 结构摘要、帧统计、progress event 数量和最后收到的 response/item/event id；SessionActor 向前端发送 `stream_error` / `turn_failed` 时保留 provider 级别 `error_detail`，避免只显示泛化错误或空 close reason。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.31.15
+
+- 改进 StellaCodeX Electron chat 虚拟高度测量：
+  chat 虚拟列表高度缓存现在按 viewport 宽度分桶，宽度或 word wrap 改变会自动使用新的测量缓存；虚拟窗口优先使用可见 entry 的 ResizeObserver 实测高度，并在新测量落地时恢复当前可见 anchor，减少长 Markdown 对话因估算修正造成的 scrollbar 跳动。工具卡展开详情限制为内部滚动，避免大 payload 改变外层虚拟列表高度。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.31.14
+
+- 修复 StellaCodeX Electron 文件预览卡死：
+  文件预览超过 3MB 时会在预览面板显示大文件提示；普通文件/PDF 预览加载超过 10 秒会停止并显示错误，后续晚到结果不会再覆盖 tab 状态。PDFium 文档打开超过 10 秒也会停止渲染并提示下载查看；预览组件同步渲染异常会回写为 tab 错误，避免文件预览面板长期停在加载或异常状态。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.13
 

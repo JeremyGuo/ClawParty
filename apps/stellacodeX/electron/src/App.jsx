@@ -1339,6 +1339,13 @@ function App() {
         onResolveMarkdownAsset={resolveMarkdownAsset}
         onCreateSelectionReference={addSelectionReference}
         onOpenFile={openWorkspaceFile}
+        onPreviewError={(file, error) => {
+          setOpenFiles((items) => items.map((item) => (
+            item.path === file?.path
+              ? { ...item, loading: false, error: `预览失败：${error?.message || '文件渲染异常'}` }
+              : item
+          )));
+        }}
         onCloseFile={(path) => {
           setOpenFiles((items) => {
             revokeFilePreviewUrls(items.filter((item) => item.path === path));

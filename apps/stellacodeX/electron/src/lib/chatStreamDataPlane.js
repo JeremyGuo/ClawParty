@@ -46,7 +46,9 @@ export function streamEventIndex(event) {
 }
 
 export function streamErrorText(event) {
-  return String(event?.error || event?.message || event?.error_detail || event?.errorDetail || '流式响应失败').trim();
+  const detail = event?.error_detail || event?.errorDetail;
+  const detailText = typeof detail === 'string' ? detail : detail?.reason;
+  return String(event?.error || event?.message || detailText || '流式响应失败').trim();
 }
 
 export function streamMessageIndexFromEvent(event) {

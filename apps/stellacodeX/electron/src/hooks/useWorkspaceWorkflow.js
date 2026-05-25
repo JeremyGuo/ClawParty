@@ -5,6 +5,8 @@ import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, worksp
 import { revokeFilePreviewUrls } from './useWorkspaceState';
 
 const PDF_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const PREVIEW_LARGE_FILE_BYTES = 3 * 1024 * 1024;
+const PREVIEW_LOAD_TIMEOUT_MS = 10_000;
 
 export function workspaceFileImageDataUrl(path, file) {
   const mime = imageMimeType(path);
@@ -46,6 +48,42 @@ function resolveWorkspaceAssetPath(markdownPath, rawSrc) {
   return normalizeWorkspacePath(parts.join('/'));
 }
 
+function entrySizeBytes(entry) {
+  const value = Number(entry?.size_bytes ?? entry?.size ?? entry?.file_size ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function formatPreviewBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb >= 10 ? 0 : 1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
+}
+
+function largeFilePreviewNotice(entry) {
+  const size = entrySizeBytes(entry);
+  if (size <= PREVIEW_LARGE_FILE_BYTES) return '';
+  return `文件较大（${formatPreviewBytes(size)}），正在准备预览；如果 10 秒内无法完成会自动停止。`;
+}
+
+function previewTimeoutError(path) {
+  const name = fileNameFromPath(path) || path || '文件';
+  return new Error(`预览 ${name} 超过 10 秒未完成，已停止。可以下载后查看。`);
+}
+
+function withPreviewTimeout(promise, path) {
+  let timer = 0;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(previewTimeoutError(path)), PREVIEW_LOAD_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) window.clearTimeout(timer);
+  });
+}
+
 export function useWorkspaceWorkflow({
   selected,
   selectedRef,
@@ -62,10 +100,29 @@ export function useWorkspaceWorkflow({
   writeWorkspaceResourceCache
 }) {
   const workspaceListingsRef = useRef(workspaceListings);
+  const previewRequestSeqRef = useRef(0);
+  const previewRequestByPathRef = useRef(new Map());
 
   useEffect(() => {
     workspaceListingsRef.current = workspaceListings;
   }, [workspaceListings]);
+
+  const beginPreviewRequest = useCallback((path) => {
+    const token = previewRequestSeqRef.current + 1;
+    previewRequestSeqRef.current = token;
+    previewRequestByPathRef.current.set(path, token);
+    return token;
+  }, []);
+
+  const previewRequestCurrent = useCallback((path, token) => {
+    return previewRequestByPathRef.current.get(path) === token;
+  }, []);
+
+  const finishPreviewRequest = useCallback((path, token) => {
+    if (previewRequestByPathRef.current.get(path) === token) {
+      previewRequestByPathRef.current.delete(path);
+    }
+  }, []);
 
   const fetchWorkspacePath = useCallback(async (path = '', options = {}) => {
     if (!selected) return null;
@@ -109,26 +166,32 @@ export function useWorkspaceWorkflow({
     const selectedConversationId = selected.conversationId;
     const conversationId = String(entry.conversationId || entry.conversation_id || selectedConversationId || '').trim();
     if (!conversationId) return;
+    const token = beginPreviewRequest(path);
+    const previewNotice = largeFilePreviewNotice(entry);
     if (!options.keepExistingPreview) {
       setOpenFiles((current) => current.map((item) => (
-        item.path === path ? { ...item, loading: true, error: '' } : item
+        item.path === path ? { ...item, loading: true, error: '', preview_notice: previewNotice } : item
       )));
     }
     try {
-      const preview = await window.stellacode2.previewWorkspace({
-        serverId,
-        conversationId,
-        path,
-        kind: 'file',
-        mediaType: 'application/pdf',
-        maxBytes: PDF_PREVIEW_MAX_BYTES,
-        suggestedName: entry.name || fileNameFromPath(path)
-      });
+      const preview = await withPreviewTimeout(
+        window.stellacode2.previewWorkspace({
+          serverId,
+          conversationId,
+          path,
+          kind: 'file',
+          mediaType: 'application/pdf',
+          maxBytes: PDF_PREVIEW_MAX_BYTES,
+          suggestedName: entry.name || fileNameFromPath(path)
+        }),
+        path
+      );
       const blob = new Blob([preview.data], { type: preview.mediaType || 'application/pdf' });
       const pdfUrl = URL.createObjectURL(blob);
       if (
         selectedRef.current?.serverId !== serverId
         || selectedRef.current?.conversationId !== selectedConversationId
+        || !previewRequestCurrent(path, token)
       ) {
         URL.revokeObjectURL(pdfUrl);
         return;
@@ -153,6 +216,7 @@ export function useWorkspaceWorkflow({
               pdf_url: pdfUrl,
               pdf_buffer: preview.data,
               preview_size: preview.size,
+              preview_notice: previewNotice,
               loaded_at: Date.now(),
               scroll_hint: options.scrollHint || item.scroll_hint,
               loading: false,
@@ -165,14 +229,17 @@ export function useWorkspaceWorkflow({
       if (
         selectedRef.current?.serverId !== serverId
         || selectedRef.current?.conversationId !== selectedConversationId
+        || !previewRequestCurrent(path, token)
       ) {
         return;
       }
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: false, error: error?.message || '读取 PDF 失败' } : item
       )));
+    } finally {
+      finishPreviewRequest(path, token);
     }
-  }, [selected, selectedRef, setOpenFiles]);
+  }, [selected, selectedRef, setOpenFiles, beginPreviewRequest, previewRequestCurrent, finishPreviewRequest]);
 
   const refreshPdfPreview = useCallback((entry, scrollHint) => {
     return loadPdfPreviewIntoTab(entry, { keepExistingPreview: true, scrollHint });
@@ -247,7 +314,13 @@ export function useWorkspaceWorkflow({
     }
     setOpenFiles((current) => {
       if (current.some((item) => item.path === path)) return current;
-      return [...current, { ...entry, path, kind: workspaceFileKind(entry), loading: true }];
+      return [...current, {
+        ...entry,
+        path,
+        kind: workspaceFileKind(entry),
+        loading: true,
+        preview_notice: largeFilePreviewNotice(entry)
+      }];
     });
     const initialKind = workspaceFileKind(path);
     if (initialKind === 'pdf') {
@@ -271,12 +344,18 @@ export function useWorkspaceWorkflow({
       )));
       return;
     }
+    const token = beginPreviewRequest(path);
     try {
-      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path, undefined, { force: true, cache: false });
+      const file = await withPreviewTimeout(
+        loadWorkspaceFileCached(selected.serverId, conversationId, path, undefined, { force: true, cache: false }),
+        path
+      );
+      if (!previewRequestCurrent(path, token)) return;
       const kind = workspaceFileKind(path);
       const data = kind === 'image'
         ? workspaceFileImageDataUrl(path, file)
         : file?.data || '';
+      const previewNotice = largeFilePreviewNotice({ ...entry, ...file });
       setOpenFiles((current) => current.map((item) => (
         item.path === path
           ? {
@@ -286,18 +365,24 @@ export function useWorkspaceWorkflow({
             language: fileExtension(path),
             content: file?.encoding === 'utf8' ? file.data || '' : '',
             data_url: kind === 'image' ? data : '',
+            preview_notice: previewNotice,
             loaded_at: Date.now(),
-            loading: false
+            loading: false,
+            error: ''
           }
           : item
       )));
+      finishPreviewRequest(path, token);
     } catch (error) {
+      if (!previewRequestCurrent(path, token)) return;
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
       )));
       if (options.throwOnError) throw error;
+    } finally {
+      finishPreviewRequest(path, token);
     }
-  }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached, setActiveFilePath, setOpenFiles, setPreviewPanelOpen, setWorkspaceListings]);
+  }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached, setActiveFilePath, setOpenFiles, setPreviewPanelOpen, setWorkspaceListings, beginPreviewRequest, previewRequestCurrent, finishPreviewRequest]);
 
   const openWorkspacePathTarget = useCallback(async (target) => {
     if (!selected || target?.path === undefined || target?.path === null) return;

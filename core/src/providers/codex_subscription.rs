@@ -298,8 +298,15 @@ impl CodexSubscriptionProvider {
                     &identity.window_id,
                 )?,
             };
-            let response =
-                send_response_create(&mut active_socket, payload.clone(), model_config, on_stream);
+            let attempt = if retried_transport_error { 2 } else { 1 };
+            let response = send_response_create(
+                &mut active_socket,
+                payload.clone(),
+                model_config,
+                attempt,
+                2,
+                on_stream,
+            );
             if response.is_ok() {
                 let mut cached = self.socket.lock().expect("mutex poisoned");
                 *cached = Some(CachedCodexSocket {
@@ -1071,6 +1078,8 @@ fn send_response_create(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     payload: Map<String, Value>,
     model_config: &ModelConfig,
+    attempt: usize,
+    max_attempts: usize,
     on_stream: &mut dyn FnMut(ProviderStreamEvent),
 ) -> Result<Value, ProviderError> {
     let mut request = Map::new();
@@ -1082,26 +1091,33 @@ fn send_response_create(
 
     let body = Value::Object(request).to_string();
     ensure_request_payload_size(model_config, "codex_subscription websocket", body.len())?;
+    let mut diagnostics = CodexWebSocketDiagnostics::new(&body, attempt, max_attempts);
 
-    socket
-        .send(Message::Text(body.into()))
-        .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
+    socket.send(Message::Text(body.into())).map_err(|error| {
+        diagnostics.error(format!(
+            "codex websocket send failed before response.completed: {error}"
+        ))
+    })?;
 
     let mut accumulator = StreamAccumulator::default();
     let progress_timeout = Duration::from_secs(model_config.request_timeout_secs());
     let mut last_progress = Instant::now();
 
     loop {
-        let message = socket
-            .read()
-            .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
+        let message = socket.read().map_err(|error| {
+            diagnostics.error(format!(
+                "codex websocket read failed before response.completed: {error}"
+            ))
+        })?;
 
         match message {
             Message::Text(text) => {
                 let value =
                     serde_json::from_str::<Value>(&text).map_err(ProviderError::DecodeJson)?;
                 let event_type = value.get("type").and_then(Value::as_str);
+                diagnostics.record_text_event(&value, event_type);
                 if event_type.is_some_and(is_codex_response_progress_event) {
+                    diagnostics.record_progress_event();
                     last_progress = Instant::now();
                 }
                 match event_type {
@@ -1211,26 +1227,268 @@ fn send_response_create(
                     _ => {}
                 }
             }
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
+            Message::Binary(_) => diagnostics.record_binary_frame(),
+            Message::Ping(payload) => {
+                diagnostics.record_ping_frame();
+                socket.send(Message::Pong(payload)).map_err(|error| {
+                    diagnostics.error(format!(
+                        "codex websocket pong send failed before response.completed: {error}"
+                    ))
+                })?;
+            }
+            Message::Pong(_) => diagnostics.record_pong_frame(),
             Message::Close(frame) => {
-                return Err(ProviderError::WebSocket(format!(
-                    "codex websocket closed before response.completed: {}",
-                    frame
-                        .map(|value| value.reason.to_string())
-                        .unwrap_or_else(|| "connection closed".to_string())
+                let close = match frame {
+                    Some(value) => {
+                        let reason = value.reason.to_string();
+                        format!(
+                            "close_code={:?}; close_reason={}",
+                            value.code,
+                            if reason.trim().is_empty() {
+                                "<empty>".to_string()
+                            } else {
+                                reason
+                            }
+                        )
+                    }
+                    None => "close_code=<none>; close_reason=connection closed".to_string(),
+                };
+                return Err(diagnostics.error(format!(
+                    "codex websocket closed before response.completed; {close}"
                 )));
             }
             _ => {}
         }
         if last_progress.elapsed() >= progress_timeout {
-            return Err(ProviderError::WebSocket(format!(
+            return Err(diagnostics.error(format!(
                 "codex websocket response made no progress for {}s",
                 progress_timeout.as_secs()
             )));
         }
     }
+}
+
+#[derive(Debug)]
+struct CodexWebSocketDiagnostics {
+    started_at: Instant,
+    attempt: usize,
+    max_attempts: usize,
+    request: CodexWebSocketRequestSummary,
+    text_frames: usize,
+    binary_frames: usize,
+    ping_frames: usize,
+    pong_frames: usize,
+    progress_events: usize,
+    last_event_type: Option<String>,
+    last_response_id: Option<String>,
+    last_item_id: Option<String>,
+}
+
+impl CodexWebSocketDiagnostics {
+    fn new(body: &str, attempt: usize, max_attempts: usize) -> Self {
+        let request = serde_json::from_str::<Value>(body)
+            .ok()
+            .map(|value| CodexWebSocketRequestSummary::from_request(&value, body.len()))
+            .unwrap_or_else(|| CodexWebSocketRequestSummary::from_body_bytes(body.len()));
+        Self {
+            started_at: Instant::now(),
+            attempt,
+            max_attempts,
+            request,
+            text_frames: 0,
+            binary_frames: 0,
+            ping_frames: 0,
+            pong_frames: 0,
+            progress_events: 0,
+            last_event_type: None,
+            last_response_id: None,
+            last_item_id: None,
+        }
+    }
+
+    fn record_text_event(&mut self, value: &Value, event_type: Option<&str>) {
+        self.text_frames = self.text_frames.saturating_add(1);
+        if let Some(event_type) = event_type {
+            self.last_event_type = Some(event_type.to_string());
+        }
+        self.last_response_id =
+            response_id_from_event(value).or_else(|| self.last_response_id.take());
+        self.last_item_id = item_id_from_event(value).or_else(|| self.last_item_id.take());
+    }
+
+    fn record_progress_event(&mut self) {
+        self.progress_events = self.progress_events.saturating_add(1);
+    }
+
+    fn record_binary_frame(&mut self) {
+        self.binary_frames = self.binary_frames.saturating_add(1);
+    }
+
+    fn record_ping_frame(&mut self) {
+        self.ping_frames = self.ping_frames.saturating_add(1);
+    }
+
+    fn record_pong_frame(&mut self) {
+        self.pong_frames = self.pong_frames.saturating_add(1);
+    }
+
+    fn error(&self, reason: String) -> ProviderError {
+        ProviderError::WebSocket(format!("{reason}; {}", self.summary()))
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "attempt={}/{}; elapsed_ms={}; {}; frames={{text:{}, binary:{}, ping:{}, pong:{}}}; progress_events={}; last_event_type={}; last_response_id={}; last_item_id={}",
+            self.attempt,
+            self.max_attempts,
+            self.started_at.elapsed().as_millis(),
+            self.request.summary(),
+            self.text_frames,
+            self.binary_frames,
+            self.ping_frames,
+            self.pong_frames,
+            self.progress_events,
+            self.last_event_type.as_deref().unwrap_or("<none>"),
+            self.last_response_id.as_deref().unwrap_or("<none>"),
+            self.last_item_id.as_deref().unwrap_or("<none>"),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexWebSocketRequestSummary {
+    body_bytes: usize,
+    model: Option<String>,
+    input_items: usize,
+    tools: usize,
+    typed_values: usize,
+    input_images: usize,
+    input_files: usize,
+    function_call_outputs: usize,
+    custom_tool_outputs: usize,
+    reasoning_items: usize,
+    encrypted_reasoning_items: usize,
+}
+
+impl CodexWebSocketRequestSummary {
+    fn from_body_bytes(body_bytes: usize) -> Self {
+        Self {
+            body_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn from_request(value: &Value, body_bytes: usize) -> Self {
+        let mut summary = Self::from_body_bytes(body_bytes);
+        let Some(object) = value.as_object() else {
+            return summary;
+        };
+        summary.model = object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        summary.input_items = object
+            .get("input")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        summary.tools = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        if let Some(input) = object.get("input") {
+            summary.count_input_value(input);
+        }
+        summary
+    }
+
+    fn count_input_value(&mut self, value: &Value) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.count_input_value(item);
+                }
+            }
+            Value::Object(object) => {
+                if let Some(kind) = object.get("type").and_then(Value::as_str) {
+                    self.typed_values = self.typed_values.saturating_add(1);
+                    match kind {
+                        "input_image" | "image_url" => {
+                            self.input_images = self.input_images.saturating_add(1);
+                        }
+                        "input_file" | "file" => {
+                            self.input_files = self.input_files.saturating_add(1);
+                        }
+                        "function_call_output" => {
+                            self.function_call_outputs =
+                                self.function_call_outputs.saturating_add(1);
+                        }
+                        "custom_tool_call_output" => {
+                            self.custom_tool_outputs = self.custom_tool_outputs.saturating_add(1);
+                        }
+                        "reasoning" => {
+                            self.reasoning_items = self.reasoning_items.saturating_add(1);
+                            if object
+                                .get("encrypted_content")
+                                .and_then(Value::as_str)
+                                .is_some_and(|content| !content.is_empty())
+                            {
+                                self.encrypted_reasoning_items =
+                                    self.encrypted_reasoning_items.saturating_add(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for child in object.values() {
+                    self.count_input_value(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "payload_bytes={}; model={}; input_items={}; tools={}; typed_values={}; input_images={}; input_files={}; function_call_outputs={}; custom_tool_outputs={}; reasoning_items={}; encrypted_reasoning_items={}",
+            self.body_bytes,
+            self.model.as_deref().unwrap_or("<unknown>"),
+            self.input_items,
+            self.tools,
+            self.typed_values,
+            self.input_images,
+            self.input_files,
+            self.function_call_outputs,
+            self.custom_tool_outputs,
+            self.reasoning_items,
+            self.encrypted_reasoning_items,
+        )
+    }
+}
+
+fn response_id_from_event(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("response_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn item_id_from_event(value: &Value) -> Option<String> {
+    value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("call_id").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
 }
 
 fn is_codex_response_progress_event(event_type: &str) -> bool {
@@ -3023,6 +3281,67 @@ mod tests {
         ));
 
         assert!(!is_websocket_transport_error(&response));
+    }
+
+    #[test]
+    fn websocket_diagnostics_include_request_shape_and_last_event() {
+        let body = json!({
+            "type": "response.create",
+            "model": "gpt-5.5",
+            "tools": [{"type": "function", "name": "shell_exec"}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "hello"},
+                        {"type": "input_image", "image_url": "file://image.png"}
+                    ]
+                },
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "ciphertext"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ]
+        })
+        .to_string();
+        let mut diagnostics = CodexWebSocketDiagnostics::new(&body, 2, 2);
+        diagnostics.record_text_event(
+            &json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_1",
+                "item_id": "item_1"
+            }),
+            Some("response.output_text.delta"),
+        );
+        diagnostics.record_progress_event();
+
+        let error = diagnostics.error(
+            "codex websocket closed before response.completed; close_code=Normal; close_reason=<empty>"
+                .to_string(),
+        );
+        let ProviderError::WebSocket(message) = error else {
+            panic!("expected websocket error");
+        };
+
+        assert!(message.contains("attempt=2/2"));
+        assert!(message.contains("payload_bytes="));
+        assert!(message.contains("model=gpt-5.5"));
+        assert!(message.contains("input_items=3"));
+        assert!(message.contains("tools=1"));
+        assert!(message.contains("input_images=1"));
+        assert!(message.contains("function_call_outputs=1"));
+        assert!(message.contains("encrypted_reasoning_items=1"));
+        assert!(message.contains("progress_events=1"));
+        assert!(message.contains("last_event_type=response.output_text.delta"));
+        assert!(message.contains("last_response_id=resp_1"));
+        assert!(message.contains("last_item_id=item_1"));
+        assert!(message.contains("close_reason=<empty>"));
     }
 
     #[test]

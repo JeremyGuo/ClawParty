@@ -19,6 +19,7 @@ const PDF_WORKER_ENGINE_LABEL = 'Stella PDFium Worker';
 const PDF_DIRECT_ENGINE_LABEL = 'Stella PDFium Glyph';
 const PDF_RENDER_WORKER_COUNT = 2;
 const PDF_RENDER_CONCURRENCY = 2;
+const PREVIEW_RENDER_TIMEOUT_MS = 10_000;
 
 function createEmptyPdfPerfStats() {
   return {
@@ -104,7 +105,7 @@ function buildPdfSelectionIndexFromRuntime(runtime) {
   return selectionPages.length > 0 ? PdfSelectionIndex.fromPages(selectionPages) : null;
 }
 
-export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onRefreshFile, onRefreshPdfPreview, onResolveMarkdownAsset, onCreateSelectionReference, onOpenFile }) {
+export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onRefreshFile, onRefreshPdfPreview, onResolveMarkdownAsset, onCreateSelectionReference, onOpenFile, onPreviewError }) {
   const activeFile = openFiles.find((file) => file.path === activeFilePath) || null;
   const [selectionMenu, setSelectionMenu] = useState(null);
 
@@ -189,12 +190,20 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
           onPointerDownCapture={preserveSelectionOnRightPointerDown}
           onContextMenuCapture={(event) => handlePreviewSurfaceContextMenu(event, activeFile, openSelectionMenu)}
         >
+          {activeFile?.preview_notice ? (
+            <div className="preview-notice" role="status">
+              {activeFile.preview_notice}
+            </div>
+          ) : null}
           {activeFile?.loading ? (
             <div className="panel-placeholder">正在读取文件...</div>
           ) : activeFile?.error ? (
             <div className="panel-placeholder">{activeFile.error}</div>
           ) : activeFile ? (
-            <PreviewErrorBoundary resetKey={`${activeFile.path}:${activeFile.preview_size || activeFile.loaded_at || ''}`}>
+            <PreviewErrorBoundary
+              resetKey={`${activeFile.path}:${activeFile.preview_size || activeFile.loaded_at || ''}`}
+              onError={(error) => onPreviewError?.(activeFile, error)}
+            >
               <FilePreview file={activeFile} onDownloadFile={onDownloadFile} onRefreshPdfPreview={onRefreshPdfPreview} onResolveMarkdownAsset={onResolveMarkdownAsset} onSelectionContextMenu={openSelectionMenu} onOpenFile={onOpenFile} />
             </PreviewErrorBoundary>
           ) : (
@@ -251,6 +260,10 @@ class PreviewErrorBoundary extends Component {
       return { error: null, resetKey: props.resetKey };
     }
     return null;
+  }
+
+  componentDidCatch(error) {
+    this.props.onError?.(error);
   }
 
   render() {
@@ -683,11 +696,26 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
     if (!wasmUrl || !pdfBuffer) return undefined;
     let disposed = false;
     let engine = null;
+    let renderTimeout = 0;
     const revision = (pdfRuntimeRef.current?.revision || 0) + 1;
     const availableWidth = shellRef.current?.clientWidth || shellWidth || 820;
     const load = async () => {
       const previousUrls = renderUrlsRef.current;
       setRenderState((current) => ({ ...current, loading: true, error: '' }));
+      renderTimeout = window.setTimeout(() => {
+        if (disposed) return;
+        disposed = true;
+        addDebugEntry('error', 'PDF preview timed out');
+        closePdfRuntime(pdfRuntimeRef.current);
+        pdfRuntimeRef.current = null;
+        closePdfEngine(engine);
+        setRenderState({
+          loading: false,
+          pages: [],
+          pageCount: 0,
+          error: 'PDF 预览超过 10 秒未完成，已停止。请下载后查看。'
+        });
+      }, PREVIEW_RENDER_TIMEOUT_MS);
       setPdfPerfStats(createEmptyPdfPerfStats());
       paintedImageKeysRef.current.clear();
       closePdfRuntime(pdfRuntimeRef.current);
@@ -780,6 +808,10 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
           pageCount: doc.pageCount,
           error: ''
         });
+        if (renderTimeout) {
+          window.clearTimeout(renderTimeout);
+          renderTimeout = 0;
+        }
         revokeObjectUrls(previousUrls);
         if (opened.mode === 'worker') {
           warmPdfRenderWorkers(pdfRuntimeRef.current, {
@@ -800,6 +832,10 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
             loading: false,
             error: error?.message || 'PDFium 渲染失败'
           }));
+          if (renderTimeout) {
+            window.clearTimeout(renderTimeout);
+            renderTimeout = 0;
+          }
         }
       }
     };
@@ -812,6 +848,7 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
       } else {
         closePdfEngine(engine);
       }
+      if (renderTimeout) window.clearTimeout(renderTimeout);
     };
   }, [documentId, pdfBuffer, wasmUrl, zoomPercent, recordPdfPerfSample]);
 

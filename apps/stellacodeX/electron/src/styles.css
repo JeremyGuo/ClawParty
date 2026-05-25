@@ -3249,6 +3249,10 @@ button {
 }
 
 .tool-inline-detail-body {
+  max-height: min(62vh, 620px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   transform: translateY(-5px);
   transition: transform 170ms cubic-bezier(.2, .8, .2, 1);
 }
@@ -4857,6 +4861,18 @@ button {
   min-height: 0;
   overflow: auto;
   background: var(--bg);
+}
+
+.preview-notice {
+  position: sticky;
+  top: 0;
+  z-index: 7;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--orange), transparent 55%);
+  color: color-mix(in srgb, var(--orange), var(--text) 25%);
+  background: color-mix(in srgb, var(--orange), var(--bg) 88%);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .preview-refresh-button {

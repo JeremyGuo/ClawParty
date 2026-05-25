@@ -1763,7 +1763,9 @@ impl SessionActor {
                         }
                     }
                     Err(error) => {
-                        let error_text = error.to_string();
+                        let actor_error = SessionActorError::from_provider_error(error);
+                        let error_detail = actor_error.detail();
+                        let error_text = error_detail.reason.clone();
                         self.emit(SessionEvent::StreamError {
                             message_id: active.message_id.clone(),
                             turn_id: active.turn_id.clone(),
@@ -1771,15 +1773,11 @@ impl SessionActor {
                             item_id: None,
                             message_index: None,
                             error: error_text.clone(),
-                            error_detail: SessionErrorDetail::new(
-                                "session_actor.provider",
-                                "provider_error",
-                                error_text,
-                            ),
+                            error_detail,
                         })?;
                         self.finish_turn_error(
                             &active.turn_id,
-                            SessionActorError::from_provider_error(error),
+                            actor_error,
                             Some(PendingContinuation::CurrentHistory),
                         )?;
                     }
@@ -2802,9 +2800,9 @@ impl SessionActorError {
             Self::Provider {
                 module,
                 kind,
-                reason,
+                source,
                 ..
-            } => SessionErrorDetail::new(*module, *kind, reason.clone()),
+            } => SessionErrorDetail::new(*module, *kind, source.to_string()),
             Self::Tool(reason) => {
                 SessionErrorDetail::new("session_actor.tool_batch", "tool_batch", reason.clone())
             }

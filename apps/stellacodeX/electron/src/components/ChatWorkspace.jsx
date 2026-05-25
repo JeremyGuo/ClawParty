@@ -19,7 +19,7 @@ import { renderCommitStart, useRenderCommitPerf } from './chat/perfHooks';
 import { buildChatRenderModel } from './chat/renderModel';
 import { importantToolFields, parseToolDetailPayload, payloadToModelText, payloadToRawText } from './chat/toolDetailFormatters';
 import { mergedToolCards, sameToolBlock, sameUsage, toolCardsAreComplete, toolGroupSummary } from './chat/toolCards';
-import { VIRTUALIZE_ENTRY_THRESHOLD, virtualWindowForEntries } from './chat/virtualWindow';
+import { scopedVirtualHeightKey, VIRTUALIZE_ENTRY_THRESHOLD, virtualHeightCacheScopeForViewport, virtualWindowForEntries } from './chat/virtualWindow';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -152,18 +152,27 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const pendingVirtualMeasureRestoreRef = useRef(null);
   const lastScrollStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
-  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, stickToBottom: true });
+  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0, clientWidth: 0, stickToBottom: true });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
+  const virtualHeightScope = useMemo(() => virtualHeightCacheScopeForViewport(viewport.clientWidth), [viewport.clientWidth]);
+  const virtualHeightCacheKey = useCallback((key) => scopedVirtualHeightKey(virtualHeightScope, key), [virtualHeightScope]);
+  const recordVirtualHeight = useCallback((heightKey, height) => {
+    if (!heightKey || !Number.isFinite(height) || height <= 0) return false;
+    if (Math.abs((virtualHeightsRef.current.get(heightKey) || 0) - height) <= 1) return false;
+    virtualHeightsRef.current.set(heightKey, height);
+    return true;
+  }, []);
   const virtualWindow = useMemo(() => measureChatPerf('chat.virtual_window', () => virtualWindowForEntries({
     entries: renderEntries,
     keys: entryKeys,
     heightCache: virtualHeightsRef.current,
+    heightCacheScope: virtualHeightScope,
     heightVersion: virtualHeightVersion,
     viewport,
     activeIndex: sessionRunning ? latestAssistantTurnIndex : -1
-  }), { entries: renderEntries.length, virtualized: renderEntries.length > VIRTUALIZE_ENTRY_THRESHOLD }), [renderEntries, entryKeys, virtualHeightVersion, viewport, sessionRunning, latestAssistantTurnIndex]);
+  }), { entries: renderEntries.length, virtualized: renderEntries.length > VIRTUALIZE_ENTRY_THRESHOLD }), [renderEntries, entryKeys, virtualHeightScope, virtualHeightVersion, viewport, sessionRunning, latestAssistantTurnIndex]);
   const toolStopNoticeCandidate = useMemo(() => {
     if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
@@ -323,12 +332,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
         content.querySelectorAll('[data-virtual-key]').forEach((node) => {
           const key = node.getAttribute('data-virtual-key');
           if (!key) return;
+          const heightKey = virtualHeightCacheKey(key);
           const height = Math.ceil(node.getBoundingClientRect().height);
-          if (!Number.isFinite(height) || height <= 0) return;
-          if (Math.abs((virtualHeightsRef.current.get(key) || 0) - height) > 1) {
-            virtualHeightsRef.current.set(key, height);
-            didChange = true;
-          }
+          if (recordVirtualHeight(heightKey, height)) didChange = true;
         });
         return didChange;
       }, { visible: virtualWindow.items.length });
@@ -351,7 +357,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       if (idleTimer) window.clearTimeout(idleTimer);
       observer.disconnect();
     };
-  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature, userScrollInProgress]);
+  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature, userScrollInProgress, virtualHeightCacheKey, recordVirtualHeight]);
 
   useLayoutEffect(() => {
     const pending = pendingVirtualMeasureRestoreRef.current;
@@ -537,11 +543,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const next = {
       scrollTop: list.scrollTop,
       clientHeight: list.clientHeight,
+      clientWidth: list.clientWidth,
       stickToBottom: list.scrollHeight - list.scrollTop - list.clientHeight < 80
     };
     setViewport((current) => (
       Math.abs(current.scrollTop - next.scrollTop) < 1
         && Math.abs(current.clientHeight - next.clientHeight) < 1
+        && Math.abs(Number(current.clientWidth || 0) - next.clientWidth) < 1
         && Boolean(current.stickToBottom) === Boolean(next.stickToBottom)
         ? current
         : next
@@ -605,6 +613,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     setViewport({
       scrollTop: viewportScrollTopForMemory(remembered),
       clientHeight: scrollRef.current?.clientHeight || remembered?.clientHeight || 0,
+      clientWidth: scrollRef.current?.clientWidth || remembered?.clientWidth || 0,
       stickToBottom: remembered ? Boolean(remembered.stickToBottom) : true
     });
     requestAnimationFrame(() => {
