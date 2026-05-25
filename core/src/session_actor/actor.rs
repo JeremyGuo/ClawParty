@@ -76,6 +76,7 @@ pub struct SessionActor {
     history: Vec<ChatMessage>,
     all_messages: Vec<ChatMessage>,
     provider_context: Option<ProviderRequestOwned>,
+    provider_context_turn_id: Option<String>,
     initial: Option<SessionInitial>,
     active_provider_request: Option<ActiveProviderRequest>,
     active_tool_batch: Option<ActiveToolBatch>,
@@ -266,6 +267,7 @@ impl SessionActor {
             history: Vec::new(),
             all_messages: Vec::new(),
             provider_context: None,
+            provider_context_turn_id: None,
             initial: None,
             active_provider_request: None,
             active_tool_batch: None,
@@ -1356,8 +1358,9 @@ impl SessionActor {
                     .collect(),
                 image_edit_mask: None,
                 image_size: None,
+                reset_incremental_context: false,
             };
-            self.sync_provider_context(request)?;
+            self.sync_provider_context(&turn_id, request)?;
             self.provider
                 .start_current(request_id.clone())
                 .map_err(SessionActorError::from_provider_error)?;
@@ -2754,27 +2757,34 @@ impl SessionActor {
 
     fn sync_provider_context(
         &mut self,
-        request: ProviderRequestOwned,
+        turn_id: &str,
+        mut request: ProviderRequestOwned,
     ) -> Result<(), SessionActorError> {
-        if let Some(existing) = self.provider_context.as_ref() {
-            if provider_request_envelope_matches(existing, &request)
-                && request.messages.starts_with(&existing.messages)
-            {
-                let appended = request.messages[existing.messages.len()..].to_vec();
-                if !appended.is_empty() {
-                    self.provider
-                        .append(appended)
-                        .map_err(SessionActorError::from_provider_error)?;
+        let same_turn = self.provider_context_turn_id.as_deref() == Some(turn_id);
+        if same_turn {
+            if let Some(existing) = self.provider_context.as_ref() {
+                if provider_request_envelope_matches(existing, &request)
+                    && request.messages.starts_with(&existing.messages)
+                {
+                    let appended = request.messages[existing.messages.len()..].to_vec();
+                    if !appended.is_empty() {
+                        self.provider
+                            .append(appended)
+                            .map_err(SessionActorError::from_provider_error)?;
+                    }
+                    self.provider_context = Some(request);
+                    self.provider_context_turn_id = Some(turn_id.to_string());
+                    return Ok(());
                 }
-                self.provider_context = Some(request);
-                return Ok(());
             }
         }
 
+        request.reset_incremental_context = true;
         self.provider
             .set(request.clone())
             .map_err(SessionActorError::from_provider_error)?;
         self.provider_context = Some(request);
+        self.provider_context_turn_id = Some(turn_id.to_string());
         Ok(())
     }
 

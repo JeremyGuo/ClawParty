@@ -386,6 +386,7 @@ pub struct ProviderRequest<'a> {
     pub tools: Vec<&'a ToolDefinition>,
     pub image_edit_mask: Option<&'a crate::session_actor::FileItem>,
     pub image_size: Option<&'a str>,
+    pub reset_incremental_context: bool,
 }
 
 impl<'a> ProviderRequest<'a> {
@@ -396,6 +397,7 @@ impl<'a> ProviderRequest<'a> {
             tools: Vec::new(),
             image_edit_mask: None,
             image_size: None,
+            reset_incremental_context: false,
         }
     }
 
@@ -418,6 +420,11 @@ impl<'a> ProviderRequest<'a> {
         self.image_size = Some(size);
         self
     }
+
+    pub fn reset_incremental_context(mut self, reset: bool) -> Self {
+        self.reset_incremental_context = reset;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +434,8 @@ pub struct ProviderRequestOwned {
     pub tools: Vec<ToolDefinition>,
     pub image_edit_mask: Option<crate::session_actor::FileItem>,
     pub image_size: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reset_incremental_context: bool,
 }
 
 impl ProviderRequestOwned {
@@ -437,6 +446,7 @@ impl ProviderRequestOwned {
             tools: Vec::new(),
             image_edit_mask: None,
             image_size: None,
+            reset_incremental_context: false,
         }
     }
 
@@ -447,6 +457,7 @@ impl ProviderRequestOwned {
             tools: request.tools.iter().map(|tool| (*tool).clone()).collect(),
             image_edit_mask: request.image_edit_mask.cloned(),
             image_size: request.image_size.map(str::to_string),
+            reset_incremental_context: request.reset_incremental_context,
         }
     }
 
@@ -467,8 +478,13 @@ impl ProviderRequestOwned {
             tools: self.tools.iter().collect(),
             image_edit_mask: self.image_edit_mask.as_ref(),
             image_size: self.image_size.as_deref(),
+            reset_incremental_context: self.reset_incremental_context,
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug)]

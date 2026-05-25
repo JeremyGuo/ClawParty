@@ -525,6 +525,7 @@ fn responses_file_item(file: &FileItem) -> Value {
         return json!({
             "type": "input_image",
             "image_url": file.uri,
+            "detail": "high",
         });
     }
 
@@ -672,7 +673,7 @@ mod tests {
     use super::*;
     use crate::{
         model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType},
-        session_actor::{ChatMessageItem, ChatRole, ContextItem},
+        session_actor::{ChatMessageItem, ChatRole, ContextItem, FileItem},
         test_support::temp_cwd,
     };
 
@@ -696,6 +697,27 @@ mod tests {
             multimodal_input: None,
             token_estimator_url: None,
         }
+    }
+
+    #[test]
+    fn image_file_items_use_high_detail() {
+        let file = FileItem {
+            uri: "data:image/png;base64,QUJD".to_string(),
+            name: Some("cat.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            width: Some(640),
+            height: Some(480),
+            state: None,
+        };
+
+        assert_eq!(
+            responses_file_item(&file),
+            serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,QUJD",
+                "detail": "high"
+            })
+        );
     }
 
     #[test]

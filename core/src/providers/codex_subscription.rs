@@ -173,6 +173,9 @@ impl CodexSubscriptionProvider {
         request: &ProviderRequest<'_>,
         on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ChatMessage, ProviderError> {
+        if request.reset_incremental_context {
+            self.clear_incremental_context();
+        }
         let auth = self.auth_manager.resolve(model_config)?;
 
         let identity = codex_request_identity(&self.session_id, model_config, request);
@@ -184,6 +187,10 @@ impl CodexSubscriptionProvider {
                 self.clear_socket();
                 let refreshed = self.auth_manager.refresh(model_config, &auth)?;
                 self.send_with_auth(model_config, payload, &identity, &refreshed, on_stream)
+            }
+            Err(error) if previous_response_not_found(&error) => {
+                self.clear_incremental_context();
+                self.send_with_auth(model_config, payload, &identity, &auth, on_stream)
             }
             Err(error) => Err(error),
         }
@@ -343,6 +350,10 @@ impl CodexSubscriptionProvider {
     fn clear_socket(&self) {
         let mut cached = self.socket.lock().expect("mutex poisoned");
         *cached = None;
+    }
+
+    fn clear_incremental_context(&self) {
+        *self.incremental_context.lock().expect("mutex poisoned") = None;
     }
 
     fn incremental_response_create_payload(
@@ -2587,6 +2598,28 @@ fn is_unauthorized(error: &ProviderError) -> bool {
     )
 }
 
+fn previous_response_not_found(error: &ProviderError) -> bool {
+    let text = match error {
+        ProviderError::ProviderFailure { message, body, .. } => {
+            format!("{message} {body}")
+        }
+        ProviderError::InvalidResponse(message)
+        | ProviderError::WebSocket(message)
+        | ProviderError::Subprocess(message)
+        | ProviderError::Request(message) => message.clone(),
+        ProviderError::HttpStatus { body, .. } => body.clone(),
+        ProviderError::MissingApiKeyEnv(_)
+        | ProviderError::BuildHttpClient(_)
+        | ProviderError::DecodeResponse(_)
+        | ProviderError::DecodeJson(_)
+        | ProviderError::PersistOutput(_)
+        | ProviderError::EmptyChoices => return false,
+    }
+    .to_ascii_lowercase();
+
+    text.contains("previous response") && text.contains("not found") && text.contains("resp_")
+}
+
 impl StreamAccumulator {
     fn record_output_item_done(&mut self, event: &Value) {
         if let Some(item) = event.get("item") {
@@ -3161,6 +3194,7 @@ fn responses_file_item(file: &FileItem) -> Result<Value, ProviderError> {
         return Ok(json!({
             "type": "input_image",
             "image_url": file.uri,
+            "detail": "high",
         }));
     }
 
@@ -4024,6 +4058,16 @@ mod tests {
     }
 
     #[test]
+    fn previous_response_not_found_error_is_retryable() {
+        let error = ProviderError::WebSocket(
+            "provider rejected request as unknown: Previous response with id 'resp_abc' not found."
+                .to_string(),
+        );
+
+        assert!(previous_response_not_found(&error));
+    }
+
+    #[test]
     fn input_file_payload_does_not_mix_filename_with_url_or_file_id() {
         let url_file = FileItem {
             uri: "https://example.com/demo.pdf".to_string(),
@@ -4217,6 +4261,7 @@ mod tests {
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "user");
         assert_eq!(input[1]["content"][0]["type"], "input_image");
+        assert_eq!(input[1]["content"][0]["detail"], "high");
         assert_eq!(
             input[1]["content"][0]["image_url"],
             "data:image/png;base64,QUJD"

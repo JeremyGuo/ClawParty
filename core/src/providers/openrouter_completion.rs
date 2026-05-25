@@ -305,7 +305,7 @@ impl OpenRouterRequestMessage {
                         OpenRouterContentPart::ImageUrl {
                             image_url: OpenRouterImageUrl {
                                 url: file.uri,
-                                detail: None,
+                                detail: Some("high".to_string()),
                             },
                         }
                     }));
@@ -1003,6 +1003,7 @@ mod tests {
             value["content"][1]["image_url"]["url"],
             "https://example.com/cat.png"
         );
+        assert_eq!(value["content"][1]["image_url"]["detail"], "high");
     }
 
     #[test]

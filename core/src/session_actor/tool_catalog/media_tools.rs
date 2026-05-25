@@ -525,7 +525,8 @@ fn image_view_tool_definition(remote_mode: &super::ToolRemoteMode) -> ToolDefini
     ToolDefinition::new(
         "image_view",
         "View a local image file in the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_view more than 3 times in the same assistant tool-call batch; excess image_view calls in that batch will fail. View more images after inspecting the first batch.",
-        media_view_schema("path", remote_mode),        ToolBackend::Local,
+        media_view_schema("path", remote_mode),
+        ToolBackend::Local,
     )
 }
 
