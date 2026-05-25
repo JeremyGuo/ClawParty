@@ -12,6 +12,16 @@ pub enum ChatRole {
     Compaction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessagePart {
+    UserInput,
+    ModelResponse,
+    ToolResult,
+    FinalResponse,
+    Repair,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub cache_read: u64,
@@ -70,6 +80,12 @@ pub struct ChatMessage {
     pub message_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_part: Option<ChatMessagePart>,
     pub data: Vec<ChatMessageItem>,
 }
 
@@ -82,6 +98,9 @@ impl ChatMessage {
             user_name: None,
             message_time: None,
             token_usage: None,
+            turn_id: None,
+            step_index: None,
+            message_part: None,
             data,
         }
     }
@@ -134,6 +153,18 @@ impl ChatMessage {
 
     pub fn with_token_usage(mut self, token_usage: TokenUsage) -> Self {
         self.token_usage = Some(token_usage);
+        self
+    }
+
+    pub fn with_turn_metadata(
+        mut self,
+        turn_id: impl Into<String>,
+        step_index: usize,
+        message_part: ChatMessagePart,
+    ) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self.step_index = Some(step_index);
+        self.message_part = Some(message_part);
         self
     }
 }

@@ -40,6 +40,18 @@ import {
 } from '../lib/chatDebugSummaries';
 import { patchConversationForegroundSession } from '../lib/conversationState';
 
+function messageFromPayload(payload) {
+  const message = payload?.message;
+  if (!message || typeof message !== 'object') return null;
+  return {
+    ...message,
+    index: message.index ?? payload.index,
+    turn_id: message.turn_id ?? payload.turn_id,
+    step_index: message.step_index ?? payload.step_index,
+    message_part: message.message_part ?? payload.message_part
+  };
+}
+
 function sortedFiniteMessages(messages) {
   return (Array.isArray(messages) ? messages : [])
     .filter((message) => {
@@ -612,10 +624,16 @@ export function useChatSessionStream({
         setSessionActivity('开始处理');
       } else if (payloadType === 'chat.user_message_committed') {
         setChatSessionState((current) => chatSessionStateIsActive(current) && current.scopeKey === key ? current : { scopeKey: key, state: 'queued' });
-        applyIncomingMessages(payload.message ? [payload.message] : []);
+        {
+          const message = messageFromPayload(payload);
+          applyIncomingMessages(message ? [message] : []);
+        }
         setSessionActivity('用户消息已落盘');
       } else if (payloadType === 'chat.message_appended') {
-        applyIncomingMessages(payload.message ? [payload.message] : []);
+        {
+          const message = messageFromPayload(payload);
+          applyIncomingMessages(message ? [message] : []);
+        }
       } else if (payloadType === 'chat.attachment_manifest') {
         setMessages((current) => {
           const next = applyStreamAttachmentManifest(current, payload);

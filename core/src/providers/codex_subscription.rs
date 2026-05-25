@@ -1012,6 +1012,9 @@ fn normalize_message_for_codex_provider(message: &ChatMessage) -> Option<ChatMes
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
         token_usage: message.token_usage.clone(),
+        turn_id: None,
+        step_index: None,
+        message_part: None,
         data,
     })
 }
@@ -2909,6 +2912,9 @@ fn responses_value_to_chat_message(
         user_name: None,
         message_time: None,
         token_usage: token_usage_from_value(value, model_config),
+        turn_id: None,
+        step_index: None,
+        message_part: None,
         data,
     })
 }

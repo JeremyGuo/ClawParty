@@ -364,6 +364,9 @@ fn convert_image_response(
         user_name: None,
         message_time: None,
         token_usage,
+        turn_id: None,
+        step_index: None,
+        message_part: None,
         data,
     })
 }

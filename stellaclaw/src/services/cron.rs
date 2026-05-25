@@ -578,7 +578,7 @@ fn handle_agent_session_event(
     event: AgentSessionEvent,
 ) -> Result<()> {
     match event {
-        AgentSessionEvent::TurnCompleted { message } => {
+        AgentSessionEvent::TurnCompleted { message, .. } => {
             let Some(run) = active_runs.remove(&session_addr) else {
                 return Ok(());
             };

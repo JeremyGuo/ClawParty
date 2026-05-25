@@ -470,13 +470,22 @@ fn project_channel_event(
                     event: serde_json::to_value(event)?,
                 }));
             }
-            AgentSessionEvent::MessageAppended { index, message } => {
+            AgentSessionEvent::MessageAppended {
+                index,
+                turn_id,
+                step_index,
+                message_part,
+                message,
+            } => {
                 events.push(ChannelEvent::MessageAppended(OutgoingMessageAppended {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
                     session_id: service_addr_storage_component(&session_addr),
                     index,
+                    turn_id,
+                    step_index,
+                    message_part,
                     message,
                 }));
             }
@@ -509,7 +518,7 @@ fn project_channel_event(
                     event: serde_json::to_value(event)?,
                 }));
             }
-            AgentSessionEvent::TurnCompleted { message } => {
+            AgentSessionEvent::TurnCompleted { message, .. } => {
                 events.push(ChannelEvent::Processing(OutgoingProcessing {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
@@ -534,7 +543,12 @@ fn project_channel_event(
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
                     session_id: service_addr_storage_component(&session_addr),
-                    event: serde_json::to_value(AgentSessionEvent::TurnCompleted { message })?,
+                    event: serde_json::to_value(AgentSessionEvent::TurnCompleted {
+                        turn_id: String::new(),
+                        final_message_id: Some(message.message_id.clone()),
+                        final_message_index: None,
+                        message,
+                    })?,
                 }));
             }
             AgentSessionEvent::TurnFailed {

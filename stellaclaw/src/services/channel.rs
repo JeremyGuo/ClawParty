@@ -1190,7 +1190,7 @@ fn handle_session_event(
         },
     )?;
     match event {
-        agent_session::AgentSessionEvent::MessageAppended { index, message } => {
+        agent_session::AgentSessionEvent::MessageAppended { index, message, .. } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
                 label: "message_appended".to_string(),
@@ -1219,7 +1219,7 @@ fn handle_session_event(
                 }),
             }))?;
         }
-        agent_session::AgentSessionEvent::UserMessageCommitted { index, message } => {
+        agent_session::AgentSessionEvent::UserMessageCommitted { index, message, .. } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
                 label: "user_message_committed".to_string(),
@@ -1328,6 +1328,7 @@ fn handle_session_event(
             turn_id,
             batch_id,
             tool_result,
+            ..
         } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),

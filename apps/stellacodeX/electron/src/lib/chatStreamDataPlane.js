@@ -40,6 +40,10 @@ export function streamDeltaText(event) {
   return String(event?.delta ?? event?.text_delta ?? event?.textDelta ?? '');
 }
 
+function streamMessagePart(event, fallback = 'model_response') {
+  return String(event?.message_part || event?.messagePart || fallback || '').trim() || fallback;
+}
+
 export function streamEventIndex(event) {
   const index = Number(event?.in_message_index ?? event?.inMessageIndex);
   return Number.isFinite(index) && index >= 0 ? index : undefined;
@@ -337,6 +341,10 @@ export function appendStreamAssistantDelta(current, event, fullText) {
       _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
+      turn_id: turnId || existing.turn_id || '',
+      step_index: event?.step_index ?? event?.stepIndex ?? existing.step_index,
+      message_part: streamMessagePart(event, existing.message_part || 'model_response'),
+      _messagePart: streamMessagePart(event, existing._messagePart || 'model_response'),
       _streaming: true
     };
   };
@@ -398,6 +406,10 @@ export function appendStreamToolCallDelta(current, event) {
       _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
+      turn_id: turnId || existing.turn_id || '',
+      step_index: event?.step_index ?? event?.stepIndex ?? existing.step_index,
+      message_part: streamMessagePart(event, existing.message_part || 'model_response'),
+      _messagePart: streamMessagePart(event, existing._messagePart || 'model_response'),
       _streaming: true
     };
   };
@@ -461,6 +473,10 @@ export function appendStreamReasoningSummary(current, event) {
       _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
+      turn_id: turnId || existing.turn_id || '',
+      step_index: event?.step_index ?? event?.stepIndex ?? existing.step_index,
+      message_part: streamMessagePart(event, existing.message_part || 'model_response'),
+      _messagePart: streamMessagePart(event, existing._messagePart || 'model_response'),
       _streaming: true
     };
   };
@@ -500,6 +516,10 @@ function liveToolResultMessage(event, existingMessages = []) {
     message_time: new Date().toISOString(),
     _lastStreamEventIndex: streamEventIndex(event),
     _streamTurnId: turnId,
+    turn_id: turnId,
+    step_index: event?.step_index ?? event?.stepIndex,
+    message_part: streamMessagePart(event, 'tool_result'),
+    _messagePart: streamMessagePart(event, 'tool_result'),
     _streaming: true,
     _liveToolResult: true,
     _liveToolCallId: toolCallId
@@ -639,6 +659,10 @@ export function applyStreamAttachmentManifest(current, event) {
       attachment_count: merged.length,
       message_time: existing.message_time || now,
       _streamTurnId: turnId || existing._streamTurnId || '',
+      turn_id: turnId || existing.turn_id || '',
+      step_index: event?.step_index ?? event?.stepIndex ?? existing.step_index,
+      message_part: streamMessagePart(event, existing.message_part || 'model_response'),
+      _messagePart: streamMessagePart(event, existing._messagePart || 'model_response'),
       _streaming: true
     };
   };

@@ -640,6 +640,9 @@ fn sanitize_message_for_compression_request(
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
         token_usage: None,
+        turn_id: None,
+        step_index: None,
+        message_part: None,
         data,
     })
 }
@@ -816,6 +819,9 @@ fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) ->
                 user_name: message.user_name.clone(),
                 message_time: message.message_time.clone(),
                 token_usage: None,
+                turn_id: None,
+                step_index: None,
+                message_part: None,
                 data,
             })
         })

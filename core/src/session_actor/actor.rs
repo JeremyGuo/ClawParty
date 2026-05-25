@@ -32,8 +32,8 @@ use super::{
         remote_aliases_prompt_for_mode, RuntimeMetadataState, REMOTE_WORKSPACE_PROMPT_COMPONENT,
     },
     session_state::{SessionActorPersistedState, SessionStateStore},
-    system_prompt_for_initial_with_common_prompt, ChatMessage, ChatMessageItem, ChatRole,
-    CompressionError, CompressionReport, ContextItem, ConversationBridge,
+    system_prompt_for_initial_with_common_prompt, ChatMessage, ChatMessageItem, ChatMessagePart,
+    ChatRole, CompressionError, CompressionReport, ContextItem, ConversationBridge,
     ConversationBridgeRequest, SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial,
     SessionMailbox, SessionMailboxKind, SessionMessageHistory, SessionMessageRecord,
     SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimate, TokenEstimator, ToolBatch,
@@ -740,6 +740,8 @@ impl SessionActor {
             message_id: active.message_id.clone(),
             turn_id: active.turn_id.clone(),
             in_message_index: active.next_stream_event_index,
+            step_index: Some(active.step_index),
+            message_part: Some(ChatMessagePart::ModelResponse),
             item_id: None,
             message_index: None,
             error: reason.clone(),
@@ -917,19 +919,15 @@ impl SessionActor {
             .iter()
             .cloned()
             .enumerate()
-            .map(|(relative_index, message)| SessionMessageRecord {
-                index: start + relative_index,
-                message,
+            .map(|(relative_index, message)| {
+                session_message_record(start + relative_index, message)
             })
             .collect::<Vec<_>>();
         let last_message = self
             .all_messages
             .last()
             .cloned()
-            .map(|message| SessionMessageRecord {
-                index: total.saturating_sub(1),
-                message,
-            });
+            .map(|message| session_message_record(total.saturating_sub(1), message));
         self.emit(SessionEvent::MessageHistoryResult {
             history: SessionMessageHistory {
                 request_id,
@@ -957,7 +955,7 @@ impl SessionActor {
                 message.message_id == message_id
                     || requested_index.is_some_and(|value| value == *index)
             })
-            .map(|(index, message)| SessionMessageRecord { index, message });
+            .map(|(index, message)| session_message_record(index, message));
         self.emit(SessionEvent::MessageDetailResult { request_id, record })
     }
 
@@ -1155,6 +1153,8 @@ impl SessionActor {
                 SessionRequest::EnqueueActorMessage { message } => message,
                 _ => return Err(SessionActorError::UnexpectedDataRequest),
             };
+            let input_message =
+                input_message.with_turn_metadata(turn_id.clone(), 0, ChatMessagePart::UserInput);
             input_roles.push(input_message.role.clone());
             input_items = input_items.saturating_add(input_message.data.len());
             if let Err(error) = self.append_history_message("input", input_message) {
@@ -1179,8 +1179,12 @@ impl SessionActor {
             .cloned()
             .enumerate()
         {
+            let (turn_id, step_index, message_part) = message_event_metadata(&message);
             self.emit(SessionEvent::MessageAppended {
                 index: appended_message_start + relative,
+                turn_id,
+                step_index,
+                message_part,
                 message,
             })?;
         }
@@ -1384,6 +1388,15 @@ impl SessionActor {
         stamp_assistant_message_time(&mut model_message);
 
         let tool_calls = collect_tool_calls(&model_message);
+        model_message = model_message.with_turn_metadata(
+            active.turn_id.clone(),
+            active.step_index,
+            if tool_calls.is_empty() {
+                ChatMessagePart::FinalResponse
+            } else {
+                ChatMessagePart::ModelResponse
+            },
+        );
         self.log_info(
             "provider_response_received",
             serde_json::json!({
@@ -1395,8 +1408,12 @@ impl SessionActor {
         );
         let model_message_index =
             self.append_history_message("model_response", model_message.clone())?;
+        let (turn_id, step_index, message_part) = message_event_metadata(&model_message);
         self.emit(SessionEvent::MessageAppended {
             index: model_message_index,
+            turn_id,
+            step_index,
+            message_part,
             message: model_message.clone(),
         })?;
 
@@ -1409,6 +1426,9 @@ impl SessionActor {
                 }),
             );
             self.emit(SessionEvent::TurnCompleted {
+                turn_id: active.turn_id.clone(),
+                final_message_id: Some(model_message.message_id.clone()),
+                final_message_index: Some(model_message_index),
                 message: model_message,
             })?;
             self.mark_turn_returned(active.turn_number);
@@ -1457,12 +1477,21 @@ impl SessionActor {
                 let mut tool_message = tool_error_message_for_operations(
                     &operations,
                     format!("tool batch failed to start: {error}"),
+                )
+                .with_turn_metadata(
+                    active.turn_id.clone(),
+                    active.step_index,
+                    ChatMessagePart::ToolResult,
                 );
                 stamp_assistant_message_time(&mut tool_message);
                 let tool_message_index =
                     self.append_history_message("tool_result", tool_message.clone())?;
+                let (turn_id, step_index, message_part) = message_event_metadata(&tool_message);
                 self.emit(SessionEvent::MessageAppended {
                     index: tool_message_index,
+                    turn_id,
+                    step_index,
+                    message_part,
                     message: tool_message,
                 })?;
                 return self.start_provider_request(
@@ -1490,6 +1519,7 @@ impl SessionActor {
         &mut self,
         message_id: &str,
         turn_id: &str,
+        step_index: usize,
         in_message_index: u64,
         event: ProviderStreamEvent,
     ) -> Result<(), SessionActorError> {
@@ -1501,6 +1531,8 @@ impl SessionActor {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
                     in_message_index,
+                    step_index: Some(step_index),
+                    message_part: Some(ChatMessagePart::ModelResponse),
                     item_id,
                     delta,
                     message_index: Some(model_message_index),
@@ -1516,6 +1548,8 @@ impl SessionActor {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
                     in_message_index,
+                    step_index: Some(step_index),
+                    message_part: Some(ChatMessagePart::ModelResponse),
                     item_id,
                     call_id,
                     tool_name,
@@ -1531,6 +1565,8 @@ impl SessionActor {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
                     in_message_index,
+                    step_index: Some(step_index),
+                    message_part: Some(ChatMessagePart::ModelResponse),
                     item_id,
                     summary_index,
                     delta,
@@ -1544,6 +1580,8 @@ impl SessionActor {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
                     in_message_index,
+                    step_index: Some(step_index),
+                    message_part: Some(ChatMessagePart::ModelResponse),
                     item_id,
                     summary_index,
                 })?;
@@ -1649,12 +1687,17 @@ impl SessionActor {
                     ChatMessageItem::ToolResult(tool_error_result_for_tool_call(tool_call, reason))
                 })
                 .collect(),
-        );
+        )
+        .with_turn_metadata(turn_id.to_string(), step_index, ChatMessagePart::Repair);
         stamp_assistant_message_time(&mut tool_message);
         let tool_message_index =
             self.append_history_message("tool_result_repair", tool_message.clone())?;
+        let (turn_id, step_index, message_part) = message_event_metadata(&tool_message);
         self.emit(SessionEvent::MessageAppended {
             index: tool_message_index,
+            turn_id,
+            step_index,
+            message_part,
             message: tool_message,
         })
     }
@@ -1689,12 +1732,14 @@ impl SessionActor {
                     let turn_id = active.turn_id.clone();
                     let message_id = active.message_id.clone();
                     let in_message_index = active.next_stream_event_index;
+                    let step_index = active.step_index;
                     active.next_stream_event_index =
                         active.next_stream_event_index.saturating_add(1);
                     active.last_activity_at = Instant::now();
                     self.emit_provider_stream_event(
                         &message_id,
                         &turn_id,
+                        step_index,
                         in_message_index,
                         event,
                     )?;
@@ -1794,6 +1839,8 @@ impl SessionActor {
                             message_id: active.message_id.clone(),
                             turn_id: active.turn_id.clone(),
                             in_message_index: active.next_stream_event_index,
+                            step_index: Some(active.step_index),
+                            message_part: Some(ChatMessagePart::ModelResponse),
                             item_id: None,
                             message_index: None,
                             error: error_text.clone(),
@@ -1836,6 +1883,8 @@ impl SessionActor {
         }
         self.emit(SessionEvent::StreamToolResultDone {
             turn_id: active.turn_id.clone(),
+            step_index: Some(active.step_index),
+            message_part: Some(ChatMessagePart::ToolResult),
             batch_id: progress.batch_id,
             tool_result: progress.result,
         })?;
@@ -1883,7 +1932,12 @@ impl SessionActor {
                     format!("tool batch failed before returning results: {error}"),
                 )
             }
-        };
+        }
+        .with_turn_metadata(
+            active.turn_id.clone(),
+            active.step_index,
+            ChatMessagePart::ToolResult,
+        );
         stamp_assistant_message_time(&mut tool_message);
         self.log_info(
             "tool_batch_completed",
@@ -1946,8 +2000,12 @@ impl SessionActor {
                 "message_index": tool_message_index,
             }),
         );
+        let (turn_id, step_index, message_part) = message_event_metadata(&tool_message);
         self.emit(SessionEvent::MessageAppended {
             index: tool_message_index,
+            turn_id,
+            step_index,
+            message_part,
             message: tool_message,
         })?;
         self.log_info(
@@ -3487,9 +3545,18 @@ fn provider_stream_event_is_renderable(event: &ProviderStreamEvent) -> bool {
 
 fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
     match event {
-        SessionEvent::MessageAppended { index, message } => serde_json::json!({
+        SessionEvent::MessageAppended {
+            index,
+            turn_id,
+            step_index,
+            message_part,
+            message,
+        } => serde_json::json!({
             "event": "message_appended",
             "index": index,
+            "turn_id": turn_id,
+            "step_index": step_index,
+            "message_part": message_part,
             "message_role": message.role,
             "message_items": message.data.len(),
         }),
@@ -3517,6 +3584,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             delta,
             message_index,
@@ -3525,6 +3594,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_id": message_id,
             "turn_id": turn_id,
             "in_message_index": in_message_index,
+            "step_index": step_index,
+            "message_part": message_part,
             "item_id": item_id,
             "message_index": message_index,
             "chars": delta.chars().count(),
@@ -3533,6 +3604,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             call_id,
             tool_name,
@@ -3542,6 +3615,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_id": message_id,
             "turn_id": turn_id,
             "in_message_index": in_message_index,
+            "step_index": step_index,
+            "message_part": message_part,
             "item_id": item_id,
             "call_id": call_id,
             "tool_name": tool_name,
@@ -3551,6 +3626,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
             delta,
@@ -3559,6 +3636,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_id": message_id,
             "turn_id": turn_id,
             "in_message_index": in_message_index,
+            "step_index": step_index,
+            "message_part": message_part,
             "item_id": item_id,
             "summary_index": summary_index,
             "chars": delta.chars().count(),
@@ -3567,6 +3646,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
         } => serde_json::json!({
@@ -3574,6 +3655,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_id": message_id,
             "turn_id": turn_id,
             "in_message_index": in_message_index,
+            "step_index": step_index,
+            "message_part": message_part,
             "item_id": item_id,
             "summary_index": summary_index,
         }),
@@ -3581,6 +3664,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             message_index,
             error,
@@ -3590,6 +3675,8 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_id": message_id,
             "turn_id": turn_id,
             "in_message_index": in_message_index,
+            "step_index": step_index,
+            "message_part": message_part,
             "item_id": item_id,
             "message_index": message_index,
             "error": error,
@@ -3597,17 +3684,29 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         }),
         SessionEvent::StreamToolResultDone {
             turn_id,
+            step_index,
+            message_part,
             batch_id,
             tool_result,
         } => serde_json::json!({
             "event": "stream_tool_result_done",
             "turn_id": turn_id,
+            "step_index": step_index,
+            "message_part": message_part,
             "batch_id": batch_id,
             "tool_name": tool_result.tool_name,
             "tool_call_id": tool_result.tool_call_id,
         }),
-        SessionEvent::TurnCompleted { message } => serde_json::json!({
+        SessionEvent::TurnCompleted {
+            turn_id,
+            final_message_id,
+            final_message_index,
+            message,
+        } => serde_json::json!({
             "event": "turn_completed",
+            "turn_id": turn_id,
+            "final_message_id": final_message_id,
+            "final_message_index": final_message_index,
             "message_items": message.data.len(),
         }),
         SessionEvent::TurnFailed {
@@ -3681,6 +3780,26 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             serde_json::json!({"event": "runtime_crashed", "error": error, "error_detail": error_detail})
         }
     }
+}
+
+fn session_message_record(index: usize, message: ChatMessage) -> SessionMessageRecord {
+    SessionMessageRecord {
+        index,
+        turn_id: message.turn_id.clone(),
+        step_index: message.step_index,
+        message_part: message.message_part.clone(),
+        message,
+    }
+}
+
+fn message_event_metadata(
+    message: &ChatMessage,
+) -> (Option<String>, Option<usize>, Option<ChatMessagePart>) {
+    (
+        message.turn_id.clone(),
+        message.step_index,
+        message.message_part.clone(),
+    )
 }
 
 fn render_task_plan_context(plan: &TaskPlanView) -> Option<String> {

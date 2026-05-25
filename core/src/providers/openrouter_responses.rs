@@ -391,6 +391,9 @@ fn responses_value_to_chat_message(
         user_name: None,
         message_time: None,
         token_usage: token_usage_from_value(value, model_config),
+        turn_id: None,
+        step_index: None,
+        message_part: None,
         data,
     })
 }

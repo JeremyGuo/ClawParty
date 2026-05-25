@@ -448,6 +448,9 @@ impl WebChannelMain {
                 &key.foreground_session_id,
                 appended.index,
                 &appended.message.message_id,
+                appended.turn_id.as_deref(),
+                appended.step_index,
+                appended.message_part.as_ref(),
                 decorated_message,
             ),
         );

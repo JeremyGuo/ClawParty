@@ -370,6 +370,9 @@ fn normalize_compaction_for_generic_provider(messages: &[ChatMessage]) -> Vec<Ch
                 user_name: message.user_name.clone(),
                 message_time: message.message_time.clone(),
                 token_usage: message.token_usage.clone(),
+                turn_id: None,
+                step_index: None,
+                message_part: None,
                 data,
             })
         })

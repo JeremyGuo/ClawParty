@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use stellaclaw_core::session_actor::ChatMessagePart;
 use stellaclaw_core::session_actor::{
     ChatMessage, SessionErrorDetail, TaskPlanView, ToolResultItem,
 };
@@ -170,6 +171,9 @@ pub fn chat_message_appended(
     foreground_session_id: &str,
     message_index: usize,
     message_id: &str,
+    turn_id: Option<&str>,
+    step_index: Option<usize>,
+    message_part: Option<&ChatMessagePart>,
     message: Value,
 ) -> Value {
     json!({
@@ -178,6 +182,9 @@ pub fn chat_message_appended(
         "foreground_session_id": foreground_session_id,
         "message_index": message_index,
         "message_id": message_id,
+        "turn_id": turn_id,
+        "step_index": step_index,
+        "message_part": message_part,
         "committed": true,
         "message": message,
     })

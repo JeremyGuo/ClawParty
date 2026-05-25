@@ -1,6 +1,8 @@
 use serde::Serialize;
 use serde_json::Value;
-use stellaclaw_core::session_actor::{ChatMessage, FileItem, SelectionReferenceItem};
+use stellaclaw_core::session_actor::{
+    ChatMessage, ChatMessagePart, FileItem, SelectionReferenceItem,
+};
 
 use crate::config::SandboxMode;
 
@@ -94,6 +96,9 @@ pub struct OutgoingMessageAppended {
     pub conversation_id: String,
     pub session_id: String,
     pub index: usize,
+    pub turn_id: Option<String>,
+    pub step_index: Option<usize>,
+    pub message_part: Option<ChatMessagePart>,
     pub message: ChatMessage,
 }
 

@@ -126,6 +126,19 @@ function conversationPath(conversationId) {
   return `/api/conversations/${encodeURIComponent(conversationId)}`;
 }
 
+
+function messageFromRecord(record) {
+  if (!record || typeof record !== 'object') return record;
+  if (!record.message || typeof record.message !== 'object') return record;
+  return {
+    ...record.message,
+    index: record.message.index ?? record.index,
+    turn_id: record.message.turn_id ?? record.turn_id,
+    step_index: record.message.step_index ?? record.step_index,
+    message_part: record.message.message_part ?? record.messagePart ?? record.message_part
+  };
+}
+
 function foregroundSessionPath(conversationId, foregroundSessionId = 'main') {
   return `${conversationPath(conversationId)}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}`;
 }
@@ -276,7 +289,7 @@ export async function loadMessages(serverId, conversationId, options = {}) {
     serverId,
     `${foregroundSessionPath(conversationId, foregroundSessionId)}/messages?offset=${encodeURIComponent(offset)}&limit=${encodeURIComponent(limit)}`
   );
-  return response.data?.messages || [];
+  return (response.data?.messages || []).map(messageFromRecord);
 }
 
 export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = [], selectionReferences = [], foregroundSessionId = 'main', clientMessageId = '') {

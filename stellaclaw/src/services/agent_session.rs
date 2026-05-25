@@ -913,6 +913,9 @@ fn handle_skeleton_enqueue(
         event_sink,
         AgentSessionEvent::MessageAppended {
             index,
+            turn_id: message.turn_id.clone(),
+            step_index: message.step_index,
+            message_part: message.message_part.clone(),
             message: message.clone(),
         },
     )?;
@@ -920,7 +923,13 @@ fn handle_skeleton_enqueue(
         emit_session_event(
             ctx,
             event_sink,
-            AgentSessionEvent::UserMessageCommitted { index, message },
+            AgentSessionEvent::UserMessageCommitted {
+                index,
+                turn_id: message.turn_id.clone(),
+                step_index: message.step_index,
+                message_part: message.message_part.clone(),
+                message,
+            },
         )?;
     }
     if should_start_turn(kind, &origin) {
@@ -946,7 +955,12 @@ fn handle_skeleton_enqueue(
         emit_session_event(
             ctx,
             event_sink,
-            AgentSessionEvent::TurnCompleted { message: response },
+            AgentSessionEvent::TurnCompleted {
+                turn_id: turn_id.clone(),
+                final_message_id: Some(response.message_id.clone()),
+                final_message_index: None,
+                message: response,
+            },
         )?;
     }
     Ok(())
@@ -1157,7 +1171,7 @@ fn handle_core_session_event(
             },
         ),
         CoreSessionEvent::Progress { .. } => Ok(()),
-        CoreSessionEvent::MessageAppended { index, message }
+        CoreSessionEvent::MessageAppended { index, message, .. }
             if matches!(message.role, ChatRole::User) =>
         {
             emit_session_event(ctx, event_sink, from_core_session_event(event.clone()))?;
@@ -1166,6 +1180,9 @@ fn handle_core_session_event(
                 event_sink,
                 AgentSessionEvent::UserMessageCommitted {
                     index: *index,
+                    turn_id: message.turn_id.clone(),
+                    step_index: message.step_index,
+                    message_part: message.message_part.clone(),
                     message: message.clone(),
                 },
             )
@@ -1233,6 +1250,11 @@ fn agent_message_history_from_core(history: SessionMessageHistory) -> AgentSessi
 fn agent_message_record_from_core(record: SessionMessageRecord) -> AgentSessionMessageRecord {
     AgentSessionMessageRecord {
         index: record.index,
+        turn_id: record.turn_id.or_else(|| record.message.turn_id.clone()),
+        step_index: record.step_index.or(record.message.step_index),
+        message_part: record
+            .message_part
+            .or_else(|| record.message.message_part.clone()),
         message: record.message,
     }
 }
@@ -1248,6 +1270,9 @@ fn skeleton_message_history(
         .as_ref()
         .map(|message| AgentSessionMessageRecord {
             index: state.message_count.saturating_sub(1),
+            turn_id: message.turn_id.clone(),
+            step_index: message.step_index,
+            message_part: message.message_part.clone(),
             message: message.clone(),
         });
     let messages = last_message
@@ -1282,6 +1307,9 @@ fn skeleton_message_detail(
         })
         .map(|message| AgentSessionMessageRecord {
             index: last_index,
+            turn_id: message.turn_id.clone(),
+            step_index: message.step_index,
+            message_part: message.message_part.clone(),
             message: message.clone(),
         })
 }
@@ -1825,7 +1853,7 @@ fn handle_child_session_event(
                     record.last_error = None;
                 }
             }
-            AgentSessionEvent::TurnCompleted { message } => {
+            AgentSessionEvent::TurnCompleted { message, .. } => {
                 if record.status == ChildAgentRuntimeStatus::Running {
                     record.status = ChildAgentRuntimeStatus::Completed;
                     record.last_message = Some(message);
@@ -1872,7 +1900,7 @@ fn handle_child_session_event(
                     record.last_error = None;
                 }
             }
-            AgentSessionEvent::TurnCompleted { message } => {
+            AgentSessionEvent::TurnCompleted { message, .. } => {
                 if record.status == ChildAgentRuntimeStatus::Running {
                     record.status = ChildAgentRuntimeStatus::Completed;
                     record.last_message = Some(message.clone());
@@ -3023,7 +3051,7 @@ fn apply_core_session_event(
     event: &CoreSessionEvent,
 ) {
     match event {
-        CoreSessionEvent::MessageAppended { index, message } => {
+        CoreSessionEvent::MessageAppended { index, message, .. } => {
             state.message_count = state.message_count.max(index.saturating_add(1));
             state.last_message = Some(message.clone());
         }
@@ -3041,7 +3069,7 @@ fn apply_core_session_event(
         CoreSessionEvent::PlanUpdated { plan } => {
             *current_plan = plan.clone();
         }
-        CoreSessionEvent::TurnCompleted { message } => {
+        CoreSessionEvent::TurnCompleted { message, .. } => {
             state.state = AgentSessionState::Idle;
             state.active_turn_id = None;
             state.last_message = Some(message.clone());
@@ -3131,9 +3159,19 @@ fn to_core_session_request(request: AgentSessionRequest) -> Result<CoreSessionRe
 
 fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
     match event {
-        CoreSessionEvent::MessageAppended { index, message } => {
-            AgentSessionEvent::MessageAppended { index, message }
-        }
+        CoreSessionEvent::MessageAppended {
+            index,
+            turn_id,
+            step_index,
+            message_part,
+            message,
+        } => AgentSessionEvent::MessageAppended {
+            index,
+            turn_id,
+            step_index,
+            message_part,
+            message,
+        },
         CoreSessionEvent::TurnStarted { turn_id, plan } => {
             AgentSessionEvent::TurnStarted { turn_id, plan }
         }
@@ -3143,6 +3181,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             delta,
             message_index,
@@ -3150,6 +3190,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             delta,
             message_index,
@@ -3158,6 +3200,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             call_id,
             tool_name,
@@ -3166,6 +3210,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             call_id,
             tool_name,
@@ -3175,6 +3221,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
             delta,
@@ -3182,6 +3230,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
             delta,
@@ -3190,12 +3240,16 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
         } => AgentSessionEvent::StreamReasoningSummaryPartAdded {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             summary_index,
         },
@@ -3203,6 +3257,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             message_index,
             error,
@@ -3211,6 +3267,8 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             message_id,
             turn_id,
             in_message_index,
+            step_index,
+            message_part,
             item_id,
             message_index,
             error,
@@ -3218,14 +3276,28 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         },
         CoreSessionEvent::StreamToolResultDone {
             turn_id,
+            step_index,
+            message_part,
             batch_id,
             tool_result,
         } => AgentSessionEvent::StreamToolResultDone {
             turn_id,
+            step_index,
+            message_part,
             batch_id,
             tool_result,
         },
-        CoreSessionEvent::TurnCompleted { message } => AgentSessionEvent::TurnCompleted { message },
+        CoreSessionEvent::TurnCompleted {
+            turn_id,
+            final_message_id,
+            final_message_index,
+            message,
+        } => AgentSessionEvent::TurnCompleted {
+            turn_id,
+            final_message_id,
+            final_message_index,
+            message,
+        },
         CoreSessionEvent::TurnFailed {
             error,
             error_detail,

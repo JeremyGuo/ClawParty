@@ -157,16 +157,34 @@ export function hasToolItems(message) {
   return messageItems(message).some((item) => item?.type === 'tool_call' || item?.type === 'tool_result');
 }
 
+export function messagePart(message) {
+  return String(message?.message_part || message?.messagePart || message?._messagePart || '').trim().toLowerCase();
+}
+
+export function hasExplicitMessagePart(message) {
+  return Boolean(messagePart(message));
+}
+
+export function isProcessMessagePart(part) {
+  return part === 'model_response' || part === 'tool_result' || part === 'repair';
+}
+
 export function isExecutionMessage(message) {
+  const part = messagePart(message);
+  if (isProcessMessagePart(part)) return true;
   return hasToolItems(message) || parseToolTextBlocks(messageText(message)).length > 0;
 }
 
 export function isAssistantResponseMessage(message) {
+  const part = messagePart(message);
+  if (part) return part === 'final_response';
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
   return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || item.text_with_attachment_markers || '').trim()));
 }
 
 export function isFinalAssistantMessage(message) {
+  const part = messagePart(message);
+  if (part) return part === 'final_response';
   if (message?._streaming) return false;
   return isAssistantResponseMessage(message);
 }
