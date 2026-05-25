@@ -68,6 +68,11 @@ import kotlin.math.min
 import kotlin.random.Random
 import kotlin.text.Charsets
 
+private val ChatPayloadJson = Json {
+    ignoreUnknownKeys = true
+    explicitNulls = false
+}
+
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val store = ConnectionProfileStore(application.connectionDataStore)
     private val api = StellaclawApi()
@@ -913,6 +918,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return count
     }
 
+    private fun ChatMessage.messagePartValue(): String = messagePart.trim().lowercase()
+
+    private fun ChatMessage.isFinalAssistantMessage(): Boolean {
+        val part = messagePartValue()
+        if (part.isNotBlank()) return part == "final_response"
+        return role.equals("assistant", ignoreCase = true) && !isToolOnlyMessage()
+    }
+
     private fun ChatMessage.isToolOnlyMessage(): Boolean =
         role.equals("assistant", ignoreCase = true) &&
             text.isBlank() &&
@@ -1312,9 +1325,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 payloadType == "chat.heartbeat" -> handleChatHeartbeat(payload)
                 payloadType == "chat.message_appended" || payloadType == "chat.user_message_committed" -> {
-                    val dto = payload["message"]?.let { json.decodeFromJsonElement<ChatMessageDto>(it) } ?: return
-                    val message = dto.toDomain()
-                    val index = payload["message_index"]?.jsonPrimitive?.intOrNull ?: message.index
+                    val message = payload.chatMessageFromPayload() ?: return
+                    val index = payload.messageIndex() ?: message.index
                     applyIncomingMessages(listOf(message.copy(index = index)))
                     latestProfile?.let { profile -> markConversationSeen(profile, conversationId, state.value.foregroundSessionId, index + 1) }
                     reconnectAttempt = 0
@@ -1647,6 +1659,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         localState = MessageLocalState.Streaming,
         streamTurnId = event.turnId().takeIf { it.isNotBlank() },
         syntheticStream = id.startsWith("live-tool-result-"),
+        turnId = event.turnId(),
+        stepIndex = event.stepIndex(),
+        messagePart = event.messagePart(default = if (id.startsWith("live-tool-result-")) "tool_result" else "model_response"),
     )
 
     private fun nextStreamingIndex(messages: List<ChatMessage>): Int =
@@ -1695,10 +1710,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun shouldDropStreamingForCanonical(local: ChatMessage, remote: ChatMessage): Boolean {
         if (local.localState != MessageLocalState.Streaming || !remote.role.equals("assistant", ignoreCase = true)) return false
-        if (local.streamTurnId != null && local.streamTurnId == remote.streamTurnId) return true
+        val localTurnId = local.effectiveTurnId()
+        val remoteTurnId = remote.effectiveTurnId()
+        if (localTurnId.isNotBlank() && localTurnId == remoteTurnId) return true
         if (local.syntheticStream && remote.index >= local.index) return true
         return local.index >= 0 && local.index == remote.index
     }
+
+    private fun ChatMessage.effectiveTurnId(): String = streamTurnId.orEmpty().ifBlank { turnId }
 
     private fun streamingStatus(type: String): String = when (type) {
         "stream_assistant_message_delta" -> "Assistant streaming..."
@@ -1751,6 +1770,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (shouldNotify) {
                     val snapshot = state.value
                     val latestAssistant = snapshot.messages.lastOrNull { message ->
+                        message.isFinalAssistantMessage() && !message.isRuntimeMetadataMessage()
+                    } ?: snapshot.messages.lastOrNull { message ->
                         message.role.equals("assistant", ignoreCase = true) &&
                             !message.isToolOnlyMessage() &&
                             !message.isRuntimeMetadataMessage()
@@ -1961,6 +1982,23 @@ private fun JsonObject.streamAttachmentKey(messageId: String = streamMessageId()
 
 private fun JsonObject.messageIndex(): Int? =
     intValue("message_index") ?: intValue("messageIndex") ?: intValue("index")
+
+private fun JsonObject.stepIndex(): Int? =
+    intValue("step_index") ?: intValue("stepIndex")
+
+private fun JsonObject.messagePart(default: String = ""): String =
+    (string("message_part") ?: string("messagePart") ?: default).orEmpty().trim()
+
+private fun JsonObject.chatMessageFromPayload(): ChatMessage? {
+    val messageElement = get("message") ?: return null
+    val base = ChatPayloadJson.decodeFromJsonElement<ChatMessageDto>(messageElement).toDomain()
+    return base.copy(
+        index = messageIndex() ?: base.index,
+        turnId = base.turnId.ifBlank { turnId() },
+        stepIndex = base.stepIndex ?: stepIndex(),
+        messagePart = base.messagePart.ifBlank { messagePart() },
+    )
+}
 
 private fun JsonObject.objectValue(name: String): JsonObject? = get(name) as? JsonObject
 

@@ -54,6 +54,9 @@ fun ChatMessageDto.toDomain(): ChatMessage {
         hasTokenUsage = hasTokenUsage || tokenUsage != null,
         tokenUsage = tokenUsage?.toDomain(),
         clientMessageId = clientMessageId,
+        turnId = turnId,
+        stepIndex = stepIndex,
+        messagePart = messagePart,
     )
 }
 

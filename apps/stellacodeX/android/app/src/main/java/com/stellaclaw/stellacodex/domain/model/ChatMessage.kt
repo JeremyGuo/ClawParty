@@ -18,6 +18,9 @@ data class ChatMessage(
     val streamTurnId: String? = null,
     val syntheticStream: Boolean = false,
     val clientMessageId: String = "",
+    val turnId: String = "",
+    val stepIndex: Int? = null,
+    val messagePart: String = "",
 )
 
 data class MessageAttachment(

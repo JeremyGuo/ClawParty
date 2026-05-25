@@ -588,10 +588,17 @@ private sealed interface ChatTimelineItem {
         val closedByUser: Boolean = false,
         val forceRunning: Boolean = false,
     ) : ChatTimelineItem {
-        val finalMessage: ChatMessage = messages.lastOrNull { !it.isToolOnlyMessage() } ?: messages.last()
+        val finalMessage: ChatMessage = messages.lastOrNull { it.isFinalAssistantMessage() }
+            ?: messages.lastOrNull { !it.isProcessMessage() }
+            ?: messages.last()
         override val key: String = "agent:$triggerKey"
-        val processMessages: List<ChatMessage> = messages.filter { it.id != finalMessage.id }
-        val processItems: List<MessageItem> = messages.flatMap { it.items }.filter { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
+        private val hasExplicitParts: Boolean = messages.any { it.hasExplicitMessagePart() }
+        val processMessages: List<ChatMessage> = if (hasExplicitParts) {
+            messages.filter { it.id != finalMessage.id && it.isProcessMessage() }
+        } else {
+            messages.filter { it.id != finalMessage.id }
+        }
+        val processItems: List<MessageItem> = processMessages.flatMap { it.items }.filter { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
         val startedAt: String? = messages.firstOrNull()?.messageTime
         val endedAt: String? = finalMessage.messageTime
         val hasStreamingMessage: Boolean = messages.any { it.localState == MessageLocalState.Streaming }
@@ -622,6 +629,11 @@ private fun buildChatTimeline(messages: List<ChatMessage>, latestAgentActive: Bo
             output += ChatTimelineItem.Message(message)
             currentUserKey = message.id.ifBlank { "user-${message.index}" }
         } else if (message.role.equals("assistant", ignoreCase = true)) {
+            val lastTurnId = pendingAgent.lastOrNull()?.effectiveTurnId().orEmpty()
+            val nextTurnId = message.effectiveTurnId()
+            if (pendingAgent.isNotEmpty() && lastTurnId.isNotBlank() && nextTurnId.isNotBlank() && lastTurnId != nextTurnId) {
+                flushAgent()
+            }
             pendingAgent += message
         } else {
             flushAgent()
@@ -651,6 +663,25 @@ private fun ChatMessage.isRuntimeMetadataMessage(): Boolean {
     return body.startsWith("[Incoming User Metadata]") ||
         body.startsWith("[Incoming Assistant Metadata]") ||
         body.startsWith("[Incoming System Metadata]")
+}
+
+private fun ChatMessage.messagePartValue(): String = messagePart.trim().lowercase()
+
+private fun ChatMessage.effectiveTurnId(): String = turnId.ifBlank { streamTurnId.orEmpty() }
+
+private fun ChatMessage.hasExplicitMessagePart(): Boolean = messagePartValue().isNotBlank()
+
+private fun ChatMessage.isProcessMessage(): Boolean {
+    val part = messagePartValue()
+    if (part in setOf("model_response", "tool_result", "repair")) return true
+    if (part == "final_response" || part == "user_input") return false
+    return isToolOnlyMessage()
+}
+
+private fun ChatMessage.isFinalAssistantMessage(): Boolean {
+    val part = messagePartValue()
+    if (part.isNotBlank()) return part == "final_response"
+    return role.equals("assistant", ignoreCase = true) && !isToolOnlyMessage()
 }
 
 private fun ChatMessage.isToolOnlyMessage(): Boolean =
