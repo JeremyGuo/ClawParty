@@ -8,6 +8,7 @@ const zlib = require('node:zlib');
 
 const SETTINGS_FILE = 'settings.json';
 const SSH_READY_TIMEOUT_MS = 10_000;
+const SSH_TUNNEL_FAILURE_COOLDOWN_MS = 3_000;
 const SERVER_REQUEST_TIMEOUT_MS = 90_000;
 const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_DISPLAY_FONT_SIZE = 11;
@@ -46,6 +47,8 @@ let updateCheckTimer = null;
 let updaterState = { state: app.isPackaged ? 'idle' : 'disabled' };
 let sshUpdaterState = { state: 'idle', channel: 'stable' };
 const tunnels = new Map();
+const tunnelOpeners = new Map();
+const tunnelFailures = new Map();
 let chatTraceState = { state: 'idle', startedAt: null, filePath: '', error: '' };
 
 function appIconPath() {
@@ -382,6 +385,10 @@ function tunnelSignature(server) {
   return `${server.sshHost.trim()}|${server.targetUrl || server.baseUrl}`;
 }
 
+function tunnelCacheKey(serverId, signature) {
+  return `${serverId}|${signature}`;
+}
+
 function stopTunnel(serverId) {
   const existing = tunnels.get(serverId);
   if (!existing) return;
@@ -399,6 +406,56 @@ function stopRemovedOrChangedTunnels(servers) {
       stopTunnel(serverId);
     }
   }
+}
+
+async function openSshTunnel(server, target, sshHost, signature, cacheKey) {
+  const port = await findFreePort();
+  const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
+  const bind = `127.0.0.1:${port}:${target.hostname}:${targetPort}`;
+  const sshProcess = childProcess.spawn('ssh', [
+    '-N',
+    '-T',
+    '-L',
+    bind,
+    '-o',
+    'ExitOnForwardFailure=no',
+    '-o',
+    'ServerAliveInterval=20',
+    '-o',
+    'ServerAliveCountMax=2',
+    sshHost
+  ], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    detached: false
+  });
+
+  const stderrLines = [];
+  let exitDetails = null;
+  sshProcess.stderr?.setEncoding('utf8');
+  sshProcess.stderr?.on('data', (chunk) => {
+    stderrLines.push(chunk);
+    if (stderrLines.length > 8) stderrLines.shift();
+  });
+  sshProcess.once('exit', (code, signal) => {
+    exitDetails = { code, signal };
+    const current = tunnels.get(server.id);
+    if (current?.process === sshProcess) {
+      tunnels.delete(server.id);
+    }
+  });
+  try {
+    await waitForLocalPort(port, () => exitDetails, stderrLines);
+  } catch (error) {
+    if (!sshProcess.killed) sshProcess.kill('SIGTERM');
+    tunnelFailures.set(cacheKey, { at: Date.now(), message: error.message });
+    throw new Error(`Failed to open SSH tunnel through ${sshHost}: ${error.message}`);
+  }
+
+  const basePath = target.pathname && target.pathname !== '/' ? target.pathname.replace(/\/$/, '') : '';
+  const baseUrl = `${target.protocol}//127.0.0.1:${port}${basePath}`;
+  tunnelFailures.delete(cacheKey);
+  tunnels.set(server.id, { process: sshProcess, baseUrl, signature });
+  return baseUrl;
 }
 
 async function resolveServerBaseUrl(server) {
@@ -419,51 +476,26 @@ async function resolveServerBaseUrl(server) {
     stopTunnel(server.id);
   }
 
-  const port = await findFreePort();
-  const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
-  const bind = `127.0.0.1:${port}:${target.hostname}:${targetPort}`;
-  const process = childProcess.spawn('ssh', [
-    '-N',
-    '-T',
-    '-L',
-    bind,
-    '-o',
-    'ExitOnForwardFailure=no',
-    '-o',
-    'ServerAliveInterval=20',
-    '-o',
-    'ServerAliveCountMax=2',
-    sshHost
-  ], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-    detached: false
-  });
-
-  const stderrLines = [];
-  let exitDetails = null;
-  process.stderr?.setEncoding('utf8');
-  process.stderr?.on('data', (chunk) => {
-    stderrLines.push(chunk);
-    if (stderrLines.length > 8) stderrLines.shift();
-  });
-  process.once('exit', (code, signal) => {
-    exitDetails = { code, signal };
-    const current = tunnels.get(server.id);
-    if (current?.process === process) {
-      tunnels.delete(server.id);
-    }
-  });
-  try {
-    await waitForLocalPort(port, () => exitDetails, stderrLines);
-  } catch (error) {
-    if (!process.killed) process.kill('SIGTERM');
-    throw new Error(`Failed to open SSH tunnel through ${sshHost}: ${error.message}`);
+  const cacheKey = tunnelCacheKey(server.id, signature);
+  const pending = tunnelOpeners.get(cacheKey);
+  if (pending) {
+    return pending;
   }
 
-  const basePath = target.pathname && target.pathname !== '/' ? target.pathname.replace(/\/$/, '') : '';
-  const baseUrl = `${target.protocol}//127.0.0.1:${port}${basePath}`;
-  tunnels.set(server.id, { process, baseUrl, signature });
-  return baseUrl;
+  const recentFailure = tunnelFailures.get(cacheKey);
+  if (recentFailure) {
+    if (Date.now() - recentFailure.at < SSH_TUNNEL_FAILURE_COOLDOWN_MS) {
+      throw new Error(`Recent SSH tunnel failure through ${sshHost}: ${recentFailure.message}`);
+    }
+    tunnelFailures.delete(cacheKey);
+  }
+
+  const opener = openSshTunnel(server, target, sshHost, signature, cacheKey)
+    .finally(() => {
+      tunnelOpeners.delete(cacheKey);
+    });
+  tunnelOpeners.set(cacheKey, opener);
+  return opener;
 }
 
 async function requestServer(_event, payload) {

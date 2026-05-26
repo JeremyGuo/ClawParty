@@ -1,5 +1,10 @@
-version: 1.31.25
+version: 1.31.26
 ---
+
+# 1.31.26
+
+- 修复 StellaCodeX Electron SSH Proxy tunnel 失败风暴：
+  同一 server / tunnel 配置的 SSH tunnel 建立现在会复用进行中的连接任务，并在 NAT/SSH 早退后做短暂失败冷却，避免 `server:connectionInfo` / `server:request` 并发触发大量 `ssh -L` 进程和 IPC 错误；初始会话刷新失败也会被捕获记录，不再形成未处理 promise。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.25
 

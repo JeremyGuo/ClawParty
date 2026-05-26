@@ -604,12 +604,16 @@ function App() {
   }, [activeServerId, refreshConversations, saveSettings]);
 
   useEffect(() => {
-    window.stellacode2.loadSettings().then((loaded) => {
-      setSettings(loaded);
-      setSidebarMode(loaded.sidebarMode || 'expanded');
-      setActiveServerId(loaded.activeServerId);
-      refreshConversations(loaded.activeServerId);
-    });
+    window.stellacode2.loadSettings()
+      .then((loaded) => {
+        setSettings(loaded);
+        setSidebarMode(loaded.sidebarMode || 'expanded');
+        setActiveServerId(loaded.activeServerId);
+        return refreshConversations(loaded.activeServerId);
+      })
+      .catch((error) => {
+        console.error('Failed to load conversations', error);
+      });
   }, [refreshConversations]);
 
   const openRenameConversationDialog = useCallback((conversation) => {
