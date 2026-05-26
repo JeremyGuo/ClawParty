@@ -179,6 +179,8 @@ struct LegacyModelConfig {
     #[serde(rename = "type")]
     model_type: LegacyModelType,
     api_endpoint: String,
+    #[serde(default)]
+    url: Option<String>,
     model: String,
     #[serde(default)]
     supports_vision_input: bool,
@@ -438,7 +440,7 @@ fn convert_model(name: &str, legacy: &LegacyModelConfig, base_dir: &Path) -> Res
             LegacyModelType::BraveSearch => ProviderType::BraveSearch,
         },
         model_name: legacy.model.clone(),
-        url: join_endpoint(&legacy.api_endpoint, &legacy.chat_completions_path),
+        url: legacy_model_url(legacy),
         api_key_env: legacy.api_key_env.clone(),
         capabilities: capabilities.clone(),
         token_max_context: legacy.context_window_tokens as u64,
@@ -458,6 +460,16 @@ fn convert_model(name: &str, legacy: &LegacyModelConfig, base_dir: &Path) -> Res
             .or_else(|| build_multimodal_input(&capabilities)),
         token_estimator_url: token_estimator.1,
     })
+}
+
+fn legacy_model_url(legacy: &LegacyModelConfig) -> String {
+    legacy
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| join_endpoint(&legacy.api_endpoint, &legacy.chat_completions_path))
 }
 
 fn convert_external_web_search_model(
@@ -1256,6 +1268,7 @@ mod tests {
               "type": "openrouter",
               "api_endpoint": "https://openrouter.ai/api/v1",
               "chat_completions_path": "/chat/completions",
+              "url": "https://proxy.example.invalid/v1/messages",
               "model": "openai/gpt-4.1-mini",
               "api_key_env": "OPENROUTER_API_KEY",
               "context_window_tokens": 128000,
@@ -1300,6 +1313,10 @@ mod tests {
                 .expect("main model should exist")
                 .model_name,
             "openai/gpt-4.1-mini"
+        );
+        assert_eq!(
+            config.models["main"].url,
+            "https://proxy.example.invalid/v1/messages"
         );
         assert_eq!(config.channels.len(), 1);
         assert!(config.session_defaults.search_tool_model.is_some());

@@ -343,6 +343,16 @@ impl ConversationRuntimeConfig {
         if self.models.is_empty() && !defaults.models.is_empty() {
             self.models = defaults.models;
             changed = true;
+        } else if !self.models.is_empty() && !defaults.models.is_empty() {
+            for (alias, default_model) in defaults.models {
+                let Some(current_model) = self.models.get_mut(&alias) else {
+                    continue;
+                };
+                if current_model != &default_model {
+                    *current_model = default_model;
+                    changed = true;
+                }
+            }
         }
         if !session_defaults_has_values(&self.session_defaults)
             && session_defaults_has_values(&defaults.session_defaults)
@@ -1386,6 +1396,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::{ModelSelection, SessionProfile},
         service_protos::{
             agent_session::{self, AgentSessionEvent},
             channel::{self, ChannelEvent, ChannelIngress},
@@ -1400,8 +1411,9 @@ mod tests {
         },
         services::channel::ChannelService,
     };
-    use stellaclaw_core::session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
+    use stellaclaw_core::{
+        model_config::{ModelCapability, ModelConfig, ProviderType, RetryMode, TokenEstimatorType},
+        session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem},
     };
 
     #[test]
@@ -1423,6 +1435,63 @@ mod tests {
             crate::config::SandboxMode::Bubblewrap
         ));
         assert_eq!(sandbox.software_mount_path, "/__software");
+    }
+
+    #[test]
+    fn runtime_config_refreshes_existing_models_from_host_defaults() {
+        let current_conversation = conversation_ref("runtime_config_refresh_models");
+        let defaults_conversation = conversation_ref("runtime_config_refresh_models_defaults");
+        let mut current = ConversationRuntimeConfig::for_conversation(&current_conversation);
+        let mut defaults = ConversationRuntimeConfig::for_conversation(&defaults_conversation);
+
+        current.models.insert(
+            "main".to_string(),
+            test_runtime_model("https://openrouter.ai/api/v1/responses"),
+        );
+        current.session_profile = Some(SessionProfile {
+            main_model: ModelSelection::alias("main"),
+        });
+        defaults.models.insert(
+            "main".to_string(),
+            test_runtime_model("https://proxy.example.invalid/v1/messages"),
+        );
+
+        assert!(current.merge_host_defaults(defaults));
+        assert_eq!(
+            current.models["main"].url,
+            "https://proxy.example.invalid/v1/messages"
+        );
+        assert_eq!(
+            current
+                .session_profile
+                .as_ref()
+                .and_then(|profile| profile.main_model.resolve(&current.models))
+                .expect("profile model should resolve")
+                .url,
+            "https://proxy.example.invalid/v1/messages"
+        );
+    }
+
+    fn test_runtime_model(url: &str) -> ModelConfig {
+        ModelConfig {
+            provider_type: ProviderType::OpenRouterResponses,
+            model_name: "openai/gpt-5.1".to_string(),
+            url: url.to_string(),
+            api_key_env: "TEST_API_KEY".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 128_000,
+            max_tokens: 0,
+            cache_timeout: 300,
+            conn_timeout: 2,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        }
     }
 
     #[test]

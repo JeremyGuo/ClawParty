@@ -1,5 +1,10 @@
-version: 1.31.24
+version: 1.31.25
 ---
+
+# 1.31.25
+
+- 修复 provider endpoint 配置不生效：
+  旧 PartyClaw/compact config 转换模型时现在会优先使用模型里的 `url` 字段，不再在同时存在 `api_endpoint` / `chat_completions_path` 时忽略它；已有 conversation 启动时会用全局 config 刷新同名模型定义，避免老会话继续使用旧的 OpenRouter endpoint。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.24
 
