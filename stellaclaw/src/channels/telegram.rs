@@ -907,6 +907,10 @@ impl TelegramChannel {
         {
             return None;
         }
+        let target_path = Path::new(&target);
+        if target_path.is_absolute() {
+            return local_attachment_from_path(target_path, None, Self::MAX_OUTGOING_FILE_BYTES);
+        }
         let relative_path = safe_relative_path(&target)?;
         let path = path_to_slash_string(&relative_path)?;
         self.read_workspace_attachment(
@@ -925,7 +929,14 @@ impl TelegramChannel {
         if file.state.is_some() {
             return None;
         }
-        let path = file_path_from_uri(&file.uri)?;
+        let path = local_path_from_file_item_uri(&file.uri)?;
+        if path.is_absolute() {
+            return local_attachment_from_path(
+                &path,
+                file.media_type.clone(),
+                Self::MAX_OUTGOING_FILE_BYTES,
+            );
+        }
         let root = WorkdirLayout::new(&self.workdir).conversation_root(&appended.conversation_id);
         let root = fs::canonicalize(root).ok()?;
         let path = fs::canonicalize(path).ok()?;
@@ -1942,10 +1953,38 @@ fn is_local_overlay_path(path: &Path) -> bool {
     )
 }
 
-fn file_path_from_uri(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://")
-        .map(percent_decode)
-        .map(PathBuf::from)
+fn local_path_from_file_item_uri(uri: &str) -> Option<PathBuf> {
+    if let Some(path) = uri.strip_prefix("file://") {
+        return Some(PathBuf::from(percent_decode(path)));
+    }
+    let path = PathBuf::from(percent_decode(uri));
+    path.is_absolute().then_some(path)
+}
+
+fn local_attachment_from_path(
+    path: &Path,
+    media_type: Option<String>,
+    max_bytes: usize,
+) -> Option<TelegramOutgoingAttachment> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    Some(TelegramOutgoingAttachment {
+        media_type: media_type.or_else(|| infer_media_type(path)),
+        name,
+        bytes,
+    })
 }
 
 fn render_file_item(file: &FileItem) -> String {
@@ -3675,7 +3714,8 @@ fn kind_label(kind: OutgoingAttachmentKind) -> &'static str {
 mod tests {
     use super::{
         build_send_text_payload, delivery_retry_delay, is_retryable_telegram_error_code,
-        is_retryable_telegram_status, is_visible_telegram_assistant_message, markdown_link_targets,
+        is_retryable_telegram_status, is_visible_telegram_assistant_message,
+        local_attachment_from_path, local_path_from_file_item_uri, markdown_link_targets,
         model_selection_options, normalize_markdown_path, parse_conversation_control,
         parse_markdown_to_rich_document, render_chat_message,
         render_markdown_chunks_to_telegram_entities, render_progress_panel,
@@ -3691,6 +3731,7 @@ mod tests {
     use reqwest::StatusCode;
     use std::{
         collections::BTreeMap,
+        fs,
         path::PathBuf,
         sync::Mutex,
         time::{Duration, Instant},
@@ -3920,6 +3961,28 @@ mod tests {
         assert_eq!(normalize_markdown_path(&targets[1]), "images/chart.png");
         assert!(safe_relative_path(&normalize_markdown_path(&targets[0])).is_some());
         assert!(safe_relative_path("../secret.txt").is_none());
+    }
+
+    #[test]
+    fn telegram_reads_absolute_local_attachment_paths() {
+        let root =
+            std::env::temp_dir().join(format!("telegram-local-attachment-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp dir should be created");
+        let path = root.join("deck.pptx");
+        fs::write(&path, b"pptx bytes").expect("temp file should be written");
+
+        let attachment =
+            local_attachment_from_path(&path, None, TelegramChannel::MAX_OUTGOING_FILE_BYTES)
+                .expect("absolute local file should be readable");
+
+        assert_eq!(attachment.name, "deck.pptx");
+        assert_eq!(attachment.bytes, b"pptx bytes");
+        assert_eq!(
+            local_path_from_file_item_uri(path.to_str().unwrap()),
+            Some(path)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

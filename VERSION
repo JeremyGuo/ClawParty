@@ -1,5 +1,10 @@
-version: 1.31.26
+version: 1.31.27
 ---
+
+# 1.31.27
+
+- 修复 Telegram 本地文件附件发送：
+  Telegram final response 解析 Markdown 附件和 `FileItem` 时，允许直接读取裸本地绝对路径或 `file://` 本地路径并作为 `sendPhoto` / `sendDocument` multipart 附件发送，同时保留原有 48MB 大小限制和媒体类型推断。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.26
 
