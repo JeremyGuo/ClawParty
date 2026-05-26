@@ -1,5 +1,10 @@
-version: 1.31.23
+version: 1.31.24
 ---
+
+# 1.31.24
+
+- 修复 Telegram `/model` 无参数菜单：
+  已授权 Telegram chat 发送 `/model` 时会直接返回一个带 inline keyboard 的模型选择面板；按钮 callback 会发送现有 `/model <alias>` 控制命令继续走 runtime config 更新路径，恢复 Telegram 端可点击切换模型的交互。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.23
 

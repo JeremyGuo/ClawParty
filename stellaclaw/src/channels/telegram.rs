@@ -38,7 +38,8 @@ use super::{
     types::{
         parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError,
-        OutgoingMessageAppended, OutgoingOptions, OutgoingSessionStream, ProcessingState,
+        OutgoingMessageAppended, OutgoingOption, OutgoingOptions, OutgoingSessionStream,
+        ProcessingState,
     },
     Channel,
 };
@@ -77,6 +78,7 @@ pub struct TelegramChannel {
     workdir: PathBuf,
     conversation_runtime: Option<Arc<ConversationHostRuntime>>,
     progress_panels: Mutex<BTreeMap<String, TelegramProgressPanel>>,
+    model_aliases: Vec<String>,
     logger: Option<Arc<StellaclawLogger>>,
     security_path: PathBuf,
     security: Mutex<SecurityState>,
@@ -98,6 +100,7 @@ impl TelegramChannel {
         admin_user_ids: Vec<i64>,
         workdir: &Path,
         conversation_runtime: Arc<ConversationHostRuntime>,
+        model_aliases: Vec<String>,
         logger: Arc<StellaclawLogger>,
     ) -> Result<Self> {
         let dir = workdir.join(".stellaclaw").join("channels").join(&id);
@@ -137,6 +140,7 @@ impl TelegramChannel {
             workdir: workdir.to_path_buf(),
             conversation_runtime: Some(conversation_runtime),
             progress_panels: Mutex::new(BTreeMap::new()),
+            model_aliases,
             logger: Some(logger),
             security_path,
             security: Mutex::new(security),
@@ -236,6 +240,14 @@ impl TelegramChannel {
             return Ok(());
         }
 
+        if matches!(
+            parse_conversation_control(&text),
+            Some(ConversationControl::ShowModel)
+        ) {
+            self.send_model_selection_panel(&chat_id)?;
+            return Ok(());
+        }
+
         let conversation_id = id_manager
             .lock()
             .map_err(|_| anyhow!("conversation id manager lock poisoned"))?
@@ -296,6 +308,14 @@ impl TelegramChannel {
         }
 
         if !self.authorize_chat(&message, from_user_id, &text)? {
+            return Ok(());
+        }
+
+        if matches!(
+            parse_conversation_control(&text),
+            Some(ConversationControl::ShowModel)
+        ) {
+            self.send_model_selection_panel(&chat_id)?;
             return Ok(());
         }
 
@@ -1006,6 +1026,18 @@ impl TelegramChannel {
         Ok(())
     }
 
+    fn send_model_selection_panel(&self, platform_chat_id: &str) -> Result<()> {
+        if self.model_aliases.is_empty() {
+            return self.send_text(platform_chat_id, "当前没有可用的 agent model。", None);
+        }
+        let text = format!(
+            "**选择模型**\n当前可用 agent model 共 {} 个。请选择这个 conversation 后续使用的模型：",
+            self.model_aliases.len()
+        );
+        let options = model_selection_options(&self.model_aliases);
+        self.send_text(platform_chat_id, &text, Some(&options))
+    }
+
     fn update_chat_state(&self, chat_id: &str, new_state: AuthorizationState) -> Result<()> {
         let mut security = self
             .security
@@ -1578,6 +1610,18 @@ fn is_visible_telegram_assistant_message(appended: &OutgoingMessageAppended) -> 
         .as_ref()
         .or(appended.message.message_part.as_ref());
     message_part == Some(&ChatMessagePart::FinalResponse)
+}
+
+fn model_selection_options(model_aliases: &[String]) -> OutgoingOptions {
+    OutgoingOptions {
+        options: model_aliases
+            .iter()
+            .map(|alias| OutgoingOption {
+                label: alias.clone(),
+                value: format!("/model {alias}"),
+            })
+            .collect(),
+    }
 }
 
 fn decode_telegram_delivery_response<T: serde::de::DeserializeOwned>(
@@ -3632,8 +3676,9 @@ mod tests {
     use super::{
         build_send_text_payload, delivery_retry_delay, is_retryable_telegram_error_code,
         is_retryable_telegram_status, is_visible_telegram_assistant_message, markdown_link_targets,
-        normalize_markdown_path, parse_conversation_control, parse_markdown_to_rich_document,
-        render_chat_message, render_markdown_chunks_to_telegram_entities, render_progress_panel,
+        model_selection_options, normalize_markdown_path, parse_conversation_control,
+        parse_markdown_to_rich_document, render_chat_message,
+        render_markdown_chunks_to_telegram_entities, render_progress_panel,
         render_rich_document_to_telegram_entities, safe_relative_path, telegram_text_len,
         ChatAuthorization, SecurityState, TelegramChannel, TelegramChat, TelegramMessage,
         TelegramMessageEntity, TelegramProgressPanel, TelegramProgressStatus, TelegramRenderedText,
@@ -3749,6 +3794,7 @@ mod tests {
             workdir: PathBuf::from("."),
             conversation_runtime: None,
             progress_panels: Mutex::new(BTreeMap::new()),
+            model_aliases: Vec::new(),
             logger: None,
             security_path: PathBuf::from("/tmp/unused-security.json"),
             security: Mutex::new(SecurityState {
@@ -3918,6 +3964,17 @@ mod tests {
         assert_eq!(delivery_retry_delay(3, None), Duration::from_secs(8));
         assert_eq!(delivery_retry_delay(20, None), Duration::from_secs(60));
         assert_eq!(delivery_retry_delay(1, Some(7)), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn telegram_model_selection_options_use_model_callback_commands() {
+        let options = model_selection_options(&["fast".to_string(), "deep".to_string()]);
+
+        assert_eq!(options.options.len(), 2);
+        assert_eq!(options.options[0].label, "fast");
+        assert_eq!(options.options[0].value, "/model fast");
+        assert_eq!(options.options[1].label, "deep");
+        assert_eq!(options.options[1].value, "/model deep");
     }
 
     #[test]
