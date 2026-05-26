@@ -15,6 +15,7 @@ use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::blocking::{multipart, Client};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellaclaw_core::session_actor::{
@@ -76,6 +77,7 @@ pub struct TelegramChannel {
     workdir: PathBuf,
     conversation_runtime: Option<Arc<ConversationHostRuntime>>,
     progress_panels: Mutex<BTreeMap<String, TelegramProgressPanel>>,
+    logger: Option<Arc<StellaclawLogger>>,
     security_path: PathBuf,
     security: Mutex<SecurityState>,
 }
@@ -84,6 +86,8 @@ impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
     const MAX_OUTGOING_FILE_BYTES: usize = 48 * 1024 * 1024;
     const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+    const DELIVERY_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+    const DELIVERY_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
     pub fn new(
         id: String,
@@ -94,6 +98,7 @@ impl TelegramChannel {
         admin_user_ids: Vec<i64>,
         workdir: &Path,
         conversation_runtime: Arc<ConversationHostRuntime>,
+        logger: Arc<StellaclawLogger>,
     ) -> Result<Self> {
         let dir = workdir.join(".stellaclaw").join("channels").join(&id);
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -132,6 +137,7 @@ impl TelegramChannel {
             workdir: workdir.to_path_buf(),
             conversation_runtime: Some(conversation_runtime),
             progress_panels: Mutex::new(BTreeMap::new()),
+            logger: Some(logger),
             security_path,
             security: Mutex::new(security),
         };
@@ -595,7 +601,7 @@ impl TelegramChannel {
                 rendered,
                 (index == last_index).then_some(options).flatten(),
             )?;
-            let _: serde_json::Value = self.call_api("sendMessage", &payload)?;
+            let _: serde_json::Value = self.call_api_delivery("sendMessage", &payload)?;
         }
         Ok(())
     }
@@ -609,7 +615,7 @@ impl TelegramChannel {
                 entities: Vec::new(),
             });
         let payload = build_send_text_payload(platform_chat_id, rendered, None)?;
-        let message: TelegramSentMessage = self.call_api("sendMessage", &payload)?;
+        let message: TelegramSentMessage = self.call_api_delivery("sendMessage", &payload)?;
         Ok(message.message_id)
     }
 
@@ -641,7 +647,7 @@ impl TelegramChannel {
                 );
             }
         }
-        let _: Value = self.call_api("editMessageText", &payload)?;
+        let _: Value = self.call_api_delivery("editMessageText", &payload)?;
         Ok(())
     }
 
@@ -816,16 +822,14 @@ impl TelegramChannel {
         } else {
             "sendDocument"
         };
-        let mut part = multipart::Part::bytes(attachment.bytes).file_name(attachment.name);
-        if let Some(media_type) = attachment.media_type.as_deref() {
-            part = part
-                .mime_str(media_type)
-                .with_context(|| format!("invalid telegram attachment media type {media_type}"))?;
-        }
-        let form = multipart::Form::new()
-            .text("chat_id", platform_chat_id.to_string())
-            .part(field.to_string(), part);
-        let _: serde_json::Value = self.call_api_multipart(method, form)?;
+        let _: serde_json::Value = self.call_api_multipart_delivery(
+            method,
+            platform_chat_id,
+            field,
+            attachment.name,
+            attachment.media_type,
+            attachment.bytes,
+        )?;
         Ok(())
     }
 
@@ -1115,32 +1119,120 @@ impl TelegramChannel {
             .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
     }
 
-    fn call_api_multipart<T: serde::de::DeserializeOwned>(
+    fn call_api_delivery<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
-        form: multipart::Form,
+        payload: &serde_json::Value,
     ) -> Result<T> {
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self.call_api_delivery_once(method, payload) {
+                Ok(result) => return Ok(result),
+                Err(error) if error.retryable => {
+                    let delay = delivery_retry_delay(attempt, error.retry_after);
+                    self.log_delivery_retry(method, attempt, delay, &error);
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(anyhow!("{}", error.describe(method))),
+            }
+        }
+    }
+
+    fn call_api_delivery_once<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        payload: &serde_json::Value,
+    ) -> std::result::Result<T, TelegramDeliveryError> {
+        let response = self
+            .client
+            .post(self.method_url(method))
+            .json(payload)
+            .send()
+            .map_err(|error| TelegramDeliveryError::transport(error.to_string()))?;
+        decode_telegram_delivery_response(method, response)
+    }
+
+    fn call_api_multipart_delivery<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        platform_chat_id: &str,
+        field: &str,
+        name: String,
+        media_type: Option<String>,
+        bytes: Vec<u8>,
+    ) -> Result<T> {
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let result = self.call_api_multipart_delivery_once(
+                method,
+                platform_chat_id,
+                field,
+                &name,
+                media_type.as_deref(),
+                bytes.clone(),
+            );
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) if error.retryable => {
+                    let delay = delivery_retry_delay(attempt, error.retry_after);
+                    self.log_delivery_retry(method, attempt, delay, &error);
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(anyhow!("{}", error.describe(method))),
+            }
+        }
+    }
+
+    fn call_api_multipart_delivery_once<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        platform_chat_id: &str,
+        field: &str,
+        name: &str,
+        media_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<T, TelegramDeliveryError> {
+        let mut part = multipart::Part::bytes(bytes).file_name(name.to_string());
+        if let Some(media_type) = media_type {
+            part = part
+                .mime_str(media_type)
+                .map_err(|error| TelegramDeliveryError::non_retryable(error.to_string()))?;
+        }
+        let form = multipart::Form::new()
+            .text("chat_id", platform_chat_id.to_string())
+            .part(field.to_string(), part);
         let response = self
             .client
             .post(self.method_url(method))
             .multipart(form)
             .send()
-            .with_context(|| format!("telegram API call {method} failed"))?;
-        let envelope = response
-            .json::<TelegramEnvelope<T>>()
-            .with_context(|| format!("telegram API {method} returned invalid JSON"))?;
-        if !envelope.ok {
-            return Err(anyhow!(
-                "telegram API {} failed: {}",
-                method,
-                envelope
-                    .description
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
+            .map_err(|error| TelegramDeliveryError::transport(error.to_string()))?;
+        decode_telegram_delivery_response(method, response)
+    }
+
+    fn log_delivery_retry(
+        &self,
+        method: &str,
+        attempt: u32,
+        delay: Duration,
+        error: &TelegramDeliveryError,
+    ) {
+        if let Some(logger) = &self.logger {
+            logger.warn(
+                "telegram_delivery_retry",
+                json!({
+                    "channel_id": self.id,
+                    "method": method,
+                    "attempt": attempt,
+                    "delay_ms": delay.as_millis(),
+                    "http_status": error.http_status,
+                    "error_code": error.error_code,
+                    "error": error.description,
+                }),
+            );
         }
-        envelope
-            .result
-            .ok_or_else(|| anyhow!("telegram API {} returned no result", method))
     }
 
     fn method_url(&self, method: &str) -> String {
@@ -1284,7 +1376,59 @@ struct TelegramEnvelope<T> {
     ok: bool,
     result: Option<T>,
     #[serde(default)]
+    error_code: Option<i64>,
+    #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramResponseParameters {
+    #[serde(default)]
+    retry_after: Option<u64>,
+}
+
+#[derive(Debug)]
+struct TelegramDeliveryError {
+    description: String,
+    http_status: Option<u16>,
+    error_code: Option<i64>,
+    retry_after: Option<u64>,
+    retryable: bool,
+}
+
+impl TelegramDeliveryError {
+    fn transport(description: String) -> Self {
+        Self {
+            description,
+            http_status: None,
+            error_code: None,
+            retry_after: None,
+            retryable: true,
+        }
+    }
+
+    fn non_retryable(description: String) -> Self {
+        Self {
+            description,
+            http_status: None,
+            error_code: None,
+            retry_after: None,
+            retryable: false,
+        }
+    }
+
+    fn describe(&self, method: &str) -> String {
+        let mut text = format!("telegram API {method} failed: {}", self.description);
+        if let Some(status) = self.http_status {
+            text.push_str(&format!(" (http_status={status})"));
+        }
+        if let Some(code) = self.error_code {
+            text.push_str(&format!(" (error_code={code})"));
+        }
+        text
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1434,6 +1578,65 @@ fn is_visible_telegram_assistant_message(appended: &OutgoingMessageAppended) -> 
         .as_ref()
         .or(appended.message.message_part.as_ref());
     message_part == Some(&ChatMessagePart::FinalResponse)
+}
+
+fn decode_telegram_delivery_response<T: serde::de::DeserializeOwned>(
+    method: &str,
+    response: reqwest::blocking::Response,
+) -> std::result::Result<T, TelegramDeliveryError> {
+    let status = response.status();
+    let retryable_status = is_retryable_telegram_status(status);
+    let envelope =
+        response
+            .json::<TelegramEnvelope<T>>()
+            .map_err(|error| TelegramDeliveryError {
+                description: format!("invalid JSON response: {error}"),
+                http_status: Some(status.as_u16()),
+                error_code: None,
+                retry_after: None,
+                retryable: retryable_status,
+            })?;
+    if !envelope.ok || !status.is_success() {
+        let error_code = envelope.error_code;
+        let retryable = retryable_status || is_retryable_telegram_error_code(error_code);
+        return Err(TelegramDeliveryError {
+            description: envelope
+                .description
+                .unwrap_or_else(|| "unknown".to_string()),
+            http_status: Some(status.as_u16()),
+            error_code,
+            retry_after: envelope
+                .parameters
+                .and_then(|parameters| parameters.retry_after),
+            retryable,
+        });
+    }
+    envelope.result.ok_or_else(|| TelegramDeliveryError {
+        description: format!("telegram API {method} returned no result"),
+        http_status: Some(status.as_u16()),
+        error_code: None,
+        retry_after: None,
+        retryable: false,
+    })
+}
+
+fn is_retryable_telegram_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn is_retryable_telegram_error_code(error_code: Option<i64>) -> bool {
+    matches!(error_code, Some(429) | Some(500..=599))
+}
+
+fn delivery_retry_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
+    if let Some(seconds) = retry_after {
+        return Duration::from_secs(seconds.max(1));
+    }
+    let shift = attempt.saturating_sub(1).min(5);
+    let multiplier = 1_u64 << shift;
+    TelegramChannel::DELIVERY_RETRY_INITIAL_DELAY
+        .saturating_mul(u32::try_from(multiplier).unwrap_or(u32::MAX))
+        .min(TelegramChannel::DELIVERY_RETRY_MAX_DELAY)
 }
 
 fn progress_panel_key(stream: &OutgoingSessionStream, turn_id: &str) -> String {
@@ -3427,7 +3630,8 @@ fn kind_label(kind: OutgoingAttachmentKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_send_text_payload, is_visible_telegram_assistant_message, markdown_link_targets,
+        build_send_text_payload, delivery_retry_delay, is_retryable_telegram_error_code,
+        is_retryable_telegram_status, is_visible_telegram_assistant_message, markdown_link_targets,
         normalize_markdown_path, parse_conversation_control, parse_markdown_to_rich_document,
         render_chat_message, render_markdown_chunks_to_telegram_entities, render_progress_panel,
         render_rich_document_to_telegram_entities, safe_relative_path, telegram_text_len,
@@ -3439,6 +3643,7 @@ mod tests {
         ConversationControl, OutgoingMessageAppended, OutgoingOption, OutgoingOptions,
     };
     use crate::config::SandboxMode;
+    use reqwest::StatusCode;
     use std::{
         collections::BTreeMap,
         path::PathBuf,
@@ -3544,6 +3749,7 @@ mod tests {
             workdir: PathBuf::from("."),
             conversation_runtime: None,
             progress_panels: Mutex::new(BTreeMap::new()),
+            logger: None,
             security_path: PathBuf::from("/tmp/unused-security.json"),
             security: Mutex::new(SecurityState {
                 admin_user_ids: Vec::new(),
@@ -3697,6 +3903,21 @@ mod tests {
         assert!(rendered.contains("[x] Inspect event flow"));
         assert!(rendered.contains("[>] Restore Telegram progress panel"));
         assert!(rendered.contains("[ ] Run focused tests"));
+    }
+
+    #[test]
+    fn telegram_delivery_retry_policy_retries_only_transient_failures() {
+        assert!(is_retryable_telegram_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_telegram_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_telegram_status(StatusCode::BAD_REQUEST));
+        assert!(is_retryable_telegram_error_code(Some(429)));
+        assert!(is_retryable_telegram_error_code(Some(503)));
+        assert!(!is_retryable_telegram_error_code(Some(400)));
+
+        assert_eq!(delivery_retry_delay(1, None), Duration::from_secs(2));
+        assert_eq!(delivery_retry_delay(3, None), Duration::from_secs(8));
+        assert_eq!(delivery_retry_delay(20, None), Duration::from_secs(60));
+        assert_eq!(delivery_retry_delay(1, Some(7)), Duration::from_secs(7));
     }
 
     #[test]

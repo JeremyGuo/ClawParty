@@ -1,5 +1,10 @@
-version: 1.31.21
+version: 1.31.22
 ---
+
+# 1.31.22
+
+- 修复 Telegram channel 发送失败吞回复：
+  Telegram delivery API 现在对 `sendMessage`、`sendPhoto`、`sendDocument` 和 `editMessageText` 使用无限重试；网络错误、HTTP 5xx 和 429 会按退避间隔持续重试，并尊重 Telegram `retry_after`；非 429 的 4xx 会停止重试并返回错误供 outgoing loop 记录日志，避免永久卡在不可恢复请求。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.21
 

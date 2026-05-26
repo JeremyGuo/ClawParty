@@ -139,6 +139,7 @@ fn run() -> Result<()> {
                     telegram.admin_user_ids.clone(),
                     &args.workdir,
                     conversation_host_runtime.clone(),
+                    logger.clone(),
                 )?);
                 instance.clone().spawn_ingress(
                     incoming_tx.clone(),
