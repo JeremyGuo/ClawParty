@@ -6,6 +6,9 @@ version: 1.31.26
 - 修复 StellaCodeX Electron SSH Proxy tunnel 失败风暴：
   同一 server / tunnel 配置的 SSH tunnel 建立现在会复用进行中的连接任务，并在 NAT/SSH 早退后做短暂失败冷却，避免 `server:connectionInfo` / `server:request` 并发触发大量 `ssh -L` 进程和 IPC 错误；初始会话刷新失败也会被捕获记录，不再形成未处理 promise。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 Telegram / Web 模型切换后仍使用旧 provider endpoint：
+  conversation runtime config 合并根配置时现在会 upsert 根配置里的同名和新增模型 alias，避免旧 runtime 快照缺少新模型；`/model <alias>` 切换会随 runtime patch 同步发送最新模型表，让正在运行的会话立即拿到新 alias 和 endpoint。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.31.25
 
 - 修复 provider endpoint 配置不生效：

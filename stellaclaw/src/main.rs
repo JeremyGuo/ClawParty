@@ -358,6 +358,7 @@ fn control_to_channel_ingress(
                     session_profile: Some(Some(SessionProfile {
                         main_model: ModelSelection::alias(model_name.clone()),
                     })),
+                    models: Some(config.models.clone()),
                     ..Default::default()
                 },
             })

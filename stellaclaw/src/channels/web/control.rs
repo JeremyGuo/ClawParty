@@ -45,6 +45,7 @@ pub(super) fn control_ingress_from_text(
                     session_profile: Some(Some(SessionProfile {
                         main_model: ModelSelection::alias(argument.to_string()),
                     })),
+                    models: Some(config.models.clone()),
                     ..Default::default()
                 },
             }

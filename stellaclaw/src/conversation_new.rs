@@ -345,11 +345,8 @@ impl ConversationRuntimeConfig {
             changed = true;
         } else if !self.models.is_empty() && !defaults.models.is_empty() {
             for (alias, default_model) in defaults.models {
-                let Some(current_model) = self.models.get_mut(&alias) else {
-                    continue;
-                };
-                if current_model != &default_model {
-                    *current_model = default_model;
+                if self.models.get(&alias) != Some(&default_model) {
+                    self.models.insert(alias, default_model);
                     changed = true;
                 }
             }
@@ -1172,6 +1169,9 @@ impl ConversationKernel {
         if let Some(session_profile) = patch.session_profile {
             self.runtime_config.session_profile = session_profile;
         }
+        if let Some(models) = patch.models {
+            self.runtime_config.models = models;
+        }
         if let Some(session_defaults) = patch.session_defaults {
             self.runtime_config.session_defaults = session_defaults;
         }
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_refreshes_existing_models_from_host_defaults() {
+    fn runtime_config_upserts_host_default_models() {
         let current_conversation = conversation_ref("runtime_config_refresh_models");
         let defaults_conversation = conversation_ref("runtime_config_refresh_models_defaults");
         let mut current = ConversationRuntimeConfig::for_conversation(&current_conversation);
@@ -1449,11 +1449,15 @@ mod tests {
             test_runtime_model("https://openrouter.ai/api/v1/responses"),
         );
         current.session_profile = Some(SessionProfile {
-            main_model: ModelSelection::alias("main"),
+            main_model: ModelSelection::alias("opus-4.7"),
         });
         defaults.models.insert(
             "main".to_string(),
             test_runtime_model("https://proxy.example.invalid/v1/messages"),
+        );
+        defaults.models.insert(
+            "opus-4.7".to_string(),
+            test_runtime_model("https://proxy.example.invalid/v1/opus"),
         );
 
         assert!(current.merge_host_defaults(defaults));
@@ -1462,13 +1466,17 @@ mod tests {
             "https://proxy.example.invalid/v1/messages"
         );
         assert_eq!(
+            current.models["opus-4.7"].url,
+            "https://proxy.example.invalid/v1/opus"
+        );
+        assert_eq!(
             current
                 .session_profile
                 .as_ref()
                 .and_then(|profile| profile.main_model.resolve(&current.models))
                 .expect("profile model should resolve")
                 .url,
-            "https://proxy.example.invalid/v1/messages"
+            "https://proxy.example.invalid/v1/opus"
         );
     }
 
@@ -2013,6 +2021,10 @@ mod tests {
             .send(ChannelIngress::UpdateRuntimeConfig {
                 patch: kernel::KernelRuntimeConfigPatch {
                     memory_enabled: Some(true),
+                    models: Some(std::collections::BTreeMap::from([(
+                        "main".to_string(),
+                        test_runtime_model("https://proxy.example.invalid/v1/messages"),
+                    )])),
                     reasoning_effort: Some(Some("high".to_string())),
                     ..Default::default()
                 },
@@ -2030,6 +2042,10 @@ mod tests {
                     .as_array()
                     .is_some_and(Vec::is_empty)
         }));
+        assert_eq!(
+            kernel.runtime_config().models["main"].url,
+            "https://proxy.example.invalid/v1/messages"
+        );
         assert!(kernel.runtime_config().memory_enabled);
         assert_eq!(
             kernel.runtime_config().reasoning_effort.as_deref(),

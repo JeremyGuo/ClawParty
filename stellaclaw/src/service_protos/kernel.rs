@@ -19,6 +19,8 @@ pub struct KernelRuntimeConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_profile: Option<Option<crate::config::SessionProfile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<BTreeMap<String, stellaclaw_core::model_config::ModelConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_defaults: Option<crate::config::SessionDefaults>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_enabled: Option<bool>,
