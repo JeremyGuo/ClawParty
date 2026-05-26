@@ -5,6 +5,14 @@ const CACHE_LIMIT = 360;
 const lowlight = createLowlight(common);
 const highlightCache = new Map();
 
+export function highlightCodeText(language, code, prefix = DEFAULT_PREFIX) {
+  const normalizedLanguage = String(language || '').trim();
+  const highlighted = normalizedLanguage
+    ? cachedHighlight(normalizedLanguage, String(code || ''), prefix)
+    : cachedAutoHighlight(String(code || ''), prefix);
+  return highlighted || { children: [{ type: 'text', value: String(code || '') }], language: '' };
+}
+
 export function cachedRehypeHighlight(options = {}) {
   const prefix = typeof options.prefix === 'string' ? options.prefix : DEFAULT_PREFIX;
   const plainText = Array.isArray(options.plainText) ? options.plainText : [];
@@ -20,14 +28,19 @@ export function cachedRehypeHighlight(options = {}) {
         return;
       }
       const language = codeLanguage(node);
-      if (!language || plainText.includes(language)) return;
+      if (language && plainText.includes(language)) return;
 
       const classes = ensureClassList(node);
       if (!classes.includes(className)) classes.unshift(className);
 
       const code = hastText(node);
-      const highlighted = cachedHighlight(language, code, prefix);
+      const highlighted = language
+        ? cachedHighlight(language, code, prefix)
+        : cachedAutoHighlight(code, prefix);
       if (!highlighted) return;
+      if (!language && highlighted.language && !classes.includes(`language-${highlighted.language}`)) {
+        classes.push(`language-${highlighted.language}`);
+      }
       node.children = cloneHastChildren(highlighted.children);
     });
   };
@@ -48,6 +61,31 @@ function cachedHighlight(language, code, prefix) {
     return null;
   }
   const cachedResult = { children: cloneHastChildren(result.children || []) };
+  highlightCache.set(key, cachedResult);
+  while (highlightCache.size > CACHE_LIMIT) {
+    highlightCache.delete(highlightCache.keys().next().value);
+  }
+  return cachedResult;
+}
+
+function cachedAutoHighlight(code, prefix) {
+  const key = `auto\u0000${prefix}\u0000${code.length}\u0000${hashText(code)}`;
+  const cached = highlightCache.get(key);
+  if (cached) {
+    highlightCache.delete(key);
+    highlightCache.set(key, cached);
+    return cached;
+  }
+  let result;
+  try {
+    result = lowlight.highlightAuto(code, { prefix });
+  } catch {
+    return null;
+  }
+  const cachedResult = {
+    children: cloneHastChildren(result.children || []),
+    language: typeof result.data?.language === 'string' ? result.data.language : ''
+  };
   highlightCache.set(key, cachedResult);
   while (highlightCache.size > CACHE_LIMIT) {
     highlightCache.delete(highlightCache.keys().next().value);

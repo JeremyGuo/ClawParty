@@ -25,6 +25,14 @@ export function isAuxiliaryUserMessage(message) {
   return /^\[(Incoming User Metadata|Runtime Prompt Updates|Runtime Skill Updates|System Context|Developer Context|Tool Context)]/i.test(text);
 }
 
+export function isControlCommandMessage(message) {
+  if (String(message?.role || '').toLowerCase() !== 'user') return false;
+  const text = messageText(message).trim();
+  if (!text.startsWith('/')) return false;
+  const name = text.split(/\s+/, 1)[0]?.toLowerCase() || '';
+  return ['/model', '/remote', '/reasoning', '/cancel', '/compact', '/status', '/continue'].includes(name);
+}
+
 export function messageItems(message) {
   if (message && typeof message === 'object') {
     const cached = messageItemsCache.get(message);
@@ -192,6 +200,7 @@ export function isFinalAssistantMessage(message) {
 
 function hasVisibleMessageContent(message) {
   if (!message) return false;
+  if (isControlCommandMessage(message)) return false;
   if (message?._streamFailed || message?.error) return true;
   if (messageText(message).trim()) return true;
   if (Number(message?.attachment_count || 0) > 0) return true;

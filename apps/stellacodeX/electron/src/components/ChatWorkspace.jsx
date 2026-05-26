@@ -4,6 +4,10 @@ import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import 'katex/dist/katex.min.css';
+import { Compartment, EditorState } from '@codemirror/state';
+import { history, historyKeymap } from '@codemirror/commands';
+import { markdown } from '@codemirror/lang-markdown';
+import { Decoration, EditorView, ViewPlugin, WidgetType, keymap, placeholder } from '@codemirror/view';
 import { ChevronDown, Code2, Copy, Download, Eye, FileText, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, fileNameFromPath, isImageAttachment, messageText } from '../lib/fileUtils';
@@ -50,6 +54,8 @@ const USER_SCROLL_ACTIVE_MS = 900;
 const STREAM_TEXT_STABLE_CHARS = 1800;
 const markdownRemarkPlugins = [remarkGfm, remarkMath];
 const markdownRehypePlugins = [cachedRehypeHighlight, rehypeKatex];
+const composerEditableCompartment = new Compartment();
+const composerPlaceholderCompartment = new Compartment();
 
 const SCROLL_CHANGE = Object.freeze({
   SessionRestore: 'session-restore',
@@ -84,7 +90,7 @@ function useStableOptionalCallback(callback) {
   return callback ? stableCallback : undefined;
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, commandNotice, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
   const renderStartedAt = renderCommitStart();
   const currentActivity = (runningActivities || []).at(-1) || null;
   const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
@@ -124,15 +130,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [modelsError, setModelsError] = useState('');
   const [draft, setDraft] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
+  const draftRef = useRef('');
   const progressRef = useRef(null);
   const composerRef = useRef(null);
-  const textareaRef = useRef(null);
+  const composerInputRef = useRef(null);
+  const composerEditorViewRef = useRef(null);
   const fileInputRef = useRef(null);
   const composerAttachmentsRef = useRef([]);
-  const composingRef = useRef(false);
-  const lastComposingEnterAtRef = useRef(0);
-  const lastEnterKeyUpAtRef = useRef(0);
-  const suppressNextEnterRef = useRef(false);
   const scrollRef = useRef(null);
   const contentRef = useRef(null);
   const previousCountRef = useRef(0);
@@ -163,6 +167,20 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     return isExecutionMessage(lastMessage);
   }, [messages, messagesReady, sending, processing, currentActivity]);
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
+
+  const setComposerEditorValue = useCallback((value, options = {}) => {
+    const nextValue = String(value || '');
+    draftRef.current = nextValue;
+    setDraft(nextValue);
+    const view = composerEditorViewRef.current;
+    if (!view) return;
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: nextValue },
+      selection: { anchor: options.cursorAtStart ? 0 : nextValue.length },
+      scrollIntoView: true
+    });
+    if (options.focus) requestAnimationFrame(() => view.focus());
+  }, []);
 
   const stickyAutoScrollEnabled = useCallback(() => (
     stickToBottomRef.current
@@ -271,13 +289,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   }, [responseSpacerVisible, activeMessageScope, renderEntries.length]);
 
   useLayoutEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-    const maxHeight = Number.parseFloat(window.getComputedStyle(textarea).maxHeight) || 220;
-    textarea.style.height = 'auto';
-    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
-    textarea.style.height = `${nextHeight}px`;
-    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
     updateComposerMetrics();
     requestAnimationFrame(() => reconcileScrollAfterContentChange(SCROLL_CHANGE.ComposerResize, lastScrollStateRef.current));
   }, [draft, composerAttachments.length, selectionReferences.length]);
@@ -461,14 +472,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     lastScopeRef.current = activeMessageScope;
     lastScrollStateRef.current = remembered;
     pendingScrollRestoreRef.current = remembered;
-    setDraft('');
+    setComposerEditorValue('');
     setComposerAttachments((current) => {
       current.forEach((attachment) => {
         if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
       });
       return [];
     });
-  }, [activeMessageScope]);
+  }, [activeMessageScope, setComposerEditorValue]);
 
   useEffect(() => {
     composerAttachmentsRef.current = composerAttachments;
@@ -613,7 +624,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       return composerAttachmentFromFile(file, fallbackName);
     }));
     setComposerAttachments((current) => [...current, ...next]);
-    requestAnimationFrame(() => textareaRef.current?.focus());
+    requestAnimationFrame(() => composerEditorViewRef.current?.focus());
   };
 
   const removeComposerAttachment = (id) => {
@@ -625,16 +636,16 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   };
 
   const submitDraft = async () => {
-    if ((!draft.trim() && composerAttachments.length === 0 && selectionReferences.length === 0) || sending) return;
-    const value = draft;
+    const value = composerEditorViewRef.current?.state.doc.toString() ?? draftRef.current ?? draft;
+    if ((!value.trim() && composerAttachments.length === 0 && selectionReferences.length === 0) || sending) return;
     const attachments = composerAttachments;
     const selections = selectionReferences;
     forceStickToBottomForOutgoingMessage();
-    setDraft('');
+    setComposerEditorValue('');
     setComposerAttachments([]);
     const sent = await onSend?.(value, attachments.map(outgoingAttachmentPayload), selections);
     if (sent === false) {
-      setDraft((current) => current || value);
+      setComposerEditorValue(value, { focus: true });
       setComposerAttachments((current) => current.length ? current : attachments);
     } else {
       attachments.forEach((attachment) => {
@@ -654,15 +665,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       event.preventDefault();
       addComposerFiles(files, 'paste').catch(() => {});
     }
-  };
-
-  const isImeComposingEnter = (event) => {
-    if (event.key !== 'Enter') return false;
-    const nativeEvent = event.nativeEvent || {};
-    return composingRef.current
-      || event.isComposing
-      || nativeEvent.isComposing
-      || nativeEvent.keyCode === 229;
   };
 
   const openModelOptions = async () => {
@@ -693,7 +695,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       onSend?.(command.command);
       return;
     }
-    setDraft(command.insert || command.command);
+    const nextDraft = command.insert || command.command;
+    setComposerEditorValue(nextDraft, { focus: true });
   };
 
   const chooseModel = (model) => {
@@ -746,6 +749,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
         />
       </div>
       <ChatPerfPopover />
+      <CommandNoticeToast notice={commandNotice} />
       <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
       <footer className="composer-wrap" ref={composerRef}>
         <div className="composer">
@@ -799,47 +803,22 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               addComposerFiles(files, 'file').catch(() => {});
             }}
           />
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onPaste={handlePaste}
-            disabled={modelSelectionPending}
-            onCompositionStart={() => {
-              composingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              composingRef.current = false;
-              if (lastComposingEnterAtRef.current > lastEnterKeyUpAtRef.current) {
-                suppressNextEnterRef.current = true;
-                window.setTimeout(() => {
-                  suppressNextEnterRef.current = false;
-                }, 160);
-              }
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && isImeComposingEnter(event)) {
-                lastComposingEnterAtRef.current = Date.now();
-                return;
-              }
-              if (event.key === 'Enter' && !event.shiftKey && suppressNextEnterRef.current) {
-                suppressNextEnterRef.current = false;
-                event.preventDefault();
-                return;
-              }
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                submitDraft().catch(() => {});
-              }
-            }}
-            onKeyUp={(event) => {
-              if (event.key === 'Enter') {
-                lastEnterKeyUpAtRef.current = Date.now();
-                suppressNextEnterRef.current = false;
-              }
-            }}
-            placeholder={modelSelectionPending ? '请先选择模型' : 'Ask Stellacode to change, inspect, or explain...'}
-          />
+          <div className="composer-input" ref={composerInputRef}>
+            <ComposerCodeMirror
+              disabled={modelSelectionPending}
+              placeholderText={modelSelectionPending ? '请先选择模型' : 'Ask Stellacode to change, inspect, or explain...'}
+              onReady={(view) => {
+                composerEditorViewRef.current = view;
+              }}
+              onChange={(value) => {
+                draftRef.current = value;
+                setDraft(value);
+                requestAnimationFrame(updateComposerMetrics);
+              }}
+              onPasteFiles={(files) => addComposerFiles(files, 'paste')}
+              onSubmit={() => submitDraft().catch(() => {})}
+            />
+          </div>
           <div className="composer-row">
             <button className="composer-icon" type="button" title="添加附件" onClick={() => fileInputRef.current?.click()}>
               <Plus size={18} />
@@ -936,7 +915,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               </Popover.Portal>
             </Popover.Root>
             <span className={`mode-pill ${modeTone}`} title={modeTitle}>{modeLabel}</span>
-            <button className="send-button" type="button" disabled={modelSelectionPending || (!draft.trim() && composerAttachments.length === 0 && selectionReferences.length === 0) || sending} onClick={() => submitDraft().catch(() => {})}>
+            <button className="send-button" type="button" disabled={modelSelectionPending || sending} onClick={() => submitDraft().catch(() => {})}>
               <Send size={18} />
             </button>
           </div>
@@ -1069,6 +1048,259 @@ function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }
       <span>{label}</span>
     </div>
   );
+}
+
+function CommandNoticeToast({ notice }) {
+  if (!notice) return null;
+  return (
+    <div className={`command-notice-toast ${notice.state || 'done'}`} role="status" aria-live="polite">
+      <strong>{notice.title || '命令已发送'}</strong>
+      {notice.detail && <span>{notice.detail}</span>}
+    </div>
+  );
+}
+
+function ComposerCodeMirror({ disabled, placeholderText, onReady, onChange, onPasteFiles, onSubmit }) {
+  const hostRef = useRef(null);
+  const viewRef = useRef(null);
+  const callbacksRef = useRef({ onReady, onChange, onPasteFiles, onSubmit });
+  useLayoutEffect(() => {
+    callbacksRef.current = { onReady, onChange, onPasteFiles, onSubmit };
+  }, [onReady, onChange, onPasteFiles, onSubmit]);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return undefined;
+    const view = new EditorView({
+      parent: host,
+      state: EditorState.create({
+        doc: '',
+        extensions: [
+          history(),
+          keymap.of(historyKeymap),
+          markdown(),
+          composerPlaceholderCompartment.of(placeholder(placeholderText)),
+          composerMarkdownPlugin,
+          composerEditableCompartment.of(EditorView.editable.of(!disabled)),
+          EditorView.lineWrapping,
+          EditorView.updateListener.of((update) => {
+            if (update.docChanged) callbacksRef.current.onChange?.(update.state.doc.toString());
+          }),
+          EditorView.domEventHandlers({
+            keydown(event, editorView) {
+              if (event.key !== 'Enter' || event.shiftKey) return false;
+              const nativeEvent = event;
+              if (editorView.composing || event.isComposing || nativeEvent.keyCode === 229) return false;
+              event.preventDefault();
+              callbacksRef.current.onSubmit?.();
+              return true;
+            },
+            paste(event) {
+              const files = Array.from(event.clipboardData?.items || [])
+                .filter((item) => item.kind === 'file')
+                .map((item) => item.getAsFile())
+                .filter(Boolean);
+              if (!files.length) return false;
+              event.preventDefault();
+              callbacksRef.current.onPasteFiles?.(files);
+              return true;
+            }
+          })
+        ]
+      })
+    });
+    viewRef.current = view;
+    callbacksRef.current.onReady?.(view);
+    return () => {
+      callbacksRef.current.onReady?.(null);
+      viewRef.current = null;
+      view.destroy();
+    };
+  }, []);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: composerEditableCompartment.reconfigure(EditorView.editable.of(!disabled)) });
+  }, [disabled]);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: composerPlaceholderCompartment.reconfigure(placeholder(placeholderText)) });
+  }, [placeholderText]);
+  return <div ref={hostRef} className="composer-codemirror" />;
+}
+
+const composerMarkdownPlugin = ViewPlugin.fromClass(class {
+  constructor(view) {
+    this.decorations = buildComposerMarkdownDecorations(view);
+  }
+
+  update(update) {
+    if (update.docChanged || update.selectionSet || update.viewportChanged) {
+      this.decorations = buildComposerMarkdownDecorations(update.view);
+    }
+  }
+}, {
+  decorations: (plugin) => plugin.decorations
+});
+
+function buildComposerMarkdownDecorations(view) {
+  const decorations = [];
+  const doc = view.state.doc;
+  const selectionRanges = view.state.selection.ranges;
+  const fencedLineNumbers = matchedComposerFenceLineNumbers(doc);
+  for (let lineNumber = 1; lineNumber <= doc.lines; lineNumber += 1) {
+    if (fencedLineNumbers.has(lineNumber)) continue;
+    const line = doc.line(lineNumber);
+    addComposerLineMarkdownDecorations(decorations, line, selectionRanges);
+    addComposerInlineMarkdownDecorations(decorations, line, selectionRanges);
+  }
+  return Decoration.set(decorations, true);
+}
+
+class ComposerListMarkerWidget extends WidgetType {
+  constructor(label) {
+    super();
+    this.label = label;
+  }
+
+  eq(other) {
+    return other.label === this.label;
+  }
+
+  toDOM() {
+    const span = document.createElement('span');
+    span.className = 'cm-composer-list-marker';
+    span.textContent = this.label;
+    return span;
+  }
+}
+
+class ComposerHiddenMarkdownWidget extends WidgetType {
+  toDOM() {
+    const span = document.createElement('span');
+    span.className = 'cm-composer-hidden-markdown-marker';
+    return span;
+  }
+}
+
+function addComposerLineMarkdownDecorations(decorations, line, selectionRanges) {
+  const headingMatch = line.text.match(/^(#{1,3})(\s+)/);
+  if (headingMatch) {
+    const level = headingMatch[1].length;
+    decorations.push(Decoration.line({
+      class: `cm-composer-heading cm-composer-heading-${level}`
+    }).range(line.from));
+    const markerFrom = line.from;
+    const markerTo = line.from + headingMatch[1].length + headingMatch[2].length;
+    addHiddenMarkdownMarker(decorations, selectionRanges, markerFrom, markerTo);
+    return;
+  }
+
+  const unorderedMatch = line.text.match(/^(\s*)([-*+])(\s+)/);
+  if (unorderedMatch) {
+    const markerFrom = line.from + unorderedMatch[1].length;
+    const markerTo = markerFrom + unorderedMatch[2].length + unorderedMatch[3].length;
+    if (selectionRanges.some((range) => rangeIntersects(range.from, range.to, markerFrom, markerTo))) return;
+    decorations.push(Decoration.replace({
+      widget: new ComposerListMarkerWidget('• '),
+      inclusive: false
+    }).range(markerFrom, markerTo));
+    return;
+  }
+
+  const orderedMatch = line.text.match(/^(\s*)(\d+[.)])(\s+)/);
+  if (orderedMatch) {
+    decorations.push(Decoration.line({ class: 'cm-composer-ordered-list-line' }).range(line.from));
+  }
+}
+
+function addComposerInlineMarkdownDecorations(decorations, line, selectionRanges) {
+  const protectedRanges = [];
+  addComposerCodeSpanDecorations(decorations, line, selectionRanges, protectedRanges);
+  addComposerDelimitedSpanDecorations(decorations, line, selectionRanges, protectedRanges, /\*\*([^*\n](?:.*?[^*\n])?)\*\*/g, 2, 2, 'cm-composer-strong');
+  addComposerDelimitedSpanDecorations(decorations, line, selectionRanges, protectedRanges, /__([^_\n](?:.*?[^_\n])?)__/g, 2, 2, 'cm-composer-strong');
+  addComposerDelimitedSpanDecorations(decorations, line, selectionRanges, protectedRanges, /(^|[^\*])\*([^*\n](?:[^*\n]*?[^*\n])?)\*/g, 1, 1, 'cm-composer-emphasis', 1);
+  addComposerDelimitedSpanDecorations(decorations, line, selectionRanges, protectedRanges, /(^|[^_])_([^_\n](?:[^_\n]*?[^_\n])?)_/g, 1, 1, 'cm-composer-emphasis', 1);
+}
+
+function addComposerCodeSpanDecorations(decorations, line, selectionRanges, protectedRanges) {
+  const pattern = /(`+)([^`\n]*?)(\1)/g;
+  let match;
+  while ((match = pattern.exec(line.text)) !== null) {
+    const openerLength = match[1].length;
+    const contentLength = match[2].length;
+    if (!contentLength) continue;
+    const from = line.from + match.index;
+    const contentFrom = from + openerLength;
+    const contentTo = contentFrom + contentLength;
+    const to = contentTo + match[3].length;
+    protectedRanges.push({ from, to });
+    decorations.push(Decoration.mark({ class: 'cm-composer-inline-code' }).range(contentFrom, contentTo));
+    addHiddenMarkdownMarker(decorations, selectionRanges, from, contentFrom);
+    addHiddenMarkdownMarker(decorations, selectionRanges, contentTo, to);
+  }
+}
+
+function addComposerDelimitedSpanDecorations(decorations, line, selectionRanges, protectedRanges, pattern, openerLength, closerLength, className, prefixLength = 0) {
+  let match;
+  while ((match = pattern.exec(line.text)) !== null) {
+    const fullFrom = line.from + match.index + prefixLength;
+    const fullTo = line.from + match.index + match[0].length;
+    if (protectedRanges.some((range) => rangesOverlap(fullFrom, fullTo, range.from, range.to))) continue;
+    const contentFrom = fullFrom + openerLength;
+    const contentTo = fullTo - closerLength;
+    if (contentFrom >= contentTo) continue;
+    decorations.push(Decoration.mark({ class: className }).range(contentFrom, contentTo));
+    addHiddenMarkdownMarker(decorations, selectionRanges, fullFrom, contentFrom);
+    addHiddenMarkdownMarker(decorations, selectionRanges, contentTo, fullTo);
+  }
+}
+
+function addHiddenMarkdownMarker(decorations, selectionRanges, from, to) {
+  if (from >= to) return;
+  if (selectionRanges.some((range) => rangeIntersects(range.from, range.to, from, to))) return;
+  decorations.push(Decoration.replace({
+    widget: new ComposerHiddenMarkdownWidget(),
+    inclusive: false
+  }).range(from, to));
+}
+
+function matchedComposerFenceLineNumbers(doc) {
+  const lineNumbers = new Set();
+  let open = null;
+  for (let lineNumber = 1; lineNumber <= doc.lines; lineNumber += 1) {
+    const line = doc.line(lineNumber);
+    const match = line.text.match(/^(\s*)(`{3,}|~{3,})(.*)$/);
+    if (!match) continue;
+    if (!open) {
+      open = {
+        number: line.number,
+        marker: match[2][0],
+        length: match[2].length
+      };
+      continue;
+    }
+    if (match[2][0] !== open.marker || match[2].length < open.length) continue;
+    for (let current = open.number; current <= line.number; current += 1) {
+      lineNumbers.add(current);
+    }
+    open = null;
+  }
+  if (open) {
+    for (let current = open.number; current <= doc.lines; current += 1) {
+      lineNumbers.add(current);
+    }
+  }
+  return lineNumbers;
+}
+
+function rangeIntersects(selectionFrom, selectionTo, start, end) {
+  if (selectionFrom === selectionTo) return selectionFrom >= start && selectionFrom <= end;
+  return selectionFrom < end && selectionTo > start;
+}
+
+function rangesOverlap(leftFrom, leftTo, rightFrom, rightTo) {
+  return leftFrom < rightTo && leftTo > rightFrom;
 }
 
 function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
@@ -1629,7 +1861,7 @@ export function ToolProcessGroup({ group, active = false, onToggleInteraction })
                 }
                 return block.kind === 'reasoning'
                   ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
-                  : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
+                  : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} streaming={!complete && activeTail} />;
               })}
             </div>
           )}
@@ -2032,7 +2264,10 @@ function uniqueAttachments(attachments) {
 export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const text = messageText(message);
   const structuredItems = messageItems(message);
-  const plainStreaming = Boolean(message?._streaming && String(message?.role || '').toLowerCase() === 'assistant');
+  const roleName = String(message?.role || '').toLowerCase();
+  const streamingMarkdown = Boolean(message?._streaming && roleName === 'assistant');
+  const preserveLineBreaks = roleName === 'user';
+  const textClassName = preserveLineBreaks ? 'message-text user-message-text' : 'message-text';
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
@@ -2081,9 +2316,9 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   return (
     <div className="message-body">
       {structuredItems.length > 0 ? (
-        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
+        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} streaming={streamingMarkdown} preserveLineBreaks={preserveLineBreaks} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : text ? (
-        <MemoMarkdownContent className="message-text" text={text} attachments={allAttachments} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
+        <MemoMarkdownContent className={textClassName} text={text} attachments={allAttachments} streaming={streamingMarkdown} preserveLineBreaks={preserveLineBreaks} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : null}
       {displayTrailingAttachments.length > 0 && <AttachmentList attachments={displayTrailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
@@ -2129,7 +2364,7 @@ function attachmentIdentity(attachment) {
   ).trim();
 }
 
-export function StructuredItems({ role, items, attachments, fallbackText, plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function StructuredItems({ role, items, attachments, fallbackText, plain = false, streaming = false, preserveLineBreaks = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const orderedItems = orderedStructuredItems(items, role);
   const hasTextItem = orderedItems.some(({ item }) => typeof item === 'string' || item?.type === 'text');
   const hasSelectionReference = orderedItems.some(({ item }) => item?.type === 'selection_reference');
@@ -2137,10 +2372,10 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
   const rendered = orderedItems
     .map(({ item, index }) => {
       if (typeof item === 'string') {
-        return <MemoMarkdownContent key={index} className="message-text" text={item} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+        return <MemoMarkdownContent key={index} className={preserveLineBreaks ? 'message-text user-message-text' : 'message-text'} text={item} attachments={attachments} plain={plain} streaming={streaming} preserveLineBreaks={preserveLineBreaks} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'text') {
-        return <MemoMarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+        return <MemoMarkdownContent key={index} className={preserveLineBreaks ? 'message-text user-message-text' : 'message-text'} text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} streaming={streaming} preserveLineBreaks={preserveLineBreaks} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'file') {
         const attachmentIndex = Number(item.attachment_index ?? item.index);
@@ -2172,10 +2407,12 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
     rendered.push(
       <MemoMarkdownContent
         key="fallback-text"
-        className="message-text"
+        className={preserveLineBreaks ? 'message-text user-message-text' : 'message-text'}
         text={fallbackText}
         attachments={attachments}
         plain={plain}
+        streaming={streaming}
+        preserveLineBreaks={preserveLineBreaks}
         onOpenAttachment={onOpenAttachment}
         onDownloadAttachment={onDownloadAttachment}
         onResolveAttachmentUrl={onResolveAttachmentUrl}
@@ -2184,7 +2421,7 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
     );
   }
   if (rendered.length) return <>{rendered}</>;
-  return <MemoMarkdownContent className="message-text" text={fallbackText} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+  return <MemoMarkdownContent className={preserveLineBreaks ? 'message-text user-message-text' : 'message-text'} text={fallbackText} attachments={attachments} plain={plain} streaming={streaming} preserveLineBreaks={preserveLineBreaks} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
 }
 
 function orderedStructuredItems(items, role) {
@@ -2253,10 +2490,11 @@ function shortReasoningSummary(value) {
   return text.length > 72 ? `${text.slice(0, 72)}...` : text;
 }
 
-export function MarkdownContent({ text, attachments = [], className = 'markdown-content', plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function MarkdownContent({ text, attachments = [], className = 'markdown-content', plain = false, streaming = false, preserveLineBreaks = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const renderStartedAt = renderCommitStart();
   const value = String(text || '');
-  useRenderCommitPerf(plain ? 'chat.markdown.plain_commit' : 'chat.markdown.rich_commit', renderStartedAt, () => {
+  const containerClassName = `${className}${preserveLineBreaks ? ' preserve-line-breaks' : ''}`;
+  useRenderCommitPerf(plain ? 'chat.markdown.plain_commit' : streaming ? 'chat.markdown.streaming_commit' : 'chat.markdown.rich_commit', renderStartedAt, () => {
     if (!value.trim()) return null;
     return {
       className,
@@ -2267,8 +2505,22 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   if (!value.trim()) return null;
   if (plain) {
     return (
-      <div className={`${className} plain-stream-text`}>
+      <div className={`${containerClassName} plain-stream-text`}>
         <StreamingPlainText text={value} />
+      </div>
+    );
+  }
+  if (streaming) {
+    return (
+      <div className={`${containerClassName} streaming-markdown-text`}>
+        <StreamingMarkdownContent
+          text={value}
+          attachments={attachments}
+          onOpenAttachment={onOpenAttachment}
+          onDownloadAttachment={onDownloadAttachment}
+          onResolveAttachmentUrl={onResolveAttachmentUrl}
+          onOpenLocalLink={onOpenLocalLink}
+        />
       </div>
     );
   }
@@ -2302,7 +2554,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   if (rest.trim()) {
     parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />);
   }
-  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />}</div>;
+  return <div className={containerClassName}>{parts.length ? parts : <MarkdownBlock text={value} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
 
 const MemoMarkdownContent = memo(MarkdownContent, (previous, next) => (
@@ -2310,6 +2562,8 @@ const MemoMarkdownContent = memo(MarkdownContent, (previous, next) => (
   && sameAttachmentList(previous.attachments, next.attachments)
   && previous.className === next.className
   && previous.plain === next.plain
+  && previous.streaming === next.streaming
+  && previous.preserveLineBreaks === next.preserveLineBreaks
   && previous.onOpenAttachment === next.onOpenAttachment
   && previous.onDownloadAttachment === next.onDownloadAttachment
   && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
@@ -2327,6 +2581,71 @@ function sameAttachmentList(left = [], right = []) {
   return true;
 }
 
+function StreamingMarkdownContent({ text, attachments = [], onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const blocks = useStreamingStableTextBlocks(text, streamMarkdownSplitIndex);
+  if (blocks.length <= 1) {
+    return (
+      <MarkdownBlock
+        text={String(text || '')}
+        attachments={attachments}
+        onOpenAttachment={onOpenAttachment}
+        onDownloadAttachment={onDownloadAttachment}
+        onResolveAttachmentUrl={onResolveAttachmentUrl}
+        onOpenLocalLink={onOpenLocalLink}
+      />
+    );
+  }
+  return (
+    <>
+      {blocks.map((block) => (
+        block.stable
+          ? (
+            <MemoMarkdownStableBlock
+              key={block.key}
+              text={block.text}
+              attachments={attachments}
+              onOpenAttachment={onOpenAttachment}
+              onDownloadAttachment={onDownloadAttachment}
+              onResolveAttachmentUrl={onResolveAttachmentUrl}
+              onOpenLocalLink={onOpenLocalLink}
+            />
+          )
+          : (
+            <MarkdownBlock
+              key={block.key}
+              text={block.text}
+              attachments={attachments}
+              onOpenAttachment={onOpenAttachment}
+              onDownloadAttachment={onDownloadAttachment}
+              onResolveAttachmentUrl={onResolveAttachmentUrl}
+              onOpenLocalLink={onOpenLocalLink}
+            />
+          )
+      ))}
+    </>
+  );
+}
+
+const MemoMarkdownStableBlock = memo(function MarkdownStableBlock({ text, attachments = [], onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  return (
+    <MarkdownBlock
+      text={text}
+      attachments={attachments}
+      onOpenAttachment={onOpenAttachment}
+      onDownloadAttachment={onDownloadAttachment}
+      onResolveAttachmentUrl={onResolveAttachmentUrl}
+      onOpenLocalLink={onOpenLocalLink}
+    />
+  );
+}, (previous, next) => (
+  previous.text === next.text
+  && sameAttachmentList(previous.attachments, next.attachments)
+  && previous.onOpenAttachment === next.onOpenAttachment
+  && previous.onDownloadAttachment === next.onDownloadAttachment
+  && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
+  && previous.onOpenLocalLink === next.onOpenLocalLink
+));
+
 function StreamingPlainText({ text }) {
   const blocks = useStreamingStableTextBlocks(text);
   if (blocks.length <= 1) return <PlainTextBlock text={String(text || '')} />;
@@ -2341,7 +2660,7 @@ function StreamingPlainText({ text }) {
   );
 }
 
-function useStreamingStableTextBlocks(text) {
+function useStreamingStableTextBlocks(text, splitIndexForText = streamTextSplitIndex) {
   const value = String(text || '');
   const stableBlocksRef = useRef([]);
   return useMemo(() => {
@@ -2352,7 +2671,7 @@ function useStreamingStableTextBlocks(text) {
     let stableLength = stableBlocksLength(blocks);
     let mutable = value.slice(stableLength);
     while (mutable.length >= STREAM_TEXT_STABLE_CHARS) {
-      const splitAt = streamTextSplitIndex(mutable);
+      const splitAt = splitIndexForText(mutable);
       if (splitAt <= 0) break;
       const blockText = mutable.slice(0, splitAt);
       blocks = blocks.concat({
@@ -2369,7 +2688,7 @@ function useStreamingStableTextBlocks(text) {
       text: mutable,
       stable: false
     });
-  }, [value]);
+  }, [value, splitIndexForText]);
 }
 
 function stableBlocksLength(blocks) {
@@ -2395,6 +2714,63 @@ function streamTextSplitIndex(text) {
   );
   if (sentence >= Math.floor(STREAM_TEXT_STABLE_CHARS * 0.75)) return sentence + 1;
   return target;
+}
+
+function streamMarkdownSplitIndex(text) {
+  const value = String(text || '');
+  const target = Math.min(value.length, STREAM_TEXT_STABLE_CHARS);
+  const preferred = streamTextSplitIndex(value);
+  if (preferred > 0 && !markdownPrefixHasOpenFence(value, preferred)) return preferred;
+
+  const safeLineBreaks = markdownSafeLineBreaks(value);
+  const preferredFloor = Math.floor(STREAM_TEXT_STABLE_CHARS * 0.55);
+  for (let index = safeLineBreaks.length - 1; index >= 0; index -= 1) {
+    const splitAt = safeLineBreaks[index];
+    if (splitAt <= target && splitAt >= preferredFloor) return splitAt;
+  }
+  const afterTarget = safeLineBreaks.find((splitAt) => splitAt > target);
+  return afterTarget || 0;
+}
+
+function markdownSafeLineBreaks(text) {
+  const value = String(text || '');
+  const safe = [];
+  let openFence = null;
+  let lineStart = 0;
+  while (lineStart <= value.length) {
+    let lineEnd = value.indexOf('\n', lineStart);
+    const hasNewline = lineEnd >= 0;
+    if (!hasNewline) lineEnd = value.length;
+    const line = value.slice(lineStart, lineEnd);
+    const fence = line.match(/^(\s*)(`{3,}|~{3,})/);
+    if (fence) {
+      if (openFence && fence[2][0] === openFence.marker && fence[2].length >= openFence.length) {
+        openFence = null;
+      } else if (!openFence) {
+        openFence = { marker: fence[2][0], length: fence[2].length };
+      }
+    }
+    if (!openFence && hasNewline) safe.push(lineEnd + 1);
+    if (!hasNewline) break;
+    lineStart = lineEnd + 1;
+  }
+  return safe;
+}
+
+function markdownPrefixHasOpenFence(text, splitAt) {
+  const value = String(text || '').slice(0, splitAt);
+  let openFence = null;
+  const lines = value.split('\n');
+  for (const line of lines) {
+    const fence = line.match(/^(\s*)(`{3,}|~{3,})/);
+    if (!fence) continue;
+    if (openFence && fence[2][0] === openFence.marker && fence[2].length >= openFence.length) {
+      openFence = null;
+    } else if (!openFence) {
+      openFence = { marker: fence[2][0], length: fence[2].length };
+    }
+  }
+  return Boolean(openFence);
 }
 
 function hashText(text) {

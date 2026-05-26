@@ -131,6 +131,7 @@ function App() {
   const [sessionActivity, setSessionActivity] = useState('');
   const [chatSessionState, setChatSessionState] = useState({ state: 'idle' });
   const [runningActivities, setRunningActivities] = useState([]);
+  const [commandNotice, setCommandNotice] = useState(null);
   const [statusDeltas, setStatusDeltas] = useState(() => new Map());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -166,6 +167,7 @@ function App() {
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
   const foregroundReadTimerRef = useRef(0);
+  const commandNoticeTimerRef = useRef(0);
   const selectedSessionId = selectedForegroundSessionId(selected);
   const selectedServerId = selected?.serverId || '';
   const selectedConversationId = selected?.conversationId || '';
@@ -329,6 +331,30 @@ function App() {
       const next = updater(current).slice(-5);
       return liveActivitySignature(next) === liveActivitySignature(current) ? current : next;
     });
+  }, []);
+
+  const showCommandNotice = useCallback((notice, durationMs = 1700) => {
+    if (commandNoticeTimerRef.current) {
+      window.clearTimeout(commandNoticeTimerRef.current);
+      commandNoticeTimerRef.current = 0;
+    }
+    setCommandNotice({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      title: notice?.title || '命令已发送',
+      detail: notice?.detail || '',
+      state: notice?.state || 'done'
+    });
+    commandNoticeTimerRef.current = window.setTimeout(() => {
+      commandNoticeTimerRef.current = 0;
+      setCommandNotice(null);
+    }, durationMs);
+  }, []);
+
+  useEffect(() => () => {
+    if (commandNoticeTimerRef.current) {
+      window.clearTimeout(commandNoticeTimerRef.current);
+      commandNoticeTimerRef.current = 0;
+    }
   }, []);
 
   const saveSettings = useCallback(async (next) => {
@@ -1099,6 +1125,28 @@ function App() {
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
       : slashCommandState(value);
     const previousLastServerIndex = lastServerMessageIndex(messagesRef.current);
+    if (commandState.control) {
+      setSending(true);
+      setSessionActivity(commandState.detail);
+      showCommandNotice({ ...commandState, state: 'running' }, 1200);
+      try {
+        await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections, selectedSessionId);
+        setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
+        if (websocketKeyRef.current !== key) return false;
+        setSessionActivity(commandState.detail);
+        showCommandNotice({ ...commandState, state: 'done' });
+        return true;
+      } catch (error) {
+        if (websocketKeyRef.current === key) {
+          const detail = error?.message || '命令发送失败';
+          setSessionActivity(detail);
+          showCommandNotice({ title: '命令发送失败', detail, state: 'failed' }, 2400);
+        }
+        return false;
+      } finally {
+        if (websocketKeyRef.current === key) setSending(false);
+      }
+    }
     const optimisticId = `local-${Date.now()}`;
     const optimistic = {
       id: optimisticId,
@@ -1134,44 +1182,30 @@ function App() {
       setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
-        const next = commandState.control
-          ? current.filter((message) => message.id !== optimistic.id)
-          : current.map((message) => (
-              message.id === optimistic.id ? { ...message, pending: false } : message
-            ));
+        const next = current.map((message) => (
+          message.id === optimistic.id ? { ...message, pending: false } : message
+        ));
         messagesRef.current = next;
         return next;
       });
-      if (commandState.control) {
-        setSessionActivity(commandState.detail);
-        updateRunningActivities(() => [
-          { id: 'command-sent', title: commandState.title, detail: commandState.detail, state: 'done' }
-        ]);
-        window.setTimeout(() => {
-          if (websocketKeyRef.current === key) setRunningActivities([]);
-        }, 900);
-      } else {
-        setSessionActivity('已发送，等待响应');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== 'sending'),
-          { id: 'waiting-response', title: commandState.title, detail: commandState.detail, state: 'running' }
-        ]);
-      }
-      if (!commandState.control) {
-        const offset = previousLastServerIndex !== undefined ? previousLastServerIndex + 1 : 0;
-        const incoming = await loadMessages(selected.serverId, selected.conversationId, {
-          offset,
-          limit: 80,
-          foregroundSessionId: selectedSessionId
+      setSessionActivity('已发送，等待响应');
+      updateRunningActivities((current) => [
+        ...current.filter((item) => item.id !== 'sending'),
+        { id: 'waiting-response', title: commandState.title, detail: commandState.detail, state: 'running' }
+      ]);
+      const offset = previousLastServerIndex !== undefined ? previousLastServerIndex + 1 : 0;
+      const incoming = await loadMessages(selected.serverId, selected.conversationId, {
+        offset,
+        limit: 80,
+        foregroundSessionId: selectedSessionId
+      });
+      if (websocketKeyRef.current === key) {
+        setMessages((current) => {
+          const next = mergeMessages(current, incoming);
+          messagesRef.current = next;
+          writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
+          return next;
         });
-        if (websocketKeyRef.current === key) {
-          setMessages((current) => {
-            const next = mergeMessages(current, incoming);
-            messagesRef.current = next;
-            writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
-            return next;
-          });
-        }
       }
       return true;
     } catch (error) {
@@ -1192,7 +1226,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, selectedSessionId, activeUserName]);
+  }, [selected, selectedSessionId, activeUserName, showCommandNotice]);
 
   const addSelectionReference = useCallback((selection) => {
     if (!selection?.file_path || !selection?.selected_text) return;
@@ -1297,6 +1331,7 @@ function App() {
           onLoadModels={loadAvailableModels}
           processing={selectedProcessing}
           runningActivities={runningActivities}
+          commandNotice={commandNotice}
           selectionReferences={selectionReferences}
           onRemoveSelectionReference={removeSelectionReference}
           onOpenAttachment={openMessageAttachment}

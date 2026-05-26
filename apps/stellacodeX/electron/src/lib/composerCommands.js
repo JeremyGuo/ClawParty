@@ -19,6 +19,9 @@ export function slashCommandState(value) {
   if (name === '/status') {
     return { control: true, name, title: '读取状态', detail: '状态命令已发送' };
   }
+  if (name === '/continue') {
+    return { control: true, name, title: '继续执行', detail: '继续命令已发送' };
+  }
   return { control: false, name, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
 }
 

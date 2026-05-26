@@ -1881,6 +1881,15 @@ button {
   white-space: pre-wrap;
 }
 
+.message-text.preserve-line-breaks {
+  white-space: pre-wrap;
+}
+
+.message-text.streaming-markdown-text,
+.tool-note.streaming-markdown-text {
+  content-visibility: visible;
+}
+
 .plain-stream-text > span {
   display: inline;
 }
@@ -2081,6 +2090,7 @@ button {
 }
 
 .message-text pre,
+.tool-note pre,
 .markdown-preview pre,
 .file-code-view {
   margin: 9px 0;
@@ -2088,10 +2098,11 @@ button {
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: var(--code-bg);
+  background: var(--code-bg) !important;
 }
 
 .message-text pre code,
+.tool-note pre code,
 .markdown-preview pre code,
 .file-code-view code {
   display: block;
@@ -2104,9 +2115,14 @@ button {
   word-break: break-word;
 }
 
-.message-text pre code.hljs {
+.message-text .hljs,
+.tool-note .hljs,
+.markdown-preview .hljs,
+.message-text pre code.hljs,
+.tool-note pre code.hljs,
+.markdown-preview pre code.hljs {
   color: var(--syntax-text);
-  background: transparent;
+  background: transparent !important;
 }
 
 .message-text .hljs-doctag,
@@ -4096,7 +4112,7 @@ button {
   padding-top: 16px;
 }
 
-.composer-wrap.with-progress .composer textarea {
+.composer-wrap.with-progress .composer-input {
   min-height: 40px;
 }
 
@@ -4119,6 +4135,61 @@ button {
   50% {
     opacity: 1;
   }
+}
+
+.command-notice-toast {
+  position: absolute;
+  right: max(24px, calc((100% - var(--chat-column-width)) / 2));
+  bottom: calc(var(--composer-wrap-height, 156px) + var(--progress-height, 0px) + 16px);
+  z-index: 10;
+  display: grid;
+  max-width: min(360px, calc(100% - 48px));
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent), transparent 56%);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-2), #000 5%);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  pointer-events: none;
+  animation: live-activity-enter 140ms ease both;
+}
+
+.command-notice-toast::before {
+  position: absolute;
+  top: 12px;
+  left: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  content: "";
+}
+
+.command-notice-toast.failed {
+  border-color: color-mix(in srgb, var(--danger), transparent 44%);
+}
+
+.command-notice-toast.failed::before {
+  background: var(--danger);
+}
+
+.command-notice-toast strong,
+.command-notice-toast span {
+  min-width: 0;
+  padding-left: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-notice-toast strong {
+  font-size: 13px;
+}
+
+.command-notice-toast span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .composer {
@@ -4240,18 +4311,114 @@ button {
   font-size: 13px;
 }
 
-.composer textarea {
+.composer-input {
+  position: relative;
   width: 100%;
   min-height: 64px;
   max-height: 220px;
-  resize: none;
-  border: 0;
-  outline: 0;
+  min-width: 0;
+  overflow: visible;
+}
+
+.composer-codemirror,
+.composer-codemirror .cm-editor {
+  width: 100%;
+  min-height: 64px;
+  max-height: 220px;
   color: var(--text);
   background: transparent;
-  font-size: 1.08em;
-  line-height: 1.5;
-  overflow-y: hidden;
+}
+
+.composer-codemirror .cm-editor {
+  outline: 0;
+}
+
+.composer-codemirror .cm-focused {
+  outline: 0;
+}
+
+.composer-codemirror .cm-scroller {
+  max-height: 220px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  font-family: inherit;
+  line-height: 1.54;
+}
+
+.composer-codemirror .cm-content {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-height: 64px;
+  padding: 0;
+  caret-color: var(--text);
+  font-family: inherit;
+  font-size: 1.12em;
+  line-height: 1.54;
+}
+
+.composer-codemirror .cm-line {
+  position: relative;
+  padding: 0;
+}
+
+.composer-codemirror .cm-placeholder {
+  color: var(--faint);
+}
+
+.composer-codemirror .cm-cursor {
+  border-left-color: var(--text);
+}
+
+.composer-codemirror .cm-selectionBackground {
+  background: color-mix(in srgb, var(--accent), transparent 72%) !important;
+}
+
+.composer-codemirror .cm-composer-list-marker {
+  color: var(--text);
+}
+
+.composer-codemirror .cm-composer-hidden-markdown-marker {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+}
+
+.composer-codemirror .cm-composer-heading {
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.composer-codemirror .cm-composer-heading-1 {
+  font-size: 1.45em;
+}
+
+.composer-codemirror .cm-composer-heading-2 {
+  font-size: 1.3em;
+}
+
+.composer-codemirror .cm-composer-heading-3 {
+  font-size: 1.16em;
+}
+
+.composer-codemirror .cm-composer-ordered-list-line {
+  padding-left: 2px;
+}
+
+.composer-codemirror .cm-composer-strong {
+  font-weight: 700;
+}
+
+.composer-codemirror .cm-composer-emphasis {
+  font-style: italic;
+}
+
+.composer-codemirror .cm-composer-inline-code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--code-inline-bg);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
 }
 
 .composer-row {

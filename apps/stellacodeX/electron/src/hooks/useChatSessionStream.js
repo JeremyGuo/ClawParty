@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { conversationKey, foregroundSessions, loadMessages } from '../lib/api';
-import { addUsageTotals, firstMessageIndexGap, mergeMessages, messageIndex, messageOrderFromId } from '../lib/messageUtils';
+import { addUsageTotals, firstMessageIndexGap, isFinalAssistantMessage, mergeMessages, messageIndex, messageOrderFromId } from '../lib/messageUtils';
 import {
   applyStreamErrorToMessages,
   applyStreamAttachmentManifest,
@@ -211,9 +211,13 @@ export function useChatSessionStream({
         updateRunningActivities((current) => current.filter((item) => !patch.finalizedActivities.has(item.id)));
       }
       if (patch.hasFinalAssistant) {
+        setChatSessionState({ scopeKey: key, state: 'idle' });
+        chatSessionStateRef.current = { scopeKey: key, state: 'idle' };
+        setSessionActivity('已完成');
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
             setRunningActivities([]);
+            setSessionActivity('');
           }
         }, 700);
       }
@@ -235,6 +239,12 @@ export function useChatSessionStream({
       });
       updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
       if (patch.activity) setSessionActivity(patch.activity);
+      if (isFinalAssistantMessage(patch.latestMessage)) {
+        setChatSessionState({ scopeKey: key, state: 'idle' });
+        chatSessionStateRef.current = { scopeKey: key, state: 'idle' };
+        setRunningActivities([]);
+        setSessionActivity('');
+      }
     };
 
     const mergeOrReplaceRecentMessages = (current, incoming) => (

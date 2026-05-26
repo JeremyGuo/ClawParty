@@ -1,5 +1,10 @@
-version: 1.31.22
+version: 1.31.23
 ---
+
+# 1.31.23
+
+- 修复 StellaCodeX Electron Chat 输入和消息渲染：
+  Chat 收到 durable final assistant 消息时前端会主动把当前 session 状态收敛到 idle，并清理 running activity，避免最终回复后仍显示执行中。assistant 流式文本改为边流式边按 Markdown 渲染，并按 Markdown 安全边界复用稳定文本块，避免 fenced code block 在流式过程中被切开导致临时渲染异常；用户消息按 Markdown 渲染并保留单换行，减少发送前后观感差异。控制类 slash command（包括 `/continue`）不再作为乐观用户消息进入 transcript，而是显示短暂 toast。Composer 改为 CodeMirror 输入层，只保留轻量 Markdown 输入效果（标题、列表、粗体、斜体、inline code），不在输入框内做代码块高亮、行号或 fence 折叠，避免 textarea 视觉 overlay 导致光标、折叠高度和实际输入位置不一致，同时保持 IME 稳定；发送规则为 Enter 发送、Shift+Enter 换行。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.22
 
