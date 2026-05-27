@@ -1,5 +1,10 @@
-version: 1.31.27
+version: 1.31.28
 ---
+
+# 1.31.28
+
+- 修复 StellaCodeX Electron renderer 偶发 SIGTRAP 崩溃风险：
+  Chat Markdown 代码高亮缓存改为同时按条目数和字符预算裁剪，超长代码块和较长无语言代码块会降级为纯文本，避免 streaming 过程中连续缓存大段高亮 AST 导致 renderer 内存膨胀；renderer 崩溃时主进程会记录时间和短窗口内次数，并在有限次数内自动 reload 界面。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.27
 

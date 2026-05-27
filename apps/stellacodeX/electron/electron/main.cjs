@@ -10,6 +10,8 @@ const SETTINGS_FILE = 'settings.json';
 const SSH_READY_TIMEOUT_MS = 10_000;
 const SSH_TUNNEL_FAILURE_COOLDOWN_MS = 3_000;
 const SERVER_REQUEST_TIMEOUT_MS = 90_000;
+const RENDERER_CRASH_RELOAD_WINDOW_MS = 30_000;
+const RENDERER_CRASH_AUTO_RELOAD_LIMIT = 2;
 const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_DISPLAY_FONT_SIZE = 11;
 const MAX_DISPLAY_FONT_SIZE = 18;
@@ -49,6 +51,7 @@ let sshUpdaterState = { state: 'idle', channel: 'stable' };
 const tunnels = new Map();
 const tunnelOpeners = new Map();
 const tunnelFailures = new Map();
+let rendererCrashTimes = [];
 let chatTraceState = { state: 'idle', startedAt: null, filePath: '', error: '' };
 
 function appIconPath() {
@@ -822,7 +825,22 @@ function createWindow() {
     }
   });
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
-    console.error('[renderer-gone]', details);
+    const now = Date.now();
+    rendererCrashTimes = rendererCrashTimes
+      .filter((timestamp) => now - timestamp < RENDERER_CRASH_RELOAD_WINDOW_MS)
+      .concat(now);
+    console.error('[renderer-gone]', {
+      ...details,
+      at: new Date(now).toISOString(),
+      recentCrashes: rendererCrashTimes.length
+    });
+    if (rendererCrashTimes.length <= RENDERER_CRASH_AUTO_RELOAD_LIMIT) {
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.reload();
+        }
+      }, 250);
+    }
   });
 }
 

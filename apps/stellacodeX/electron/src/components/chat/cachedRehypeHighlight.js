@@ -1,9 +1,14 @@
 import { common, createLowlight } from 'lowlight';
 
 const DEFAULT_PREFIX = 'hljs-';
-const CACHE_LIMIT = 360;
+const CACHE_LIMIT = 96;
+const CACHE_CHAR_BUDGET = 280_000;
+const CACHE_ITEM_CHAR_LIMIT = 24_000;
+const HIGHLIGHT_CHAR_LIMIT = 24_000;
+const AUTO_HIGHLIGHT_CHAR_LIMIT = 4_000;
 const lowlight = createLowlight(common);
 const highlightCache = new Map();
+let highlightCacheChars = 0;
 
 export function highlightCodeText(language, code, prefix = DEFAULT_PREFIX) {
   const normalizedLanguage = String(language || '').trim();
@@ -47,6 +52,7 @@ export function cachedRehypeHighlight(options = {}) {
 }
 
 function cachedHighlight(language, code, prefix) {
+  if (code.length > HIGHLIGHT_CHAR_LIMIT) return null;
   const key = `${language}\u0000${prefix}\u0000${code.length}\u0000${hashText(code)}`;
   const cached = highlightCache.get(key);
   if (cached) {
@@ -61,14 +67,12 @@ function cachedHighlight(language, code, prefix) {
     return null;
   }
   const cachedResult = { children: cloneHastChildren(result.children || []) };
-  highlightCache.set(key, cachedResult);
-  while (highlightCache.size > CACHE_LIMIT) {
-    highlightCache.delete(highlightCache.keys().next().value);
-  }
+  rememberHighlight(key, cachedResult, code.length);
   return cachedResult;
 }
 
 function cachedAutoHighlight(code, prefix) {
+  if (code.length > AUTO_HIGHLIGHT_CHAR_LIMIT) return null;
   const key = `auto\u0000${prefix}\u0000${code.length}\u0000${hashText(code)}`;
   const cached = highlightCache.get(key);
   if (cached) {
@@ -86,11 +90,30 @@ function cachedAutoHighlight(code, prefix) {
     children: cloneHastChildren(result.children || []),
     language: typeof result.data?.language === 'string' ? result.data.language : ''
   };
-  highlightCache.set(key, cachedResult);
-  while (highlightCache.size > CACHE_LIMIT) {
-    highlightCache.delete(highlightCache.keys().next().value);
-  }
+  rememberHighlight(key, cachedResult, code.length);
   return cachedResult;
+}
+
+function rememberHighlight(key, result, chars) {
+  if (chars > CACHE_ITEM_CHAR_LIMIT) return;
+  const existing = highlightCache.get(key);
+  if (existing) {
+    highlightCacheChars -= existing.chars || 0;
+    highlightCache.delete(key);
+  }
+  highlightCache.set(key, { ...result, chars });
+  highlightCacheChars += chars;
+  trimHighlightCache();
+}
+
+function trimHighlightCache() {
+  while (highlightCache.size > CACHE_LIMIT || highlightCacheChars > CACHE_CHAR_BUDGET) {
+    const oldestKey = highlightCache.keys().next().value;
+    const oldest = highlightCache.get(oldestKey);
+    highlightCacheChars -= oldest?.chars || 0;
+    highlightCache.delete(oldestKey);
+  }
+  if (highlightCacheChars < 0) highlightCacheChars = 0;
 }
 
 function visitElements(node, visitor, parent = null) {
