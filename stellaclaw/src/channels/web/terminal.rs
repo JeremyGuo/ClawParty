@@ -1,6 +1,6 @@
 use std::{net::TcpStream, thread, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::RecvTimeoutError;
 use serde_json::{json, Value};
@@ -105,11 +105,19 @@ impl WebChannel {
         terminal_id: &str,
     ) -> Result<()> {
         accept_websocket(&mut stream, request)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)?;
+        if let Err(error) = self
+            .conversation_runtime
+            .ensure_conversation_started(conversation_id)
+        {
+            send_websocket_json(
+                &mut stream,
+                &json!({"type": "terminal.error", "message": error.to_string()}),
+            )?;
+            return Ok(());
+        }
         let offset = query_u64(&request.query, "offset").unwrap_or(0);
         let request_id = generated_request_id("terminal-attach");
-        let rx = self
+        let rx = match self
             .conversation_runtime
             .send_main_channel_ingress_subscribed(
                 conversation_id,
@@ -121,15 +129,33 @@ impl WebChannel {
                     },
                 },
             )
-            .map_err(|error| anyhow!("{error:#}"))?;
-        let attached = wait_for_event(&rx, Duration::from_secs(30), |event| match event {
+        {
+            Ok(rx) => rx,
+            Err(error) => {
+                send_websocket_json(
+                    &mut stream,
+                    &json!({"type": "terminal.error", "message": format!("{error:#}")}),
+                )?;
+                return Ok(());
+            }
+        };
+        let attached = match wait_for_event(&rx, Duration::from_secs(30), |event| match event {
             KernelChannelEvent::Terminal {
                 request_id: Some(id),
                 response,
             } if id == request_id => Some(response),
             _ => None,
         })
-        .map_err(|error| anyhow!("{}", error.message))?;
+        {
+            Ok(attached) => attached,
+            Err(error) => {
+                send_websocket_json(
+                    &mut stream,
+                    &json!({"type": "terminal.error", "message": error.message}),
+                )?;
+                return Ok(());
+            }
+        };
         let (replay, subscriber_id) = match attached {
             TerminalResponse::Attached {
                 replay,

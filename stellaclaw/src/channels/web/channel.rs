@@ -868,9 +868,7 @@ impl WebChannel {
     fn conversation_summaries(&self) -> HttpResult<Vec<Value>> {
         let mut summaries = Vec::new();
         for conversation_id in self.conversation_runtime.conversation_ids() {
-            let Ok(metadata) = self.query_conversation_metadata(&conversation_id) else {
-                continue;
-            };
+            let metadata = self.query_conversation_metadata(&conversation_id)?;
             summaries.push(self.conversation_summary(&metadata)?);
         }
         Ok(summaries)
@@ -975,13 +973,19 @@ impl WebChannel {
     fn accept_home_stream(&self, mut stream: TcpStream, request: &HttpRequest) -> Result<()> {
         accept_websocket(&mut stream, request)?;
         let (rx, seq) = self.main.subscribe_home()?;
+        let conversations = match self.conversation_summaries() {
+            Ok(conversations) => conversations,
+            Err(error) => {
+                send_websocket_json(
+                    &mut stream,
+                    &protocol::home_error(seq, "home_snapshot_failed", error.message),
+                )?;
+                return Ok(());
+            }
+        };
         send_websocket_json(
             &mut stream,
-            &protocol::home_snapshot(
-                seq,
-                self.conversation_summaries().unwrap_or_default(),
-                now_rfc3339(),
-            ),
+            &protocol::home_snapshot(seq, conversations, now_rfc3339()),
         )?;
         websocket_event_loop(stream, rx, "home.heartbeat")
     }
@@ -994,14 +998,54 @@ impl WebChannel {
         foreground_session_id: &str,
     ) -> Result<()> {
         accept_websocket(&mut stream, request)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)?;
-        let (rx, live) = self
+        if let Err(error) = self
+            .conversation_runtime
+            .ensure_conversation_started(conversation_id)
+        {
+            send_websocket_json(
+                &mut stream,
+                &protocol::chat_error(
+                    conversation_id,
+                    foreground_session_id,
+                    "conversation_not_found",
+                    error.to_string(),
+                ),
+            )?;
+            return Ok(());
+        }
+        let (rx, live) = match self
             .main
-            .subscribe_chat(conversation_id, foreground_session_id)?;
-        let summary = self
-            .query_message_summary(conversation_id, foreground_session_id)
-            .unwrap_or_default();
+            .subscribe_chat(conversation_id, foreground_session_id)
+        {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                send_websocket_json(
+                    &mut stream,
+                    &protocol::chat_error(
+                        conversation_id,
+                        foreground_session_id,
+                        "chat_subscribe_failed",
+                        error.to_string(),
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
+        let summary = match self.query_message_summary(conversation_id, foreground_session_id) {
+            Ok(summary) => summary,
+            Err(error) => {
+                send_websocket_json(
+                    &mut stream,
+                    &protocol::chat_error(
+                        conversation_id,
+                        foreground_session_id,
+                        "chat_snapshot_failed",
+                        error.message,
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
         send_websocket_json(
             &mut stream,
             &protocol::chat_snapshot(

@@ -23,6 +23,15 @@ pub fn home_snapshot(seq: u64, conversations: Vec<Value>, server_time: String) -
     })
 }
 
+pub fn home_error(seq: u64, code: &str, message: impl Into<String>) -> Value {
+    json!({
+        "type": "home.error",
+        "seq": seq,
+        "code": code,
+        "message": message.into(),
+    })
+}
+
 pub fn home_conversation_upserted(conversation: Value) -> Value {
     json!({
         "type": "home.conversation_upserted",
@@ -139,6 +148,21 @@ pub fn chat_snapshot(
         "current_provisional_assistant_message": current_provisional_assistant_message,
         "running_tool_results": running_tool_results,
         "queued_outbound_messages": queued_outbound_messages,
+    })
+}
+
+pub fn chat_error(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    code: &str,
+    message: impl Into<String>,
+) -> Value {
+    json!({
+        "type": "chat.error",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "code": code,
+        "message": message.into(),
     })
 }
 
