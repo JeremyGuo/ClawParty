@@ -2,6 +2,7 @@ package com.stellaclaw.stellacodex.ui.chat
 
 import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -57,11 +58,11 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -83,6 +84,7 @@ import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -98,6 +100,7 @@ private val UserBubbleText = Color.White
 private val AssistantAccent = Color(0xFF7A45FF)
 private val AssistantAccent2 = Color(0xFF2C7BFF)
 private val CodeHeaderText = Color(0xFF8A8F98)
+private const val ChatBottomThresholdPx = 96
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,7 +110,8 @@ fun ChatScreen(
     onBack: () -> Unit,
     onOpenWorkspace: (String, String) -> Unit,
 ) {
-    val application = LocalContext.current.applicationContext as Application
+    val context = LocalContext.current
+    val application = context.applicationContext as Application
     val viewModel: ChatViewModel = viewModel(
         factory = viewModelFactory {
             initializer { ChatViewModel(application) }
@@ -115,8 +119,9 @@ fun ChatScreen(
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
-    var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
-    var earlierLoadAnchor by remember(conversationId) { mutableStateOf<ScrollAnchor?>(null) }
+    var initialBottomPlaced by remember(conversationId, foregroundSessionId) { mutableStateOf(false) }
+    var earlierLoadAnchor by remember(conversationId, foregroundSessionId) { mutableStateOf<ScrollAnchor?>(null) }
+    var stickToBottom by remember(conversationId, foregroundSessionId) { mutableStateOf(true) }
     var showDetails by remember(conversationId) { mutableStateOf(false) }
     val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
     val agentProcessing = remember(state.progressTitle, state.realtimeState) {
@@ -129,12 +134,6 @@ fun ChatScreen(
         state.attachmentPreviews
             .filterKeys { it.startsWith(scopedPreviewPrefix) }
             .mapKeys { (key, _) -> key.removePrefix(scopedPreviewPrefix) }
-    }
-    val isNearBottom by remember(listState, timeline) {
-        derivedStateOf {
-            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            lastVisible >= timeline.lastIndex - 1
-        }
     }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -155,9 +154,25 @@ fun ChatScreen(
     LaunchedEffect(timeline.lastOrNull()?.key, timelineContentVersion) {
         if (timeline.isNotEmpty() && earlierLoadAnchor == null) {
             if (!initialBottomPlaced) {
-                listState.scrollToItem(timeline.lastIndex)
+                val restored = ChatScrollPositionStore.load(context, conversationId, foregroundSessionId)
+                if (restored == null || restored.stickToBottom) {
+                    listState.scrollToItem(timeline.lastIndex)
+                    stickToBottom = true
+                } else {
+                    val index = restored.messageId
+                        ?.let { messageId -> timeline.indexOfFirst { it.containsMessageId(messageId) } }
+                        ?.takeIf { it >= 0 }
+                        ?: timeline.indexOfFirst { it.key == restored.key }
+                    if (index >= 0) {
+                        listState.scrollToItem(index, restored.scrollOffset)
+                        stickToBottom = false
+                    } else {
+                        listState.scrollToItem(timeline.lastIndex)
+                        stickToBottom = true
+                    }
+                }
                 initialBottomPlaced = true
-            } else if (isNearBottom) {
+            } else if (stickToBottom) {
                 listState.animateScrollToItem(timeline.lastIndex)
             }
         }
@@ -183,6 +198,17 @@ fun ChatScreen(
         }
     }
 
+    LaunchedEffect(conversationId, foregroundSessionId, timeline) {
+        snapshotFlow { listState.toScrollAnchor(timeline) }
+            .distinctUntilChanged()
+            .collect { anchor ->
+                if (initialBottomPlaced && anchor != null) {
+                    stickToBottom = anchor.stickToBottom
+                    ChatScrollPositionStore.save(context, conversationId, foregroundSessionId, anchor)
+                }
+            }
+    }
+
     LaunchedEffect(
         listState.firstVisibleItemIndex,
         state.loadedOffset,
@@ -203,6 +229,8 @@ fun ChatScreen(
                     key = anchorItem.key,
                     messageId = anchorItem.anchorMessageId(),
                     scrollOffset = listState.firstVisibleItemScrollOffset,
+                    stickToBottom = false,
+                    viewportHeight = listState.layoutInfo.viewportSize.height,
                 )
             }
             viewModel.loadEarlier()
@@ -568,7 +596,41 @@ private data class ScrollAnchor(
     val key: String,
     val messageId: String?,
     val scrollOffset: Int,
+    val stickToBottom: Boolean = false,
+    val viewportHeight: Int = 0,
 )
+
+private object ChatScrollPositionStore {
+    private const val PrefsName = "stellacodex_chat_scroll"
+
+    fun load(context: Context, conversationId: String, foregroundSessionId: String): ScrollAnchor? {
+        val prefs = context.getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
+        val prefix = key(conversationId, foregroundSessionId)
+        val itemKey = prefs.getString("$prefix:key", null)?.takeIf { it.isNotBlank() } ?: return null
+        return ScrollAnchor(
+            key = itemKey,
+            messageId = prefs.getString("$prefix:message", null),
+            scrollOffset = prefs.getInt("$prefix:offset", 0),
+            stickToBottom = prefs.getBoolean("$prefix:bottom", true),
+            viewportHeight = prefs.getInt("$prefix:viewport", 0),
+        )
+    }
+
+    fun save(context: Context, conversationId: String, foregroundSessionId: String, anchor: ScrollAnchor) {
+        val prefix = key(conversationId, foregroundSessionId)
+        context.getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
+            .edit()
+            .putString("$prefix:key", anchor.key)
+            .putString("$prefix:message", anchor.messageId.orEmpty())
+            .putInt("$prefix:offset", anchor.scrollOffset)
+            .putBoolean("$prefix:bottom", anchor.stickToBottom)
+            .putInt("$prefix:viewport", anchor.viewportHeight)
+            .apply()
+    }
+
+    private fun key(conversationId: String, foregroundSessionId: String): String =
+        "${conversationId}:${foregroundSessionId.ifBlank { "main" }}"
+}
 
 private sealed interface ChatTimelineItem {
     val key: String
@@ -679,9 +741,10 @@ private fun ChatMessage.isProcessMessage(): Boolean {
 }
 
 private fun ChatMessage.isFinalAssistantMessage(): Boolean {
+    if (!role.equals("assistant", ignoreCase = true) || localState == MessageLocalState.Streaming) return false
     val part = messagePartValue()
     if (part.isNotBlank()) return part == "final_response"
-    return role.equals("assistant", ignoreCase = true) && !isToolOnlyMessage()
+    return !isToolOnlyMessage()
 }
 
 private fun ChatMessage.isToolOnlyMessage(): Boolean =
@@ -698,6 +761,28 @@ private fun ChatTimelineItem.anchorMessageId(): String? = when (this) {
 private fun ChatTimelineItem.containsMessageId(messageId: String): Boolean = when (this) {
     is ChatTimelineItem.Message -> message.id == messageId
     is ChatTimelineItem.AgentRun -> messages.any { it.id == messageId }
+}
+
+private fun LazyListState.bottomDistancePx(timeline: List<ChatTimelineItem>): Int {
+    if (timeline.isEmpty()) return 0
+    val layout = layoutInfo
+    val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return Int.MAX_VALUE
+    if (lastVisible.index < timeline.lastIndex) return Int.MAX_VALUE
+    return (layout.viewportEndOffset - (lastVisible.offset + lastVisible.size)).coerceAtLeast(0)
+}
+
+private fun LazyListState.toScrollAnchor(timeline: List<ChatTimelineItem>): ScrollAnchor? {
+    if (timeline.isEmpty()) return null
+    val layout = layoutInfo
+    val firstVisible = layout.visibleItemsInfo.firstOrNull() ?: return null
+    val item = timeline.getOrNull(firstVisible.index) ?: return null
+    return ScrollAnchor(
+        key = item.key,
+        messageId = item.anchorMessageId(),
+        scrollOffset = firstVisible.offset - layout.viewportStartOffset,
+        stickToBottom = bottomDistancePx(timeline) <= ChatBottomThresholdPx,
+        viewportHeight = layout.viewportSize.height,
+    )
 }
 
 @Composable
@@ -753,6 +838,7 @@ private fun AgentRunCard(
                         text = bodyText,
                         attachments = finalMessage.attachments,
                         previews = previews,
+                        streaming = finalMessage.localState == MessageLocalState.Streaming,
                         onPreviewMarkdownImage = onPreviewMarkdownImage,
                         onOpenAttachment = onOpenAttachment,
                     )
@@ -881,6 +967,7 @@ private fun MessageCard(
                             text = bodyText,
                             attachments = message.attachments,
                             previews = previews,
+                            streaming = message.localState == MessageLocalState.Streaming,
                             onPreviewMarkdownImage = onPreviewMarkdownImage,
                             onOpenAttachment = onOpenAttachment,
                         )
@@ -1005,10 +1092,11 @@ private fun MessageBody(
     text: String,
     attachments: List<MessageAttachment>,
     previews: Map<String, AttachmentPreviewUiState>,
+    streaming: Boolean = false,
     onPreviewMarkdownImage: (String, String) -> Unit,
     onOpenAttachment: (MessageAttachment) -> Unit,
 ) {
-    val blocks = markdownBlocks(text)
+    val blocks = markdownBlocks(text, streaming = streaming)
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { block ->
             when (block) {
@@ -1047,33 +1135,92 @@ private fun MarkdownText(
                     onClick = { onOpenAttachment(attachmentLink) },
                 )
                 line.isBlank() -> Text("", style = MaterialTheme.typography.bodySmall)
+                line == "---" || line == "***" || line == "___" -> Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.dp),
+                    color = FrostedBorder,
+                ) {}
+                line.startsWith(">") -> Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = FrostedSurface,
+                    border = BorderStroke(1.dp, FrostedBorder),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(
+                        text = line.removePrefix(">").trim().cleanInlineMarkdown(),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = CodeHeaderText,
+                    )
+                }
                 line.startsWith("### ") -> Text(
-                    text = line.removePrefix("### "),
+                    text = line.removePrefix("### ").cleanInlineMarkdown(),
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                 )
                 line.startsWith("## ") -> Text(
-                    text = line.removePrefix("## "),
+                    text = line.removePrefix("## ").cleanInlineMarkdown(),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
                 line.startsWith("# ") -> Text(
-                    text = line.removePrefix("# "),
+                    text = line.removePrefix("# ").cleanInlineMarkdown(),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold,
                 )
-                line.startsWith("- ") || line.startsWith("* ") -> Text(
-                    text = "• ${line.drop(2)}",
+                line.matches(Regex("\\s*[-*] \\[([ xX])] .+")) -> Text(
+                    text = line.checkboxDisplayText(),
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                line.matches(Regex("\\d+\\.\\s+.*")) -> Text(
-                    text = line,
+                line.trimStart().startsWith("- ") || line.trimStart().startsWith("* ") -> Text(
+                    text = "${line.leadingIndent()}• ${line.trimStart().drop(2).cleanInlineMarkdown()}",
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                else -> Text(text = line, style = MaterialTheme.typography.bodyMedium)
+                line.matches(Regex("\\s*\\d+\\.\\s+.*")) -> Text(
+                    text = line.cleanInlineMarkdown(),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                line.looksLikeMarkdownTableRow() -> Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = FrostedSurface,
+                    border = BorderStroke(1.dp, FrostedBorder),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(
+                        text = line.trim().trim('|').split('|').joinToString("   ") { it.trim().cleanInlineMarkdown() },
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+                else -> Text(text = line.cleanInlineMarkdown(), style = MaterialTheme.typography.bodyMedium)
             }
         }
     }
+}
+
+
+private fun String.cleanInlineMarkdown(): String =
+    replace(Regex("`([^`]+)`"), "$1")
+        .replace(Regex("\\*\\*([^*]+)\\*\\*"), "$1")
+        .replace(Regex("__([^_]+)__"), "$1")
+        .replace(Regex("\\*([^*]+)\\*"), "$1")
+
+private fun String.leadingIndent(): String = takeWhile { it == ' ' || it == '\t' }.replace("\t", "    ")
+
+private fun String.checkboxDisplayText(): String {
+    val trimmed = trimStart()
+    val checked = trimmed.startsWith("- [x]", ignoreCase = true) || trimmed.startsWith("* [x]", ignoreCase = true)
+    val body = trimmed.drop(6).trim().cleanInlineMarkdown()
+    return "${leadingIndent()}${if (checked) "[x]" else "[ ]"} $body"
+}
+
+private fun String.looksLikeMarkdownTableRow(): Boolean {
+    val trimmed = trim()
+    if (!trimmed.contains('|')) return false
+    if (trimmed.count { it == '|' } < 2) return false
+    return !trimmed.matches(Regex("\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)+\\|?"))
 }
 
 private fun String.markdownImageAttachment(attachments: List<MessageAttachment>): MessageAttachment? {
@@ -1652,7 +1799,61 @@ private sealed interface MarkdownBlock {
     data class Code(val language: String, val code: String) : MarkdownBlock
 }
 
-private fun markdownBlocks(text: String): List<MarkdownBlock> {
+
+private fun streamingMarkdownBlocks(text: String): List<MarkdownBlock> {
+    val splitAt = streamMarkdownSplitIndex(text)
+    if (splitAt <= 0 || splitAt >= text.length) return parseMarkdownBlocks(text, tolerateOpenFence = true)
+    return parseMarkdownBlocks(text.take(splitAt), tolerateOpenFence = false) +
+        parseMarkdownBlocks(text.drop(splitAt), tolerateOpenFence = true)
+}
+
+private fun streamMarkdownSplitIndex(text: String): Int {
+    val target = minOf(text.length, 1800)
+    if (text.length <= target) return 0
+    val preferred = text.lastIndexOf('\n', startIndex = target).takeIf { it >= 900 }
+    if (preferred != null && !markdownPrefixHasOpenFence(text, preferred)) return preferred + 1
+    return markdownSafeLineBreaks(text).lastOrNull { it <= target && it >= 900 } ?: 0
+}
+
+private fun markdownSafeLineBreaks(text: String): List<Int> {
+    val safe = mutableListOf<Int>()
+    var openFence: Char? = null
+    var openFenceLength = 0
+    var offset = 0
+    text.lines().forEach { line ->
+        val fence = Regex("^\\s*(`{3,}|~{3,})").find(line)?.groupValues?.getOrNull(1)
+        if (fence != null) {
+            if (openFence != null && fence.first() == openFence && fence.length >= openFenceLength) {
+                openFence = null
+                openFenceLength = 0
+            } else if (openFence == null) {
+                openFence = fence.first()
+                openFenceLength = fence.length
+            }
+        }
+        offset += line.length + 1
+        if (openFence == null && offset <= text.length) safe += offset
+    }
+    return safe
+}
+
+private fun markdownPrefixHasOpenFence(text: String, splitAt: Int): Boolean {
+    var openFence: Char? = null
+    var openFenceLength = 0
+    text.take(splitAt).lines().forEach { line ->
+        val fence = Regex("^\\s*(`{3,}|~{3,})").find(line)?.groupValues?.getOrNull(1) ?: return@forEach
+        if (openFence != null && fence.first() == openFence && fence.length >= openFenceLength) {
+            openFence = null
+            openFenceLength = 0
+        } else if (openFence == null) {
+            openFence = fence.first()
+            openFenceLength = fence.length
+        }
+    }
+    return openFence != null
+}
+
+private fun parseMarkdownBlocks(text: String, tolerateOpenFence: Boolean): List<MarkdownBlock> {
     if (text.isBlank()) return listOf(MarkdownBlock.Text(""))
     val blocks = mutableListOf<MarkdownBlock>()
     val pendingText = StringBuilder()
@@ -1681,13 +1882,20 @@ private fun markdownBlocks(text: String): List<MarkdownBlock> {
         }
     }
     if (inCode) {
-        blocks += MarkdownBlock.Code(language, pendingCode.toString().trimEnd())
+        if (tolerateOpenFence) {
+            blocks += MarkdownBlock.Code(language, pendingCode.toString().trimEnd())
+        } else {
+            pendingText.append("```").append(language).append('\n').append(pendingCode)
+        }
     }
     if (pendingText.isNotEmpty()) {
         blocks += MarkdownBlock.Text(pendingText.toString().trimEnd())
     }
     return blocks.ifEmpty { listOf(MarkdownBlock.Text(text)) }
 }
+
+private fun markdownBlocks(text: String, streaming: Boolean = false): List<MarkdownBlock> =
+    if (streaming) streamingMarkdownBlocks(text) else parseMarkdownBlocks(text, tolerateOpenFence = true)
 
 private fun formatBytes(value: Long): String {
     val units = listOf("B", "KB", "MB", "GB")
