@@ -128,8 +128,7 @@ impl WebChannel {
                         offset,
                     },
                 },
-            )
-        {
+            ) {
             Ok(rx) => rx,
             Err(error) => {
                 send_websocket_json(
@@ -145,8 +144,7 @@ impl WebChannel {
                 response,
             } if id == request_id => Some(response),
             _ => None,
-        })
-        {
+        }) {
             Ok(attached) => attached,
             Err(error) => {
                 send_websocket_json(

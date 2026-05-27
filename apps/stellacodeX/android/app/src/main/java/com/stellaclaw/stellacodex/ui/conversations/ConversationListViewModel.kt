@@ -305,6 +305,13 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
                     log("home snapshot conversations=${response.conversations.size}")
                     mutableState.update { it.copy(conversations = response.conversations.map { item -> item.toDomain() }, error = null) }
                 }
+                "home.error" -> {
+                    val message = payload["message"]?.jsonPrimitive?.content
+                        ?: payload["code"]?.jsonPrimitive?.content
+                        ?: "Home stream error"
+                    log("home stream error message=$message")
+                    mutableState.update { it.copy(error = message) }
+                }
                 "home.conversation_upserted" -> {
                     val dto = payload["conversation"]?.let { json.decodeFromJsonElement<ConversationSummaryDto>(it) } ?: return
                     upsertConversation(dto.toDomain())

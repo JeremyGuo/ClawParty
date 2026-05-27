@@ -103,10 +103,20 @@ class StellaclawApi(
             val socket = webSocketClient.newWebSocket(request, object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     try {
-                        val snapshot = json.decodeFromString<HomeSnapshotDto>(text)
-                        if (snapshot.type == "home.snapshot") {
-                            deferred.complete(AppResult.Ok(snapshot))
-                            webSocket.close(1000, "snapshot received")
+                        val payload = json.decodeFromString<JsonObject>(text)
+                        when (payload["type"]?.jsonPrimitive?.content) {
+                            "home.snapshot" -> {
+                                val snapshot = json.decodeFromString<HomeSnapshotDto>(text)
+                                deferred.complete(AppResult.Ok(snapshot))
+                                webSocket.close(1000, "snapshot received")
+                            }
+                            "home.error" -> {
+                                val message = payload["message"]?.jsonPrimitive?.content
+                                    ?: payload["code"]?.jsonPrimitive?.content
+                                    ?: "Home snapshot failed"
+                                deferred.complete(AppResult.Err(AppError.Server(500, message)))
+                                webSocket.close(1011, "snapshot failed")
+                            }
                         }
                     } catch (error: SerializationException) {
                         deferred.complete(AppResult.Err(AppError.Decode(error.message.orEmpty())))

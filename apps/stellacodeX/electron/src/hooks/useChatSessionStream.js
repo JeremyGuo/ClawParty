@@ -659,7 +659,7 @@ export function useChatSessionStream({
         || payloadType === 'chat.plan_updated'
       ) {
         applySessionStream(payload);
-      } else if (payloadType === 'error') {
+      } else if (payloadType === 'chat.error' || payloadType === 'error') {
         setChatSessionState({ scopeKey: key, state: 'failed', lastError: payload.message || payload.error || '实时连接错误' });
         setSessionActivity(payload.message || payload.error || '实时连接错误');
       }

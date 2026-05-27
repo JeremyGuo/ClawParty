@@ -210,6 +210,10 @@ export async function loadHomeSnapshot(serverId, timeoutMs = 5000) {
       } catch {
         return;
       }
+      if (payload?.type === 'home.error') {
+        finish(null, new Error(payload.message || payload.code || 'Home snapshot failed'));
+        return;
+      }
       if (payload?.type !== 'home.snapshot') return;
       finish({
         ...payload,

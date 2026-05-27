@@ -868,8 +868,13 @@ impl WebChannel {
     fn conversation_summaries(&self) -> HttpResult<Vec<Value>> {
         let mut summaries = Vec::new();
         for conversation_id in self.conversation_runtime.conversation_ids() {
-            let metadata = self.query_conversation_metadata(&conversation_id)?;
-            summaries.push(self.conversation_summary(&metadata)?);
+            let Ok(metadata) = self.query_conversation_metadata(&conversation_id) else {
+                continue;
+            };
+            let Ok(summary) = self.conversation_summary(&metadata) else {
+                continue;
+            };
+            summaries.push(summary);
         }
         Ok(summaries)
     }
