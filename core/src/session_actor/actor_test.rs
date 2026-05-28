@@ -2784,6 +2784,56 @@ fn compresses_history_before_appending_next_data_message_when_threshold_is_excee
 }
 
 #[test]
+fn append_history_does_not_emit_compact_events_when_under_threshold() {
+    let _cwd = temp_cwd("actor-compression-no-flash");
+    let (inbox, mailbox) = test_inbox();
+    let mut initial = SessionInitial::new(
+        test_session_id("session_compression_no_flash"),
+        super::super::SessionType::Foreground,
+    );
+    initial.compression_threshold_tokens = Some(1_000);
+    initial.compression_retain_recent_tokens = Some(12);
+    mailbox.append(
+        SessionMailboxKind::Control,
+        SessionRequest::Initial { initial },
+    );
+    mailbox.append(
+        SessionMailboxKind::Data,
+        SessionRequest::EnqueueUserMessage {
+            message: text_message(ChatRole::User, "short request"),
+        },
+    );
+    let events = Arc::new(MemoryEventSink::default());
+    let provider = Arc::new(ScriptedProvider::new(vec![text_message(
+        ChatRole::Assistant,
+        "short final",
+    )]));
+    let tools = Arc::new(EchoToolExecutor::new());
+    let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+    let (model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+    let mut actor = SessionActor::new(
+        model_config,
+        provider,
+        tools,
+        inbox,
+        events.clone(),
+        catalog,
+    );
+
+    actor.run_until_idle(6).expect("short turn should run");
+
+    let events = events.events.lock().unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactStarted { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactCompleted { .. })));
+
+    fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+}
+
+#[test]
 fn model_response_with_tool_call_defers_compression_until_protocol_closes() {
     let message = ChatMessage::new(
         ChatRole::Assistant,

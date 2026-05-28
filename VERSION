@@ -1,5 +1,10 @@
-version: 1.31.32
+version: 1.31.33
 ---
+
+# 1.31.33
+
+- 修复普通发送消息时前端“压缩中”分割线闪烁：
+  SessionActor 的自动 append-history 路径现在只在 `would_compress` 为 true、即确实要执行上下文压缩时发送 `compact_started` / `compact_completed` websocket 事件；普通消息落盘时仍会进行压缩阈值检查，但不会把 no-op compression check 投影成正在压缩。手动 `/compact` 和 request-too-large 恢复压缩继续保留明确的压缩状态事件。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.32
 

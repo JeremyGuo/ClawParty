@@ -2209,7 +2209,9 @@ impl SessionActor {
                 "all_messages_len": self.all_messages.len(),
             }),
         );
-        self.emit_compact_started(phase)?;
+        if would_compress {
+            self.emit_compact_started(phase)?;
+        }
         let report = {
             let mut request_too_large_attempts = 0usize;
             loop {
@@ -2243,12 +2245,16 @@ impl SessionActor {
                             continue;
                         }
                         let reason = error.to_string();
-                        self.emit_compact_failed(phase, reason.clone())?;
+                        if would_compress {
+                            self.emit_compact_failed(phase, reason.clone())?;
+                        }
                         return Err(SessionActorError::Compression(reason));
                     }
                     Err(error) => {
                         let reason = error.to_string();
-                        self.emit_compact_failed(phase, reason.clone())?;
+                        if would_compress {
+                            self.emit_compact_failed(phase, reason.clone())?;
+                        }
                         return Err(SessionActorError::Compression(reason));
                     }
                 }
@@ -2271,14 +2277,16 @@ impl SessionActor {
                 .promote_notified_components_to_system_snapshot();
             clear_context_model_token_usage(&mut self.history);
         }
-        self.emit(SessionEvent::CompactCompleted {
-            compressed: report.compressed,
-            estimated_tokens_before: report.estimated_tokens_before,
-            estimated_tokens_after: report.estimated_tokens_after,
-            threshold_tokens: report.threshold_tokens,
-            retained_message_count: report.retained_message_count,
-            compressed_message_count: report.compressed_message_count,
-        })?;
+        if would_compress {
+            self.emit(SessionEvent::CompactCompleted {
+                compressed: report.compressed,
+                estimated_tokens_before: report.estimated_tokens_before,
+                estimated_tokens_after: report.estimated_tokens_after,
+                threshold_tokens: report.threshold_tokens,
+                retained_message_count: report.retained_message_count,
+                compressed_message_count: report.compressed_message_count,
+            })?;
+        }
         self.persist_state_if_history_closed(phase)?;
         self.log_info(
             "append_history_message_completed",
