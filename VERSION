@@ -1,5 +1,10 @@
-version: 1.31.30
+version: 1.31.31
 ---
+
+# 1.31.31
+
+- 修复 StellaCodeX Electron SSH proxy 请求偶发 `ECONNRESET`：
+  Electron 主进程对 `server:request`、workspace download 和 workspace upload 增加 transient fetch error 识别；通过 SSH proxy 访问后端时如果遇到连接 reset、拒绝、超时或网络不可达等临时错误，会丢弃当前 tunnel、短暂等待后重新建立 tunnel 并重试一次，最终失败时返回稳定的网络错误信息而不是把底层 `TypeError: fetch failed` 透传给 renderer。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.30
 

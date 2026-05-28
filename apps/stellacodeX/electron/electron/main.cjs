@@ -18,6 +18,17 @@ const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
 const WORKSPACE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const TRANSIENT_FETCH_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EPIPE',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET'
+]);
 const TRACE_CATEGORIES = [
   'devtools.timeline',
   'v8',
@@ -411,6 +422,49 @@ function stopRemovedOrChangedTunnels(servers) {
   }
 }
 
+function fetchErrorCode(error) {
+  return error?.cause?.code || error?.code || error?.cause?.cause?.code || '';
+}
+
+function isTransientFetchError(error) {
+  const code = fetchErrorCode(error);
+  return TRANSIENT_FETCH_ERROR_CODES.has(code);
+}
+
+function normalizedFetchError(error, operation) {
+  if (!isTransientFetchError(error)) {
+    return error instanceof Error ? error : new Error(String(error || 'Unknown server request error'));
+  }
+  const code = fetchErrorCode(error) || error?.name || 'network_error';
+  const message = error?.cause?.message || error?.message || 'request failed';
+  return new Error(`${operation} failed: ${code}: ${message}`);
+}
+
+async function withServerFetchRetry(server, operation, fetcher) {
+  const baseUrl = await resolveServerBaseUrl(server);
+  try {
+    return await fetcher(baseUrl);
+  } catch (error) {
+    if (server.connectionMode === 'ssh_proxy' && isTransientFetchError(error)) {
+      console.warn('[server-fetch-retry]', {
+        serverId: server.id,
+        operation,
+        code: fetchErrorCode(error) || error?.name || '',
+        message: error?.message || String(error)
+      });
+      stopTunnel(server.id);
+      await sleep(150);
+      const retryBaseUrl = await resolveServerBaseUrl(server);
+      try {
+        return await fetcher(retryBaseUrl);
+      } catch (retryError) {
+        throw normalizedFetchError(retryError, `${operation} retry`);
+      }
+    }
+    throw normalizedFetchError(error, operation);
+  }
+}
+
 async function openSshTunnel(server, target, sshHost, signature, cacheKey) {
   const port = await findFreePort();
   const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
@@ -507,7 +561,6 @@ async function requestServer(_event, payload) {
   if (!server) {
     throw new Error(`Unknown server: ${payload.serverId}`);
   }
-  const baseUrl = await resolveServerBaseUrl(server);
   const headers = {
     Accept: 'application/json',
     Authorization: `Bearer ${server.token}`
@@ -524,20 +577,26 @@ async function requestServer(_event, payload) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(joinApiUrl(baseUrl, payload.path), { ...options, signal: controller.signal });
-    const text = await response.text();
-    let data = null;
-    if (text.trim()) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { text };
+    return await withServerFetchRetry(
+      server,
+      `server:request ${options.method} ${payload.path || '/'}`,
+      async (resolvedBaseUrl) => {
+        const response = await fetch(joinApiUrl(resolvedBaseUrl, payload.path), { ...options, signal: controller.signal });
+        const text = await response.text();
+        let data = null;
+        if (text.trim()) {
+          try {
+            data = JSON.parse(text);
+          } catch {
+            data = { text };
+          }
+        }
+        if (!response.ok) {
+          throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
+        }
+        return { status: response.status, data };
       }
-    }
-    if (!response.ok) {
-      throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
-    }
-    return { status: response.status, data };
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -666,31 +725,36 @@ async function fetchWorkspaceDownloadArchive(payload) {
   const settings = await readSettings();
   const server = settings.servers.find((item) => item.id === payload.serverId);
   if (!server) throw new Error(`Unknown server: ${payload.serverId}`);
-  const baseUrl = await resolveServerBaseUrl(server);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(joinApiUrl(
-      baseUrl,
-      `/api/conversations/${payload.conversationId}/workspace/download?path=${encodeURIComponent(payload.path || '')}`
-    ), {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${server.token}`,
-        Accept: 'application/gzip'
-      },
-      signal: controller.signal
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      let message = `${response.status} ${response.statusText}`;
-      try {
-        const json = JSON.parse(text);
-        message = json.error || json.message || message;
-      } catch {}
-      throw new Error(message);
-    }
-    return Buffer.from(await response.arrayBuffer());
+    return await withServerFetchRetry(
+      server,
+      `workspace:download ${payload.conversationId || ''}`,
+      async (baseUrl) => {
+        const response = await fetch(joinApiUrl(
+          baseUrl,
+          `/api/conversations/${payload.conversationId}/workspace/download?path=${encodeURIComponent(payload.path || '')}`
+        ), {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${server.token}`,
+            Accept: 'application/gzip'
+          },
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          let message = `${response.status} ${response.statusText}`;
+          try {
+            const json = JSON.parse(text);
+            message = json.error || json.message || message;
+          } catch {}
+          throw new Error(message);
+        }
+        return Buffer.from(await response.arrayBuffer());
+      }
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -705,29 +769,34 @@ async function uploadWorkspaceFile(_event, payload) {
   const settings = await readSettings();
   const server = settings.servers.find((item) => item.id === payload.serverId);
   if (!server) throw new Error(`Unknown server: ${payload.serverId}`);
-  const baseUrl = await resolveServerBaseUrl(server);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(joinApiUrl(
-      baseUrl,
-      `/api/conversations/${payload.conversationId}/workspace/upload?path=${encodeURIComponent(payload.path || '')}`
-    ), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${server.token}`,
-        'Content-Type': 'application/gzip',
-        Accept: 'application/json'
-      },
-      body: bufferFromIpcBinary(payload.data),
-      signal: controller.signal
-    });
-    const text = await response.text();
-    const data = text.trim() ? JSON.parse(text) : {};
-    if (!response.ok) {
-      throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
-    }
-    return data;
+    return await withServerFetchRetry(
+      server,
+      `workspace:upload ${payload.conversationId || ''}`,
+      async (baseUrl) => {
+        const response = await fetch(joinApiUrl(
+          baseUrl,
+          `/api/conversations/${payload.conversationId}/workspace/upload?path=${encodeURIComponent(payload.path || '')}`
+        ), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${server.token}`,
+            'Content-Type': 'application/gzip',
+            Accept: 'application/json'
+          },
+          body: bufferFromIpcBinary(payload.data),
+          signal: controller.signal
+        });
+        const text = await response.text();
+        const data = text.trim() ? JSON.parse(text) : {};
+        if (!response.ok) {
+          throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
+        }
+        return data;
+      }
+    );
   } finally {
     clearTimeout(timeout);
   }
