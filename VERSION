@@ -1,5 +1,10 @@
-version: 1.31.29
+version: 1.31.30
 ---
+
+# 1.31.30
+
+- 修复 Telegram final response 中本地 Markdown 文件链接导致整条消息拒收：
+  Telegram 只对合法 `http://` / `https://` Markdown 链接生成 `text_link` entity；相对路径或本地路径链接在正文中渲染为文件占位符（例如 `📎 文件名`），同时继续走已有 Markdown target 扫描和 workspace 附件读取链路发送真实文件，避免 `paper-library/data/papers.json` 这类相对路径被当成非法 URL entity。Foreground session 的 system prompt 同步强化 final assistant message 约束，明确只有真实源码、命令片段、原始日志或必须保留格式的结构化数据才使用 literal ``` fenced code block。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.29
 

@@ -2910,11 +2910,30 @@ fn render_inlines_to_telegram_entities(
                 maybe_push_wrapping_entity(builder, start, "strikethrough", None, None);
             }
             RichInline::Link { url, content } => {
-                let start = builder.cursor();
-                render_inlines_to_telegram_entities(content, builder, quote_depth);
-                let end = builder.cursor();
-                if !builder.has_any_entity_in_range(start.utf16, end.utf16) {
-                    builder.push_entity_trimmed(start, "text_link", Some(url.clone()), None);
+                if is_telegram_text_link_url(url) {
+                    let start = builder.cursor();
+                    render_inlines_to_telegram_entities(content, builder, quote_depth);
+                    let end = builder.cursor();
+                    if !builder.has_any_entity_in_range(start.utf16, end.utf16) {
+                        builder.push_entity_trimmed(start, "text_link", Some(url.clone()), None);
+                    }
+                } else if is_local_markdown_attachment_target(url) {
+                    render_text_to_telegram_entities(
+                        &telegram_file_link_placeholder(url, content),
+                        builder,
+                        quote_depth,
+                    );
+                } else {
+                    let start = builder.cursor();
+                    render_inlines_to_telegram_entities(content, builder, quote_depth);
+                    let end = builder.cursor();
+                    let label = builder.text[start.byte..end.byte].trim().to_string();
+                    let target = url.trim();
+                    if !target.is_empty() && label != target {
+                        builder.push_text(" (");
+                        builder.push_text(target);
+                        builder.push_text(")");
+                    }
                 }
             }
             RichInline::Code(code) => {
@@ -2925,6 +2944,62 @@ fn render_inlines_to_telegram_entities(
             RichInline::LineBreak => builder.push_text("\n"),
         }
     }
+}
+
+fn is_telegram_text_link_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return false;
+    }
+    trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+fn is_local_markdown_attachment_target(url: &str) -> bool {
+    let target = normalize_markdown_path(url);
+    !target.is_empty() && !target.starts_with("attachment://") && !has_external_scheme(&target)
+}
+
+fn telegram_file_link_placeholder(url: &str, content: &[RichInline]) -> String {
+    let label = plain_text_from_inlines(content).trim().to_string();
+    let target = normalize_markdown_path(url);
+    let fallback = target
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(target.trim())
+        .trim();
+    let display = if !label.is_empty() && label != url.trim() {
+        label.as_str()
+    } else if !fallback.is_empty() {
+        fallback
+    } else if !label.is_empty() {
+        label.as_str()
+    } else {
+        "文件"
+    };
+    format!("📎 {display}")
+}
+
+fn plain_text_from_inlines(inlines: &[RichInline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            RichInline::Text(text) | RichInline::Code(text) => out.push_str(text),
+            RichInline::LineBreak => out.push('\n'),
+            RichInline::Emphasis(children)
+            | RichInline::Strong(children)
+            | RichInline::Strikethrough(children)
+            | RichInline::Link {
+                content: children, ..
+            } => out.push_str(&plain_text_from_inlines(children)),
+        }
+    }
+    out
 }
 
 fn render_text_to_telegram_entities(
@@ -4064,6 +4139,24 @@ mod tests {
             .entities
             .iter()
             .any(|entity| entity.kind == "pre" && entity.language.as_deref() == Some("rust")));
+    }
+
+    #[test]
+    fn renders_local_markdown_links_as_file_placeholders_for_telegram() {
+        let document = parse_markdown_to_rich_document(
+            "see [文件1](paper-library/data/papers.json) and [paper-library/data/papers.json](paper-library/data/papers.json)",
+        );
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(rendered.text.contains("📎 文件1"));
+        assert!(rendered.text.contains("📎 papers.json"));
+        assert!(!rendered.entities.iter().any(|entity| {
+            entity.kind == "text_link"
+                && entity
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.contains("paper-library/data/papers.json"))
+        }));
     }
 
     #[test]
