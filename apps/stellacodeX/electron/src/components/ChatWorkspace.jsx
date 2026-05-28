@@ -151,6 +151,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const pendingScrollRestoreRef = useRef(null);
   const lastScrollStateRef = useRef(null);
   const scrollMemoryFrameRef = useRef(0);
+  const scrollReconcileFrameRef = useRef(0);
+  const visibleReadFrameRef = useRef(0);
   const pendingScrollMemoryScopeRef = useRef('');
   const pendingScrollMemoryStateRef = useRef(null);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
@@ -249,6 +251,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     list.style.setProperty('--response-spacer-height', `${height}px`);
   }
 
+  function scheduleScrollReconcile(reason) {
+    if (scrollReconcileFrameRef.current) return;
+    scrollReconcileFrameRef.current = window.requestAnimationFrame(() => {
+      scrollReconcileFrameRef.current = 0;
+      reconcileScrollAfterContentChange(reason, lastScrollStateRef.current);
+    });
+  }
+
   useLayoutEffect(() => {
     scrollRef.current?.style.setProperty('--progress-height', '0px');
   }, [activeMessageScope, activitySignature, progressVisible]);
@@ -267,7 +277,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   useLayoutEffect(() => {
     updateResponseSpacerMetrics();
     if (lastScopeRef.current === activeMessageScope) {
-      requestAnimationFrame(() => reconcileScrollAfterContentChange(SCROLL_CHANGE.StreamUpdate, lastScrollStateRef.current));
+      scheduleScrollReconcile(SCROLL_CHANGE.StreamUpdate);
     }
   }, [responseSpacerVisible, activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature, pendingAssistantVisible]);
 
@@ -279,7 +289,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const observer = new ResizeObserver(() => {
       measureChatPerf('chat.resize_observer.message_scroll', () => {
         updateResponseSpacerMetrics();
-        requestAnimationFrame(() => reconcileScrollAfterContentChange(SCROLL_CHANGE.ContentResize, lastScrollStateRef.current));
+        scheduleScrollReconcile(SCROLL_CHANGE.ContentResize);
       });
     });
     observer.observe(list);
@@ -290,7 +300,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
 
   useLayoutEffect(() => {
     updateComposerMetrics();
-    requestAnimationFrame(() => reconcileScrollAfterContentChange(SCROLL_CHANGE.ComposerResize, lastScrollStateRef.current));
+    scheduleScrollReconcile(SCROLL_CHANGE.ComposerResize);
   }, [draft, composerAttachments.length, selectionReferences.length]);
 
   useEffect(() => {
@@ -486,6 +496,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   }, [composerAttachments]);
 
   useEffect(() => () => {
+    if (scrollReconcileFrameRef.current) {
+      window.cancelAnimationFrame(scrollReconcileFrameRef.current);
+      scrollReconcileFrameRef.current = 0;
+    }
+    if (visibleReadFrameRef.current) {
+      window.cancelAnimationFrame(visibleReadFrameRef.current);
+      visibleReadFrameRef.current = 0;
+    }
     flushPendingScrollMemory(lastScopeRef.current);
     rememberChatScroll(lastScopeRef.current, captureScrollState());
     composerAttachmentsRef.current.forEach((attachment) => {
@@ -544,73 +562,55 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!restoringScrollRef.current) {
       rememberCurrentScrollSoon(activeMessageScope, captureScrollState());
     }
+    scheduleVisibleReadReport();
     if (list.scrollTop <= 96) {
       loadOlderPreservingViewport();
     }
   };
 
-  const reportVisibleReadMessages = useCallback((nodes) => {
+  const reportVisibleReadNode = useCallback((node) => {
     if (!stableVisibleMessageRead) return;
-    let bestId = '';
-    let bestOrder = -1;
-    nodes.forEach((node) => {
-      const id = String(node?.getAttribute?.('data-message-id') || '').trim();
-      const order = messageOrderFromId(id);
-      if (order !== undefined && order > bestOrder) {
-        bestId = id;
-        bestOrder = order;
-      }
-    });
-    if (!bestId) return;
+    const bestId = String(node?.getAttribute?.('data-message-id') || '').trim();
+    const bestOrder = messageOrderFromId(bestId);
+    if (bestOrder === undefined) return;
     const previousOrder = messageOrderFromId(visibleReadIdRef.current) ?? -1;
     if (bestOrder <= previousOrder) return;
     visibleReadIdRef.current = bestId;
     stableVisibleMessageRead(bestId);
   }, [stableVisibleMessageRead]);
 
-  useEffect(() => {
-    if (!messagesReady || !stableVisibleMessageRead) return undefined;
+  const scanLatestVisibleReadNode = useCallback(() => {
     const list = scrollRef.current;
     const content = contentRef.current;
-    if (!list || !content || typeof IntersectionObserver === 'undefined') return undefined;
-    const nodes = Array.from(content.querySelectorAll('[data-message-id]'));
-    if (!nodes.length) return undefined;
-    const visibleNodes = new Set();
-    let frame = 0;
-    const scheduleReport = () => {
-      if (frame) return;
-      frame = window.requestAnimationFrame(() => {
-        frame = 0;
-        reportVisibleReadMessages(visibleNodes);
-      });
-    };
+    if (!list || !content) return null;
     const listRect = list.getBoundingClientRect();
-    nodes.forEach((node) => {
+    const entries = content.children;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const node = entries[index]?.querySelector?.('[data-message-id]');
+      if (!node) continue;
       const rect = node.getBoundingClientRect();
-      if (rect.bottom > listRect.top && rect.top < listRect.bottom) {
-        visibleNodes.add(node);
-      }
+      if (rect.bottom <= listRect.top) break;
+      if (rect.top < listRect.bottom && rect.bottom > listRect.top) return node;
+    }
+    return null;
+  }, []);
+
+  const scheduleVisibleReadReport = useCallback(() => {
+    if (!messagesReady || !stableVisibleMessageRead || visibleReadFrameRef.current) return;
+    visibleReadFrameRef.current = window.requestAnimationFrame(() => {
+      visibleReadFrameRef.current = 0;
+      reportVisibleReadNode(scanLatestVisibleReadNode());
     });
-    scheduleReport();
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) visibleNodes.add(entry.target);
-        else visibleNodes.delete(entry.target);
-      });
-      scheduleReport();
-    }, { root: list, threshold: 0.01 });
-    nodes.forEach((node) => observer.observe(node));
-    return () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
+  }, [messagesReady, stableVisibleMessageRead, reportVisibleReadNode, scanLatestVisibleReadNode]);
+
+  useEffect(() => {
+    scheduleVisibleReadReport();
   }, [
     activeMessageScope,
     messagesReady,
-    stableVisibleMessageRead,
-    reportVisibleReadMessages,
     renderEntries.length,
-    newestMessageKey
+    newestMessageKey,
+    scheduleVisibleReadReport
   ]);
 
   const addComposerFiles = async (files, source = 'file') => {

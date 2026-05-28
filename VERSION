@@ -1,5 +1,10 @@
-version: 1.31.31
+version: 1.31.32
 ---
+
+# 1.31.32
+
+- 降低 StellaCodeX Electron Chat 滚动触发 renderer crash 的风险：
+  Chat 面板不再为每条消息创建 `IntersectionObserver` 来判断已读位置，改为滚动时按 animation frame 合并扫描当前可见的最后一条 durable message；stream/content/composer resize 触发的 scroll reconcile 也合并到单个 animation frame，并在组件卸载时取消挂起帧，避免长页面滚动时大量 observer 回调、布局读取和程序化 `scrollTop` 调整叠加。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.31
 
