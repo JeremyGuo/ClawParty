@@ -84,7 +84,7 @@ pub struct SessionActor {
     next_turn_id: u64,
     next_batch_id: u64,
     shutdown: bool,
-    logger: Option<SessionActorLogger>,
+    logger: Option<Arc<SessionActorLogger>>,
     state_store: Option<SessionStateStore>,
     compressor: Option<SessionCompressor>,
     token_estimator: Option<TokenEstimator>,
@@ -488,8 +488,10 @@ impl SessionActor {
                     });
                 }
 
-                let logger = SessionActorLogger::open_default(&initial.session_id)
-                    .map_err(SessionActorError::Logging)?;
+                let logger = Arc::new(
+                    SessionActorLogger::open_default(&initial.session_id)
+                        .map_err(SessionActorError::Logging)?,
+                );
                 let state_store = SessionStateStore::open_default(&initial.session_id)
                     .map_err(SessionActorError::Persistence)?;
                 self.tool_catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
@@ -565,6 +567,8 @@ impl SessionActor {
                         "log_path": logger.path(),
                     }),
                 );
+                #[cfg(not(test))]
+                self.tool_executor.set_logger(Some(logger.clone()));
                 self.logger = Some(logger);
                 self.state_store = Some(state_store);
                 self.compressor = compressor;
@@ -643,6 +647,7 @@ impl SessionActor {
                 "all_messages_len": self.all_messages.len(),
             }),
         );
+        self.emit_compact_started("manual_compaction")?;
         let system_prompt = self.system_prompt_for_current_initial()?;
         let compression_context = self.compression_memory_context(&self.history, None);
 
@@ -2088,6 +2093,12 @@ impl SessionActor {
         })
     }
 
+    fn emit_compact_started(&self, phase: impl Into<String>) -> Result<(), SessionActorError> {
+        self.emit(SessionEvent::CompactStarted {
+            phase: phase.into(),
+        })
+    }
+
     fn append_history_message(
         &mut self,
         phase: &str,
@@ -2129,7 +2140,7 @@ impl SessionActor {
         };
 
         self.all_messages.push(message.clone());
-        if append_phase_should_defer_compression(phase) {
+        if append_message_should_defer_compression(phase, &message) {
             self.log_info(
                 "append_history_message_compression_deferred",
                 serde_json::json!({
@@ -2198,6 +2209,7 @@ impl SessionActor {
                 "all_messages_len": self.all_messages.len(),
             }),
         );
+        self.emit_compact_started(phase)?;
         let report = {
             let mut request_too_large_attempts = 0usize;
             loop {
@@ -2259,6 +2271,14 @@ impl SessionActor {
                 .promote_notified_components_to_system_snapshot();
             clear_context_model_token_usage(&mut self.history);
         }
+        self.emit(SessionEvent::CompactCompleted {
+            compressed: report.compressed,
+            estimated_tokens_before: report.estimated_tokens_before,
+            estimated_tokens_after: report.estimated_tokens_after,
+            threshold_tokens: report.threshold_tokens,
+            retained_message_count: report.retained_message_count,
+            compressed_message_count: report.compressed_message_count,
+        })?;
         self.persist_state_if_history_closed(phase)?;
         self.log_info(
             "append_history_message_completed",
@@ -2667,6 +2687,7 @@ impl SessionActor {
                 "error": error,
             }),
         );
+        self.emit_compact_started(phase)?;
         let system_prompt = self.system_prompt_for_current_initial()?;
         let compression_context = self.compression_memory_context(&self.history, None);
         let started_at = Instant::now();
@@ -3435,8 +3456,12 @@ fn clear_context_model_token_usage(messages: &mut [ChatMessage]) {
     }
 }
 
-fn append_phase_should_defer_compression(phase: &str) -> bool {
+fn append_message_should_defer_compression(phase: &str, message: &ChatMessage) -> bool {
     phase.starts_with("tool_result")
+        || message
+            .data
+            .iter()
+            .any(|item| matches!(item, ChatMessageItem::ToolCall(_)))
 }
 
 fn request_too_large_prune_start(messages: &[ChatMessage]) -> Option<usize> {
@@ -3764,6 +3789,10 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "message_detail_result",
             "request_id": request_id,
             "found": record.is_some(),
+        }),
+        SessionEvent::CompactStarted { phase } => serde_json::json!({
+            "event": "compact_started",
+            "phase": phase,
         }),
         SessionEvent::CompactCompleted {
             compressed,

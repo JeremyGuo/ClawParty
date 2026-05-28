@@ -1856,6 +1856,93 @@ button {
   animation: text-shimmer 2.6s linear infinite;
 }
 
+.compression-divider {
+  display: grid;
+  width: 100%;
+  max-width: var(--chat-column-width);
+  margin: 10px auto 18px;
+  grid-template-columns: minmax(24px, 1fr) auto minmax(24px, 1fr);
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  content-visibility: visible;
+}
+
+.compression-divider::before,
+.compression-divider::after {
+  display: block;
+  grid-row: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--border), transparent 25%);
+  content: "";
+}
+
+.compression-divider::before {
+  grid-column: 1;
+}
+
+.compression-divider::after {
+  grid-column: 3;
+}
+
+.compression-divider span {
+  display: inline-block;
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  background: linear-gradient(
+    100deg,
+    var(--muted) 0%,
+    var(--muted) 44%,
+    var(--text-shimmer-highlight) 50%,
+    var(--muted) 56%,
+    var(--muted) 100%
+  );
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  animation: text-shimmer 2.6s linear infinite;
+}
+
+.compression-divider.error {
+  margin-top: 12px;
+  color: var(--danger);
+}
+
+.compression-divider.error::before,
+.compression-divider.error::after {
+  background: color-mix(in srgb, var(--danger), transparent 48%);
+}
+
+.compression-divider.error span {
+  background: none;
+  color: var(--danger);
+  -webkit-text-fill-color: currentColor;
+  animation: none;
+}
+
+.compression-divider small {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  max-width: min(680px, 100%);
+  margin: -4px auto 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--danger), var(--muted) 35%);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message-status {
   margin-top: 8px;
   padding-right: 10px;

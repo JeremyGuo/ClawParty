@@ -936,6 +936,7 @@ pub(super) struct ConversationSeen {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ChatLiveState {
     pub(super) current_turn_state: Option<Value>,
+    pub(super) current_compression_state: Option<Value>,
     pub(super) current_provisional_assistant_message: Option<Value>,
     pub(super) running_tool_results: Vec<Value>,
     pub(super) queued_outbound_messages: Vec<Value>,
@@ -1016,6 +1017,7 @@ impl ChatLiveState {
             "focus_message_id": focus_message_id,
             "focus_expected_index": focus_expected_index,
             "has_current_turn": self.current_turn_state.is_some(),
+            "compression_active": self.current_compression_state.is_some(),
             "has_provisional": provisional_message.is_some(),
             "provisional_message_id": provisional_message_id,
             "provisional_text_len": provisional_message.map(message_text_len).unwrap_or(0),
@@ -1271,6 +1273,15 @@ impl ChatLiveState {
                 self.running_tool_results.clear();
                 self.stream_next_indices.clear();
                 self.invalid_stream_messages.clear();
+            }
+            "compact_started" => {
+                self.current_compression_state = Some(json!({
+                    "phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
+                    "started_at": now_rfc3339(),
+                }));
+            }
+            "compact_completed" | "compact_failed" => {
+                self.current_compression_state = None;
             }
             "stream_assistant_message_delta" => self.apply_assistant_delta(event),
             "stream_tool_call_delta" => self.apply_tool_call_delta(event),

@@ -90,7 +90,7 @@ function useStableOptionalCallback(callback) {
   return callback ? stableCallback : undefined;
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, commandNotice, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, compressionActive = false, compressionError = null, runningActivities, commandNotice, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onVisibleMessageRead }) {
   const renderStartedAt = renderCommitStart();
   const currentActivity = (runningActivities || []).at(-1) || null;
   const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
@@ -737,6 +737,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           sessionRunning={sessionRunning}
           latestAssistantTurnIndex={latestAssistantTurnIndex}
           pendingAssistantVisible={pendingAssistantVisible}
+          compressionActive={compressionActive}
+          compressionError={compressionError}
           turnStoppedAfterTool={turnStoppedAfterTool}
           onContinue={continueTurn}
           sending={sending}
@@ -939,6 +941,8 @@ function MessageStreamView({
   sessionRunning,
   latestAssistantTurnIndex,
   pendingAssistantVisible,
+  compressionActive,
+  compressionError,
   turnStoppedAfterTool,
   onContinue,
   sending,
@@ -963,9 +967,14 @@ function MessageStreamView({
 
   if (renderedMessages.length === 0) {
     return (
-      <div className="empty-chat">
-        <strong>欢迎使用 Stellacode</strong>
-        <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
+      <div className="message-stream-content" ref={contentRef}>
+        <div className="empty-chat">
+          <strong>欢迎使用 Stellacode</strong>
+          <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
+        </div>
+        {compressionActive && <CompressionDivider />}
+        {compressionError && <CompressionDivider variant="error" label="压缩失败" detail={compressionError.reason || compressionError.message || String(compressionError)} />}
+        <div className="response-spacer" aria-hidden="true" />
       </div>
     );
   }
@@ -1002,6 +1011,8 @@ function MessageStreamView({
         );
       })}
       {pendingAssistantVisible && <PendingAssistantPlaceholder />}
+      {compressionActive && <CompressionDivider />}
+      {compressionError && <CompressionDivider variant="error" label="压缩失败" detail={compressionError.reason || compressionError.message || String(compressionError)} />}
       {turnStoppedAfterTool && (
         <div className="turn-continuation-notice">
           <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
@@ -1031,6 +1042,8 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.sessionRunning === next.sessionRunning
     && previous.latestAssistantTurnIndex === next.latestAssistantTurnIndex
     && previous.pendingAssistantVisible === next.pendingAssistantVisible
+    && previous.compressionActive === next.compressionActive
+    && previous.compressionError === next.compressionError
     && previous.turnStoppedAfterTool === next.turnStoppedAfterTool
     && previous.onContinue === next.onContinue
     && previous.sending === next.sending
@@ -1046,6 +1059,15 @@ function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }
   return (
     <div className={`pending-assistant-placeholder${compact ? ' compact' : ''}`} aria-live="polite">
       <span>{label}</span>
+    </div>
+  );
+}
+
+function CompressionDivider({ variant = 'active', label = '压缩中', detail = '' }) {
+  return (
+    <div className={`compression-divider ${variant}`} role="status" aria-live="polite">
+      <span>{label}</span>
+      {detail && <small>{detail}</small>}
     </div>
   );
 }

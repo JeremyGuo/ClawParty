@@ -111,6 +111,7 @@ export function useChatSessionStream({
   setStatusDeltas,
   setConversations,
   updateRunningActivities,
+  showCommandNotice,
   markConversationRead
 }) {
   useEffect(() => {
@@ -459,6 +460,17 @@ export function useChatSessionStream({
       }));
 
       if (type === 'turn_started' || type === 'stream_turn_start') {
+        setChatSessionState((current) => (
+          current?.scopeKey === key
+            ? { ...current, compressionError: null }
+            : current
+        ));
+        if (chatSessionStateRef.current?.scopeKey === key) {
+          chatSessionStateRef.current = {
+            ...chatSessionStateRef.current,
+            compressionError: null
+          };
+        }
         applyStreamPatch(streamTurnStartedPatch(event), event, type);
         return;
       }
@@ -478,6 +490,61 @@ export function useChatSessionStream({
           mergeProgressActivity(current, progress)
         ]);
         setSessionActivity(progress.detail || progress.title || '已更新计划');
+        return;
+      }
+
+      if (type === 'compact_started') {
+        setChatSessionState((current) => ({
+          ...(current?.scopeKey === key ? current : { scopeKey: key, state: 'idle' }),
+          compressionActive: true,
+          compressionError: null,
+          currentCompressionState: {
+            phase: event.phase || '',
+            startedAt: event.started_at || event.startedAt || new Date().toISOString()
+          }
+        }));
+        chatSessionStateRef.current = {
+          ...(chatSessionStateRef.current?.scopeKey === key ? chatSessionStateRef.current : { scopeKey: key, state: 'idle' }),
+          compressionActive: true,
+          compressionError: null,
+          currentCompressionState: {
+            phase: event.phase || '',
+            startedAt: event.started_at || event.startedAt || new Date().toISOString()
+          }
+        };
+        setSessionActivity('正在压缩上下文');
+        return;
+      }
+
+      if (type === 'compact_completed' || type === 'compact_failed') {
+        const compressionError = type === 'compact_failed'
+          ? {
+            reason: event.reason || event.message || '上下文压缩失败',
+            phase: event.phase || '',
+            failedAt: event.failed_at || event.failedAt || new Date().toISOString()
+          }
+          : null;
+        setChatSessionState((current) => (
+          current?.scopeKey === key
+            ? { ...current, compressionActive: false, currentCompressionState: null, compressionError }
+            : current
+        ));
+        if (chatSessionStateRef.current?.scopeKey === key) {
+          chatSessionStateRef.current = {
+            ...chatSessionStateRef.current,
+            compressionActive: false,
+            currentCompressionState: null,
+            compressionError
+          };
+        }
+        if (type === 'compact_failed') {
+          setSessionActivity(compressionError.reason);
+          showCommandNotice?.({
+            title: '上下文压缩失败',
+            detail: compressionError.reason,
+            state: 'failed'
+          }, 3600);
+        }
         return;
       }
 
@@ -618,6 +685,7 @@ export function useChatSessionStream({
       if (payloadType === 'chat.snapshot') {
         const snapshotState = chatSnapshotState(payload);
         setChatSessionState({ scopeKey: key, ...snapshotState });
+        chatSessionStateRef.current = { scopeKey: key, ...snapshotState };
         setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
         reconcileAck(payload).catch(() => {});
         applyChatSnapshotLiveProjection(payload);
@@ -656,6 +724,12 @@ export function useChatSessionStream({
         || nestedStreamType === 'turn_started'
         || nestedStreamType === 'turn_completed'
         || nestedStreamType === 'plan_updated'
+        || nestedStreamType === 'compact_started'
+        || nestedStreamType === 'compact_completed'
+        || nestedStreamType === 'compact_failed'
+        || payloadType === 'chat.compact_started'
+        || payloadType === 'chat.compact_completed'
+        || payloadType === 'chat.compact_failed'
         || payloadType === 'chat.plan_updated'
       ) {
         applySessionStream(payload);
@@ -746,6 +820,7 @@ export function useChatSessionStream({
     setStatusDeltas,
     setConversations,
     updateRunningActivities,
+    showCommandNotice,
     markConversationRead
   ]);
 }

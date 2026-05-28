@@ -517,7 +517,10 @@ fn project_channel_event(
             | AgentSessionEvent::StreamReasoningSummaryPartAdded { .. }
             | AgentSessionEvent::StreamError { .. }
             | AgentSessionEvent::StreamToolResultDone { .. }
-            | AgentSessionEvent::PlanUpdated { .. }) => {
+            | AgentSessionEvent::PlanUpdated { .. }
+            | AgentSessionEvent::CompactStarted { .. }
+            | AgentSessionEvent::CompactCompleted { .. }
+            | AgentSessionEvent::CompactFailed { .. }) => {
                 events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),

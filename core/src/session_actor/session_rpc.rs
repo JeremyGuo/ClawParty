@@ -340,6 +340,9 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record: Option<SessionMessageRecord>,
     },
+    CompactStarted {
+        phase: String,
+    },
     CompactCompleted {
         compressed: bool,
         estimated_tokens_before: u64,

@@ -1400,6 +1400,16 @@ fn handle_session_event(
                 }),
             }))?;
         }
+        agent_session::AgentSessionEvent::CompactStarted { phase } => {
+            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                addr: ctx.addr.clone(),
+                label: "compact_started".to_string(),
+                detail: serde_json::json!({
+                    "session_addr": session_addr,
+                    "phase": phase,
+                }),
+            }))?;
+        }
         agent_session::AgentSessionEvent::CompactCompleted {
             compressed,
             estimated_tokens_before,

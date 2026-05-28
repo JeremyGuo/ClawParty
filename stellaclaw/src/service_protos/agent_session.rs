@@ -282,6 +282,9 @@ pub enum AgentSessionEvent {
         query_id: String,
         payload: Value,
     },
+    CompactStarted {
+        phase: String,
+    },
     CompactCompleted {
         compressed: bool,
         estimated_tokens_before: u64,

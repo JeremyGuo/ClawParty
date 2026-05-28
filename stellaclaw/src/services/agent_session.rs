@@ -3341,6 +3341,7 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
                 }),
             }
         }
+        CoreSessionEvent::CompactStarted { phase } => AgentSessionEvent::CompactStarted { phase },
         CoreSessionEvent::CompactCompleted {
             compressed,
             estimated_tokens_before,

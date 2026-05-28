@@ -27,6 +27,7 @@ export function isActiveSessionState(value) {
 
 export function chatSnapshotState(snapshot) {
   const currentTurnState = snapshot?.current_turn_state || snapshot?.currentTurnState || null;
+  const currentCompressionState = snapshot?.current_compression_state || snapshot?.currentCompressionState || null;
   const queued = Array.isArray(snapshot?.queued_outbound_messages)
     ? snapshot.queued_outbound_messages
     : Array.isArray(snapshot?.queuedOutboundMessages)
@@ -40,6 +41,8 @@ export function chatSnapshotState(snapshot) {
   return {
     state,
     currentTurnState,
+    currentCompressionState,
+    compressionActive: Boolean(currentCompressionState),
     activeTurnId: String(currentTurnState?.turn_id || currentTurnState?.turnId || '').trim()
   };
 }

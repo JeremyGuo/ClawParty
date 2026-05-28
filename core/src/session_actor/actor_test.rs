@@ -2784,6 +2784,26 @@ fn compresses_history_before_appending_next_data_message_when_threshold_is_excee
 }
 
 #[test]
+fn model_response_with_tool_call_defers_compression_until_protocol_closes() {
+    let message = ChatMessage::new(
+        ChatRole::Assistant,
+        vec![ChatMessageItem::ToolCall(ToolCallItem {
+            item_id: None,
+            tool_call_id: "call_1".to_string(),
+            tool_name: "attachment_make_visible".to_string(),
+            arguments: ContextItem {
+                text: r#"{"path":"plot.svg"}"#.to_string(),
+            },
+        })],
+    );
+
+    assert!(append_message_should_defer_compression(
+        "model_response",
+        &message
+    ));
+}
+
+#[test]
 fn compression_does_not_append_runtime_update_plan_context() {
     let _cwd = temp_cwd("actor-compression-no-runtime-plan");
     let (inbox, mailbox) = test_inbox();

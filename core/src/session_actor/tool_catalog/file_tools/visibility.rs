@@ -2,8 +2,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -15,7 +14,8 @@ use super::super::{
 };
 use crate::session_actor::{
     tool_runtime::{
-        f64_arg_with_default, shell_quote, string_arg, LocalToolError, ToolExecutionContext,
+        f64_arg_with_default, run_command_with_timeout, shell_quote, string_arg, LocalToolError,
+        ToolExecutionContext,
     },
     ToolResultContent,
 };
@@ -696,48 +696,17 @@ fn run_shell_command_with_timeout(
     command: &str,
     timeout: Duration,
 ) -> Result<std::process::Output, LocalToolError> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| LocalToolError::Io(format!("failed to spawn copy command: {error}")))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().map_err(|error| {
-                    LocalToolError::Io(format!("failed to collect copy output: {error}"))
-                })?;
-                if status.success() {
-                    return Ok(output);
-                }
-                return Err(LocalToolError::Remote(format!(
-                    "copy command exited with {}; stderr: {}",
-                    status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(LocalToolError::Remote(format!(
-                        "copy command timed out after {} seconds",
-                        timeout.as_secs()
-                    )));
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                return Err(LocalToolError::Io(format!(
-                    "failed to wait for copy command: {error}"
-                )));
-            }
-        }
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(command);
+    let output = run_command_with_timeout(child, timeout, None, "copy command")?;
+    if output.status.success() {
+        return Ok(output);
     }
+    Err(LocalToolError::Remote(format!(
+        "copy command exited with {}; stderr: {}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 fn remote_shell_command(cwd: Option<&str>, command: &str) -> String {

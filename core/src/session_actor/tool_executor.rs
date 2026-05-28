@@ -14,6 +14,7 @@ use super::tool_runtime::ExecutionTarget;
 #[cfg(test)]
 use super::ToolBatchExecutor;
 use super::{
+    logger::SessionActorLogger,
     tool_catalog::{ToolCallContext, ToolCatalog},
     tool_runtime::{
         normalize_tool_value, parse_arguments, LocalToolError, ToolCancellationToken,
@@ -37,6 +38,7 @@ pub struct LocalToolBatchExecutor {
     search_tool_models: Option<SearchToolModels>,
     provider_backed_tool_models: Option<ProviderBackedToolModels>,
     tool_catalog: Option<ToolCatalog>,
+    logger: RwLock<Option<Arc<SessionActorLogger>>>,
     running_batch: Mutex<Option<RunningToolBatch>>,
 }
 
@@ -56,6 +58,7 @@ impl LocalToolBatchExecutor {
             search_tool_models: None,
             provider_backed_tool_models: None,
             tool_catalog: None,
+            logger: RwLock::new(None),
             running_batch: Mutex::new(None),
         }
     }
@@ -96,6 +99,12 @@ impl LocalToolBatchExecutor {
         self
     }
 
+    pub fn set_logger(&self, logger: Option<Arc<SessionActorLogger>>) {
+        if let Ok(mut current) = self.logger.write() {
+            *current = logger;
+        }
+    }
+
     fn spawn_batch_worker(
         &self,
         batch: ToolBatch,
@@ -113,6 +122,7 @@ impl LocalToolBatchExecutor {
             search_tool_models: self.search_tool_models.clone(),
             provider_backed_tool_models: self.provider_backed_tool_models.clone(),
             tool_catalog: self.tool_catalog.clone(),
+            logger: self.logger.read().ok().and_then(|logger| logger.clone()),
             interrupt_rx,
             operation_lock: Arc::new(RwLock::new(())),
             progress_tx,
@@ -175,6 +185,7 @@ struct ToolBatchRunner {
     search_tool_models: Option<SearchToolModels>,
     provider_backed_tool_models: Option<ProviderBackedToolModels>,
     tool_catalog: Option<ToolCatalog>,
+    logger: Option<Arc<SessionActorLogger>>,
     interrupt_rx: Receiver<()>,
     operation_lock: Arc<RwLock<()>>,
     progress_tx: Sender<ToolBatchProgress>,
@@ -197,8 +208,10 @@ impl ToolBatchRunner {
             }
 
             if batch.operations[index].concurrency == ToolConcurrency::Serial {
-                let (outcome, batch_interrupted) =
-                    self.execute_operation_interruptibly(batch.operations[index].clone());
+                let (outcome, batch_interrupted) = self.execute_operation_interruptibly(
+                    &batch.batch_id,
+                    batch.operations[index].clone(),
+                );
                 match outcome {
                     OperationOutcome::Completed(result) => {
                         self.emit_progress_result(&batch.batch_id, &result);
@@ -253,13 +266,15 @@ impl ToolBatchRunner {
 
     fn execute_operation_interruptibly(
         &self,
+        batch_id: &str,
         scheduled: ToolBatchOperation,
     ) -> (OperationOutcome, bool) {
         let (result_tx, result_rx) = crossbeam_channel::bounded(1);
         let (operation_interrupt_tx, operation_interrupt_rx) = crossbeam_channel::bounded(1);
-        let runner = self.operation_runner(ToolCancellationToken::from_interrupt_rx(
-            operation_interrupt_rx,
-        ));
+        let runner = self.operation_runner(
+            batch_id,
+            ToolCancellationToken::from_interrupt_rx(operation_interrupt_rx),
+        );
         let operation_lock = self.operation_lock.clone();
         let join_handle = thread::spawn(move || {
             let result = execute_scheduled_operation(runner, scheduled, operation_lock);
@@ -295,9 +310,10 @@ impl ToolBatchRunner {
             let result_tx = result_tx.clone();
             let (operation_interrupt_tx, operation_interrupt_rx) = crossbeam_channel::bounded(1);
             interrupt_txs.push(Some(operation_interrupt_tx));
-            let runner = self.operation_runner(ToolCancellationToken::from_interrupt_rx(
-                operation_interrupt_rx,
-            ));
+            let runner = self.operation_runner(
+                batch_id,
+                ToolCancellationToken::from_interrupt_rx(operation_interrupt_rx),
+            );
             let operation_lock = self.operation_lock.clone();
             join_handles.push(Some(thread::spawn(move || {
                 let result = execute_scheduled_operation(runner, scheduled, operation_lock);
@@ -395,8 +411,13 @@ impl ToolBatchRunner {
         }
     }
 
-    fn operation_runner(&self, cancel_token: ToolCancellationToken) -> ToolOperationRunner {
+    fn operation_runner(
+        &self,
+        batch_id: &str,
+        cancel_token: ToolCancellationToken,
+    ) -> ToolOperationRunner {
         ToolOperationRunner {
+            batch_id: batch_id.to_string(),
             workspace_root: self.workspace_root.clone(),
             data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
@@ -405,6 +426,7 @@ impl ToolBatchRunner {
             search_tool_models: self.search_tool_models.clone(),
             provider_backed_tool_models: self.provider_backed_tool_models.clone(),
             tool_catalog: self.tool_catalog.clone(),
+            logger: self.logger.clone(),
             cancel_token,
         }
     }
@@ -422,6 +444,17 @@ fn next_serial_operation_index(operations: &[ToolBatchOperation], start: usize) 
         .map(|offset| start + offset)
         .unwrap_or(operations.len())
         .max(start + 1)
+}
+
+fn tool_log_fields(item: &ToolBatchItem) -> (String, String, String) {
+    match item {
+        ToolBatchItem::RegisteredTool(tool_call)
+        | ToolBatchItem::UnsupportedTool { tool_call, .. } => (
+            tool_call.tool_name.clone(),
+            tool_call.tool_call_id.clone(),
+            item.progress_label(),
+        ),
+    }
 }
 
 fn execute_scheduled_operation(
@@ -520,6 +553,7 @@ fn finish_disconnected_operation(join_handle: JoinHandle<()>) -> OperationOutcom
 }
 
 struct ToolOperationRunner {
+    batch_id: String,
     workspace_root: PathBuf,
     data_root: PathBuf,
     remote_mode: ToolRemoteMode,
@@ -528,18 +562,68 @@ struct ToolOperationRunner {
     search_tool_models: Option<SearchToolModels>,
     provider_backed_tool_models: Option<ProviderBackedToolModels>,
     tool_catalog: Option<ToolCatalog>,
+    logger: Option<Arc<SessionActorLogger>>,
     cancel_token: ToolCancellationToken,
 }
 
 impl ToolOperationRunner {
     fn execute_operation(&self, item: &ToolBatchItem) -> Result<ToolResultItem, LocalToolError> {
+        let started_at = std::time::Instant::now();
+        let (tool_name, tool_call_id, progress_label) = tool_log_fields(item);
+        if let Some(logger) = &self.logger {
+            logger.info(
+                "tool_operation_started",
+                json!({
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "batch_id": self.batch_id,
+                    "progress_label": progress_label,
+                }),
+            );
+        }
         let result = match item {
             ToolBatchItem::RegisteredTool(tool_call) => self.execute_registered_tool(tool_call),
             ToolBatchItem::UnsupportedTool { reason, .. } => {
                 Err(LocalToolError::UnsupportedTool(reason.clone()))
             }
-        }?;
-        Ok(self.cap_tool_result_context(result))
+        };
+        let elapsed_ms = started_at.elapsed().as_millis();
+        match result {
+            Ok(result) => {
+                let result = self.cap_tool_result_context(result);
+                if let Some(logger) = &self.logger {
+                    logger.info(
+                        "tool_operation_completed",
+                        json!({
+                            "tool_name": result.tool_name,
+                            "tool_call_id": result.tool_call_id,
+                            "batch_id": self.batch_id,
+                            "progress_label": progress_label,
+                            "elapsed_ms": elapsed_ms,
+                            "status": "ok",
+                        }),
+                    );
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                if let Some(logger) = &self.logger {
+                    logger.warn(
+                        "tool_operation_completed",
+                        json!({
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "batch_id": self.batch_id,
+                            "progress_label": progress_label,
+                            "elapsed_ms": elapsed_ms,
+                            "status": "error",
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     fn execute_registered_tool(
@@ -1041,6 +1125,39 @@ mod tests {
         assert_eq!(result.tool_call_id, "call_ext");
         assert_eq!(result.tool_name, "provider_shell_echo");
         assert!(crate::session_actor::tool_result_text(result).contains("hello"));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn executor_logs_tool_operation_timing() {
+        let workspace = temp_workspace();
+        let catalog = builtin_test_catalog();
+        let executor = LocalToolBatchExecutor::new(&workspace).with_tool_catalog(catalog);
+        let logger = Arc::new(
+            SessionActorLogger::open_under(&workspace, "session_tool_logs")
+                .expect("logger should open"),
+        );
+        let log_path = logger.path().to_path_buf();
+        executor.set_logger(Some(logger));
+        let batch = ToolBatch::new(
+            "batch_tool_logs",
+            vec![tool_call(
+                "shell_exec",
+                json!({"command": "printf ok", "yield_time_ms": 250, "max_output_chars": 1000}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, batch);
+
+        assert_eq!(message.data.len(), 1);
+        let raw = fs::read_to_string(log_path).expect("tool log should be readable");
+        assert!(raw.contains("\"event\":\"tool_operation_started\""));
+        assert!(raw.contains("\"event\":\"tool_operation_completed\""));
+        assert!(raw.contains("\"tool_name\":\"shell_exec\""));
+        assert!(raw.contains("\"tool_call_id\":\"call_1\""));
+        assert!(raw.contains("\"batch_id\":\"batch_tool_logs\""));
+        assert!(raw.contains("\"elapsed_ms\""));
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

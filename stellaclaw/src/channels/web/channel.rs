@@ -1060,6 +1060,7 @@ impl WebChannel {
                 summary.last_message_id,
                 summary.last_message_index,
                 live.current_turn_state,
+                live.current_compression_state,
                 live.current_provisional_assistant_message,
                 live.running_tool_results,
                 live.queued_outbound_messages,
@@ -1079,13 +1080,11 @@ impl WebChannel {
             match rx.recv_timeout(Duration::from_secs(protocol::HEARTBEAT_INTERVAL_SECS)) {
                 Ok(value) => send_websocket_json(&mut stream, &value)?,
                 Err(RecvTimeoutError::Timeout) => {
-                    let live = self.chat_live_snapshot(conversation_id, foreground_session_id);
                     send_websocket_json(
                         &mut stream,
                         &protocol::chat_heartbeat(
                             conversation_id,
                             foreground_session_id,
-                            live,
                             now_rfc3339(),
                         ),
                     )?;

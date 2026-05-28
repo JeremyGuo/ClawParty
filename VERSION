@@ -1,5 +1,10 @@
-version: 1.31.28
+version: 1.31.29
 ---
+
+# 1.31.29
+
+- 增强 Session 压缩和工具执行诊断：
+  SessionActor 在手动压缩、append-history 自动压缩和 request-too-large 恢复压缩开始时会发出 `compact_started`，完成或失败时发出对应结束事件；WebChannel 会在每个 chat live state / snapshot 中维护当前压缩状态，StellaCodeX Electron 在消息区底部显示带 shimmer 的“压缩中”分割线并在结束后自动隐藏，`compact_failed` 会显示明确 toast 和底部错误分割线。Chat websocket heartbeat 收敛为纯保活包，不再携带 live state；前端运行状态只由 snapshot 初始化和 stream 事件增量维护，避免长时间工具执行但没有新消息时被误判为不在工作。Batch Tool 执行器统一记录每个工具操作的开始、完成、耗时、状态和错误信息，便于从每个 chat 的 actor log 定位卡住的工具；具体工具不再需要自行补日志。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.28
 

@@ -1033,6 +1033,7 @@ function App() {
     setStatusDeltas,
     setConversations,
     updateRunningActivities,
+    showCommandNotice,
     markConversationRead
   });
 
@@ -1302,7 +1303,7 @@ function App() {
         statuses={statuses}
         selected={selected}
         loading={loading}
-        activeRunningKey={runningActivities.length > 0 && chatSessionStateIsActive(chatSessionState) ? chatSessionState.scopeKey || '' : ''}
+        activeRunningKey={chatSessionStateIsActive(chatSessionState) ? chatSessionState.scopeKey || '' : ''}
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
         onRename={openRenameConversationDialog}
@@ -1334,6 +1335,8 @@ function App() {
           onSend={sendMessage}
           onLoadModels={loadAvailableModels}
           processing={selectedProcessing}
+          compressionActive={Boolean(chatSessionState?.compressionActive)}
+          compressionError={chatSessionState?.compressionError || null}
           runningActivities={runningActivities}
           commandNotice={commandNotice}
           selectionReferences={selectionReferences}
