@@ -1,5 +1,10 @@
-version: 1.31.30
+version: 1.32.0
 ---
+
+# 1.32.0
+
+- 新增 Feishu channel MVP：
+  配置 schema 升级到 `0.15`，新增 `kind: "feishu"` channel，Host 会启动基于官方 `@larksuiteoapi/node-sdk` 的 Node bridge，通过飞书 WebSocket 长连接接收 `im.message.receive_v1` 文本事件，并把 final assistant 文本回复发送回飞书。新增 `docs/feishu-channel.md` 说明 bridge 依赖安装、环境变量和飞书后台长连接订阅配置。本次改变 `config` schema，不改变 `workdir` schema。
 
 # 1.31.30
 

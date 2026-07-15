@@ -11,6 +11,7 @@ target/
 apps/*/node_modules/
 apps/*/dist/
 apps/stellacodeX/**/node_modules/
+stellaclaw/sidecars/**/node_modules/
 .log/
 **/.log/
 .output/

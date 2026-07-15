@@ -5,10 +5,12 @@ use crossbeam_channel::Sender;
 
 use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLogger};
 
+pub mod feishu;
 pub mod telegram;
 pub mod types;
 pub mod web;
 
+pub use feishu::FeishuChannel;
 pub use telegram::TelegramChannel;
 pub use types::{
     ChannelEvent, IncomingDispatch, OutgoingError, OutgoingMessageAppended, OutgoingSessionStream,

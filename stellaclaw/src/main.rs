@@ -32,7 +32,7 @@ use channels::{
         OutgoingHomeEvent, OutgoingMessageAppended, OutgoingProcessing, OutgoingSessionStream,
         ProcessingState,
     },
-    Channel, TelegramChannel, WebChannel,
+    Channel, FeishuChannel, TelegramChannel, WebChannel,
 };
 use config::{ChannelConfig, ModelSelection, SessionProfile, StellaclawConfig};
 use conversation_host::ConversationHostRuntime;
@@ -129,6 +129,15 @@ fn run() -> Result<()> {
     let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     for channel in &config.channels {
         match channel {
+            ChannelConfig::Feishu(feishu) => {
+                let instance = Arc::new(FeishuChannel::new(feishu, &args.workdir, logger.clone())?);
+                instance.clone().spawn_ingress(
+                    incoming_tx.clone(),
+                    id_manager.clone(),
+                    logger.clone(),
+                );
+                channels.insert(instance.id().to_string(), instance);
+            }
             ChannelConfig::Telegram(telegram) => {
                 let instance = Arc::new(TelegramChannel::new(
                     telegram.id.clone(),

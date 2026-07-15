@@ -13,9 +13,9 @@ use stellaclaw_core::model_config::{
 };
 
 use crate::config::{
-    AgentServerConfig, ChannelConfig, MemoryConfig, ModelSelection, SandboxConfig, SessionDefaults,
-    SessionProfile, StellaclawConfig, TelegramChannelConfig, ToolModelTarget, WebChannelConfig,
-    LATEST_CONFIG_VERSION,
+    AgentServerConfig, ChannelConfig, FeishuChannelConfig, MemoryConfig, ModelSelection,
+    SandboxConfig, SessionDefaults, SessionProfile, StellaclawConfig, TelegramChannelConfig,
+    ToolModelTarget, WebChannelConfig, LATEST_CONFIG_VERSION,
 };
 
 pub struct SetupArgs {
@@ -520,6 +520,7 @@ fn configure_channels(config: &mut StellaclawConfig) -> Result<()> {
             &[
                 "Add Web channel",
                 "Add Telegram channel",
+                "Add Feishu channel",
                 "Remove channel",
                 "Continue",
             ],
@@ -527,11 +528,12 @@ fn configure_channels(config: &mut StellaclawConfig) -> Result<()> {
         match choice {
             0 => add_web_channel(config)?,
             1 => add_telegram_channel(config)?,
-            2 => remove_channel(config)?,
-            3 if config.channels.is_empty() => {
+            2 => add_feishu_channel(config)?,
+            3 => remove_channel(config)?,
+            4 if config.channels.is_empty() => {
                 println!("{}", yellow("Add at least one channel before continuing."));
             }
-            3 => return Ok(()),
+            4 => return Ok(()),
             _ => unreachable!(),
         }
     }
@@ -577,6 +579,32 @@ fn add_telegram_channel(config: &mut StellaclawConfig) -> Result<()> {
             poll_timeout_seconds: 30,
             poll_interval_ms: 250,
             admin_user_ids: Vec::new(),
+        }));
+    Ok(())
+}
+
+fn add_feishu_channel(config: &mut StellaclawConfig) -> Result<()> {
+    let id = prompt_channel_id(config, "Feishu channel id", "feishu-main")?;
+    let app_id_env = prompt_text("App ID environment variable", Some("FEISHU_APP_ID"))?;
+    let app_secret_env = prompt_text("App Secret environment variable", Some("FEISHU_APP_SECRET"))?;
+    let domain = prompt_text("Domain (feishu or lark)", Some("feishu"))?;
+    config
+        .channels
+        .push(ChannelConfig::Feishu(FeishuChannelConfig {
+            id,
+            app_id: None,
+            app_id_env,
+            app_secret: None,
+            app_secret_env,
+            encrypt_key: None,
+            encrypt_key_env: "FEISHU_ENCRYPT_KEY".to_string(),
+            verification_token: None,
+            verification_token_env: "FEISHU_VERIFICATION_TOKEN".to_string(),
+            domain,
+            bridge_command: "node".to_string(),
+            bridge_script: None,
+            allowed_chat_ids: Vec::new(),
+            allowed_user_ids: Vec::new(),
         }));
     Ok(())
 }
@@ -887,6 +915,7 @@ fn remove_channel(config: &mut StellaclawConfig) -> Result<()> {
         .channels
         .iter()
         .map(|channel| match channel {
+            ChannelConfig::Feishu(channel) => format!("feishu:{}", channel.id),
             ChannelConfig::Telegram(channel) => format!("telegram:{}", channel.id),
             ChannelConfig::Web(channel) => format!("web:{}", channel.id),
         })
@@ -1024,6 +1053,15 @@ fn print_channel_summary(config: &StellaclawConfig) {
     println!("{}", bold("Channels:"));
     for channel in &config.channels {
         match channel {
+            ChannelConfig::Feishu(channel) => {
+                println!(
+                    "  - {}:{} app_id_env={} domain={}",
+                    cyan("feishu"),
+                    channel.id,
+                    channel.app_id_env,
+                    channel.domain
+                );
+            }
             ChannelConfig::Telegram(channel) => {
                 println!(
                     "  - {}:{} token_env={}",
@@ -1101,6 +1139,7 @@ fn next_available(base: &str, exists: impl Fn(&str) -> bool) -> String {
 
 fn channel_id_exists(config: &StellaclawConfig, id: &str) -> bool {
     config.channels.iter().any(|channel| match channel {
+        ChannelConfig::Feishu(channel) => channel.id == id,
         ChannelConfig::Telegram(channel) => channel.id == id,
         ChannelConfig::Web(channel) => channel.id == id,
     })

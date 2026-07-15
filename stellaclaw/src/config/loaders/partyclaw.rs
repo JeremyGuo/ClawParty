@@ -1367,6 +1367,7 @@ mod tests {
 
         assert_eq!(config.channels.len(), 1);
         match &config.channels[0] {
+            ChannelConfig::Feishu(_) => panic!("legacy feishu channel should not be converted yet"),
             ChannelConfig::Telegram(channel) => assert_eq!(channel.id, "telegram-main"),
             ChannelConfig::Web(_) => panic!("legacy web channel should not be converted yet"),
         }

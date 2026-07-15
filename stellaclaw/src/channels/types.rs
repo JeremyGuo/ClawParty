@@ -37,6 +37,38 @@ pub enum ConversationControl {
     InvalidSandbox { reason: String },
 }
 
+pub(crate) fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let first = parts.next()?;
+    let argument = parts.next().map(str::trim).unwrap_or("");
+    let command = first.split_once('@').map_or(first, |(base, _)| base);
+
+    match command {
+        "/continue" if argument.is_empty() => Some(ConversationControl::Continue),
+        "/cancel" if argument.is_empty() => Some(ConversationControl::Cancel),
+        "/compact" if argument.is_empty() => Some(ConversationControl::Compact),
+        "/status" if argument.is_empty() => Some(ConversationControl::ShowStatus),
+        "/model" if argument.is_empty() => Some(ConversationControl::ShowModel),
+        "/model" => Some(ConversationControl::SwitchModel {
+            model_name: argument.to_string(),
+        }),
+        "/reasoning" => Some(parse_reasoning_control_argument(argument)),
+        "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
+        "/remote" if argument.eq_ignore_ascii_case("off") => {
+            Some(ConversationControl::DisableRemote)
+        }
+        "/remote" => parse_remote_control(argument),
+        "/sandbox" if argument.is_empty() => Some(ConversationControl::ShowSandbox),
+        "/sandbox" => parse_sandbox_control(argument),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationControl {
     let argument = argument.trim();
     if argument.is_empty() {
@@ -53,6 +85,45 @@ pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationCo
             reason: format!("未知 reasoning effort `{argument}`。"),
         },
     }
+}
+
+fn parse_remote_control(argument: &str) -> Option<ConversationControl> {
+    let mut parts = argument.trim().splitn(2, char::is_whitespace);
+    let host = parts.next().unwrap_or_default().trim();
+    let path = parts.next().map(str::trim).unwrap_or_default();
+    if host.is_empty() || path.is_empty() {
+        return Some(ConversationControl::InvalidRemote {
+            reason: "remote 命令缺少 host 或 path。".to_string(),
+        });
+    }
+    Some(ConversationControl::SetRemote {
+        host: host.to_string(),
+        path: path.to_string(),
+    })
+}
+
+fn parse_sandbox_control(argument: &str) -> Option<ConversationControl> {
+    let argument = argument.trim();
+    if argument.eq_ignore_ascii_case("default") || argument.eq_ignore_ascii_case("global") {
+        return Some(ConversationControl::SetSandbox { mode: None });
+    }
+    if argument.eq_ignore_ascii_case("subprocess")
+        || argument.eq_ignore_ascii_case("off")
+        || argument.eq_ignore_ascii_case("none")
+        || argument.eq_ignore_ascii_case("disabled")
+    {
+        return Some(ConversationControl::SetSandbox {
+            mode: Some(crate::config::SandboxMode::Subprocess),
+        });
+    }
+    if argument.eq_ignore_ascii_case("bubblewrap") || argument.eq_ignore_ascii_case("bwrap") {
+        return Some(ConversationControl::SetSandbox {
+            mode: Some(crate::config::SandboxMode::Bubblewrap),
+        });
+    }
+    Some(ConversationControl::InvalidSandbox {
+        reason: format!("未知 sandbox 模式 `{argument}`。"),
+    })
 }
 
 #[derive(Debug, Clone)]

@@ -21,7 +21,8 @@ pub const CONFIG_VERSION_0_10: &str = "0.10";
 pub const CONFIG_VERSION_0_11: &str = "0.11";
 pub const CONFIG_VERSION_0_12: &str = "0.12";
 pub const CONFIG_VERSION_0_13: &str = "0.13";
-pub const LATEST_CONFIG_VERSION: &str = "0.14";
+pub const CONFIG_VERSION_0_14: &str = "0.14";
+pub const LATEST_CONFIG_VERSION: &str = "0.15";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -257,8 +258,40 @@ impl Default for SandboxConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelConfig {
+    Feishu(FeishuChannelConfig),
     Telegram(TelegramChannelConfig),
     Web(WebChannelConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuChannelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default = "default_feishu_app_id_env")]
+    pub app_id_env: String,
+    #[serde(default)]
+    pub app_secret: Option<String>,
+    #[serde(default = "default_feishu_app_secret_env")]
+    pub app_secret_env: String,
+    #[serde(default)]
+    pub encrypt_key: Option<String>,
+    #[serde(default = "default_feishu_encrypt_key_env")]
+    pub encrypt_key_env: String,
+    #[serde(default)]
+    pub verification_token: Option<String>,
+    #[serde(default = "default_feishu_verification_token_env")]
+    pub verification_token_env: String,
+    #[serde(default = "default_feishu_domain")]
+    pub domain: String,
+    #[serde(default = "default_feishu_bridge_command")]
+    pub bridge_command: String,
+    #[serde(default)]
+    pub bridge_script: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<String>,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,8 +341,10 @@ impl StellaclawConfig {
         }
         self.sandbox.validate()?;
         for channel in &self.channels {
-            if let ChannelConfig::Web(channel) = channel {
-                channel.validate()?;
+            match channel {
+                ChannelConfig::Feishu(channel) => channel.validate()?,
+                ChannelConfig::Telegram(_) => {}
+                ChannelConfig::Web(channel) => channel.validate()?,
             }
         }
         validate_skill_sync(&self.skill_sync)?;
@@ -547,6 +582,56 @@ impl TelegramChannelConfig {
     }
 }
 
+impl FeishuChannelConfig {
+    pub fn resolve_app_id(&self) -> Result<String, String> {
+        resolve_required_secret(self.app_id.as_deref(), &self.app_id_env, || {
+            format!(
+                "feishu channel {} requires app_id or env {}",
+                self.id, self.app_id_env
+            )
+        })
+    }
+
+    pub fn resolve_app_secret(&self) -> Result<String, String> {
+        resolve_required_secret(self.app_secret.as_deref(), &self.app_secret_env, || {
+            format!(
+                "feishu channel {} requires app_secret or env {}",
+                self.id, self.app_secret_env
+            )
+        })
+    }
+
+    pub fn resolve_encrypt_key(&self) -> Option<String> {
+        resolve_optional_secret(self.encrypt_key.as_deref(), &self.encrypt_key_env)
+    }
+
+    pub fn resolve_verification_token(&self) -> Option<String> {
+        resolve_optional_secret(
+            self.verification_token.as_deref(),
+            &self.verification_token_env,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("feishu channel id must not be empty".to_string());
+        }
+        if self.domain.trim().is_empty() {
+            return Err(format!(
+                "feishu channel {} domain must not be empty",
+                self.id
+            ));
+        }
+        if self.bridge_command.trim().is_empty() {
+            return Err(format!(
+                "feishu channel {} bridge_command must not be empty",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl WebChannelConfig {
     pub fn resolve_token(&self) -> Result<String, String> {
         std::env::var(&self.token_env).map_err(|_| {
@@ -577,12 +662,61 @@ impl WebChannelConfig {
     }
 }
 
+fn resolve_required_secret(
+    inline: Option<&str>,
+    env_name: &str,
+    error: impl FnOnce() -> String,
+) -> Result<String, String> {
+    match inline {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => std::env::var(env_name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(error),
+    }
+}
+
+fn resolve_optional_secret(inline: Option<&str>, env_name: &str) -> Option<String> {
+    inline
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var(env_name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
 fn default_version() -> String {
     LATEST_CONFIG_VERSION.to_string()
 }
 
 fn default_telegram_bot_token_env() -> String {
     "TELEGRAM_BOT_TOKEN".to_string()
+}
+
+fn default_feishu_app_id_env() -> String {
+    "FEISHU_APP_ID".to_string()
+}
+
+fn default_feishu_app_secret_env() -> String {
+    "FEISHU_APP_SECRET".to_string()
+}
+
+fn default_feishu_encrypt_key_env() -> String {
+    "FEISHU_ENCRYPT_KEY".to_string()
+}
+
+fn default_feishu_verification_token_env() -> String {
+    "FEISHU_VERIFICATION_TOKEN".to_string()
+}
+
+fn default_feishu_domain() -> String {
+    "feishu".to_string()
+}
+
+fn default_feishu_bridge_command() -> String {
+    "node".to_string()
 }
 
 fn default_telegram_api_base_url() -> String {

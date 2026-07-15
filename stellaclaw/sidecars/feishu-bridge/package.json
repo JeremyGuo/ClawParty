@@ -1,0 +1,12 @@
+{
+  "name": "@stellaclaw/feishu-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.64.0"
+  },
+  "overrides": {
+    "axios": "^1.18.0"
+  }
+}
